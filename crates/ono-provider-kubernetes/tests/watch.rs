@@ -21,12 +21,16 @@ use std::time::Duration;
 use ono_provider_kubernetes::coverage::Scope;
 use ono_provider_kubernetes::discovery::Gvr;
 use ono_provider_kubernetes::object::Object;
+use ono_provider_kubernetes::transport::{
+    FixtureStream, HttpConnection, ListOptions, watch_request,
+};
 use ono_provider_kubernetes::watch::{
-    Backoff, ChangeClass, GapReason, Reception, Reconciliation, ReconciliationStage,
-    ResourceVersion, ResumeError, SyncState, WatchEvent, WatchFailure, WatchStream,
+    Backoff, ChangeClass, FrameError, GapReason, Reception, Reconciliation, ReconciliationStage,
+    ResourceVersion, ResumeError, SyncState, WatchDecoder, WatchEvent, WatchFailure, WatchStream,
 };
 
 const INSTANCE: &str = "kubernetes:prod-eu";
+const HOST: &str = "kubernetes.default.svc";
 
 /// One Pod as the API server sends it, with the metadata continuity reasoning needs.
 fn pod(name: &str, uid: &str, resource_version: &str) -> Object {
@@ -589,4 +593,342 @@ fn should_survive_the_canonical_watch_expiry_scenario() {
         stream.checkpoint().map(ResourceVersion::as_str),
         Some("18730")
     );
+}
+
+// --- decoding the wire (§19.3) ------------------------------------------------------------------
+
+/// One watch frame as the API server writes it: a JSON object, then a newline.
+fn frame(class: &str, object: &str) -> String {
+    format!(r#"{{"type":"{class}","object":{object}}}"#) + "\n"
+}
+
+/// A Pod as a watch frame carries it, which is the whole object rather than a summary.
+fn pod_json(name: &str, uid: &str, resource_version: &str) -> String {
+    format!(
+        r#"{{"apiVersion":"v1","kind":"Pod","metadata":{{"name":"{name}","namespace":"shop",
+           "uid":"{uid}","resourceVersion":"{resource_version}"}}}}"#
+    )
+    .replace('\n', "")
+}
+
+/// A `Status` as the server sends it inside an `ERROR` frame.
+fn status_json(code: u16, reason: &str, message: &str) -> String {
+    format!(
+        r#"{{"kind":"Status","apiVersion":"v1","metadata":{{}},"status":"Failure",
+           "message":"{message}","reason":"{reason}","code":{code}}}"#
+    )
+    .replace('\n', "")
+}
+
+/// A chunked HTTP response body, framed exactly as a keep-alive watch delivers one.
+fn chunked_response(chunks: &[&str]) -> String {
+    let mut text =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+            .to_owned();
+    for chunk in chunks {
+        text.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+    }
+    text.push_str("0\r\n\r\n");
+    text
+}
+
+#[test]
+fn should_decode_each_watch_frame_into_the_event_class_it_names() {
+    // §19.3: the five upstream classes are distinct and the provider MUST understand them. The
+    // plausible mistake is to decode only the object and treat every frame as a change, which
+    // turns a DELETED into an upsert and leaves the cache holding an object the cluster removed.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let wire = format!(
+        "{}{}{}",
+        frame("ADDED", &pod_json("checkout-1", "uid-1", "18011")),
+        frame("MODIFIED", &pod_json("checkout-1", "uid-1", "18012")),
+        frame("DELETED", &pod_json("checkout-1", "uid-1", "18013")),
+    );
+
+    let events = decoder.decode(wire.as_bytes()).expect("the frames decode");
+
+    let classes: Vec<&str> = events.iter().map(WatchEvent::class).collect();
+    assert_eq!(classes, ["ADDED", "MODIFIED", "DELETED"]);
+    assert!(events.iter().all(WatchEvent::is_mutation));
+    match &events[0] {
+        WatchEvent::Added(object) => {
+            assert_eq!(object.name(), "checkout-1");
+            assert_eq!(object.uid(), Some("uid-1"));
+            assert_eq!(object.resource_version(), Some("18011"));
+        }
+        other => panic!("the first frame is an ADDED, not {other:?}"),
+    }
+}
+
+#[test]
+fn should_decode_a_bookmark_as_a_checkpoint_carrying_no_object_change() {
+    // §19.3: a BOOKMARK's object holds nothing but metadata.resourceVersion, and it is a
+    // continuity signal rather than a mutation. Decoding it through the object path is the
+    // plausible mistake: the frame parses as an object with no name, and the cache acquires a
+    // phantom entry — or worse, the frame is dropped and the checkpoint never advances, so every
+    // reconnect asks for a position further in the past than the server still holds.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let wire = frame(
+        "BOOKMARK",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"18730"}}"#,
+    );
+
+    let events = decoder
+        .decode(wire.as_bytes())
+        .expect("the bookmark decodes");
+
+    assert_eq!(events.len(), 1);
+    assert!(!events[0].is_mutation());
+    assert_eq!(
+        events[0],
+        WatchEvent::Bookmark(ResourceVersion::new("18730"))
+    );
+
+    let mut stream = live_pods();
+    let before = stream.continuous_changes().len();
+    assert_eq!(stream.observe(events[0].clone()), Reception::Checkpointed);
+    assert_eq!(
+        stream.checkpoint().map(ResourceVersion::as_str),
+        Some("18730")
+    );
+    assert_eq!(stream.continuous_changes().len(), before);
+}
+
+#[test]
+fn should_decode_a_410_error_frame_as_an_expiry_rather_than_a_generic_failure() {
+    // §19.4 and §4 invariant 14. A `410 Gone` arrives inside the stream as an ERROR frame whose
+    // object is a Status, not as an HTTP status code — the response was `200 OK` minutes ago.
+    // Reading it as an unspecified failure is the plausible mistake and the expensive one: the
+    // stream would go to Reconnecting, resume from a checkpoint the server has discarded, and
+    // present the events after the break as a continuation of the history before it.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let wire = frame(
+        "ERROR",
+        &status_json(410, "Expired", "too old resource version: 18010 (18700)"),
+    );
+
+    let events = decoder.decode(wire.as_bytes()).expect("the error decodes");
+
+    assert_eq!(events, vec![WatchEvent::Error(WatchFailure::Expired)]);
+
+    let mut stream = live_pods();
+    assert_eq!(
+        stream.observe(events[0].clone()),
+        Reception::ContinuityBroken
+    );
+    assert_eq!(stream.state(), SyncState::GapDetected);
+    assert_eq!(stream.gaps().len(), 1);
+    assert_eq!(stream.gaps()[0].reason(), GapReason::Expired);
+    assert_eq!(stream.checkpoint(), None);
+}
+
+#[test]
+fn should_decode_a_forbidden_error_frame_as_a_denial_rather_than_an_expiry() {
+    // §21.4 and §4 invariant 13: a refused watch leaves the upstream state unknown, and an
+    // expiry says the history is gone. Both break continuity and they are not the same break —
+    // collapsing them would relist a collection the identity may not read at all.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let wire = frame(
+        "ERROR",
+        &status_json(403, "Forbidden", "pods is forbidden: no permission"),
+    );
+
+    let events = decoder.decode(wire.as_bytes()).expect("the error decodes");
+
+    assert_eq!(events, vec![WatchEvent::Error(WatchFailure::Denied)]);
+
+    let mut stream = live_pods();
+    stream.observe(events[0].clone());
+    assert_eq!(stream.state(), SyncState::Denied);
+    assert_eq!(stream.gaps()[0].reason(), GapReason::AccessDenied);
+}
+
+#[test]
+fn should_decode_an_unclassified_error_frame_as_an_interruption_that_keeps_the_checkpoint() {
+    // §19.5: a server-side blip is not a continuity break. The checkpoint still names history the
+    // server holds, so the stream may resume from it. Treating every ERROR as an expiry is the
+    // plausible over-correction, and it throws away a usable position and forces a full relist.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let wire = frame(
+        "ERROR",
+        &status_json(500, "InternalError", "etcd is unavailable"),
+    );
+
+    let events = decoder.decode(wire.as_bytes()).expect("the error decodes");
+
+    match &events[0] {
+        WatchEvent::Error(WatchFailure::Interrupted(detail)) => {
+            assert!(
+                detail.contains("etcd is unavailable"),
+                "the interruption keeps what the server said, but was {detail:?}"
+            );
+        }
+        other => panic!("a 500 is an interruption, not {other:?}"),
+    }
+
+    let mut stream = live_pods();
+    assert_eq!(stream.observe(events[0].clone()), Reception::Suspended);
+    assert_eq!(stream.state(), SyncState::Reconnecting);
+    assert!(stream.checkpoint().is_some());
+    assert!(stream.reconnected().is_ok());
+}
+
+#[test]
+fn should_hold_a_frame_split_across_two_chunks_until_it_is_whole() {
+    // Chunked transfer framing and JSON framing are unrelated: a chunk boundary lands wherever
+    // the server's writer flushed, routinely mid-object and even mid-string. Decoding each chunk
+    // on its own is the plausible mistake — it fails to parse a perfectly good event, and a
+    // decoder that then skips the unparsable bytes drops a change nobody will ever see again.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let whole = frame("ADDED", &pod_json("checkout-1", "uid-1", "18011"));
+    let (head, tail) = whole.split_at(whole.len() / 2);
+
+    assert_eq!(
+        decoder
+            .decode(head.as_bytes())
+            .expect("a partial frame is not an error"),
+        Vec::new(),
+        "half an object is not an event yet"
+    );
+    assert!(decoder.pending_bytes() > 0);
+
+    let events = decoder
+        .decode(tail.as_bytes())
+        .expect("the frame completes");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].class(), "ADDED");
+    assert_eq!(decoder.pending_bytes(), 0);
+}
+
+#[test]
+fn should_decode_the_frames_of_a_chunked_watch_response_off_the_transport() {
+    // §19.1 end to end over recorded bytes: the response the API server writes for
+    // `?watch=true` is a chunked body whose chunks are watch frames, and `next_chunk` hands them
+    // over one at a time. This is the connection the provider did not have — the state machine
+    // was only ever fed by hand — so the test drives it the way the real path will: bytes in,
+    // WatchEvents out, a stream that is live at the end.
+    let pod_one = pod_json("checkout-1", "uid-1", "18011");
+    let pod_two = pod_json("checkout-2", "uid-2", "18012");
+    let added = frame("ADDED", &pod_one);
+    let modified = frame("MODIFIED", &pod_two);
+    let bookmark = frame(
+        "BOOKMARK",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"18999"}}"#,
+    );
+    // The second frame is deliberately cut in half across two chunks.
+    let (modified_head, modified_tail) = modified.split_at(modified.len() / 2);
+    let wire = chunked_response(&[&added, modified_head, &format!("{modified_tail}{bookmark}")]);
+
+    let mut connection = HttpConnection::new(FixtureStream::new(&wire), HOST);
+    let request = watch_request(
+        &Gvr::new("", "v1", "pods"),
+        &Scope::in_namespace("shop"),
+        &ListOptions::new(),
+        Some("18010"),
+    );
+    let mut response = connection.open(&request).expect("the watch response opens");
+    assert_eq!(response.status(), 200);
+
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let mut stream = live_pods();
+    let mut receptions = Vec::new();
+    while let Some(chunk) = response.next_chunk() {
+        let chunk = chunk.expect("the chunk is framed");
+        for event in decoder.decode(&chunk).expect("the frames decode") {
+            receptions.push(stream.observe(event));
+        }
+    }
+
+    assert_eq!(
+        receptions,
+        vec![
+            Reception::Applied,
+            Reception::Applied,
+            Reception::Checkpointed
+        ]
+    );
+    assert_eq!(stream.state(), SyncState::Live);
+    assert_eq!(stream.object_count(), 2);
+    assert!(stream.find(Some("shop"), "checkout-2").is_some());
+    assert_eq!(
+        stream.checkpoint().map(ResourceVersion::as_str),
+        Some("18999")
+    );
+    assert!(stream.is_gap_free());
+}
+
+#[test]
+fn should_refuse_a_frame_whose_class_it_does_not_model() {
+    // §19.3 lists the classes that matter for continuity and says "including", so a future
+    // Kubernetes release may add one. Skipping the unknown frame is the plausible mistake: the
+    // stream would carry on looking continuous while something the server considered worth
+    // sending was never accounted for. Saying so lets the caller break continuity deliberately.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let wire = frame("RESYNC", &pod_json("checkout-1", "uid-1", "18011"));
+
+    let failure = decoder
+        .decode(wire.as_bytes())
+        .expect_err("an unmodelled class is not silently dropped");
+
+    assert_eq!(failure, FrameError::UnknownClass("RESYNC".to_owned()));
+    assert!(failure.to_string().contains("RESYNC"));
+}
+
+#[test]
+fn should_not_decode_a_truncated_final_frame_as_an_event() {
+    // A watch stream that is cut mid-object ends with bytes that are not a frame. Parsing them
+    // anyway would either fail loudly for the wrong reason or, with a lenient parser, invent a
+    // half-populated object. The truncation is itself the news: it is an interruption (§19.5),
+    // not a malformed protocol, and the checkpoint survives it.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let whole = frame("ADDED", &pod_json("checkout-1", "uid-1", "18011"));
+    let (head, _) = whole.split_at(whole.len() / 2);
+
+    assert!(
+        decoder
+            .decode(head.as_bytes())
+            .expect("no frame yet")
+            .is_empty()
+    );
+
+    assert_eq!(
+        decoder.finish().expect_err("a cut frame is not an event"),
+        FrameError::Truncated
+    );
+}
+
+#[test]
+fn should_refuse_a_bookmark_that_names_no_position() {
+    // §19.3: a BOOKMARK's entire content is the resourceVersion it checkpoints. One without it
+    // checkpoints nothing, and the plausible mistake — checkpointing at the empty string — sends
+    // the next watch request to a position the server will reject or, worse, silently read as
+    // "from now", which skips everything in between.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let wire = frame(
+        "BOOKMARK",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{}}"#,
+    );
+
+    assert_eq!(
+        decoder
+            .decode(wire.as_bytes())
+            .expect_err("a bookmark without a position is not a checkpoint"),
+        FrameError::UncheckpointedBookmark
+    );
+}
+
+#[test]
+fn should_ignore_the_blank_lines_between_frames() {
+    // Servers and proxies do insert an empty line. Treating one as a frame produces a JSON parse
+    // failure that ends a perfectly healthy watch.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let wire = format!(
+        "\n{}\n\n",
+        frame("ADDED", &pod_json("checkout-1", "uid-1", "18011"))
+    );
+
+    let events = decoder.decode(wire.as_bytes()).expect("the frame decodes");
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(decoder.pending_bytes(), 0);
 }

@@ -18,10 +18,11 @@
 
 use ono_provider_kubernetes::coverage::{Outcome, Scope};
 use ono_provider_kubernetes::discovery::Gvr;
+use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::transport::{
     ApiError, BreakReason, Client, Continuity, EndpointCategory, FixedClock, FixtureStream,
-    HttpConnection, ListOptions, Method, ObservedAt, Operation, Origin, Request, get_request,
-    list_request, watch_request,
+    Freshness, HttpConnection, ListOptions, Method, ObservedAt, Operation, Origin, Read, Request,
+    get_request, list_request, watch_request,
 };
 
 // --- fixtures ---------------------------------------------------------------------------------
@@ -819,4 +820,64 @@ fn should_send_default_headers_on_every_request() {
 
     let written = client.stream().written_text();
     assert_eq!(written.matches("Authorization: Bearer s3cr3t").count(), 2);
+}
+
+#[test]
+fn should_build_a_cached_observation_without_calling_it_a_direct_read() {
+    // §20.2: "the user MUST be able to distinguish a direct read from a cached observation".
+    // A cache that has to construct its freshness through the direct-read constructor and correct
+    // it afterwards is one refactor away from forgetting the correction, and the mistake is
+    // silent — the value looks exactly like a read that just happened. So the cached observation
+    // has a constructor of its own, and it carries the sync state a cache hit is only as good as.
+    let cached = Freshness::cached(
+        ObservedAt::from_unix_millis(OBSERVED),
+        Some("18010".to_owned()),
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        EndpointCategory::Core,
+        true,
+    );
+
+    assert_eq!(cached.origin(), Origin::Cache);
+    assert!(!cached.is_direct_read());
+    assert_eq!(cached.watch_synced(), Some(true));
+    assert_eq!(
+        cached.observed_at().unix_millis(),
+        OBSERVED,
+        "a cache hit is as old as the read that filled it, never as young as the hit"
+    );
+    assert_eq!(cached.resource_version(), Some("18010"));
+    assert_eq!(cached.provider_instance(), INSTANCE);
+}
+
+#[test]
+fn should_carry_a_cached_object_in_the_same_shape_a_direct_read_uses() {
+    // §20.2 again, from the other side. The distinction belongs in the *value*, not in the type:
+    // if a cache hit had a type of its own, every consumer would need two code paths and the one
+    // that forgot the second would render a cached object as a fresh one. One `Read`, whose
+    // freshness says how it was come by.
+    let object = Object::parse(
+        INSTANCE,
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-1","namespace":"shop","uid":"uid-1","resourceVersion":"18010"}}"#,
+    )
+    .expect("the fixture Pod parses");
+    let read = Read::new(
+        object.clone(),
+        Freshness::cached(
+            ObservedAt::from_unix_millis(OBSERVED),
+            Some("18010".to_owned()),
+            INSTANCE,
+            Scope::in_namespace("shop"),
+            EndpointCategory::Core,
+            false,
+        ),
+    );
+
+    assert_eq!(read.object().name(), "checkout-1");
+    assert!(!read.freshness().is_direct_read());
+    assert_eq!(
+        read.freshness().watch_synced(),
+        Some(false),
+        "an unsynced cache says so rather than presenting itself as authoritative"
+    );
 }

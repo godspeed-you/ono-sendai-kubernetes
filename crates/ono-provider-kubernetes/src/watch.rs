@@ -28,6 +28,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
+use serde_json::Value as Json;
+
 use crate::coverage::Scope;
 use crate::discovery::Gvr;
 use crate::object::{Identity, Object};
@@ -842,4 +844,214 @@ impl Reconciliation {
             .collect::<Vec<_>>()
             .join("; ")
     }
+}
+
+// --- the wire (§19.3) ---------------------------------------------------------------------------
+
+/// Why a watch frame could not be read as an event.
+///
+/// Every variant is a refusal rather than a silent skip. A decoder that drops what it cannot read
+/// leaves the stream looking continuous over bytes nobody accounted for, which is the same lie
+/// §19.4 forbids after a `410` — arrived at by a quieter route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameError {
+    /// The frame is not a JSON object, or the stream is not a watch stream at all.
+    Malformed(String),
+    /// The frame carries no `type`, so nothing says what it is.
+    Untyped,
+    /// A `type` this provider does not model (§19.3 lists the classes it must, and says
+    /// "including" — a later Kubernetes release may add one).
+    UnknownClass(String),
+    /// The frame carries a class but no `object`, which every class sends one of.
+    ObjectMissing(String),
+    /// The object of a mutation frame is not a Kubernetes object.
+    NotAnObject(String),
+    /// A `BOOKMARK` with no `metadata.resourceVersion`, which checkpoints nothing.
+    UncheckpointedBookmark,
+    /// The stream ended part-way through a frame.
+    ///
+    /// Its own variant because it is not a protocol fault: it is how a cut connection looks from
+    /// here, and the honest response is [`WatchFailure::Interrupted`] rather than a decoder bug
+    /// report.
+    Truncated,
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed(detail) => write!(f, "the watch frame is not JSON: {detail}"),
+            Self::Untyped => f.write_str("the watch frame states no type"),
+            Self::UnknownClass(class) => write!(
+                f,
+                "the watch frame class {class:?} is not one this provider models"
+            ),
+            Self::ObjectMissing(class) => {
+                write!(f, "the {class} watch frame carries no object")
+            }
+            Self::NotAnObject(detail) => {
+                write!(
+                    f,
+                    "the watch frame's object is not a Kubernetes object: {detail}"
+                )
+            }
+            Self::UncheckpointedBookmark => f.write_str(
+                "the BOOKMARK carries no metadata.resourceVersion, so it checkpoints nothing",
+            ),
+            Self::Truncated => f.write_str("the watch stream ended part-way through a frame"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// Turns the bytes of a watch response into [`WatchEvent`]s (§19.3).
+///
+/// A watch body is a sequence of JSON objects, one per line, each `{"type":…,"object":…}`. The
+/// two framings involved are unrelated: HTTP chunked transfer flushes wherever the server's
+/// writer did, and a chunk boundary lands mid-object as a matter of course. So this buffers —
+/// bytes go in, whole events come out, and a half-arrived frame is held rather than guessed at.
+///
+/// It is deliberately separate from [`WatchStream`]. Decoding answers "what did the server say",
+/// the stream answers "what may this provider now claim", and a decoder that also updated a cache
+/// would make the second question untestable without the first.
+#[derive(Debug, Clone)]
+pub struct WatchDecoder {
+    provider_instance: String,
+    buffer: Vec<u8>,
+}
+
+impl WatchDecoder {
+    /// A decoder for one provider instance's stream.
+    ///
+    /// The instance travels with every object it decodes (§6.5): an identity is only unique
+    /// within the cluster that issued it, and two sessions decoding into a shared identity space
+    /// is how one cluster's Pod comes to answer for another's.
+    #[must_use]
+    pub fn new(provider_instance: impl Into<String>) -> Self {
+        Self {
+            provider_instance: provider_instance.into(),
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Decodes every whole frame this chunk completes, holding any remainder.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError`] for a frame that arrived whole and could not be read. The decoder keeps
+    /// whatever followed, but a caller should treat a frame it could not read as a break in
+    /// continuity rather than resuming: the events after an unreadable one are a history with a
+    /// hole in it.
+    pub fn decode(&mut self, chunk: &[u8]) -> Result<Vec<WatchEvent>, FrameError> {
+        self.buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        while let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.buffer.drain(..=end).collect();
+            let line = &line[..line.len() - 1];
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            events.push(self.frame(line)?);
+        }
+        Ok(events)
+    }
+
+    /// Decodes what is left once the response body has ended.
+    ///
+    /// # Errors
+    ///
+    /// [`FrameError::Truncated`] when the stream stopped part-way through a frame, and whatever
+    /// [`Self::decode`] would have reported for a final frame the server did not terminate.
+    pub fn finish(&mut self) -> Result<Vec<WatchEvent>, FrameError> {
+        let rest = std::mem::take(&mut self.buffer);
+        if rest.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Vec::new());
+        }
+        match self.frame(&rest) {
+            Ok(event) => Ok(vec![event]),
+            // A frame that is not whole JSON at the end of a body is a cut connection rather than
+            // a server that writes malformed frames, and the two want different responses.
+            Err(FrameError::Malformed(_)) => Err(FrameError::Truncated),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// How many bytes are held back as an incomplete frame.
+    ///
+    /// Exposed so a caller can tell "nothing arrived" from "something arrived and is not a frame
+    /// yet" — the difference between an idle watch and a stalled one.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Which provider instance the decoded objects belong to (§6.2).
+    #[must_use]
+    pub fn provider_instance(&self) -> &str {
+        &self.provider_instance
+    }
+
+    fn frame(&self, line: &[u8]) -> Result<WatchEvent, FrameError> {
+        let frame: Json = serde_json::from_slice(line)
+            .map_err(|error| FrameError::Malformed(error.to_string()))?;
+        let class = frame
+            .get("type")
+            .and_then(Json::as_str)
+            .ok_or(FrameError::Untyped)?
+            .to_owned();
+        let object = frame
+            .get("object")
+            .ok_or_else(|| FrameError::ObjectMissing(class.clone()))?;
+
+        match class.as_str() {
+            "ADDED" => Ok(WatchEvent::Added(self.object(object)?)),
+            "MODIFIED" => Ok(WatchEvent::Modified(self.object(object)?)),
+            "DELETED" => Ok(WatchEvent::Deleted(self.object(object)?)),
+            "BOOKMARK" => object
+                .get("metadata")
+                .and_then(|metadata| metadata.get("resourceVersion"))
+                .and_then(Json::as_str)
+                .filter(|version| !version.is_empty())
+                .map(|version| WatchEvent::Bookmark(ResourceVersion::new(version)))
+                .ok_or(FrameError::UncheckpointedBookmark),
+            "ERROR" => Ok(WatchEvent::Error(failure_of(object))),
+            other => Err(FrameError::UnknownClass(other.to_owned())),
+        }
+    }
+
+    fn object(&self, value: &Json) -> Result<Object, FrameError> {
+        Object::from_json(&self.provider_instance, value.clone())
+            .map_err(|error| FrameError::NotAnObject(error.to_string()))
+    }
+}
+
+/// What an `ERROR` frame's `Status` means for continuity (§19.4, §21.4).
+///
+/// The code inside the frame is the one that matters. The HTTP status was `200 OK` when the watch
+/// opened, possibly hours earlier, so a `410` never arrives as a response code — it arrives here,
+/// and an implementation that only classifies HTTP codes will never see one.
+fn failure_of(object: &Json) -> WatchFailure {
+    let Ok(bytes) = serde_json::to_vec(object) else {
+        return WatchFailure::Interrupted("the ERROR frame could not be read".to_owned());
+    };
+    let Some(status) = crate::transport::Status::parse(&bytes) else {
+        // Not a `Status`, but still the server saying the stream failed. Reporting it as an
+        // interruption keeps the watch honest; discarding it would leave the stream looking live.
+        return WatchFailure::Interrupted(
+            "the server sent an ERROR frame that is not a Status".to_owned(),
+        );
+    };
+    let expired =
+        status.code() == Some(410) || status.reason().is_some_and(|reason| reason == "Expired");
+    if expired {
+        return WatchFailure::Expired;
+    }
+    if matches!(status.code(), Some(401 | 403)) {
+        return WatchFailure::Denied;
+    }
+    WatchFailure::Interrupted(
+        status
+            .message()
+            .map_or_else(|| "the watch failed".to_owned(), str::to_owned),
+    )
 }

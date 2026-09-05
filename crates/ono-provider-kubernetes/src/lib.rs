@@ -14,6 +14,8 @@
 //! object        one object: projected metadata, identity, unknown fields preserved
 //! watch         list/watch continuity, 410 gaps, reconciliation evidence
 //! relationship  edges and the evidence each rests on
+//! evidence      what a Node states about the machine under it, for someone else to resolve
+//! events        best-effort observations, and everything they are not
 //! workload      curated controller, service and routing relationships
 //! condition     desired versus observed, cited from the fields it depends on
 //! redaction     Secret payloads, destroyed at the boundary rather than filtered
@@ -22,18 +24,22 @@
 //! diagnostics   which cluster this is, whether it answers, and who the provider is to it
 //! kubeconfig    a context becomes a connection identity
 //! tls           a TLS session, wrapping the brokered byte stream below HTTP
+//! session       what one provider instance holds between two invocations
 //! ```
 
 pub mod condition;
 pub mod coverage;
 pub mod diagnostics;
 pub mod discovery;
+pub mod events;
+pub mod evidence;
 pub mod kubeconfig;
 pub mod object;
 pub mod place;
 pub mod redaction;
 pub mod relationship;
 pub mod schema;
+pub mod session;
 pub mod tls;
 pub mod transport;
 pub mod watch;

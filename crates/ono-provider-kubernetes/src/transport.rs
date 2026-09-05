@@ -1094,6 +1094,37 @@ impl Freshness {
         }
     }
 
+    /// What a cache serves (§20.2).
+    ///
+    /// A constructor of its own rather than a direct read corrected afterwards. The two differ in
+    /// one field, and a field that has to be corrected is a field that gets forgotten — silently,
+    /// because the uncorrected value is a perfectly well-formed direct read that claims the
+    /// object was seen just now.
+    ///
+    /// `observed_at` is the moment the *read* was made, never the moment the cache answered:
+    /// stamping a hit with the time it was served is how an hour-old object comes to look
+    /// current. `watch_synced` is what the hit is worth — a cache no watch is feeding knows only
+    /// what was true at its checkpoint (§20.3).
+    #[must_use]
+    pub fn cached(
+        observed_at: ObservedAt,
+        resource_version: Option<String>,
+        provider_instance: impl Into<String>,
+        scope: Scope,
+        endpoint: EndpointCategory,
+        watch_synced: bool,
+    ) -> Self {
+        Self {
+            observed_at,
+            resource_version,
+            provider_instance: provider_instance.into(),
+            scope,
+            endpoint,
+            origin: Origin::Cache,
+            watch_synced: Some(watch_synced),
+        }
+    }
+
     /// When this provider observed the object.
     #[must_use]
     pub fn observed_at(&self) -> ObservedAt {
@@ -1338,6 +1369,18 @@ pub struct Read {
 }
 
 impl Read {
+    /// One object and what is known about how it was come by.
+    ///
+    /// Public so that a cache can hand back the same type a direct read produces (§20.2). The
+    /// distinction between the two lives in [`Freshness::origin`] rather than in the type,
+    /// because a cache hit with a type of its own would need every consumer to grow a second
+    /// code path — and the consumer that grew only the first would render a cached object as a
+    /// fresh one without anybody deciding to.
+    #[must_use]
+    pub fn new(object: Object, freshness: Freshness) -> Self {
+        Self { object, freshness }
+    }
+
     /// The object.
     #[must_use]
     pub fn object(&self) -> &Object {
