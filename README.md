@@ -50,12 +50,12 @@ the shell language and pipeline semantics, the generic systems model, the KUANG/
 runtime contracts, the generic external-system provider architecture, cross-provider policy and
 project-wide governance. Two documents there govern this one:
 
-- `docs/architecture/external-system-provider.md` — the generic contract this provider conforms to;
-- `docs/strategy/cloud-native-vision.md` — why the cloud-native direction is being taken at all.
+- [`docs/architecture/external-system-provider.md`](https://github.com/godspeed-you/ono-sendai/blob/main/docs/architecture/external-system-provider.md)
+  — the generic contract this provider conforms to;
+- [`docs/strategy/cloud-native-vision.md`](https://github.com/godspeed-you/ono-sendai/blob/main/docs/strategy/cloud-native-vision.md)
+  — why the cloud-native direction is being taken at all.
 
-Both are canonical in that repository and are deliberately not copied here. At the time of
-writing they are on the branch carrying the documentation restructuring and are not yet on
-`main`, so this README names their paths rather than linking to a commit that would move.
+Both are canonical in that repository and are deliberately not copied here.
 
 ## Compatibility
 
@@ -89,8 +89,8 @@ production-ready for its declared scope.
 ## Status and roadmap
 
 The provider is at the specification stage. The first implementation milestone is the
-Cloud-Native Validation Gate described in `docs/strategy/cncf-readiness.md` in the core
-repository: a proof-of-concept that demonstrates Ono's existing concepts becoming *more* useful
+Cloud-Native Validation Gate described in
+[`docs/strategy/cncf-readiness.md`](https://github.com/godspeed-you/ono-sendai/blob/main/docs/strategy/cncf-readiness.md) in the core repository: a proof-of-concept that demonstrates Ono's existing concepts becoming *more* useful
 against Kubernetes without creating a Kubernetes-specific second shell. That gate is allowed to
 fail, and failing it is evidence worth having.
 
