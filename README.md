@@ -5,13 +5,15 @@ reference KUANG/11 external-system provider.
 
 > Kubernetes is not a command namespace inside Ono. It is a system Ono can understand.
 
-**This repository currently holds a specification and no implementation.** Nothing is installable
-from it, nothing runs, and no Kubernetes version is supported yet. What exists is the contract the
-implementation will be measured against:
+**Nothing is installable from this repository yet, and no Kubernetes version is supported.** The
+package declares its nouns and the domain layer is under construction; there is no transport, so
+nothing has reached a cluster. `docs/STATE.md` says precisely how far it goes.
 
 | | |
 |---|---|
 | [`docs/architecture/kubernetes-provider.md`](docs/architecture/kubernetes-provider.md) | the canonical Kubernetes Provider Specification — immutable, checksummed |
+| [`crates/ono-provider-kubernetes/`](crates/ono-provider-kubernetes/) | the domain layer: configuration, discovery, identity, relationships, coverage |
+| [`package/`](package/) | the KUANG/11 package: manifest and contributed targets |
 | [`AGENTS.md`](AGENTS.md) | the development contract, for humans and AI agents alike |
 | [`docs/STATE.md`](docs/STATE.md) | the work board: what is in progress, found, or deferred |
 | [`docs/adr/`](docs/adr/) | decisions recorded in this repository |
@@ -65,7 +67,8 @@ Both are canonical in that repository and are deliberately not copied here.
 
 | | |
 |---|---|
-| Ono / KUANG/11 provider contract | none declared yet — no implementation exists to declare one |
+| KUANG/11 package format | `kuang-package/1`, `kuang_api >=11.1 <12` |
+| Ono-Sendai core | **at or after ADR-0582.** Before it, a contributed target could only be answered through a contributed command, which returns values carrying no declared schema, no identity and no provenance |
 | Kubernetes versions | the specification was written against the API model of 2026-09-03 and targets the then-supported v1.35 – v1.37 (§0.5, §5.1). This is a specification target, not a support claim |
 | Supported versions of this provider | none — there is no release |
 
