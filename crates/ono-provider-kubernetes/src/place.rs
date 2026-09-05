@@ -449,29 +449,42 @@ impl Place {
     ///
     /// [`PlaceError::EmptyComponent`] when the object's name or namespace is empty.
     pub fn of_object(object: &Object) -> Result<Self, PlaceError> {
-        let identity = object.identity();
-        let gvk = object.gvk().clone();
-        let uri = if is_namespace_kind(&gvk) && object.namespace().is_none() {
-            PlaceUri::of_namespace(identity.provider_instance(), object.name())?
-        } else if let Some(namespace) = object.namespace() {
+        Self::of_identity(&object.identity())
+    }
+
+    /// The place of an identity, for an object read at the far end of an edge (§35.4).
+    ///
+    /// An identity carries everything an address needs — instance, kind, namespace, name — so a
+    /// neighbour that reaches *in* to a place is addressable from the edge alone. That is the
+    /// same address [`Self::of_object`] produces, and it is produced here so the two cannot
+    /// drift apart.
+    ///
+    /// # Errors
+    ///
+    /// [`PlaceError::EmptyComponent`] when the identity's name or namespace is empty.
+    pub fn of_identity(identity: &Identity) -> Result<Self, PlaceError> {
+        let gvk = identity.gvk().clone();
+        let uri = if is_namespace_kind(&gvk) && identity.namespace().is_none() {
+            PlaceUri::of_namespace(identity.provider_instance(), identity.name())?
+        } else if let Some(namespace) = identity.namespace() {
             PlaceUri::namespaced(
                 identity.provider_instance(),
                 namespace,
                 TypeSegment::of(&gvk),
-                object.name(),
+                identity.name(),
             )?
         } else {
             PlaceUri::cluster_scoped(
                 identity.provider_instance(),
                 TypeSegment::of(&gvk),
-                object.name(),
+                identity.name(),
             )?
         };
         Ok(Self {
             uri,
             roles: roles_of(&gvk),
             gvk: Some(gvk),
-            identity: Some(identity),
+            identity: Some(identity.clone()),
         })
     }
 
@@ -752,25 +765,51 @@ pub fn roles_of(gvk: &Gvk) -> &'static [SemanticRole] {
 /// A named relationship you can walk along with `follow` (§35.7).
 ///
 /// The five words §35.7 spells out are all here, plus the ones this provider's relationship model
-/// already produces. Every word is a *relationship*: there is no `get`, no `describe`, no `logs`.
-/// A traversal vocabulary that accepted verbs would be the `k8s>` sub-shell of §35.1 arriving one
-/// word at a time.
+/// produces. That second half is the rule rather than an accident: a [`Relation`] this provider
+/// can extract and a user cannot name is a relationship they have to already know about, so every
+/// relation has a word here and [`Self::from_relation`] is total.
+///
+/// Every word is a *relationship*: there is no `get`, no `describe`, no `logs`. A traversal
+/// vocabulary that accepted verbs would be the `k8s>` sub-shell of §35.1 arriving one word at a
+/// time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Waypoint {
     /// The object is owned by the neighbour (§24.1).
     OwnedBy,
     /// The neighbour is the controlling owner (§24.3).
     ControlledBy,
+    /// The neighbour is owned by this object — `owned-by` from the owner's end (§25.1).
+    Owns,
+    /// The neighbour is controlled by this object (§24.3).
+    Controls,
     /// A Pod is placed on a Node (§28.1).
     ScheduledOn,
     /// A selector of this object matches the neighbour's labels (§26.1).
     Selects,
+    /// A workload controller's selector fits the neighbour without owning it (§23.3).
+    SelectorMatches,
     /// The neighbour routes traffic here — Ingress, Gateway, HTTPRoute (§27).
     RoutesTo,
+    /// A route attaches to a Gateway (§27.3).
+    AttachesTo,
     /// A claim and what satisfies it (§30.2).
     BoundTo,
     /// The endpoint objects that carry this endpoint's addresses (§26.2).
+    ///
+    /// The navigation word for [`Relation::RepresentedBy`]: §35.5 names the EndpointSlices of a
+    /// Service as something to walk to, §26.2 names the edge that gets there, and one edge with
+    /// two followable words would split the vocabulary for no gain.
     HasEndpoints,
+    /// What stands behind one endpoint of a slice (§26.2).
+    EndpointFor,
+    /// The governing Service of a StatefulSet (§25.3).
+    UsesService,
+    /// The Secret a route terminates TLS with (§27.1).
+    UsesTlsSecret,
+    /// The IngressClass that handles an Ingress (§27.2).
+    UsesIngressClass,
+    /// The GatewayClass that implements a Gateway (§27.3).
+    UsesGatewayClass,
     /// A Pod runs under a ServiceAccount (§32.1).
     RunsAs,
     /// A Pod mounts a claim (§30.1).
@@ -779,6 +818,10 @@ pub enum Waypoint {
     ReferencesConfig,
     /// A reference to secret material (§29.2).
     ReferencesSecret,
+    /// A Secret a ServiceAccount carries (§22.4).
+    UsesSecret,
+    /// A Secret images are pulled with (§22.4, §32.1).
+    UsesImagePullSecret,
     /// A policy that applies here (§31.1).
     ConstrainedBy,
     /// Nothing more than living in the same namespace.
@@ -793,15 +836,26 @@ impl Waypoint {
     pub const ALL: &'static [Self] = &[
         Self::OwnedBy,
         Self::ControlledBy,
+        Self::Owns,
+        Self::Controls,
         Self::ScheduledOn,
         Self::Selects,
+        Self::SelectorMatches,
         Self::RoutesTo,
+        Self::AttachesTo,
         Self::BoundTo,
         Self::HasEndpoints,
+        Self::EndpointFor,
+        Self::UsesService,
+        Self::UsesTlsSecret,
+        Self::UsesIngressClass,
+        Self::UsesGatewayClass,
         Self::RunsAs,
         Self::Mounts,
         Self::ReferencesConfig,
         Self::ReferencesSecret,
+        Self::UsesSecret,
+        Self::UsesImagePullSecret,
         Self::ConstrainedBy,
         Self::SharesNamespace,
     ];
@@ -812,15 +866,26 @@ impl Waypoint {
         match self {
             Self::OwnedBy => "owned-by",
             Self::ControlledBy => "controlled-by",
+            Self::Owns => "owns",
+            Self::Controls => "controls",
             Self::ScheduledOn => "scheduled-on",
             Self::Selects => "selects",
+            Self::SelectorMatches => "selector-matches",
             Self::RoutesTo => "routes-to",
+            Self::AttachesTo => "attaches-to",
             Self::BoundTo => "bound-to",
             Self::HasEndpoints => "has-endpoints",
+            Self::EndpointFor => "endpoint-for",
+            Self::UsesService => "uses-service",
+            Self::UsesTlsSecret => "uses-tls-secret",
+            Self::UsesIngressClass => "uses-ingress-class",
+            Self::UsesGatewayClass => "uses-gateway-class",
             Self::RunsAs => "runs-as",
             Self::Mounts => "mounts",
             Self::ReferencesConfig => "references-config",
             Self::ReferencesSecret => "references-secret",
+            Self::UsesSecret => "uses-secret",
+            Self::UsesImagePullSecret => "uses-image-pull-secret",
             Self::ConstrainedBy => "constrained-by",
             Self::SharesNamespace => "shares-namespace",
         }
@@ -836,40 +901,71 @@ impl Waypoint {
     }
 
     /// The waypoint an extracted relationship travels along.
+    ///
+    /// Total, and that is the point: every relationship this provider can extract is one a user
+    /// can name. A relation with no word would arrive in `near` and be unfollowable.
     #[must_use]
     pub fn from_relation(relation: Relation) -> Self {
         match relation {
             Relation::OwnedBy => Self::OwnedBy,
             Relation::ControlledBy => Self::ControlledBy,
+            Relation::Owns => Self::Owns,
+            Relation::Controls => Self::Controls,
             Relation::ScheduledOn => Self::ScheduledOn,
             Relation::Selects => Self::Selects,
+            Relation::SelectorMatches => Self::SelectorMatches,
+            Relation::RoutesTo => Self::RoutesTo,
+            Relation::AttachesTo => Self::AttachesTo,
+            Relation::BoundTo => Self::BoundTo,
+            Relation::RepresentedBy => Self::HasEndpoints,
+            Relation::EndpointFor => Self::EndpointFor,
+            Relation::UsesService => Self::UsesService,
+            Relation::UsesTlsSecret => Self::UsesTlsSecret,
+            Relation::UsesIngressClass => Self::UsesIngressClass,
+            Relation::UsesGatewayClass => Self::UsesGatewayClass,
             Relation::RunsAs => Self::RunsAs,
             Relation::Mounts => Self::Mounts,
             Relation::ReferencesConfig => Self::ReferencesConfig,
             Relation::ReferencesSecret => Self::ReferencesSecret,
+            Relation::UsesSecret => Self::UsesSecret,
+            Relation::UsesImagePullSecret => Self::UsesImagePullSecret,
         }
     }
 
     /// The extracted relationship this waypoint corresponds to, where there is one.
     ///
-    /// [`None`] for `routes-to`, `bound-to`, `has-endpoints` and `constrained-by`: §35.5 and §35.7
-    /// name them as things a user navigates, and the relationship model does not yet derive them
-    /// from objects. A caller that has read the objects supplies such a neighbour explicitly with
-    /// [`Neighbourhood::with`] and its evidence, so the gap is visible rather than silently
-    /// rendered as "no neighbours".
+    /// [`None`] for `constrained-by`: §35.5 names policies as something a user navigates to, and
+    /// the relationship model derives a NetworkPolicy's reach as `selects` (§31.1) rather than as
+    /// a word of its own. A caller that has read the policy supplies such a neighbour explicitly
+    /// with [`Neighbourhood::with`] and its evidence, so the gap is visible rather than silently
+    /// rendered as "no neighbours". [`None`] for `shares-namespace` because co-location is not a
+    /// relationship at all.
     #[must_use]
     pub fn relation(self) -> Option<Relation> {
         match self {
             Self::OwnedBy => Some(Relation::OwnedBy),
             Self::ControlledBy => Some(Relation::ControlledBy),
+            Self::Owns => Some(Relation::Owns),
+            Self::Controls => Some(Relation::Controls),
             Self::ScheduledOn => Some(Relation::ScheduledOn),
             Self::Selects => Some(Relation::Selects),
+            Self::SelectorMatches => Some(Relation::SelectorMatches),
+            Self::RoutesTo => Some(Relation::RoutesTo),
+            Self::AttachesTo => Some(Relation::AttachesTo),
+            Self::BoundTo => Some(Relation::BoundTo),
+            Self::HasEndpoints => Some(Relation::RepresentedBy),
+            Self::EndpointFor => Some(Relation::EndpointFor),
+            Self::UsesService => Some(Relation::UsesService),
+            Self::UsesTlsSecret => Some(Relation::UsesTlsSecret),
+            Self::UsesIngressClass => Some(Relation::UsesIngressClass),
+            Self::UsesGatewayClass => Some(Relation::UsesGatewayClass),
             Self::RunsAs => Some(Relation::RunsAs),
             Self::Mounts => Some(Relation::Mounts),
             Self::ReferencesConfig => Some(Relation::ReferencesConfig),
             Self::ReferencesSecret => Some(Relation::ReferencesSecret),
-            Self::RoutesTo | Self::BoundTo | Self::HasEndpoints | Self::ConstrainedBy => None,
-            Self::SharesNamespace => None,
+            Self::UsesSecret => Some(Relation::UsesSecret),
+            Self::UsesImagePullSecret => Some(Relation::UsesImagePullSecret),
+            Self::ConstrainedBy | Self::SharesNamespace => None,
         }
     }
 
@@ -921,17 +1017,30 @@ pub enum Proximity {
 /// end of `near` instead of displacing something the specification named.
 const PROXIMITY: &[(Waypoint, Proximity)] = &[
     (Waypoint::Selects, Proximity::Selected),
+    (Waypoint::SelectorMatches, Proximity::Selected),
+    (Waypoint::EndpointFor, Proximity::Selected),
     (Waypoint::HasEndpoints, Proximity::Endpoint),
     (Waypoint::RoutesTo, Proximity::Route),
+    (Waypoint::AttachesTo, Proximity::Route),
     (Waypoint::ConstrainedBy, Proximity::Policy),
     (Waypoint::ScheduledOn, Proximity::Placement),
     (Waypoint::ControlledBy, Proximity::Lineage),
     (Waypoint::OwnedBy, Proximity::Lineage),
+    (Waypoint::Controls, Proximity::Lineage),
+    (Waypoint::Owns, Proximity::Lineage),
     (Waypoint::BoundTo, Proximity::Dependency),
     (Waypoint::Mounts, Proximity::Dependency),
     (Waypoint::ReferencesConfig, Proximity::Dependency),
     (Waypoint::ReferencesSecret, Proximity::Dependency),
     (Waypoint::RunsAs, Proximity::Dependency),
+    (Waypoint::UsesSecret, Proximity::Dependency),
+    (Waypoint::UsesImagePullSecret, Proximity::Dependency),
+    (Waypoint::UsesService, Proximity::Dependency),
+    (Waypoint::UsesTlsSecret, Proximity::Dependency),
+    // The class an Ingress or Gateway names is what implements it, so it ranks with the other
+    // things the object needs to work rather than with the traffic arriving at it.
+    (Waypoint::UsesIngressClass, Proximity::Dependency),
+    (Waypoint::UsesGatewayClass, Proximity::Dependency),
     (Waypoint::SharesNamespace, Proximity::Ambient),
 ];
 
@@ -941,6 +1050,7 @@ pub struct Neighbour {
     place: Place,
     via: Waypoint,
     evidence: Evidence,
+    inbound: bool,
 }
 
 impl Neighbour {
@@ -954,6 +1064,17 @@ impl Neighbour {
     #[must_use]
     pub fn via(&self) -> Waypoint {
         self.via
+    }
+
+    /// Which way the relationship runs.
+    ///
+    /// True where the edge points *at* the focus: the neighbour is the source and this place is
+    /// the target. The word is the same either way — a relationship is one fact — but which end
+    /// asserts it is not, and a renderer that read `owned-by` off an inbound edge would say the
+    /// owner is owned by its own child.
+    #[must_use]
+    pub fn is_inbound(&self) -> bool {
+        self.inbound
     }
 
     /// What makes the relationship checkable (Gate D).
@@ -991,47 +1112,81 @@ impl Neighbourhood {
         }
     }
 
-    /// Adds the neighbours the focus's own edges reach.
+    /// Adds the neighbours the focus's edges reach, in either direction.
     ///
-    /// Only edges leaving the focus. An edge's far end is an [`Identity`], and an identity is not
-    /// an address — it carries no namespace — so a neighbour that reaches *in* is added by the
-    /// caller that read the object at the other end, with [`Self::with`]. Edges whose source is
-    /// some other object are skipped rather than adopted, so that passing a whole graph cannot
-    /// quietly attribute a stranger's relationships to this place.
+    /// An edge leaving the focus contributes its target; an edge arriving at the focus
+    /// contributes its source, marked [`Neighbour::is_inbound`] so the direction survives the
+    /// trip. Both ends are addressable — a target carries its namespace and a source is an
+    /// [`Identity`], which carries one too — and a `near` that reported only outbound edges would
+    /// tell a Pod nothing about the Service in front of it.
+    ///
+    /// An edge with neither end at the focus is skipped rather than adopted, so that passing a
+    /// whole graph cannot quietly attribute a stranger's relationships to this place. A focus
+    /// that is only an address, with no identity bound, cannot be matched against an edge's
+    /// source, so its edges are taken as the caller offered them: outbound.
     #[must_use]
     pub fn reached(mut self, edges: &[Edge]) -> Self {
         for edge in edges {
-            if self
+            let instance = edge.source().provider_instance();
+            let outbound = self
                 .focus
                 .identity()
-                .is_some_and(|identity| identity != edge.source())
-            {
+                .is_none_or(|identity| identity == edge.source());
+            if outbound {
+                if let Ok(place) = Place::of_target(instance, edge.target()) {
+                    self.push(place, edge, false);
+                }
                 continue;
             }
-            let instance = edge.source().provider_instance();
-            if let Ok(place) = Place::of_target(instance, edge.target()) {
-                self.neighbours.push(Neighbour {
-                    place,
-                    via: Waypoint::from_relation(edge.relation()),
-                    evidence: edge.evidence().clone(),
-                });
+            let reaches_focus = Place::of_target(instance, edge.target())
+                .is_ok_and(|target| target.is_same_address(&self.focus));
+            if reaches_focus && let Ok(place) = Place::of_identity(edge.source()) {
+                self.push(place, edge, true);
             }
         }
         self
     }
 
+    /// Records one end of an edge as a neighbour.
+    fn push(&mut self, place: Place, edge: &Edge, inbound: bool) {
+        self.neighbours.push(Neighbour {
+            place,
+            via: Waypoint::from_relation(edge.relation()),
+            evidence: edge.evidence().clone(),
+            inbound,
+        });
+    }
+
     /// Adds a neighbour the caller established, with the evidence for it.
     ///
-    /// The way in for the relationships §35.5 names that the relationship model does not yet
-    /// derive — EndpointSlices, Ingress and Gateway routes, NetworkPolicies — and for anything
-    /// reaching the focus from outside. The evidence is required, so an added neighbour is as
-    /// checkable as an extracted one (Gate D).
+    /// The way in for a relationship this provider does not extract from an object — a
+    /// NetworkPolicy's `constrained-by` (§31.1), a correlation a cross-system resolver drew — and
+    /// for a neighbour whose edge the caller does not have in hand. The evidence is required, so
+    /// an added neighbour is as checkable as an extracted one (Gate D). Use
+    /// [`Self::with_inbound`] where the relationship points at the focus.
     #[must_use]
     pub fn with(mut self, via: Waypoint, place: Place, evidence: Evidence) -> Self {
         self.neighbours.push(Neighbour {
             place,
             via,
             evidence,
+            inbound: false,
+        });
+        self
+    }
+
+    /// Adds a neighbour whose relationship points at the focus rather than away from it.
+    ///
+    /// The same as [`Self::with`] except for what [`Neighbour::is_inbound`] then reports. A
+    /// caller that read the object at the other end knows which way the edge runs, and saying so
+    /// is what keeps the relationship word from being rendered backwards.
+    #[must_use]
+    pub fn with_inbound(mut self, via: Waypoint, place: Place, evidence: Evidence) -> Self {
+        self.neighbours.push(Neighbour {
+            place,
+            via,
+            evidence,
+            inbound: true,
         });
         self
     }

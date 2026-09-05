@@ -1,0 +1,358 @@
+# The schemas the targets of `contributions/targets.yaml` name, readable before any of this
+# package's code runs (spec §31.23, §31.68).
+#
+# Written in the field vocabulary of core's `docs/contracts/schemas/*.v1.yaml`, because §31.23
+# says a contributed schema is written in the language core schemas are written in. One document
+# rather than one file per schema: these five are one decision about how a Kubernetes object
+# becomes a record, and splitting them would let them drift apart a field at a time.
+#
+# **Identity is `uid` for every kind, without exception** (§16.1, §4 invariants 4–5). A name is a
+# label a human reuses; `metadata.uid` is what the API server guarantees about one object's life.
+# A Pod recreated under the same name is a different Pod, and a schema whose identity were `name`
+# would let the new one inherit the old one's history. `uid` is `nullable` rather than `required`
+# because §16.5 admits objects the server gave none — the identity is then not lifetime-stable,
+# and saying so beats fabricating a key.
+#
+# **Every absent fact is `null`** (§4, "unknown data is null, never fabricated and never zero").
+# `restarts` is null when the API server sent no container statuses, not `0`; `unschedulable` is
+# null when `spec.unschedulable` is absent, not `false`, because the API server's defaulting is
+# the API server's business and asserting it here would report something the object never said.
+#
+# **Five schemas, not nineteen.** `targets.yaml` declares nineteen nouns; this document declares
+# the five the plugin emits records for today. A declared schema nothing emits is a claim the
+# package cannot keep, and §31.68's placeholders already give the other fourteen help and
+# completion without pretending they answer. The five are chosen so that each proves something
+# different: `namespace` is the scope dimension itself, `node` and `namespace` are cluster-scoped
+# while the rest are namespaced, `pod` is the noun the milestone names, `deployment` carries the
+# desired-versus-observed pair of §14.4, and `secret` is where §22's redaction boundary is
+# demonstrated rather than asserted.
+#
+# **What this document says and the handshake cannot.** `SchemaContribution` on the wire carries
+# `id`, `name`, `summary`, `identity` and the fields' names, types and nullability — it has no
+# place for `doc` or `default_view`. Those live here only, which is why this file is the one a
+# reader is pointed at. `tests/contributions.rs` asserts that everything the two *can* both say
+# they say identically.
+
+schemas:
+  - id: io.github.godspeed-you.kubernetes.namespace/1
+    name: KubernetesNamespace
+    summary: A namespace, the primary scope dimension of a cluster.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). Null for an object the server gave
+          none, which means this observation cannot tell a recreation from a change (§16.5).
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp, not a clock, and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      phase:
+        type: string
+        nullable: true
+        doc: '`status.phase`, such as `Active` or `Terminating`, verbatim.'
+    default_view:
+      columns: [name, phase, terminating, created]
+
+  - id: io.github.godspeed-you.kubernetes.node/1
+    name: KubernetesNode
+    summary: A node, and what the kubelet on it reports about itself.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: '`metadata.uid` — the lifetime identity (§16.1). A name reused is a new node.'
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`.'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: '`metadata.resourceVersion`, opaque (§14.3).'
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole — this is where topology and instance type live.'
+      terminating:
+        type: bool
+        required: true
+        doc: Whether deletion was accepted and has not completed.
+      ready:
+        type: string
+        nullable: true
+        doc: >-
+          The `status` of the node's `Ready` condition, as the server spells it — `True`,
+          `False` or `Unknown`. Null when the node reports no `Ready` condition at all, which
+          is a different state from reporting `Unknown` (§21.4).
+      unschedulable:
+        type: bool
+        nullable: true
+        doc: >-
+          `spec.unschedulable`. Null when the field is absent: the API server defaults it to
+          false, and repeating that defaulting here would state a fact the object did not.
+      kubelet_version:
+        type: string
+        nullable: true
+        doc: >-
+          `status.nodeInfo.kubeletVersion`, verbatim. Never parsed into a comparison — §5.3
+          forbids rejecting a cluster because its version string is unfamiliar.
+      internal_ip:
+        type: string
+        nullable: true
+        doc: >-
+          The first `status.addresses` entry of type `InternalIP`, as text the server sent. A
+          string rather than an `ip` so that an address this shell cannot parse is still shown.
+    default_view:
+      columns: [name, ready, unschedulable, kubelet_version, internal_ip]
+
+  - id: io.github.godspeed-you.kubernetes.pod/1
+    name: KubernetesPod
+    summary: A pod, the workload that actually runs.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A recreated pod with the same name is
+          a different pod, and this is the field that says so.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`.'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`. Null only for an object the server sent without one (§9.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`.'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: '`metadata.resourceVersion`, opaque (§14.3).'
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole — what a Service selector matches on.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed. A pod held by a finalizer stays
+          here indefinitely, and is not deleted (Gate H).
+      phase:
+        type: string
+        nullable: true
+        doc: '`status.phase`, verbatim: `Pending`, `Running`, `Succeeded`, `Failed`, `Unknown`.'
+      node:
+        type: string
+        nullable: true
+        doc: '`spec.nodeName`. Null while the pod is unscheduled, which is a fact worth seeing.'
+      pod_ip:
+        type: string
+        nullable: true
+        doc: '`status.podIP`, as text. Null before the network is set up.'
+      containers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The names in `spec.containers`, in order. Init and ephemeral containers are not folded
+          in: they are different lifecycles and merging them would lose that.
+      restarts:
+        type: int
+        nullable: true
+        doc: >-
+          The sum of `status.containerStatuses[*].restartCount`. Null when the server sent no
+          container statuses — an unscheduled pod has restarted zero times *as far as nobody
+          knows*, and reporting `0` would turn missing evidence into a measurement.
+    default_view:
+      columns: [name, namespace, phase, node, restarts, created]
+
+  - id: io.github.godspeed-you.kubernetes.deployment/1
+    name: KubernetesDeployment
+    summary: A deployment, with what was asked of it beside what has been observed.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: '`metadata.uid` — the lifetime identity (§16.1).'
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`.'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, here `apps/v1` on every server that serves one.'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: '`metadata.resourceVersion`, opaque (§14.3).'
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole.'
+      terminating:
+        type: bool
+        required: true
+        doc: Whether deletion was accepted and has not completed.
+      desired_replicas:
+        type: int
+        nullable: true
+        doc: >-
+          `spec.replicas` — what was asked for. Null when the field is absent, which is what a
+          deployment under a horizontal autoscaler can look like.
+      ready_replicas:
+        type: int
+        nullable: true
+        doc: '`status.readyReplicas` — what has been observed. Null when the status is silent.'
+      updated_replicas:
+        type: int
+        nullable: true
+        doc: '`status.updatedReplicas`: how much of the observed set is on the current template.'
+      available_replicas:
+        type: int
+        nullable: true
+        doc: '`status.availableReplicas`: ready for at least the minimum readiness period.'
+      generation:
+        type: int
+        nullable: true
+        doc: >-
+          `metadata.generation`, which counts spec changes. It is not `resourceVersion` (§14.4,
+          §4 invariant 7), and the two are never compared.
+      observed_generation:
+        type: int
+        nullable: true
+        doc: >-
+          `status.observedGeneration`. Behind `generation` means the controller has not caught
+          up with the spec yet — the desired-versus-observed pair §14.4 asks to be kept visible.
+    default_view:
+      columns: [name, namespace, ready_replicas, desired_replicas, available_replicas, created]
+
+  - id: io.github.godspeed-you.kubernetes.secret/1
+    name: KubernetesSecret
+    summary: A secret's metadata — which keys exist, never what they hold (§22).
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: '`metadata.uid` — the lifetime identity (§16.1).'
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name` (§22.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace` (§22.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`.'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: '`metadata.resourceVersion`, opaque (§14.3).'
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp` (§22.2).'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Labels are not payload.'
+      terminating:
+        type: bool
+        required: true
+        doc: Whether deletion was accepted and has not completed.
+      secret_type:
+        type: string
+        nullable: true
+        doc: >-
+          `type`, such as `Opaque` or `kubernetes.io/tls` (§22.2). Null when the object carries
+          none, rather than defaulted to `Opaque`.
+      keys:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The key names of `data` and `stringData` together, sorted (§22.2). Names only: a
+          length or a hash would be a small, steady leak of the payload. There is deliberately
+          no field for a value — the record is built from a `redaction::Guarded`, which holds a
+          Secret whose payload was destroyed rather than filtered, so no rendering rule, log
+          line or navigation path can reach one. Null when the collection answered with an
+          object that is not a payload-bearing kind at all, so no key list was ever taken:
+          §21.4 keeps that apart from a Secret that carries no keys, which is `[]`.
+    default_view:
+      columns: [name, namespace, secret_type, keys, created]

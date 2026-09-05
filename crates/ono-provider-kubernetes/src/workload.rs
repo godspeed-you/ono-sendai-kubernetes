@@ -25,17 +25,17 @@
 //!
 //! # Relation vocabulary
 //!
-//! [`WorkloadRelation`] is a second relation enum beside [`crate::relationship::Relation`]
-//! because these curated relations — `owns`, `routes-to`, `represented-by` — did not exist there
-//! yet. Merging the two into one vocabulary is a follow-up; two enums naming relationships is one
-//! more than a user should ever see.
+//! One vocabulary, in [`crate::relationship`]. These relations — `owns`, `routes-to`,
+//! `represented-by` — are curated in the sense that this module knows which fields to read for
+//! them, not in the sense that they are a second kind of relationship: an [`Edge`] from here is
+//! the same value an owner reference produces, and a user follows it by the same word.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value as Json;
 
 use crate::object::{Identity, Object};
-use crate::relationship::Evidence;
+use crate::relationship::{Edge, Evidence, Relation, Target};
 
 /// The well-known label by which an EndpointSlice names the Service it belongs to (§26.2).
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
@@ -46,164 +46,6 @@ const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
 /// The Gateway API versions whose field layout this adapter has actually seen (§27.3, §5.3).
 const KNOWN_GATEWAY_VERSIONS: [&str; 3] = ["v1alpha2", "v1beta1", "v1"];
 
-/// A curated relationship among workloads, services and routes.
-///
-/// Deliberately distinct from a selector match: `Owns` says a controller's mark is on the child,
-/// `SelectorMatches` says two label sets agree. Collapsing them would let a canary ReplicaSet
-/// read as one its neighbour controls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum WorkloadRelation {
-    /// The target's `metadata.ownerReferences` names the source (§25.1).
-    Owns,
-    /// As [`Self::Owns`], and the source is the target's controller (§24.3).
-    Controls,
-    /// The source's selector matches the target's labels, which is weaker than owning it (§23.3).
-    SelectorMatches,
-    /// The source StatefulSet is governed by the target Service (§25.3).
-    UsesService,
-    /// The source Service is represented by the target EndpointSlice (§26.2).
-    RepresentedBy,
-    /// The source EndpointSlice holds an endpoint backed by the target (§26.2).
-    EndpointFor,
-    /// The source routes traffic to the target Service (§27.1, §27.3).
-    RoutesTo,
-    /// The source terminates TLS with the target Secret (§27.1).
-    UsesTlsSecret,
-    /// The source Ingress is handled by the target IngressClass (§27.2).
-    UsesIngressClass,
-    /// The source route attaches to the target Gateway (§27.3).
-    AttachesTo,
-    /// The source Gateway is implemented by the target GatewayClass (§27.3).
-    UsesGatewayClass,
-}
-
-impl WorkloadRelation {
-    /// The word a user types after `follow`.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Owns => "owns",
-            Self::Controls => "controls",
-            Self::SelectorMatches => "selector-matches",
-            Self::UsesService => "uses-service",
-            Self::RepresentedBy => "represented-by",
-            Self::EndpointFor => "endpoint-for",
-            Self::RoutesTo => "routes-to",
-            Self::UsesTlsSecret => "uses-tls-secret",
-            Self::UsesIngressClass => "uses-ingress-class",
-            Self::AttachesTo => "attaches-to",
-            Self::UsesGatewayClass => "uses-gateway-class",
-        }
-    }
-}
-
-/// Where a workload edge points.
-///
-/// A descriptor rather than an identity, for the same reason as
-/// [`crate::relationship::Target`]: an edge to an object nobody has read is a relationship whose
-/// far end is unexamined, and that is a different thing from a broken edge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkloadTarget {
-    kind: String,
-    api_version: Option<String>,
-    namespace: Option<String>,
-    name: String,
-    uid: Option<String>,
-    resolved: Option<Identity>,
-}
-
-impl WorkloadTarget {
-    /// The target's kind.
-    #[must_use]
-    pub fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    /// The target's `apiVersion`, where the reference carried or implied one.
-    #[must_use]
-    pub fn api_version(&self) -> Option<&str> {
-        self.api_version.as_deref()
-    }
-
-    /// The namespace the target lives in, absent where it is cluster-scoped.
-    #[must_use]
-    pub fn namespace(&self) -> Option<&str> {
-        self.namespace.as_deref()
-    }
-
-    /// The target's name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The target's UID, where something stated it.
-    #[must_use]
-    pub fn uid(&self) -> Option<&str> {
-        self.uid.as_deref()
-    }
-
-    /// Whether the target object was actually read.
-    #[must_use]
-    pub fn is_resolved(&self) -> bool {
-        self.resolved.is_some()
-    }
-
-    /// The target's identity, once something resolved it.
-    #[must_use]
-    pub fn identity(&self) -> Option<&Identity> {
-        self.resolved.as_ref()
-    }
-}
-
-/// One curated relationship, with the evidence that decided it and the evidence that qualifies it.
-///
-/// The split between the two matters for routing. `Ingress -> Service` is decided by the backend
-/// service name, and the host, path and port are what make the edge worth walking: §27.1 requires
-/// them to stay attached, because "which Service" without "for which URL" answers a question
-/// nobody asked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkloadEdge {
-    source: Identity,
-    relation: WorkloadRelation,
-    target: WorkloadTarget,
-    evidence: Evidence,
-    supporting: Vec<Evidence>,
-}
-
-impl WorkloadEdge {
-    /// The object the relationship starts at.
-    #[must_use]
-    pub fn source(&self) -> &Identity {
-        &self.source
-    }
-
-    /// What the relationship is.
-    #[must_use]
-    pub fn relation(&self) -> WorkloadRelation {
-        self.relation
-    }
-
-    /// Where it points.
-    #[must_use]
-    pub fn target(&self) -> &WorkloadTarget {
-        &self.target
-    }
-
-    /// What decided it (Gate D).
-    #[must_use]
-    pub fn evidence(&self) -> &Evidence {
-        &self.evidence
-    }
-
-    /// What qualifies it: the host, path and port of a route, the hosts a certificate serves,
-    /// the adapter and version that read a custom resource.
-    #[must_use]
-    pub fn supporting(&self) -> &[Evidence] {
-        &self.supporting
-    }
-}
-
 /// The outcome of evaluating a workload controller's selector (§23.3).
 ///
 /// Two outcomes rather than one list, because "nothing matched" and "this selector was not
@@ -212,7 +54,7 @@ impl WorkloadEdge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectorMatch {
     /// The selector was evaluated in full against every candidate offered.
-    Evaluated(Vec<WorkloadEdge>),
+    Evaluated(Vec<Edge>),
     /// The selector was not evaluated, and no candidate may be presumed excluded.
     NotEvaluated {
         /// What stopped it, in the words of the field that stopped it.
@@ -276,7 +118,7 @@ impl ClaimTemplate {
 /// nights running reads as one that never ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobHistory {
-    observed: Vec<WorkloadEdge>,
+    observed: Vec<Edge>,
     successful_history_limit: Option<i64>,
     failed_history_limit: Option<i64>,
 }
@@ -284,13 +126,13 @@ pub struct JobHistory {
 impl JobHistory {
     /// The ownership edges to the Jobs that still exist.
     #[must_use]
-    pub fn observed(&self) -> &[WorkloadEdge] {
+    pub fn observed(&self) -> &[Edge] {
         &self.observed
     }
 
     /// Those same edges, owned.
     #[must_use]
-    pub fn into_observed(self) -> Vec<WorkloadEdge> {
+    pub fn into_observed(self) -> Vec<Edge> {
         self.observed
     }
 
@@ -327,7 +169,7 @@ impl JobHistory {
 pub struct Endpoint {
     addresses: Vec<String>,
     ready: Option<bool>,
-    pod: Option<WorkloadEdge>,
+    pod: Option<Edge>,
 }
 
 impl Endpoint {
@@ -348,7 +190,7 @@ impl Endpoint {
 
     /// The edge to the object behind this endpoint, where `targetRef` resolves.
     #[must_use]
-    pub fn pod_edge(&self) -> Option<&WorkloadEdge> {
+    pub fn pod_edge(&self) -> Option<&Edge> {
         self.pod.as_ref()
     }
 
@@ -380,7 +222,7 @@ impl Workload {
     /// [`crate::relationship::Graph::edges_of`], so a caller wanting all ownership does not have
     /// to know which of the two words to ask for.
     #[must_use]
-    pub fn owns(owner: &Object, candidates: &[Object]) -> Vec<WorkloadEdge> {
+    pub fn owns(owner: &Object, candidates: &[Object]) -> Vec<Edge> {
         let Some(owner_uid) = owner.uid() else {
             return Vec::new();
         };
@@ -397,7 +239,7 @@ impl Workload {
                 if reference.uid() != owner_uid || reference.kind() != owner.gvk().kind() {
                     continue;
                 }
-                let target = target_of(child);
+                let target = Target::of_object(child);
                 let evidence = Evidence::OwnerReference {
                     controller: reference.is_controller(),
                 };
@@ -411,21 +253,20 @@ impl Workload {
                         child.name()
                     ),
                 }];
-                edges.push(WorkloadEdge {
-                    source: source.clone(),
-                    relation: WorkloadRelation::Owns,
-                    target: target.clone(),
-                    evidence: evidence.clone(),
-                    supporting: supporting.clone(),
-                });
+                edges.push(
+                    Edge::new(
+                        source.clone(),
+                        Relation::Owns,
+                        target.clone(),
+                        evidence.clone(),
+                    )
+                    .with_supporting(supporting.clone()),
+                );
                 if reference.is_controller() {
-                    edges.push(WorkloadEdge {
-                        source: source.clone(),
-                        relation: WorkloadRelation::Controls,
-                        target,
-                        evidence,
-                        supporting,
-                    });
+                    edges.push(
+                        Edge::new(source.clone(), Relation::Controls, target, evidence)
+                            .with_supporting(supporting),
+                    );
                 }
             }
         }
@@ -481,16 +322,15 @@ impl Workload {
                     }
                     matched.insert(key.clone(), wanted.clone());
                 }
-                Some(WorkloadEdge {
-                    source: source.clone(),
-                    relation: WorkloadRelation::SelectorMatches,
-                    target: target_of(candidate),
-                    evidence: Evidence::Selector {
+                Some(Edge::new(
+                    source.clone(),
+                    Relation::SelectorMatches,
+                    Target::of_object(candidate),
+                    Evidence::Selector {
                         selector: labels.clone(),
                         matched_labels: matched,
                     },
-                    supporting: Vec::new(),
-                })
+                ))
             })
             .collect();
         SelectorMatch::Evaluated(edges)
@@ -502,28 +342,22 @@ impl Workload {
     /// deriving it from that resemblance would be right often enough to be trusted and wrong
     /// exactly where a cluster is unusual.
     #[must_use]
-    pub fn governing_service(statefulset: &Object) -> Option<WorkloadEdge> {
+    pub fn governing_service(statefulset: &Object) -> Option<Edge> {
         let name = statefulset
             .field("/spec/serviceName")
             .and_then(Json::as_str)
             .filter(|name| !name.is_empty())?;
-        Some(WorkloadEdge {
-            source: statefulset.identity(),
-            relation: WorkloadRelation::UsesService,
-            target: WorkloadTarget {
-                kind: "Service".to_owned(),
-                api_version: Some("v1".to_owned()),
-                namespace: statefulset.namespace().map(str::to_owned),
-                name: name.to_owned(),
-                uid: None,
-                resolved: None,
-            },
-            evidence: Evidence::NativeField {
+        Some(Edge::new(
+            statefulset.identity(),
+            Relation::UsesService,
+            Target::new("Service", name)
+                .with_api_version(Some("v1"))
+                .in_namespace(statefulset.namespace()),
+            Evidence::NativeField {
                 path: "/spec/serviceName".to_owned(),
                 value: name.to_owned(),
             },
-            supporting: Vec::new(),
-        })
+        ))
     }
 
     /// The claim templates a StatefulSet declares (§25.3).
@@ -590,7 +424,7 @@ impl Workload {
     /// may build and never something this function does on their behalf — folding them together
     /// would lose which slice is stale and which controller wrote it.
     #[must_use]
-    pub fn endpoint_slices(service: &Object, slices: &[Object]) -> Vec<WorkloadEdge> {
+    pub fn endpoint_slices(service: &Object, slices: &[Object]) -> Vec<Edge> {
         let source = service.identity();
         slices
             .iter()
@@ -598,15 +432,16 @@ impl Workload {
             // the same name (§24.2).
             .filter(|slice| slice.namespace() == service.namespace())
             .filter(|slice| slice.label(SERVICE_NAME_LABEL) == Some(service.name()))
-            .map(|slice| WorkloadEdge {
-                source: source.clone(),
-                relation: WorkloadRelation::RepresentedBy,
-                target: target_of(slice),
-                evidence: Evidence::Convention {
-                    key: SERVICE_NAME_LABEL.to_owned(),
-                    value: service.name().to_owned(),
-                },
-                supporting: Vec::new(),
+            .map(|slice| {
+                Edge::new(
+                    source.clone(),
+                    Relation::RepresentedBy,
+                    Target::of_object(slice),
+                    Evidence::Convention {
+                        key: SERVICE_NAME_LABEL.to_owned(),
+                        value: service.name().to_owned(),
+                    },
+                )
             })
             .collect()
     }
@@ -646,7 +481,7 @@ impl Workload {
     /// requires that evidence to stay attached: "which Service" without "for which URL" is not
     /// the question anyone walks this edge to ask.
     #[must_use]
-    pub fn ingress_edges(ingress: &Object) -> Vec<WorkloadEdge> {
+    pub fn ingress_edges(ingress: &Object) -> Vec<Edge> {
         let source = ingress.identity();
         let namespace = ingress.namespace().map(str::to_owned);
         let mut edges = Vec::new();
@@ -655,25 +490,17 @@ impl Workload {
             .field("/spec/ingressClassName")
             .and_then(Json::as_str)
         {
-            edges.push(WorkloadEdge {
-                source: source.clone(),
-                relation: WorkloadRelation::UsesIngressClass,
-                target: WorkloadTarget {
-                    kind: "IngressClass".to_owned(),
-                    api_version: Some(api_version_of(ingress)),
-                    // Cluster-scoped: copying the Ingress's namespace onto it would name
-                    // something that cannot be looked up (§9.5).
-                    namespace: None,
-                    name: class.to_owned(),
-                    uid: None,
-                    resolved: None,
-                },
-                evidence: Evidence::NativeField {
+            edges.push(Edge::new(
+                source.clone(),
+                Relation::UsesIngressClass,
+                // Cluster-scoped, so no namespace: copying the Ingress's onto it would name
+                // something that cannot be looked up (§9.5).
+                Target::new("IngressClass", class).with_api_version(Some(&api_version_of(ingress))),
+                Evidence::NativeField {
                     path: "/spec/ingressClassName".to_owned(),
                     value: class.to_owned(),
                 },
-                supporting: Vec::new(),
-            });
+            ));
         }
 
         if let Some(entries) = ingress.field("/spec/tls").and_then(Json::as_array) {
@@ -696,23 +523,20 @@ impl Workload {
                         })
                     })
                     .collect();
-                edges.push(WorkloadEdge {
-                    source: source.clone(),
-                    relation: WorkloadRelation::UsesTlsSecret,
-                    target: WorkloadTarget {
-                        kind: "Secret".to_owned(),
-                        api_version: Some("v1".to_owned()),
-                        namespace: namespace.clone(),
-                        name: secret.to_owned(),
-                        uid: None,
-                        resolved: None,
-                    },
-                    evidence: Evidence::NativeField {
-                        path: format!("/spec/tls/{index}/secretName"),
-                        value: secret.to_owned(),
-                    },
-                    supporting,
-                });
+                edges.push(
+                    Edge::new(
+                        source.clone(),
+                        Relation::UsesTlsSecret,
+                        Target::new("Secret", secret)
+                            .with_api_version(Some("v1"))
+                            .in_namespace(namespace.as_deref()),
+                        Evidence::NativeField {
+                            path: format!("/spec/tls/{index}/secretName"),
+                            value: secret.to_owned(),
+                        },
+                    )
+                    .with_supporting(supporting),
+                );
             }
         }
 
@@ -776,7 +600,7 @@ impl Workload {
     /// are not known to mean what today's mean (§5.3), and the object stays fully available
     /// through universal dynamic support (§15.1), which is where an unknown schema belongs.
     #[must_use]
-    pub fn gateway_edges(object: &Object) -> Vec<WorkloadEdge> {
+    pub fn gateway_edges(object: &Object) -> Vec<Edge> {
         let gvk = object.gvk();
         if gvk.group() != GATEWAY_GROUP || !KNOWN_GATEWAY_VERSIONS.contains(&gvk.version()) {
             return Vec::new();
@@ -795,23 +619,18 @@ impl Workload {
                     .field("/spec/gatewayClassName")
                     .and_then(Json::as_str)
                 {
-                    edges.push(WorkloadEdge {
-                        source,
-                        relation: WorkloadRelation::UsesGatewayClass,
-                        target: WorkloadTarget {
-                            kind: "GatewayClass".to_owned(),
-                            api_version: Some(api_version),
-                            namespace: None,
-                            name: class.to_owned(),
-                            uid: None,
-                            resolved: None,
-                        },
-                        evidence: Evidence::NativeField {
-                            path: "/spec/gatewayClassName".to_owned(),
-                            value: class.to_owned(),
-                        },
-                        supporting: vec![adapter],
-                    });
+                    edges.push(
+                        Edge::new(
+                            source,
+                            Relation::UsesGatewayClass,
+                            Target::new("GatewayClass", class).with_api_version(Some(&api_version)),
+                            Evidence::NativeField {
+                                path: "/spec/gatewayClassName".to_owned(),
+                                value: class.to_owned(),
+                            },
+                        )
+                        .with_supporting(vec![adapter]),
+                    );
                 }
             }
             "HTTPRoute" | "GRPCRoute" => {
@@ -819,7 +638,7 @@ impl Workload {
                     for (index, parent) in parents.iter().enumerate() {
                         if let Some(edge) = reference_edge(
                             &source,
-                            WorkloadRelation::AttachesTo,
+                            Relation::AttachesTo,
                             parent,
                             "Gateway",
                             Some(&api_version),
@@ -840,7 +659,7 @@ impl Workload {
                         for (backend_index, backend) in backends.iter().enumerate() {
                             if let Some(edge) = reference_edge(
                                 &source,
-                                WorkloadRelation::RoutesTo,
+                                Relation::RoutesTo,
                                 backend,
                                 "Service",
                                 Some("v1"),
@@ -869,42 +688,32 @@ fn endpoint_target(
     index: usize,
     slice: &Object,
     source: &Identity,
-) -> Option<WorkloadEdge> {
+) -> Option<Edge> {
     let reference = endpoint.get("targetRef")?;
     let name = reference.get("name").and_then(Json::as_str)?;
-    Some(WorkloadEdge {
-        source: source.clone(),
-        relation: WorkloadRelation::EndpointFor,
-        target: WorkloadTarget {
-            kind: reference
-                .get("kind")
-                .and_then(Json::as_str)
-                .unwrap_or("Pod")
-                .to_owned(),
-            api_version: reference
-                .get("apiVersion")
-                .and_then(Json::as_str)
-                .map(str::to_owned),
-            namespace: reference
-                .get("namespace")
-                .and_then(Json::as_str)
-                .map(str::to_owned)
-                .or_else(|| slice.namespace().map(str::to_owned)),
-            name: name.to_owned(),
+    let kind = reference
+        .get("kind")
+        .and_then(Json::as_str)
+        .unwrap_or("Pod");
+    Some(Edge::new(
+        source.clone(),
+        Relation::EndpointFor,
+        Target::new(kind, name)
+            .with_api_version(reference.get("apiVersion").and_then(Json::as_str))
+            .in_namespace(
+                reference
+                    .get("namespace")
+                    .and_then(Json::as_str)
+                    .or_else(|| slice.namespace()),
+            )
             // The UID is what makes this step provable rather than a name match, so it is
             // carried through even though nothing here resolved the Pod itself.
-            uid: reference
-                .get("uid")
-                .and_then(Json::as_str)
-                .map(str::to_owned),
-            resolved: None,
-        },
-        evidence: Evidence::NativeField {
+            .with_uid(reference.get("uid").and_then(Json::as_str)),
+        Evidence::NativeField {
             path: format!("/endpoints/{index}/targetRef/name"),
             value: name.to_owned(),
         },
-        supporting: Vec::new(),
-    })
+    ))
 }
 
 /// The routing edge one Ingress backend states, with the port riding along as evidence.
@@ -914,7 +723,7 @@ fn backend_edge(
     namespace: Option<&str>,
     pointer: &str,
     mut supporting: Vec<Evidence>,
-) -> Option<WorkloadEdge> {
+) -> Option<Edge> {
     let backend = ingress.field(pointer)?;
     let name = backend.pointer("/service/name").and_then(Json::as_str)?;
     if let Some(number) = backend
@@ -932,24 +741,21 @@ fn backend_edge(
             value: port.to_owned(),
         });
     }
-    Some(WorkloadEdge {
-        source: source.clone(),
-        relation: WorkloadRelation::RoutesTo,
-        target: WorkloadTarget {
-            kind: "Service".to_owned(),
-            api_version: Some("v1".to_owned()),
-            // An Ingress backend is namespace-local; there is no cross-namespace form of it.
-            namespace: namespace.map(str::to_owned),
-            name: name.to_owned(),
-            uid: None,
-            resolved: None,
-        },
-        evidence: Evidence::NativeField {
-            path: format!("{pointer}/service/name"),
-            value: name.to_owned(),
-        },
-        supporting,
-    })
+    Some(
+        Edge::new(
+            source.clone(),
+            Relation::RoutesTo,
+            Target::new("Service", name)
+                .with_api_version(Some("v1"))
+                // An Ingress backend is namespace-local; there is no cross-namespace form of it.
+                .in_namespace(namespace),
+            Evidence::NativeField {
+                path: format!("{pointer}/service/name"),
+                value: name.to_owned(),
+            },
+        )
+        .with_supporting(supporting),
+    )
 }
 
 /// One Gateway API `*Ref`: a name, with kind, group and namespace defaulted the way the API
@@ -965,52 +771,38 @@ fn backend_edge(
 )]
 fn reference_edge(
     source: &Identity,
-    relation: WorkloadRelation,
+    relation: Relation,
     reference: &Json,
     default_kind: &str,
     default_api_version: Option<&str>,
     default_namespace: Option<&str>,
     pointer: &str,
     supporting: Vec<Evidence>,
-) -> Option<WorkloadEdge> {
+) -> Option<Edge> {
     let name = reference.get("name").and_then(Json::as_str)?;
-    Some(WorkloadEdge {
-        source: source.clone(),
-        relation,
-        target: WorkloadTarget {
-            kind: reference
-                .get("kind")
-                .and_then(Json::as_str)
-                .unwrap_or(default_kind)
-                .to_owned(),
-            api_version: default_api_version.map(str::to_owned),
-            namespace: reference
-                .get("namespace")
-                .and_then(Json::as_str)
-                .map(str::to_owned)
-                .or_else(|| default_namespace.map(str::to_owned)),
-            name: name.to_owned(),
-            uid: None,
-            resolved: None,
-        },
-        evidence: Evidence::NativeField {
-            path: format!("{pointer}/name"),
-            value: name.to_owned(),
-        },
-        supporting,
-    })
-}
-
-/// A target descriptor for an object that was actually read, so the edge carries its identity.
-fn target_of(object: &Object) -> WorkloadTarget {
-    WorkloadTarget {
-        kind: object.gvk().kind().to_owned(),
-        api_version: Some(api_version_of(object)),
-        namespace: object.namespace().map(str::to_owned),
-        name: object.name().to_owned(),
-        uid: object.uid().map(str::to_owned),
-        resolved: Some(object.identity()),
-    }
+    let kind = reference
+        .get("kind")
+        .and_then(Json::as_str)
+        .unwrap_or(default_kind);
+    Some(
+        Edge::new(
+            source.clone(),
+            relation,
+            Target::new(kind, name)
+                .with_api_version(default_api_version)
+                .in_namespace(
+                    reference
+                        .get("namespace")
+                        .and_then(Json::as_str)
+                        .or(default_namespace),
+                ),
+            Evidence::NativeField {
+                path: format!("{pointer}/name"),
+                value: name.to_owned(),
+            },
+        )
+        .with_supporting(supporting),
+    )
 }
 
 /// The `apiVersion` string an object would carry, rebuilt from its GVK.

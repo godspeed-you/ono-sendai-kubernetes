@@ -17,7 +17,7 @@
 )]
 
 use ono_provider_kubernetes::object::Object;
-use ono_provider_kubernetes::relationship::{Evidence, Graph, Relation};
+use ono_provider_kubernetes::relationship::{Edge, Evidence, Graph, Relation, Target};
 
 const POD: &str = r#"{
   "apiVersion":"v1","kind":"Pod",
@@ -146,6 +146,74 @@ fn should_keep_an_owner_edge_whose_target_cannot_be_read() {
         owner.target().uid(),
         Some("rs-1"),
         "the target descriptor carries enough to resolve it later"
+    );
+}
+
+#[test]
+fn should_spell_relationships_the_way_the_specification_does() {
+    // §22.4, §24.3, §25 to §27 and §30 name these words in the specification's own examples. One
+    // vocabulary for the whole provider only helps if it is the vocabulary the specification
+    // already uses; a synonym invented here is a word a reader of the spec cannot follow.
+    let named = [
+        (Relation::OwnedBy, "owned-by"),
+        (Relation::ControlledBy, "controlled-by"),
+        (Relation::Owns, "owns"),
+        (Relation::ScheduledOn, "scheduled-on"),
+        (Relation::Selects, "selects"),
+        (Relation::SelectorMatches, "selector-matches"),
+        (Relation::RepresentedBy, "represented-by"),
+        (Relation::EndpointFor, "endpoint-for"),
+        (Relation::RoutesTo, "routes-to"),
+        (Relation::UsesTlsSecret, "uses-tls-secret"),
+        (Relation::AttachesTo, "attaches-to"),
+        (Relation::RunsAs, "runs-as"),
+        (Relation::Mounts, "mounts"),
+        (Relation::BoundTo, "bound-to"),
+        (Relation::ReferencesConfig, "references-config"),
+        (Relation::ReferencesSecret, "references-secret"),
+        (Relation::UsesImagePullSecret, "uses-image-pull-secret"),
+    ];
+
+    for (relation, word) in named {
+        assert_eq!(relation.as_str(), word);
+    }
+}
+
+#[test]
+fn should_require_evidence_of_an_edge_built_outside_the_graph() {
+    // Gate D, expressed in the type rather than in a review comment: a module that reads fields
+    // this one does not — a curated routing adapter, a secret reference — builds its edges here,
+    // and cannot build one that fails to say where it came from. §27.1's host, path and port ride
+    // along beside that evidence rather than inside it, because they qualify the edge without
+    // being what decided it.
+    let ingress = object(SERVICE);
+    let edge = Edge::new(
+        ingress.identity(),
+        Relation::RoutesTo,
+        Target::new("Service", "checkout")
+            .with_api_version(Some("v1"))
+            .in_namespace(Some("shop")),
+        Evidence::NativeField {
+            path: "/spec/rules/0/http/paths/0/backend/service/name".to_owned(),
+            value: "checkout".to_owned(),
+        },
+    )
+    .with_supporting(vec![Evidence::NativeField {
+        path: "/spec/rules/0/host".to_owned(),
+        value: "shop.example.com".to_owned(),
+    }]);
+
+    assert_eq!(edge.relation(), Relation::RoutesTo);
+    assert_eq!(edge.target().namespace(), Some("shop"));
+    assert!(
+        !edge.target().is_resolved(),
+        "nothing read the Service, and an edge says so rather than inventing its identity (§24.1)"
+    );
+    assert_eq!(edge.evidence().class(), "native-field");
+    assert_eq!(
+        edge.supporting().len(),
+        1,
+        "the host stays attached to the routing edge (§27.1)"
     );
 }
 

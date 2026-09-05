@@ -1,0 +1,31 @@
+[package]
+name = "ono-kubernetes-plugin"
+description = "The KUANG/11 plugin binary: answers Ono-Sendai's provider queries from a Kubernetes cluster."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ono-kubernetes"
+path = "src/main.rs"
+
+[dependencies]
+ono-provider-kubernetes = { path = "../ono-provider-kubernetes" }
+ono-kuang-sdk = { workspace = true }
+ono-value = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The deterministic test host of spec §31.73, and the supervisor types its host services are
+# written against. Both come from the same git reference as the SDK, so a plugin is tested
+# against exactly the host revision it is built against.
+ono-kuang-testhost = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
+ono-kuang-supervisor = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[lints]
+workspace = true

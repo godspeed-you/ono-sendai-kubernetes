@@ -54,3 +54,4 @@ network:
 
 contributions:
   targets: [contributions/targets.yaml]
+  schemas: [contributions/schemas.yaml]

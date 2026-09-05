@@ -123,6 +123,23 @@ impl Identity {
         self.uid.as_deref()
     }
 
+    /// The namespace the object was observed in, absent where its kind is cluster-scoped.
+    ///
+    /// Part of the identity because it is part of the locator (§16.2): two objects of one kind
+    /// may share a name in different namespaces and are not the same object. Exposing it is what
+    /// lets an identity be turned back into an address (§35.4) — without it, an edge's far end
+    /// could be compared but never navigated to.
+    #[must_use]
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    /// The object's name, as `metadata.name` stated it.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Whether this identity survives the name being reused.
     ///
     /// False for an object the server gave no UID (§16.5). Such an identity falls back to the

@@ -443,6 +443,73 @@ fn should_rank_ambient_namespace_objects_behind_every_relationship() {
     );
 }
 
+/// §35.5: `near` reports the graph neighbours of a place, and a relationship that arrives is as
+/// much a neighbour as one that leaves — the Service in front of a Pod is the first thing anyone
+/// looks for when the Pod is the one misbehaving. What blocked it was addressing: an edge's near
+/// end is an identity, and an identity that would not say which namespace it was in could not be
+/// turned back into an address. The direction still has to survive the trip, because `selects`
+/// read off an inbound edge would say the Pod selects the Service.
+#[test]
+fn should_reach_the_neighbour_at_either_end_of_an_edge() {
+    let service = object("kubernetes:prod", SERVICE);
+    let pod_object = object("kubernetes:prod", POD);
+    let selection = Graph::selects(&service, std::slice::from_ref(&pod_object));
+
+    let neighbourhood = Neighbourhood::around(Place::of_object(&pod_object).expect("addressable"))
+        .reached(&selection);
+
+    let neighbours = neighbourhood.neighbours();
+    assert_eq!(
+        neighbours.len(),
+        1,
+        "the Service that selects this Pod is a neighbour of it"
+    );
+    assert_eq!(
+        neighbours[0].place().uri().to_string(),
+        "k8s://prod/ns/production/service/checkout"
+    );
+    assert_eq!(neighbours[0].via(), Waypoint::Selects);
+    assert!(
+        neighbours[0].is_inbound(),
+        "the Service selects the Pod, not the other way round"
+    );
+
+    let stranger = object("kubernetes:prod", DEPLOYMENT);
+    let unrelated = Neighbourhood::around(Place::of_object(&stranger).expect("addressable"))
+        .reached(&selection);
+    assert!(
+        unrelated.neighbours().is_empty(),
+        "an edge with neither end here is not this place's relationship to adopt"
+    );
+}
+
+/// §35.7 with §23: the word a user follows and the relationship the provider extracts are one
+/// vocabulary. `routes-to`, `bound-to` and `has-endpoints` were navigable words with nothing
+/// extractable behind them, so those neighbours could only ever be supplied by hand; and a
+/// relation with no word would arrive in `near` unfollowable.
+#[test]
+fn should_name_every_extracted_relation_with_a_waypoint() {
+    for waypoint in Waypoint::ALL {
+        if let Some(relation) = waypoint.relation() {
+            assert_eq!(
+                Waypoint::from_relation(relation),
+                *waypoint,
+                "`{}` and `{}` must name each other",
+                waypoint.as_str(),
+                relation.as_str()
+            );
+        }
+    }
+
+    for word in ["routes-to", "bound-to", "has-endpoints"] {
+        let waypoint = Waypoint::parse(word).expect("§35.5 and §35.7 name it");
+        assert!(
+            waypoint.relation().is_some(),
+            "`{word}` is a relationship this provider extracts, not only one it accepts"
+        );
+    }
+}
+
 /// §35.5: the prioritisation is a table, so every relationship this provider can traverse has a
 /// declared rank. Without the completeness check a newly modelled relationship silently defaults
 /// to the weakest class and disappears from the top of `near`.

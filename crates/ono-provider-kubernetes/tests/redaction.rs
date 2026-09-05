@@ -19,6 +19,14 @@
 
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::{Guarded, RedactionError, RevealPolicy, RevealRefusal};
+use ono_provider_kubernetes::relationship::{Edge, Relation};
+
+/// The field a reference was read from, which §22.4's edges always cite.
+fn cited_path(edge: &Edge) -> &str {
+    edge.evidence()
+        .path()
+        .expect("a secret reference is read from a field and says which one")
+}
 
 /// The base64 the API server sends for `password`.
 const CIPHERTEXT: &str = "c3VwZXItc2VjcmV0";
@@ -329,16 +337,19 @@ fn should_keep_pod_secret_references_useful_without_payload() {
     // consumes it. Dropping the edges to protect the payload would protect nothing — the name of
     // a Secret is not its contents — and would cost the answer an operator came for.
     let references = ono_provider_kubernetes::redaction::secret_references(&parse(POD));
-    let relations: Vec<&str> = references.iter().map(|item| item.relation()).collect();
+    let relations: Vec<Relation> = references.iter().map(Edge::relation).collect();
 
-    assert_eq!(relations, ["references-secret", "references-secret"]);
+    assert_eq!(
+        relations,
+        [Relation::ReferencesSecret, Relation::ReferencesSecret]
+    );
     for reference in &references {
-        assert_eq!(reference.name(), "db-credentials");
-        assert_eq!(reference.namespace(), Some("shop"));
+        assert_eq!(reference.target().name(), "db-credentials");
+        assert_eq!(reference.target().namespace(), Some("shop"));
         assert!(
-            reference.path().starts_with("/spec/"),
+            cited_path(reference).starts_with("/spec/"),
             "the reference cites the field it was read from (§23): {}",
-            reference.path()
+            cited_path(reference)
         );
     }
 }
@@ -351,7 +362,14 @@ fn should_model_the_service_account_image_pull_secret_reference() {
     let references = ono_provider_kubernetes::redaction::secret_references(&parse(SERVICE_ACCOUNT));
     let described: Vec<String> = references
         .iter()
-        .map(|item| format!("{} {} at {}", item.relation(), item.name(), item.path()))
+        .map(|item| {
+            format!(
+                "{} {} at {}",
+                item.relation().as_str(),
+                item.target().name(),
+                cited_path(item)
+            )
+        })
         .collect();
 
     assert_eq!(

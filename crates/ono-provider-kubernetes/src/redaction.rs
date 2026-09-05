@@ -32,8 +32,8 @@
 //! Everything §22.2 calls safe: name, namespace, type, **which keys are present**, creation time,
 //! owner references. Knowing that a Secret has a `password` key is what tells an operator whether
 //! the Pod that mounts it will start, and it is not knowing the password. The relationships of
-//! §22.4 stay too ([`secret_references`]) — a Secret's name is not its contents, and the workload
-//! that consumes it is usually the reason anyone looked.
+//! §22.4 stay too ([`secret_references`], as ordinary edges) — a Secret's name is not its
+//! contents, and the workload that consumes it is usually the reason anyone looked.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -42,7 +42,7 @@ use serde_json::Value as Json;
 
 use crate::discovery::Gvk;
 use crate::object::{Object, ObjectError};
-use crate::relationship::{Evidence, Graph, Relation};
+use crate::relationship::{Edge, Evidence, Graph, Relation, Target};
 
 /// What stands where a secret value stood.
 ///
@@ -347,107 +347,62 @@ impl Guarded {
     }
 }
 
-/// A reference from some object to a Secret, carried as names and field paths (§22.4, §29.2).
-///
-/// The Pod cases come from [`Graph::edges_of`] rather than being restated here, so there is one
-/// set of reference rules. The ServiceAccount cases §22.4 names have no [`Relation`] yet and are
-/// derived here; when the relationship model grows a word for them, this collapses into the graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecretReference {
-    relation: &'static str,
-    name: String,
-    namespace: Option<String>,
-    path: String,
-}
-
-impl SecretReference {
-    /// What the reference is, in the vocabulary a user follows.
-    #[must_use]
-    pub fn relation(&self) -> &'static str {
-        self.relation
-    }
-
-    /// The Secret's name.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The namespace the Secret is looked for in — always the referring object's, since none of
-    /// these references cross a namespace.
-    #[must_use]
-    pub fn namespace(&self) -> Option<&str> {
-        self.namespace.as_deref()
-    }
-
-    /// The JSON pointer the reference was read from, so a reader can check it (§23).
-    #[must_use]
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-}
-
-impl fmt::Display for SecretReference {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} ({})", self.relation, self.name, self.path)
-    }
-}
-
 /// Every Secret one object refers to, derived without reading any payload (§22.4).
 ///
-/// Only references a field states. A convention or an inference is not produced here: §23 keeps
-/// those evidence classes apart, and a guessed edge to a Secret is a worse guess than most.
+/// Ordinary [`Edge`]s in the ordinary vocabulary. A reference to a Secret is a relationship like
+/// any other — it is the *payload* that is protected, not the fact that a workload consumes one —
+/// and giving these their own shape would leave the edges §22.4 asks for unfollowable.
+///
+/// The Pod cases come from [`Graph::edges_of`] rather than being restated here, so there is one
+/// set of reference rules. Only references a field states: a convention or an inference is not
+/// produced here, because §23 keeps those evidence classes apart and a guessed edge to a Secret
+/// is a worse guess than most.
 #[must_use]
-pub fn secret_references(object: &Object) -> Vec<SecretReference> {
-    let namespace = object.namespace().map(str::to_owned);
-    let mut references: Vec<SecretReference> = Graph::edges_of(object)
-        .iter()
+pub fn secret_references(object: &Object) -> Vec<Edge> {
+    let mut references: Vec<Edge> = Graph::edges_of(object)
+        .into_iter()
         .filter(|edge| edge.relation() == Relation::ReferencesSecret)
-        .filter_map(|edge| match edge.evidence() {
-            Evidence::NativeField { path, .. } => Some(SecretReference {
-                relation: Relation::ReferencesSecret.as_str(),
-                name: edge.target().name().to_owned(),
-                namespace: edge.target().namespace().map(str::to_owned),
-                path: path.clone(),
-            }),
-            _ => None,
-        })
+        .filter(|edge| edge.evidence().path().is_some())
         .collect();
 
     if object.gvk().kind() == "ServiceAccount" {
-        references.extend(named_entries(object, "/secrets", "uses-secret", &namespace));
+        references.extend(named_entries(object, "/secrets", Relation::UsesSecret));
         references.extend(named_entries(
             object,
             "/imagePullSecrets",
-            "uses-image-pull-secret",
-            &namespace,
+            Relation::UsesImagePullSecret,
         ));
     }
 
     references
 }
 
-/// The `{ name: ... }` entries of one array, as references.
-fn named_entries(
-    object: &Object,
-    pointer: &str,
-    relation: &'static str,
-    namespace: &Option<String>,
-) -> Vec<SecretReference> {
+/// The `{ name: ... }` entries of one array, as edges to Secrets.
+///
+/// The namespace is the referring object's, because none of §22.4's references crosses one: a
+/// ServiceAccount's Secrets and pull Secrets are namespace-local, and looking one up elsewhere
+/// would find a namesake rather than the Secret in question (§24.2, §32.1).
+fn named_entries(object: &Object, pointer: &str, relation: Relation) -> Vec<Edge> {
     let Some(entries) = object.field(pointer).and_then(Json::as_array) else {
         return Vec::new();
     };
+    let source = object.identity();
     entries
         .iter()
         .enumerate()
         .filter_map(|(index, entry)| {
             let name = entry.get("name")?.as_str()?;
-            Some(SecretReference {
+            Some(Edge::new(
+                source.clone(),
                 relation,
-                name: name.to_owned(),
-                namespace: namespace.clone(),
-                path: format!("{pointer}/{index}/name"),
-            })
+                Target::new("Secret", name)
+                    .with_api_version(Some("v1"))
+                    .in_namespace(object.namespace()),
+                Evidence::NativeField {
+                    path: format!("{pointer}/{index}/name"),
+                    value: name.to_owned(),
+                },
+            ))
         })
         .collect()
 }

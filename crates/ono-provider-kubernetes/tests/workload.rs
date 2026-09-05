@@ -20,8 +20,8 @@
 )]
 
 use ono_provider_kubernetes::object::Object;
-use ono_provider_kubernetes::relationship::{Evidence, Graph, Relation};
-use ono_provider_kubernetes::workload::{SelectorMatch, Workload, WorkloadEdge, WorkloadRelation};
+use ono_provider_kubernetes::relationship::{Edge, Evidence, Graph, Relation};
+use ono_provider_kubernetes::workload::{SelectorMatch, Workload};
 
 const DEPLOYMENT: &str = r#"{
   "apiVersion":"apps/v1","kind":"Deployment",
@@ -223,7 +223,7 @@ fn object(json: &str) -> Object {
     Object::parse("kubernetes:prod", json).expect("the fixture reads")
 }
 
-fn edges_to(edges: &[WorkloadEdge], relation: WorkloadRelation) -> Vec<&WorkloadEdge> {
+fn edges_to(edges: &[Edge], relation: Relation) -> Vec<&Edge> {
     edges
         .iter()
         .filter(|edge| edge.relation() == relation)
@@ -241,7 +241,7 @@ fn should_own_the_children_whose_owner_reference_names_it() {
 
     let owned: Vec<&str> = edges
         .iter()
-        .filter(|edge| edge.relation() == WorkloadRelation::Owns)
+        .filter(|edge| edge.relation() == Relation::Owns)
         .map(|edge| edge.target().name())
         .collect();
     assert_eq!(owned, vec!["checkout-6ac1"]);
@@ -277,7 +277,7 @@ fn should_not_promote_a_selector_match_to_ownership() {
         panic!("a matchLabels-only selector is evaluable");
     };
     assert_eq!(matches.len(), 1);
-    assert_eq!(matches[0].relation(), WorkloadRelation::SelectorMatches);
+    assert_eq!(matches[0].relation(), Relation::SelectorMatches);
     match matches[0].evidence() {
         Evidence::Selector {
             selector,
@@ -325,13 +325,11 @@ fn should_label_the_controller_edge_beside_the_generic_ownership_edge() {
     assert!(
         edges
             .iter()
-            .any(|edge| edge.relation() == WorkloadRelation::Controls),
+            .any(|edge| edge.relation() == Relation::Controls),
         "the ReplicaSet controls the Pod"
     );
     assert!(
-        edges
-            .iter()
-            .any(|edge| edge.relation() == WorkloadRelation::Owns),
+        edges.iter().any(|edge| edge.relation() == Relation::Owns),
         "and owns it"
     );
 }
@@ -365,7 +363,7 @@ fn should_resolve_the_governing_service_of_a_statefulset_from_the_field_that_nam
     let statefulset = object(STATEFULSET);
     let edge = Workload::governing_service(&statefulset).expect("serviceName resolves");
 
-    assert_eq!(edge.relation(), WorkloadRelation::UsesService);
+    assert_eq!(edge.relation(), Relation::UsesService);
     assert_eq!(edge.target().kind(), "Service");
     assert_eq!(edge.target().name(), "web-headless");
     assert_eq!(
@@ -427,7 +425,7 @@ fn should_traverse_a_daemonset_to_the_nodes_its_pods_cover() {
     let owned = Workload::owns(&daemonset, &pods);
 
     let mut covered: Vec<String> = Vec::new();
-    for edge in edges_to(&owned, WorkloadRelation::Owns) {
+    for edge in edges_to(&owned, Relation::Owns) {
         let pod = pods
             .iter()
             .find(|candidate| candidate.name() == edge.target().name())
@@ -472,7 +470,7 @@ fn should_relate_a_service_to_its_slices_through_the_service_name_label() {
     let edges = Workload::endpoint_slices(&service, &[object(SLICE_ONE)]);
 
     assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0].relation(), WorkloadRelation::RepresentedBy);
+    assert_eq!(edges[0].relation(), Relation::RepresentedBy);
     assert_eq!(edges[0].target().kind(), "EndpointSlice");
     match edges[0].evidence() {
         Evidence::Convention { key, value } => {
@@ -514,7 +512,7 @@ fn should_relate_an_endpoint_to_its_pod_only_when_the_target_reference_resolves(
 
     assert_eq!(endpoints.len(), 1);
     let edge = endpoints[0].pod_edge().expect("the targetRef names a Pod");
-    assert_eq!(edge.relation(), WorkloadRelation::EndpointFor);
+    assert_eq!(edge.relation(), Relation::EndpointFor);
     assert_eq!(edge.target().kind(), "Pod");
     assert_eq!(edge.target().name(), "checkout-6ac1-x7");
     assert_eq!(edge.target().uid(), Some("pod-1"));
@@ -555,7 +553,7 @@ fn should_attach_host_path_and_port_evidence_to_a_routing_edge() {
     // which is the only question the edge is ever walked for.
     let ingress = object(INGRESS);
     let edges = Workload::ingress_edges(&ingress);
-    let routes = edges_to(&edges, WorkloadRelation::RoutesTo);
+    let routes = edges_to(&edges, Relation::RoutesTo);
 
     assert_eq!(routes.len(), 1);
     let route = routes[0];
@@ -602,7 +600,7 @@ fn should_relate_an_ingress_to_the_secret_that_terminates_its_tls() {
     // the certificate itself is not.
     let ingress = object(INGRESS);
     let edges = Workload::ingress_edges(&ingress);
-    let tls = edges_to(&edges, WorkloadRelation::UsesTlsSecret);
+    let tls = edges_to(&edges, Relation::UsesTlsSecret);
 
     assert_eq!(tls.len(), 1);
     assert_eq!(tls[0].target().kind(), "Secret");
@@ -632,7 +630,7 @@ fn should_relate_an_ingress_to_its_class_when_the_field_names_one() {
     // target that cannot be looked up.
     let ingress = object(INGRESS);
     let edges = Workload::ingress_edges(&ingress);
-    let class = edges_to(&edges, WorkloadRelation::UsesIngressClass);
+    let class = edges_to(&edges, Relation::UsesIngressClass);
 
     assert_eq!(class.len(), 1);
     assert_eq!(class[0].target().name(), "nginx");
@@ -666,13 +664,13 @@ fn should_relate_a_route_to_its_gateway_and_backend_when_the_gateway_api_is_inst
     let route = object(HTTPROUTE);
     let edges = Workload::gateway_edges(&route);
 
-    let parents = edges_to(&edges, WorkloadRelation::AttachesTo);
+    let parents = edges_to(&edges, Relation::AttachesTo);
     assert_eq!(parents.len(), 1);
     assert_eq!(parents[0].target().kind(), "Gateway");
     assert_eq!(parents[0].target().name(), "public");
     assert_eq!(parents[0].target().namespace(), Some("gateways"));
 
-    let backends = edges_to(&edges, WorkloadRelation::RoutesTo);
+    let backends = edges_to(&edges, Relation::RoutesTo);
     assert_eq!(backends.len(), 1);
     assert_eq!(backends[0].target().kind(), "Service");
     assert_eq!(
@@ -684,7 +682,7 @@ fn should_relate_a_route_to_its_gateway_and_backend_when_the_gateway_api_is_inst
     let gateway = object(GATEWAY);
     let class = Workload::gateway_edges(&gateway);
     assert_eq!(class.len(), 1);
-    assert_eq!(class[0].relation(), WorkloadRelation::UsesGatewayClass);
+    assert_eq!(class[0].relation(), Relation::UsesGatewayClass);
     assert_eq!(class[0].target().name(), "istio");
     assert_eq!(class[0].target().namespace(), None);
 }
@@ -729,13 +727,10 @@ fn should_traverse_the_canonical_path_from_an_ingress_to_a_node() {
     let slice = object(SLICE_ONE);
     let pod = object(POD);
 
-    let route = edges_to(
-        &Workload::ingress_edges(&ingress),
-        WorkloadRelation::RoutesTo,
-    )
-    .first()
-    .map(|edge| edge.target().name().to_owned())
-    .expect("the ingress routes somewhere");
+    let route = edges_to(&Workload::ingress_edges(&ingress), Relation::RoutesTo)
+        .first()
+        .map(|edge| edge.target().name().to_owned())
+        .expect("the ingress routes somewhere");
     assert_eq!(route, service.name());
 
     let represented = Workload::endpoint_slices(&service, std::slice::from_ref(&slice));

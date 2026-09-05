@@ -25,6 +25,20 @@ serde_json = "1"
 serde_yaml_ng = "0.10"
 base64 = "0.22"
 
+# The same TLS stack the shell uses (core's ADR-0353), with the `ring` provider. A provider that
+# introduced a second TLS implementation into the tree it plugs into would widen the supply chain
+# for no gain. §8.4's validation is this package's obligation, because the host brokers bytes and
+# not requests (core ADR-0573, and ADR-0002 here).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+# What a KUANG/11 package is written against. A git dependency because the SDK is not published;
+# `Cargo.lock` pins the exact revision, so a build is reproducible even though the reference moves.
+ono-kuang-sdk = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
+ono-kuang-protocol = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
+ono-value = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
+
 [profile.dev]
 # Line tables keep test backtraces readable at a fraction of full debuginfo's disk cost.
 debug = "line-tables-only"
