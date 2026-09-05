@@ -6,6 +6,13 @@
 //! asked for it not to be (§8.4), and a namespace default is a starting point rather than a
 //! permission boundary (§7.5).
 
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "a test states its preconditions directly (AGENTS.md section 16)"
+)]
+
 use ono_provider_kubernetes::kubeconfig::{Credential, Kubeconfig, Trust};
 
 /// Two clusters, two identities, two contexts — the shape every kubeconfig has.
