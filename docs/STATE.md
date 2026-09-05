@@ -163,6 +163,49 @@ are the dynamic ones: the GVK/GVR registry, OpenAPI schema loading, unstructured
 metadata projection, UID identity and the CRD fixtures are all in place and driven end to end.
 What Phase 2 still owes is `get` (§17.1) and the schema cache (§12.4).
 
+## Proven from a prompt (2026-09-05)
+
+The chain runs end to end against a live HTTP API server, typed at an ordinary shell prompt:
+
+```text
+> grant capability network.connect --plugin io.github.godspeed-you.kubernetes
+> get k8s-pod --host 127.0.0.1 --port 18002 | to json
+
+[{"uid":"pod-uid-1","name":"checkout-7f9d","namespace":"shop","api_version":"v1","kind":"Pod",
+  "resource_version":"884213","created":"2026-09-05T10:00:00Z","labels":{"app":"checkout"},
+  "terminating":false,"phase":"Running","node":"ip-10-42-2-19","pod_ip":null,
+  "containers":["app"],"restarts":2}]
+```
+
+`inspect` on the same record answers what matters more than the fields:
+
+```text
+schema      io.github.godspeed-you.kubernetes.pod/1
+identity    {"uid": "pod-uid-1"}
+provider    plugin:io.github.godspeed-you.kubernetes
+```
+
+Identity is the UID and not the name, the schema is the one the target declared, and the
+provenance is stamped by the host rather than claimed by the package. `pod_ip` is null because
+the fixture's Pod has no address — unknown, never fabricated. The record composes:
+`| where phase == "Running" | select name node restarts` filters and projects it like any other.
+
+What the run traverses, in order: the command registry's placeholder for the contributed target,
+core's `provider.query` route, the plugin process, the host's brokered `network.connect` with the
+operator's grant checked at the call, HTTP/1.1 written by this package, the API server, discovery,
+the list, the typed projection, and back through the pipeline.
+
+Three refusals were observed on the way to it, each correct and each worth keeping:
+
+- without a grant, `capability.denied` naming `network.connect`;
+- without a context or host, `provider.unavailable` saying this provider does not guess an API
+  server;
+- against an HTTP/1.0 server that closes each response, a protocol error whose help names TLS as
+  the usual cause.
+
+**This is not a claimed conformance level.** It is one target, against one recorded shape, over
+plain HTTP. What it establishes is that the route exists and the contracts hold along it.
+
 ## In progress
 
 - **Provider instance isolation (Gate J, §62.10).** Nothing is shared between queries, so nothing
