@@ -6,3 +6,4 @@
 pub mod discovery;
 pub mod kubeconfig;
 pub mod object;
+pub mod relationship;
