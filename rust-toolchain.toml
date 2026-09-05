@@ -1,0 +1,6 @@
+[toolchain]
+# The same channel Ono-Sendai pins, so a provider built here and a shell built there agree on
+# the compiler. Bumping it is a deliberate increment, not a side effect of a new machine.
+channel = "1.94"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

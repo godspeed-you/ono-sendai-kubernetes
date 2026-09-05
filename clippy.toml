@@ -1,0 +1,9 @@
+# Mirrors Ono-Sendai's thresholds so a contributor moving between the repositories meets one bar.
+too-many-arguments-threshold = 8
+type-complexity-threshold = 500
+
+# `unwrap`/`expect`/`panic` are how a test states a precondition it does not intend to survive.
+# The workspace bans below exist for library code reachable from cluster input.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

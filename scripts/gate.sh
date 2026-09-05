@@ -2,9 +2,9 @@
 # The quality gate of AGENTS.md section 10. Every increment must pass this before it is
 # committed. Runs identically on a developer machine and in CI.
 #
-# This repository holds a specification and no implementation yet, so the gate checks what is
-# checkable in a repository of documents. When an implementation exists these checks stay and the
-# usual `cargo fmt --check`, `clippy -D warnings` and test steps are added around them (section 10).
+# The document checks below came first, when this repository held a specification and nothing
+# else. The Rust steps joined them when the first crate landed, which is the direction section 10
+# requires: the gate grows with the repository and never shrinks to match it.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -116,6 +116,27 @@ for file in README.md AGENTS.md CLAUDE.md; do
   fi
 done
 echo "instructions: README.md, AGENTS.md and CLAUDE.md name the specification"
+
+# --- the code ------------------------------------------------------------------------------------
+# Skipped only when there is no workspace to build, so that this script keeps working in a
+# checkout that predates the first crate. It is not a way to opt out of the Rust bar.
+if [[ -f Cargo.toml ]]; then
+  step "format"
+  cargo fmt --all -- --check || fail "cargo fmt --check found formatting the tree does not use"
+
+  step "lint"
+  cargo clippy --all-targets --all-features -- -D warnings || fail "clippy found warnings"
+
+  step "test"
+  cargo test --workspace --all-features || fail "the test suite is not green"
+
+  step "docs"
+  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --quiet \
+    || fail "cargo doc found warnings"
+else
+  step "code"
+  echo "code: no Cargo workspace yet — nothing to build"
+fi
 
 # --- verdict ------------------------------------------------------------------------------------
 if (( problems > 0 )); then
