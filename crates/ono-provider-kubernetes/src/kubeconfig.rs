@@ -144,6 +144,8 @@ pub struct Connection {
     namespace: Option<String>,
     credential: Credential,
     material: Option<Secret>,
+    client_certificate: Option<(Vec<u8>, Secret)>,
+    client_certificate_files: Vec<String>,
     trust: Trust,
 }
 
@@ -182,6 +184,32 @@ impl Connection {
         self.material.as_ref()
     }
 
+    /// The client certificate and its key, where the kubeconfig carries both inline, in PEM.
+    ///
+    /// `None` when the context has no client certificate at all, and also when it names either
+    /// half as a *file*: this module opens none. [`Self::client_certificate_files`] then names
+    /// the paths, so a caller that cannot read them can say which read it could not make rather
+    /// than reporting a context with no credential.
+    #[must_use]
+    pub fn client_certificate(&self) -> Option<(&[u8], &Secret)> {
+        self.client_certificate
+            .as_ref()
+            .map(|(certificate, key)| (certificate.as_slice(), key))
+    }
+
+    /// The paths a context names for client certificate material it does not carry inline.
+    ///
+    /// Reported rather than read. Reading one needs the host's `filesystem.read` capability, and
+    /// hiding that read inside a config resolver would put a capability decision somewhere no
+    /// reviewer looks (§8.1, §27.3 of the generic provider contract).
+    #[must_use]
+    pub fn client_certificate_files(&self) -> Vec<&str> {
+        self.client_certificate_files
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
     /// What the API server's certificate is checked against.
     #[must_use]
     pub fn trust(&self) -> &Trust {
@@ -218,6 +246,14 @@ impl fmt::Debug for Connection {
         // Named rather than shown: a reader of a diagnostic needs to know a credential exists and
         // what kind it is, and must not be handed the bytes (§8.1).
         rendered.field("material", &self.material);
+        // `Secret` redacts itself, so the pair renders as the certificate's length and
+        // `<redacted>`; the certificate is public material and the key never is.
+        rendered.field(
+            "client_certificate",
+            &self.client_certificate.as_ref().map(|(certificate, _)| {
+                format!("{} bytes of PEM, key <redacted>", certificate.len())
+            }),
+        );
         if self.is_insecure() {
             rendered.field("tls", &"insecure: certificate verification disabled");
         } else {
@@ -327,6 +363,7 @@ impl Kubeconfig {
             })?;
 
         let (credential, material) = classify(user);
+        let (client_certificate, client_certificate_files) = client_certificate_of(user)?;
 
         Ok(Connection {
             context: context.to_owned(),
@@ -334,6 +371,8 @@ impl Kubeconfig {
             namespace: entry.namespace.clone(),
             credential,
             material,
+            client_certificate,
+            client_certificate_files,
             trust: trust_of(cluster)?,
         })
     }
@@ -360,6 +399,54 @@ fn classify(user: Option<&UserSpec>) -> (Credential, Option<Secret>) {
         return (Credential::ClientCertificate, None);
     }
     (Credential::Anonymous, None)
+}
+
+/// The client certificate a user entry carries inline, and the paths it names instead.
+///
+/// Both halves are needed for the material to be usable, so a context that carries one inline and
+/// names the other as a file reports *no* inline certificate and both locations — a half-resolved
+/// identity would fail at the handshake for a reason nothing here had recorded.
+type ClientCertificate = (Option<(Vec<u8>, Secret)>, Vec<String>);
+
+fn client_certificate_of(user: Option<&UserSpec>) -> Result<ClientCertificate, ConfigError> {
+    let Some(user) = user else {
+        return Ok((None, Vec::new()));
+    };
+    let certificate = decode(
+        user.client_certificate_data.as_deref(),
+        "client-certificate-data",
+    )?;
+    let key = decode(user.client_key_data.as_deref(), "client-key-data")?;
+    let mut files = Vec::new();
+    if let (Some(certificate), Some(key)) = (certificate, key) {
+        return Ok((
+            Some((
+                certificate,
+                // The key is the only half that is credential material; the certificate is
+                // published to every peer that connects (§8.1).
+                Secret::new(String::from_utf8_lossy(&key).into_owned()),
+            )),
+            files,
+        ));
+    }
+    if let Some(path) = &user.client_certificate {
+        files.push(path.clone());
+    }
+    if let Some(path) = &user.client_key {
+        files.push(path.clone());
+    }
+    Ok((None, files))
+}
+
+/// Base64 material from the kubeconfig, or a named failure.
+fn decode(encoded: Option<&str>, field: &str) -> Result<Option<Vec<u8>>, ConfigError> {
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map(Some)
+        .map_err(|error| ConfigError::Malformed(format!("`{field}` is not base64: {error}")))
 }
 
 /// What the API server's certificate is checked against.

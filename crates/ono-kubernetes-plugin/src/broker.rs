@@ -13,13 +13,13 @@
 //! truncated one. This stream reports the first as end of stream and the second as a failure that
 //! says so.
 //!
-//! **What is still missing, and is not here.** A Kubernetes API server speaks HTTPS. §8.4 puts
-//! certificate validation in this package rather than in the host, which means a TLS session
-//! wrapping this stream — `rustls` over a [`BrokeredStream`], with the kubeconfig's trust anchors
-//! — has to exist before a production cluster is reachable. It does not exist yet, so the plugin
-//! speaks HTTP/1.1 straight over the brokered bytes. That is enough for an API server reached
-//! through a local proxy and not enough for anything else, and [`crate::query`] says so out loud
-//! rather than connecting and failing obscurely.
+//! **TLS wraps this stream rather than living in it.** A Kubernetes API server speaks HTTPS, and
+//! §8.4 puts certificate validation in this package rather than in the host. That session is
+//! `ono_provider_kubernetes::tls::TlsStream` over a [`BrokeredStream`], built from the trust
+//! anchors of the kubeconfig context [`crate::query`] resolved, and it is itself a [`ByteStream`]
+//! — so nothing here knows a certificate exists. A query that names a `host` instead of a context
+//! has no kubeconfig and therefore no anchors, and speaks plain HTTP/1.1 straight over these
+//! bytes: enough for an API server reached through `kubectl proxy`, and nothing else.
 
 use std::collections::VecDeque;
 

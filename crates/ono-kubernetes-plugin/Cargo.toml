@@ -25,6 +25,11 @@ serde_json = { workspace = true }
 ono-kuang-testhost = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
 ono-kuang-supervisor = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
 async-trait = "0.1"
+# The recorded cluster speaks TLS in one test, so the package's own `rustls` session has a real
+# server on the other end of it rather than a fixture that replays a handshake.
+rustls = { workspace = true }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+base64 = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [lints]

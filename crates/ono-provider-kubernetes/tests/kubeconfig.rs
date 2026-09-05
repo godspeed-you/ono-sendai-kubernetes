@@ -246,3 +246,130 @@ contexts:
         "the error must name what is missing, got {error}"
     );
 }
+
+#[test]
+fn should_hand_over_an_inline_client_certificate_for_the_connection_to_present() {
+    // §7.1: "client certificates where configured". A kubeadm cluster's admin context is exactly
+    // this shape, so a provider that resolves everything except this one cannot reach the most
+    // common self-hosted cluster there is.
+    let certificates = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://one.example.test:6443}}
+users:
+  - name: admin
+    user:
+      client-certificate-data: Y2VydC1wZW0=
+      client-key-data: a2V5LXBlbQ==
+contexts:
+  - {name: admin, context: {cluster: c, user: admin}}
+"#;
+    let config = Kubeconfig::parse(certificates).expect("the kubeconfig parses");
+    let admin = config.connection("admin").expect("`admin` resolves");
+
+    assert_eq!(admin.credential(), Credential::ClientCertificate);
+    let (certificate, key) = admin
+        .client_certificate()
+        .expect("the context carries both halves inline");
+    assert_eq!(certificate, b"cert-pem");
+    assert_eq!(key.expose(), "key-pem");
+    assert!(
+        admin.client_certificate_files().is_empty(),
+        "nothing has to be read from disk for this context"
+    );
+}
+
+#[test]
+fn should_keep_an_inline_client_key_out_of_a_debug_rendering() {
+    let certificates = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://one.example.test:6443}}
+users:
+  - name: admin
+    user:
+      client-certificate-data: Y2VydC1wZW0=
+      client-key-data: c2VjcmV0LWtleS1tYXRlcmlhbA==
+contexts:
+  - {name: admin, context: {cluster: c, user: admin}}
+"#;
+    let config = Kubeconfig::parse(certificates).expect("the kubeconfig parses");
+    let admin = config.connection("admin").expect("`admin` resolves");
+
+    let rendered = format!("{admin:?}");
+    assert!(
+        !rendered.contains("secret-key-material"),
+        "a private key is credential material (§8.1): {rendered}"
+    );
+}
+
+#[test]
+fn should_name_the_files_a_context_expects_its_client_certificate_to_be_read_from() {
+    // This module opens no files, and the paths are reported rather than resolved: reading them
+    // needs a capability the caller holds, and a caller that cannot read them has to be able to
+    // say *which* read it could not make.
+    let paths = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://one.example.test:6443}}
+users:
+  - name: admin
+    user:
+      client-certificate: /etc/kubernetes/pki/admin.crt
+      client-key: /etc/kubernetes/pki/admin.key
+contexts:
+  - {name: admin, context: {cluster: c, user: admin}}
+"#;
+    let config = Kubeconfig::parse(paths).expect("the kubeconfig parses");
+    let admin = config.connection("admin").expect("`admin` resolves");
+
+    assert_eq!(admin.credential(), Credential::ClientCertificate);
+    assert!(
+        admin.client_certificate().is_none(),
+        "nothing is inline, and the resolver does not read the files to make it so"
+    );
+    assert_eq!(
+        admin.client_certificate_files(),
+        vec![
+            "/etc/kubernetes/pki/admin.crt",
+            "/etc/kubernetes/pki/admin.key"
+        ]
+    );
+}
+
+#[test]
+fn should_refuse_client_certificate_data_that_is_not_base64() {
+    let broken = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://one.example.test:6443}}
+users:
+  - name: admin
+    user:
+      client-certificate-data: "!!! not base64 !!!"
+      client-key-data: a2V5
+contexts:
+  - {name: admin, context: {cluster: c, user: admin}}
+"#;
+    let config = Kubeconfig::parse(broken).expect("the kubeconfig parses");
+    let error = config
+        .connection("admin")
+        .expect_err("material that is not base64 is a broken file, not an empty certificate");
+    assert!(
+        format!("{error}").contains("client-certificate-data"),
+        "the error must name the field that does not read, got {error}"
+    );
+}
+
+#[test]
+fn should_report_a_context_with_no_client_certificate_as_having_none() {
+    let config = Kubeconfig::parse(TWO_CONTEXTS).expect("the kubeconfig parses");
+    let dev = config.connection("dev").expect("`dev` resolves");
+
+    assert!(dev.client_certificate().is_none());
+    assert!(dev.client_certificate_files().is_empty());
+}

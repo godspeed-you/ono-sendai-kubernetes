@@ -73,11 +73,122 @@ fn text_of(record: &RecordValue, field: &str) -> Option<String> {
     }
 }
 
+// --- a certificate authority, and TLS on the wire ----------------------------------------------
+
+/// A certificate authority and the server certificate it signed, generated for the test.
+///
+/// Generated rather than checked in, so nothing here expires on a date nobody chose.
+struct Authority {
+    ca_pem: String,
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+impl Authority {
+    /// An authority that vouches for `server_name` and nothing else.
+    fn issuing(server_name: &str) -> Self {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "recorded cluster authority");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let params = rcgen::CertificateParams::new(vec![server_name.to_owned()]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&key, &ca, &ca_key).unwrap();
+
+        Self {
+            ca_pem: ca.pem(),
+            chain: vec![certificate.der().clone()],
+            key: rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+        }
+    }
+
+    /// The authority as a kubeconfig writes it: base64 of the PEM.
+    fn certificate_authority_data(&self) -> String {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            self.ca_pem.as_bytes(),
+        )
+    }
+
+    fn server_config(&self) -> rustls::ServerConfig {
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(self.chain.clone(), self.key.clone_key())
+        .unwrap()
+    }
+}
+
+/// Feeds received TLS bytes into the server session and returns whatever plaintext came out.
+fn decrypt(connection: &mut rustls::ServerConnection, bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut cursor = bytes;
+    while !cursor.is_empty() {
+        match connection.read_tls(&mut cursor) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if connection.process_new_packets().is_err() {
+            return Vec::new();
+        }
+    }
+    let mut plaintext = Vec::new();
+    // `WouldBlock` is "nothing decrypted yet", which is every byte of the handshake.
+    let _ = connection.reader().read_to_end(&mut plaintext);
+    plaintext
+}
+
+/// Encrypts the replies and whatever handshake the session still owes.
+fn encrypt(connection: &mut rustls::ServerConnection, replies: &[Vec<u8>]) -> Vec<u8> {
+    use std::io::Write as _;
+    for reply in replies {
+        connection.writer().write_all(reply).unwrap();
+    }
+    let mut outbound = Vec::new();
+    while connection.wants_write() {
+        if connection.write_tls(&mut outbound).is_err() {
+            break;
+        }
+    }
+    outbound
+}
+
+/// Writes a kubeconfig into a directory of its own and hands back both paths.
+///
+/// A real file, because the host reads it through `filesystem.read` against the real filesystem —
+/// which is the capability boundary this test exists to exercise.
+fn kubeconfig_at(name: &str, document: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let directory = std::env::temp_dir().join(format!(
+        "ono-kubernetes-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&directory).expect("the test may write a temporary directory");
+    let path = directory.join("config");
+    std::fs::write(&path, document).expect("the kubeconfig is written");
+    (directory, path)
+}
+
+/// A `filesystem.read` grant scoped to one directory, the way an operator scopes one.
+fn readable(directory: &std::path::Path) -> JsonMap<String, Json> {
+    options(&[("paths", json!([format!("{}/**", directory.display())]))])
+}
+
 // --- the recorded cluster ----------------------------------------------------------------------
 
 /// An API server that answers from recorded documents, reached the way a real one is: through
 /// the host's `network.connect`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct RecordedCluster {
     /// How many pods the `default` namespace holds. Two for the ordinary cases; many when a
     /// test needs an answer long enough to cancel in the middle of.
@@ -85,11 +196,31 @@ struct RecordedCluster {
     /// Whether the server serves the `apps` group at all. A cluster without it is not an
     /// unusual cluster — it is any cluster whose API surface this build has never seen.
     apps: bool,
+    /// The TLS identity this server presents, where it speaks HTTPS at all. `None` is the plain
+    /// HTTP/1.1 an API server behind `kubectl proxy` speaks.
+    tls: Option<Arc<rustls::ServerConfig>>,
+    /// Every request head the server received, so a test can assert what travelled — including
+    /// the `Authorization` header, which is the only proof that a credential left the package.
+    heads: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl std::fmt::Debug for RecordedCluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordedCluster")
+            .field("pods", &self.pods)
+            .field("apps", &self.apps)
+            .field("tls", &self.tls.is_some())
+            .finish()
+    }
 }
 
 impl RecordedCluster {
     fn with_pods(pods: usize) -> Arc<Self> {
-        Arc::new(Self { pods, apps: true })
+        Arc::new(Self {
+            pods,
+            apps: true,
+            ..Self::default()
+        })
     }
 
     /// A server that serves no `apps` group, so nothing serves a Deployment.
@@ -97,7 +228,26 @@ impl RecordedCluster {
         Arc::new(Self {
             pods: 2,
             apps: false,
+            ..Self::default()
         })
+    }
+
+    /// A server that speaks TLS, presenting `authority`'s certificate.
+    fn over_tls(authority: &Authority) -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            tls: Some(Arc::new(authority.server_config())),
+            heads: Arc::default(),
+        })
+    }
+
+    /// Every request head the server has received.
+    fn heads(&self) -> Vec<String> {
+        self.heads
+            .lock()
+            .map(|heads| heads.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -168,7 +318,7 @@ fn pod(index: usize) -> Json {
     })
 }
 
-fn document(path: &str, cluster: RecordedCluster) -> Vec<u8> {
+fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let pods = cluster.pods;
     let path = path.split('?').next().unwrap_or(path);
     let body = match path {
@@ -248,6 +398,24 @@ fn document(path: &str, cluster: RecordedCluster) -> Vec<u8> {
             "metadata": {"resourceVersion": "9002"},
             "items": (0..pods).map(pod).collect::<Vec<_>>(),
         }),
+        // A second namespace, so that a namespace coming from a kubeconfig context can be told
+        // apart from the one a query would have defaulted to (§7.5).
+        "/api/v1/namespaces/shop/pods" => json!({
+            "kind": "PodList",
+            "apiVersion": "v1",
+            "metadata": {"resourceVersion": "9005"},
+            "items": [{
+                "metadata": {
+                    "name": "shop-till",
+                    "namespace": "shop",
+                    "uid": "77777777-7777-7777-7777-777777777777",
+                    "resourceVersion": "4713",
+                    "creationTimestamp": "2026-09-01T10:00:00Z",
+                },
+                "spec": {"nodeName": "node-a", "containers": [{"name": "till"}]},
+                "status": {"phase": "Running", "podIP": "10.1.2.9"},
+            }],
+        }),
         "/api/v1/namespaces/default/secrets" => json!({
             "kind": "SecretList",
             "apiVersion": "v1",
@@ -294,22 +462,44 @@ impl HostServices for RecordedCluster {
     ) -> Result<Connection, HostError> {
         let (inbound, incoming) = mpsc::channel(64);
         let (outgoing, mut written) = mpsc::channel::<Vec<u8>>(64);
-        let cluster = *self;
+        let cluster = self.clone();
         tokio::spawn(async move {
+            // A TLS server where the cluster has an identity, and nothing at all where it does
+            // not. The handshake runs here rather than in a fixture, so the package's own
+            // `rustls` session is what is on the other end of it.
+            let mut session = cluster.tls.as_ref().map(|config| {
+                rustls::ServerConnection::new(Arc::clone(config))
+                    .expect("the recorded server configuration is usable")
+            });
             let mut buffered: Vec<u8> = Vec::new();
             while let Some(bytes) = written.recv().await {
-                buffered.extend(bytes);
+                let plaintext = match &mut session {
+                    None => bytes,
+                    Some(connection) => decrypt(connection, &bytes),
+                };
+                buffered.extend(plaintext);
+                let mut replies: Vec<Vec<u8>> = Vec::new();
                 // A request head ends at the blank line, and a `GET` carries no body — which is
                 // every request this provider makes.
                 while let Some(at) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
                     let head = String::from_utf8_lossy(&buffered[..at]).into_owned();
                     buffered.drain(..at + 4);
                     let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
-                    let reply = document(&path, cluster);
-                    let chunk = json!({"bytes": {"$bytes": encode_hex(&reply)}});
-                    if inbound.send(Ok(chunk)).await.is_err() {
-                        return;
+                    if let Ok(mut heads) = cluster.heads.lock() {
+                        heads.push(head);
                     }
+                    replies.push(document(&path, &cluster));
+                }
+                let outbound = match &mut session {
+                    None => replies.concat(),
+                    Some(connection) => encrypt(connection, &replies),
+                };
+                if outbound.is_empty() {
+                    continue;
+                }
+                let chunk = json!({"bytes": {"$bytes": encode_hex(&outbound)}});
+                if inbound.send(Ok(chunk)).await.is_err() {
+                    return;
                 }
             }
         });
@@ -681,4 +871,257 @@ async fn should_refuse_to_reach_the_cluster_without_a_network_connect_grant() {
         "capability.denied"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- the kubeconfig path -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn should_resolve_a_named_context_through_the_kubeconfig_and_speak_tls_to_its_server() {
+    // The whole connection path in one test: a context name in, a kubeconfig read through the
+    // host's `filesystem.read`, its server and namespace and certificate authority taken from
+    // the file, a real TLS handshake against the certificate that authority signed, and the
+    // bearer token on every request that went out (§7.1, §7.4, §7.5, §8.1, §8.4).
+    let authority = Authority::issuing("cluster.test");
+    let (directory, path) = kubeconfig_at(
+        "context",
+        &format!(
+            r#"
+apiVersion: v1
+kind: Config
+current-context: recorded
+clusters:
+  - name: recorded
+    cluster:
+      server: https://cluster.test:6443
+      certificate-authority-data: {}
+users:
+  - {{name: operator, user: {{token: recorded-token}}}}
+contexts:
+  - {{name: recorded, context: {{cluster: recorded, user: operator, namespace: shop}}}}
+"#,
+            authority.certificate_authority_data()
+        ),
+    );
+    let cluster = RecordedCluster::over_tls(&authority);
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(Arc::clone(&cluster) as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads");
+
+    let invocation = plugin
+        .query(
+            "k8s-pod",
+            options(&[
+                ("context", json!("recorded")),
+                ("kubeconfig", json!(path.display().to_string())),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    let records = records(&events);
+
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records.len(),
+        1,
+        "the context's namespace decided what was listed, and `shop` holds one pod"
+    );
+    assert_eq!(text_of(&records[0], "name").as_deref(), Some("shop-till"));
+    assert_eq!(text_of(&records[0], "namespace").as_deref(), Some("shop"));
+
+    let heads = cluster.heads();
+    assert!(
+        heads.iter().any(|head| head.starts_with("GET /api ")),
+        "discovery is asked for first, and it arrived decrypted: {heads:?}"
+    );
+    assert!(
+        heads
+            .iter()
+            .all(|head| head.contains("Authorization: Bearer recorded-token")),
+        "every request carries the context's credential, discovery included: {heads:?}"
+    );
+    assert!(
+        heads
+            .iter()
+            .any(|head| head.contains("/api/v1/namespaces/shop/pods")),
+        "the namespace came from the context rather than from a default: {heads:?}"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
+async fn should_say_that_a_denied_kubeconfig_read_is_a_capability_decision() {
+    // §21.4's distinction, applied to configuration: "the host would not let me read the file"
+    // and "the file has no such context" are different states, and a refusal that blurs them
+    // sends the operator to edit a file that was never opened.
+    let (directory, path) = kubeconfig_at(
+        "denied",
+        r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: recorded, cluster: {server: http://cluster.test:8001}}
+users:
+  - {name: operator, user: {token: t}}
+contexts:
+  - {name: recorded, context: {cluster: recorded, user: operator}}
+"#,
+    );
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .host(RecordedCluster::with_pods(2))
+        .load()
+        .await
+        .expect("the package loads");
+
+    let invocation = plugin
+        .query(
+            "k8s-pod",
+            options(&[
+                ("context", json!("recorded")),
+                ("kubeconfig", json!(path.display().to_string())),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty(), "nothing was invented");
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert_eq!(error.name, "provider.unavailable");
+    assert!(
+        error.message.contains("refused to read"),
+        "the refusal must be about the read, got {}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("defines no context"),
+        "a denied read is not a missing context, got {}",
+        error.message
+    );
+    assert!(
+        error.help.unwrap_or_default().contains("filesystem.read"),
+        "the refusal names the capability the operator has to grant"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
+async fn should_refuse_a_context_the_kubeconfig_does_not_define_and_name_the_ones_it_does() {
+    let (directory, path) = kubeconfig_at(
+        "missing",
+        r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: recorded, cluster: {server: http://cluster.test:8001}}
+users:
+  - {name: operator, user: {token: t}}
+contexts:
+  - {name: recorded, context: {cluster: recorded, user: operator}}
+"#,
+    );
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(RecordedCluster::with_pods(2))
+        .load()
+        .await
+        .expect("the package loads");
+
+    let invocation = plugin
+        .query(
+            "k8s-pod",
+            options(&[
+                ("context", json!("staging")),
+                ("kubeconfig", json!(path.display().to_string())),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("staging"),
+        "the refusal names the context that was asked for, got {}",
+        error.message
+    );
+    assert!(
+        error.help.unwrap_or_default().contains("recorded"),
+        "and the ones the file does define"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
+async fn should_refuse_a_context_that_authenticates_through_an_exec_credential_plugin() {
+    // §8.2: an exec plugin runs only under an explicit process-execution capability, and the
+    // host must honour its interaction mode. This package has neither, so it refuses instead of
+    // connecting anonymously — a wrong identity reads as a permission problem on the cluster,
+    // and the operator debugs RBAC for something that was never sent.
+    let (directory, path) = kubeconfig_at(
+        "exec",
+        r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: managed, cluster: {server: http://cluster.test:8001}}
+users:
+  - name: managed
+    user:
+      exec:
+        apiVersion: client.authentication.k8s.io/v1beta1
+        command: aws
+        args: [eks, get-token]
+        interactiveMode: IfAvailable
+contexts:
+  - {name: managed, context: {cluster: managed, user: managed}}
+"#,
+    );
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(RecordedCluster::with_pods(2))
+        .load()
+        .await
+        .expect("the package loads");
+
+    let invocation = plugin
+        .query(
+            "k8s-pod",
+            options(&[
+                ("context", json!("managed")),
+                ("kubeconfig", json!(path.display().to_string())),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty(), "nothing was read as somebody");
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert_eq!(error.name, "provider.unsupported");
+    assert!(
+        error.message.contains("exec"),
+        "the refusal names what it will not do, got {}",
+        error.message
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
 }

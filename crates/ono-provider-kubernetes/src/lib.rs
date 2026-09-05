@@ -20,6 +20,7 @@
 //! place         resources as addresses, and what is near them
 //! coverage      what a query observed, and what it did not
 //! kubeconfig    a context becomes a connection identity
+//! tls           a TLS session, wrapping the brokered byte stream below HTTP
 //! ```
 
 pub mod condition;
@@ -31,6 +32,7 @@ pub mod place;
 pub mod redaction;
 pub mod relationship;
 pub mod schema;
+pub mod tls;
 pub mod transport;
 pub mod watch;
 pub mod workload;

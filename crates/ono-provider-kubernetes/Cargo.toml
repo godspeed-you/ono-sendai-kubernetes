@@ -14,5 +14,19 @@ serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 base64 = { workspace = true }
 
+# TLS is this package's obligation rather than the host's: KUANG/11 brokers a byte connection and
+# deliberately serves no `network.request`, so §8.4's certificate validation has nowhere else to
+# live (core `ADR-0573`, and `ADR-0002` here). The same stack the shell uses, with the `ring`
+# provider, so the tree carries one TLS implementation rather than two.
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+# A certificate authority, a server certificate and a key, generated inside the test. The
+# alternative is a PEM checked into the repository, which expires one day and fails the suite on
+# a date nobody chose.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+
 [lints]
 workspace = true
