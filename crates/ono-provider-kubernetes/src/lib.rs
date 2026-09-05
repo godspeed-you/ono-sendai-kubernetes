@@ -5,3 +5,4 @@
 
 pub mod discovery;
 pub mod kubeconfig;
+pub mod object;
