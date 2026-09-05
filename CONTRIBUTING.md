@@ -1,9 +1,13 @@
 # Contributing to the Ono-Sendai Kubernetes provider
 
 Contributions are welcome. This repository is developed **specification-first and test-first**,
-the same way [Ono-Sendai](https://github.com/godspeed-you/ono-sendai) is; that repository's
-[`AGENTS.md`](https://github.com/godspeed-you/ono-sendai/blob/main/AGENTS.md) is the authoritative
-development contract and applies here too, with the Kubernetes-specific additions below.
+the same way [Ono-Sendai](https://github.com/godspeed-you/ono-sendai) is.
+
+[`AGENTS.md`](AGENTS.md) is the authoritative development contract for this repository, and it
+applies to human contributors as well as to AI agents. It inherits Ono-Sendai's
+[project-wide contract](https://github.com/godspeed-you/ono-sendai/blob/main/AGENTS.md) by
+reference and states what differs here; neither file is a copy of the other. Read both before your
+first change. This page is the short version.
 
 ## Where the project currently is
 
@@ -65,6 +69,20 @@ breaks one of them is rejected regardless of how convenient it is.
   Vision, §35.1).
 - **Reads do not mutate.** Discovery, inspection, relationship traversal and rendering are
   side-effect free.
+
+## Before you commit
+
+```bash
+scripts/gate.sh
+```
+
+It verifies that the specification is unmodified and present, that every relative markdown link
+resolves, that ADRs match `ADR-NNNN-kebab-title.md` with the required headings, and that the
+instruction files still name the specification. It refuses to run on `main`, because
+implementation belongs on `implementation` (`AGENTS.md` §11).
+
+There is no compile, lint or test step yet, because there is nothing to compile. When the first
+crate lands the gate grows to Ono-Sendai's shape and these checks stay.
 
 ## Tests
 

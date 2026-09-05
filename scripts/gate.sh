@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# The quality gate of AGENTS.md section 10. Every increment must pass this before it is
+# committed. Runs identically on a developer machine and in CI.
+#
+# This repository holds a specification and no implementation yet, so the gate checks what is
+# checkable in a repository of documents. When an implementation exists these checks stay and the
+# usual `cargo fmt --check`, `clippy -D warnings` and test steps are added around them (section 10).
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+fail() { printf '\033[31m%s\033[0m\n' "$*" >&2; problems=$((problems + 1)); }
+problems=0
+
+# Section 10 puts the gate *before* the commit, so what it is asked about is the working tree —
+# tracked files plus files that are new and not ignored. Reading only the index would let a new
+# ADR, a new document or a new broken link pass unchecked until the commit that adds it is
+# already made, which is the wrong side of the gate.
+tracked_and_new() { git ls-files --cached --others --exclude-standard -- "$1" | sort -u; }
+
+SPEC="docs/architecture/kubernetes-provider.md"
+
+# --- branch guard ------------------------------------------------------------------------------
+# Implementation belongs on a feature branch so the whole run stays disposable (AGENTS.md §11).
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+if [[ "$branch" == "main" && "${ONO_ALLOW_MAIN:-0}" != "1" ]]; then
+  cat >&2 <<'GUARD'
+gate: refusing to run on `main`.
+
+Implementation belongs on the `implementation` branch, so that the run can be discarded and
+restarted from a clean `main` at any time (AGENTS.md section 11):
+
+    git switch implementation || git switch --create implementation main
+
+If you are the user working on the specification or the instructions themselves, run the gate
+with ONO_ALLOW_MAIN=1.
+GUARD
+  exit 1
+fi
+
+# --- the specification is untouched ------------------------------------------------------------
+# The rule is checked rather than trusted: a written rule is easy to forget halfway through a long
+# session (AGENTS.md §5.2).
+step "specification"
+manifest="docs/architecture/spec.sha256"
+if [[ ! -f "$manifest" ]]; then
+  fail "$manifest is missing; the specification can no longer be proven untouched"
+elif [[ ! -s "$manifest" ]]; then
+  fail "$manifest is empty; an empty manifest verifies successfully and proves nothing"
+elif [[ ! -f "$SPEC" ]]; then
+  # The half a checksum cannot answer: a manifest naming a file that is not there would otherwise
+  # be reported by `sha256sum -c` as a missing-file warning that is easy to lose in a log. In core
+  # this exact shape — documents moving out from under their discovery root — nearly left nine
+  # immutable specifications unguarded behind a green gate (ADR-0581 in core).
+  fail "$SPEC does not exist, so nothing the manifest names is being verified"
+elif ! ( cd docs/architecture && sha256sum --check --strict --status spec.sha256 ); then
+  fail "the specification has been modified. It is IMMUTABLE (AGENTS.md section 5.1): restore it
+with \`git checkout -- $SPEC\` and record the decision in an ADR instead. If the user replaced the
+specification deliberately, they update $manifest."
+else
+  echo "specification: unmodified"
+fi
+
+# --- every relative markdown link resolves -----------------------------------------------------
+step "links"
+links=0
+while IFS= read -r file; do
+  # Skip the immutable specification: a dangling path inside it could never be repaired, and
+  # demanding it would only make the gate unpassable (AGENTS.md §5.1).
+  [[ "$file" == "$SPEC" ]] && continue
+  while IFS= read -r link; do
+    [[ -z "$link" ]] && continue
+    if [[ ! -e "$(dirname "$file")/$link" ]]; then
+      fail "$file: the link \`$link\` does not resolve"
+    fi
+    links=$((links + 1))
+  done < <(grep -oE '\]\(([^)#h][^)]*)\)' "$file" 2>/dev/null | sed -E 's/^\]\(//; s/\)$//; s/#.*//')
+done < <(tracked_and_new '*.md')
+echo "links: $links relative links resolve"
+
+# --- ADRs ---------------------------------------------------------------------------------------
+step "decisions"
+adrs=0
+if [[ -d docs/adr ]]; then
+  previous=0
+  for path in $(tracked_and_new 'docs/adr/*.md'); do
+    name="$(basename "$path")"
+    if [[ ! "$name" =~ ^ADR-[0-9]{4}-[a-z0-9-]+\.md$ ]]; then
+      fail "docs/adr/$name does not match ADR-NNNN-kebab-title.md (AGENTS.md section 8)"
+      continue
+    fi
+    number=$((10#${name:4:4}))
+    if (( number == previous )); then
+      fail "docs/adr/$name reuses number $number; ADR numbers are monotonic"
+    fi
+    previous=$number
+    for heading in "## Context" "## Decision" "## Consequences"; do
+      grep -qF "$heading" "$path" || fail "docs/adr/$name has no \`$heading\` section"
+    done
+    grep -qE '^- Status: ' "$path" || fail "docs/adr/$name has no \`- Status:\` line"
+    adrs=$((adrs + 1))
+  done
+fi
+echo "decisions: $adrs records"
+
+# --- the instructions name the specification ---------------------------------------------------
+# A specification the instructions do not name is one no agent reads — the failure core's
+# narrative check exists to prevent (ADR-0423, ADR-0026 in core).
+step "instructions"
+for file in README.md AGENTS.md CLAUDE.md; do
+  if [[ ! -f "$file" ]]; then
+    fail "$file is missing"
+  elif ! grep -qF "$SPEC" "$file"; then
+    fail "$file does not reference the specification \`$SPEC\`"
+  fi
+done
+echo "instructions: README.md, AGENTS.md and CLAUDE.md name the specification"
+
+# --- verdict ------------------------------------------------------------------------------------
+if (( problems > 0 )); then
+  printf '\n\033[31mgate: %d problem(s)\033[0m\n' "$problems"
+  exit 1
+fi
+printf '\n\033[1;32mgate: green\033[0m\n'

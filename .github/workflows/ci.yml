@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main, implementation, "implementation/**"]
+  pull_request:
+  workflow_dispatch:
+
+# Nothing here writes to the repository and nothing reads a stored secret, so a run proposed from
+# a fork holds a read-only token and sees no credential.
+permissions:
+  contents: read
+
+env:
+  # `scripts/gate.sh` refuses to run on `main` so that a developer cannot write an increment
+  # there by accident (AGENTS.md section 11). CI checks whatever ref it was handed, including
+  # `main`, which is the one place that guard would only get in the way.
+  ONO_ALLOW_MAIN: 1
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The same script a developer runs before every commit, with no CI-only variant: a gate that
+      # differs between the two is a gate that disagrees with itself (AGENTS.md section 10).
+      - name: gate
+        run: scripts/gate.sh

@@ -11,7 +11,11 @@ implementation will be measured against:
 
 | | |
 |---|---|
-| [`docs/architecture/kubernetes-provider.md`](docs/architecture/kubernetes-provider.md) | the canonical Kubernetes Provider Specification |
+| [`docs/architecture/kubernetes-provider.md`](docs/architecture/kubernetes-provider.md) | the canonical Kubernetes Provider Specification — immutable, checksummed |
+| [`AGENTS.md`](AGENTS.md) | the development contract, for humans and AI agents alike |
+| [`docs/STATE.md`](docs/STATE.md) | the work board: what is in progress, found, or deferred |
+| [`docs/adr/`](docs/adr/) | decisions recorded in this repository |
+| [`scripts/gate.sh`](scripts/gate.sh) | the quality gate every change must pass |
 
 ## What the provider is for
 
