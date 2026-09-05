@@ -5,6 +5,29 @@
 # its completion answer on a shell that has never loaded this package, and so that the package
 # loads on first use rather than on every start.
 #
+# **Every word here has a schema and a handler behind it.** ADR-0005 held fourteen of them back
+# because a declared schema is a promise the package could not yet keep; `contributions/
+# schemas.yaml` now declares all of them and `contributions::TARGETS` wires all of them, and
+# `tests/contributions.rs` fails if the three ever disagree again.
+#
+# **Every noun below takes the same options, and this document has nowhere to say so.** A target
+# contribution carries a `name`, a `schema`, a `summary` and an `identity_doc` and nothing else —
+# `docs/contracts/kuang/contributions.v1.yaml` in core has no `options` key for a target, and the
+# wire type is `deny_unknown_fields` — so the options are documented here and in each target's
+# `summary` line rather than in a field a shell could complete:
+#
+#   context      a kubeconfig context; its server, namespace, trust anchors and credential
+#   kubeconfig   which file to read it from, default `~/.kube/config`
+#   host, port   an explicit endpoint instead of a context (§7.3), spoken as plain HTTP/1.1
+#   namespace    one namespace, beating the context's default (§7.5)
+#   all_namespaces  every namespace the caller can see, and never a silent fan-out (§9.4)
+#   name         one object, read at its own REST endpoint rather than filtered out of the
+#                collection (§17.1). A different request with different permissions, and its
+#                `404` means the object is absent where a collection's means the API is not
+#                served — ADR-0012
+#   max_pages    a page budget (§18.4)
+#   kind, group, version, resource   for `k8s-resource` only: which resource to read (ADR-0010)
+#
 # The `k8s-` prefix is deliberate. `pod` and `node` are reserved in core's `docs/contracts/
 # targets.yaml` as provider-qualified words with no schema yet, and claiming them from a package
 # would decide a question that belongs to core. A prefixed noun is honest about who answers it

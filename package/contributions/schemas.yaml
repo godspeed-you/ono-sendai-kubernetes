@@ -3,8 +3,9 @@
 #
 # Written in the field vocabulary of core's `docs/contracts/schemas/*.v1.yaml`, because §31.23
 # says a contributed schema is written in the language core schemas are written in. One document
-# rather than one file per schema: these five are one decision about how a Kubernetes object
-# becomes a record, and splitting them would let them drift apart a field at a time.
+# rather than one file per schema: these are one decision about how a Kubernetes object becomes a
+# record — the same metadata projection, the same `uid` identity, the same unknown-is-null rule —
+# and separate files would let them drift apart a field at a time.
 #
 # **Identity is `uid` for every kind, without exception** (§16.1, §4 invariants 4–5). A name is a
 # label a human reuses; `metadata.uid` is what the API server guarantees about one object's life.
@@ -18,16 +19,32 @@
 # null when `spec.unschedulable` is absent, not `false`, because the API server's defaulting is
 # the API server's business and asserting it here would report something the object never said.
 #
-# **A schema per noun that answers, and no more.** `targets.yaml` declares every noun this
-# package makes typeable; this document declares only the schemas the plugin emits records for. A declared schema nothing emits is a claim the package
-# cannot keep, and §31.68's placeholders already give the other fourteen help and completion
-# without pretending they answer. The five curated ones are chosen so that each proves something
-# different: `namespace` is the scope dimension itself, `node` and `namespace` are cluster-scoped
-# while the rest are namespaced, `pod` is the noun the milestone names, `deployment` carries the
-# desired-versus-observed pair of §14.4, and `secret` is where §22's redaction boundary is
-# demonstrated rather than asserted.
+# **A schema per noun that answers, and no more.** A declared schema is a promise the package
+# will emit records of that shape (ADR-0005), so this document declares exactly the schemas
+# something emits — and since every noun `targets.yaml` declares now has a handler, that is all
+# nineteen of §15.2's Tier 1 set, in §15.2's own order. `tests/contributions.rs` holds the two
+# documents and the handshake to each other, so a schema without a handler is a test failure
+# rather than a runtime one.
 #
-# **`resource` is the sixth, and it is one schema for every kind there will ever be** (§15.1,
+# **The fields are the ones an operator troubleshoots with, and not every field the API has**
+# (§15.5). A resource being readable does not imply that Ono understands every field of it, and a
+# schema that listed everything would be claiming it does. What is left out stays reachable
+# through `k8s-resource`, which projects the whole object.
+#
+# **One field name means one thing everywhere.** `phase` is `status.phase` on a Namespace, a Pod,
+# a claim and a volume; `ready_replicas` is `status.readyReplicas` wherever it appears; a
+# DaemonSet counts nodes rather than replicas and its fields say `scheduled` rather than
+# `replicas` for exactly that reason. The record builder resolves a field by its name alone, so a
+# name that meant two things would be a bug the type system could not catch.
+#
+# **A derived state arrives with its rule and its evidence.** The four workload controllers and
+# Job carry a `reconciliation` map rather than a status word: §37.5 requires the state, the rule
+# that produced it and the fields that rule read, and §37.3 requires a matching
+# `observedGeneration` never to be read as health — which is why `verified_convergence` is a key
+# of its own. A kind with no controller reconciling it towards anything gets no such field, on
+# §37.2's rule that a reconciliation rule is kind-specific.
+#
+# **`resource` is the twentieth, and it is one schema for every kind there will ever be** (§15.1,
 # §33.1, ADR-0010). A record may only claim a schema its package contributed at load, and the
 # contributions are written before the package has spoken to any cluster — so there is no moment
 # at which a schema named after a CRD could honestly be declared. The consequence is deliberate
@@ -302,8 +319,867 @@ schemas:
         doc: >-
           `status.observedGeneration`. Behind `generation` means the controller has not caught
           up with the spec yet — the desired-versus-observed pair §14.4 asks to be kept visible.
+      reconciliation:
+        type: map
+        required: true
+        doc: >-
+          Where the object stands between what was asked of it and what has been observed, derived
+          by the rule §37.2 requires to be kind-specific. Five keys: `state` in §37.5's own
+          wording, `rule` naming the derivation so a reader can look it up and disagree with it,
+          `evidence` listing every field the rule read and what it held, `verified_convergence`
+          which is true for exactly one of the five states, and `stage` — how far up §20.4's
+          ladder the evidence reaches, null where it establishes nothing and never `workload
+          externally healthy`, which no API read can establish. §37.3 is why
+          `verified_convergence` is separate from `state`: a matching `observedGeneration` says a
+          controller has seen the spec and says nothing about health.
     default_view:
       columns: [name, namespace, ready_replicas, desired_replicas, available_replicas, created]
+
+  - id: io.github.godspeed-you.kubernetes.replicaset/1
+    name: KubernetesReplicaSet
+    summary: A ReplicaSet, and the controller above it.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different ReplicaSet.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      desired_replicas:
+        type: int
+        nullable: true
+        doc: '`spec.replicas` — what was asked for. Null when the field is absent.'
+      current_replicas:
+        type: int
+        nullable: true
+        doc: '`status.replicas` — how many the controller currently observes.'
+      ready_replicas:
+        type: int
+        nullable: true
+        doc: '`status.readyReplicas`. Null when the status is silent, never zero.'
+      available_replicas:
+        type: int
+        nullable: true
+        doc: '`status.availableReplicas` — ready for at least the minimum readiness period.'
+      generation:
+        type: int
+        nullable: true
+        doc: >-
+          `metadata.generation`, which counts spec changes. It is not `resourceVersion` (§14.4, §4
+          invariant 7).
+      observed_generation:
+        type: int
+        nullable: true
+        doc: >-
+          `status.observedGeneration`. Behind `generation` means the controller has not caught up
+          with the spec yet.
+      controller:
+        type: string
+        nullable: true
+        doc: >-
+          The name of the owner reference marked `controller: true` — normally the Deployment
+          above this ReplicaSet (§24.3, §25.2). Owner-reference evidence, which is the strongest
+          class §23 defines, and null for a ReplicaSet nothing controls.
+      controller_kind:
+        type: string
+        nullable: true
+        doc: >-
+          That owner's `kind`, because an owner reference names a kind and this provider does not
+          assume which one. Null when there is no controlling owner.
+    default_view:
+      columns: [name, namespace, ready_replicas, desired_replicas, controller, created]
+
+  - id: io.github.godspeed-you.kubernetes.statefulset/1
+    name: KubernetesStatefulSet
+    summary: A StatefulSet, its rollout revisions and the claims its templates ask for.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StatefulSet.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      desired_replicas:
+        type: int
+        nullable: true
+        doc: '`spec.replicas` — what was asked for.'
+      current_replicas:
+        type: int
+        nullable: true
+        doc: '`status.replicas` — how many the controller currently observes.'
+      ready_replicas:
+        type: int
+        nullable: true
+        doc: '`status.readyReplicas`. Null when the status is silent.'
+      updated_replicas:
+        type: int
+        nullable: true
+        doc: '`status.updatedReplicas` — how much of the observed set is on the current template.'
+      available_replicas:
+        type: int
+        nullable: true
+        doc: '`status.availableReplicas`. Null on a server that does not report it.'
+      service_name:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.serviceName` — the governing headless Service (§25.3). Taken from the field rather
+          than from the set's own name, because the two match by convention often enough to be
+          trusted and differ exactly where a cluster is unusual.
+      current_revision:
+        type: string
+        nullable: true
+        doc: '`status.currentRevision` — the controller revision the settled pods are on.'
+      update_revision:
+        type: string
+        nullable: true
+        doc: >-
+          `status.updateRevision`. Different from `current_revision` means a rollout is in
+          progress; equal means it is not.
+      claim_templates:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The names under `spec.volumeClaimTemplates`. Template *intent* and never a list of
+          PersistentVolumeClaims that exist — §25.3 requires the two to stay distinguishable, and
+          this field is on the intent side of that line. Null when the set declares none.
+      reconciliation:
+        type: map
+        required: true
+        doc: >-
+          Where the object stands between what was asked of it and what has been observed, derived
+          by the rule §37.2 requires to be kind-specific. Five keys: `state` in §37.5's own
+          wording, `rule` naming the derivation so a reader can look it up and disagree with it,
+          `evidence` listing every field the rule read and what it held, `verified_convergence`
+          which is true for exactly one of the five states, and `stage` — how far up §20.4's
+          ladder the evidence reaches, null where it establishes nothing and never `workload
+          externally healthy`, which no API read can establish. §37.3 is why
+          `verified_convergence` is separate from `state`: a matching `observedGeneration` says a
+          controller has seen the spec and says nothing about health.
+    default_view:
+      columns: [name, namespace, ready_replicas, desired_replicas, update_revision, created]
+
+  - id: io.github.godspeed-you.kubernetes.daemonset/1
+    name: KubernetesDaemonSet
+    summary: A DaemonSet, counted per node rather than per replica.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different DaemonSet.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      desired_scheduled:
+        type: int
+        nullable: true
+        doc: '`status.desiredNumberScheduled` — how many nodes should run this daemon.'
+      current_scheduled:
+        type: int
+        nullable: true
+        doc: '`status.currentNumberScheduled` — how many are running it.'
+      ready_scheduled:
+        type: int
+        nullable: true
+        doc: '`status.numberReady` — how many of those report ready.'
+      updated_scheduled:
+        type: int
+        nullable: true
+        doc: >-
+          `status.updatedNumberScheduled` — how many are on the current template, which is how far
+          a rollout has reached across the fleet (§25.4).
+      available_scheduled:
+        type: int
+        nullable: true
+        doc: '`status.numberAvailable`.'
+      misscheduled:
+        type: int
+        nullable: true
+        doc: >-
+          `status.numberMisscheduled` — running where they should no longer be, usually after a
+          selector or taint change. Null when the server does not report it, never zero.
+      generation:
+        type: int
+        nullable: true
+        doc: '`metadata.generation`, which counts spec changes (§14.4).'
+      observed_generation:
+        type: int
+        nullable: true
+        doc: '`status.observedGeneration`.'
+      reconciliation:
+        type: map
+        required: true
+        doc: >-
+          Where the object stands between what was asked of it and what has been observed, derived
+          by the rule §37.2 requires to be kind-specific. Five keys: `state` in §37.5's own
+          wording, `rule` naming the derivation so a reader can look it up and disagree with it,
+          `evidence` listing every field the rule read and what it held, `verified_convergence`
+          which is true for exactly one of the five states, and `stage` — how far up §20.4's
+          ladder the evidence reaches, null where it establishes nothing and never `workload
+          externally healthy`, which no API read can establish. §37.3 is why
+          `verified_convergence` is separate from `state`: a matching `observedGeneration` says a
+          controller has seen the spec and says nothing about health.
+    default_view:
+      columns: [name, namespace, ready_scheduled, desired_scheduled, updated_scheduled, created]
+
+  - id: io.github.godspeed-you.kubernetes.service/1
+    name: KubernetesService
+    summary: >-
+      A service: how it is addressed, on which ports, and what it selects.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different Service.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      service_type:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.type`, verbatim — `ClusterIP`, `NodePort`, `LoadBalancer` or `ExternalName`. Null
+          when the object carries none rather than defaulted to `ClusterIP`.
+      cluster_ip:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.clusterIP`. `None` for a headless Service is what the API writes, and it is kept
+          as that word rather than turned into a null, because a headless Service is a deliberate
+          configuration and not a missing address.
+      external_ips:
+        type: list<string>
+        nullable: true
+        doc: '`spec.externalIPs`, whole. Null when there are none.'
+      external_name:
+        type: string
+        nullable: true
+        doc: '`spec.externalName`, for a Service that is a CNAME and selects nothing.'
+      load_balancer:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The addresses under `status.loadBalancer.ingress`, each entry's `ip` or `hostname`. Null
+          when the status carries none — which is every Service that is not a load balancer, and
+          also one whose provisioning has not finished.
+      ports:
+        type: map
+        nullable: true
+        doc: >-
+          `spec.ports`, keyed by each port's name and by its number where it has none. Structured
+          rather than flattened into text, because §31.4 asks for fields a later layer can relate
+          to a local socket or a cloud load balancer, and `http 80/TCP` is not one.
+      selector:
+        type: map
+        nullable: true
+        doc: >-
+          `spec.selector`, whole. Null for a selector-less Service, which §26.1 requires to
+          produce no guessed Pod edges — so the null is load-bearing rather than cosmetic.
+    default_view:
+      columns: [name, namespace, service_type, cluster_ip, ports, created]
+
+  - id: io.github.godspeed-you.kubernetes.endpointslice/1
+    name: KubernetesEndpointSlice
+    summary: >-
+      An EndpointSlice: which addresses answer for a service, and which of them are ready.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different EndpointSlice.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      address_type:
+        type: string
+        nullable: true
+        doc: '`addressType` — `IPv4`, `IPv6` or `FQDN`. What the addresses below are.'
+      service_name:
+        type: string
+        nullable: true
+        doc: >-
+          The `kubernetes.io/service-name` label, which is how a slice says which Service it
+          represents (§26.2). **Convention evidence, not API structure**: an operator can relabel
+          a slice, so this is weaker than a field the API server maintains, and §23 requires the
+          difference to be visible rather than folded into one notion of a relationship.
+      endpoint_count:
+        type: int
+        nullable: true
+        doc: >-
+          How many endpoints the slice carries. Null for an object with no `endpoints` array at
+          all, which is not a slice with zero endpoints.
+      ready_endpoints:
+        type: int
+        nullable: true
+        doc: >-
+          How many of them state `conditions.ready: true`. An endpoint that does not state its
+          readiness is not counted ready: §26 leaves the condition optional and defaulting it to
+          true would report an endpoint as serving on no evidence.
+      addresses:
+        type: list<string>
+        nullable: true
+        doc: 'Every address the endpoints serve, in the slice''s own order.'
+      targets:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The names of the objects behind those endpoints, where `targetRef` resolves. An endpoint
+          without one contributes nothing rather than a blank entry: §26.4 keeps an external
+          address an endpoint fact instead of forcing it into a Pod relationship, so this list is
+          shorter than `addresses` exactly when some endpoints are external.
+      ports:
+        type: map
+        nullable: true
+        doc: '`ports`, keyed by name and by number where a port has none.'
+    default_view:
+      columns: [name, namespace, service_name, ready_endpoints, endpoint_count, created]
+
+  - id: io.github.godspeed-you.kubernetes.ingress/1
+    name: KubernetesIngress
+    summary: >-
+      An ingress: which hosts it answers for, which services it routes to, and which secrets
+      terminate its TLS.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different Ingress.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      ingress_class:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.ingressClassName` — which controller is asked to implement this ingress (§27.2).
+          Null when the object names none, in which case the cluster's default class applies and
+          this provider does not resolve which that is.
+      hosts:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The hosts named by `spec.rules`, in the order the rules list them and without repeats.
+          Null when the ingress states none, which is a catch-all rather than an ingress that
+          answers for nothing.
+      services:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The Services this ingress routes to, from its default backend and every rule path
+          (§27.1). Native-field evidence throughout. The *routing* evidence — which host, which
+          path, which port led to which Service — is on the edges of the relationship graph rather
+          than in this list, which is the summary an operator scans.
+      tls_secrets:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The secrets named by `spec.tls[*].secretName` (§27.1). Names only: the relationship is
+          useful and the payload is not reachable through it (§22.4).
+      load_balancer:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The addresses under `status.loadBalancer.ingress` (§27.1). Null before the controller
+          has published one, which is a different state from an ingress no controller has claimed.
+    default_view:
+      columns: [name, namespace, hosts, services, load_balancer, created]
+
+  - id: io.github.godspeed-you.kubernetes.job/1
+    name: KubernetesJob
+    summary: A job, with what it was asked to complete beside what it has.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different Job.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      completions:
+        type: int
+        nullable: true
+        doc: >-
+          `spec.completions` — how many successful pods make this job done. Null for a job that
+          does not state one.
+      parallelism:
+        type: int
+        nullable: true
+        doc: '`spec.parallelism` — how many may run at once.'
+      active:
+        type: int
+        nullable: true
+        doc: '`status.active` — pods running now.'
+      succeeded:
+        type: int
+        nullable: true
+        doc: >-
+          `status.succeeded`. Null when the status is silent, never zero: a job whose status has
+          not been written has not succeeded zero times, nobody has looked.
+      failed:
+        type: int
+        nullable: true
+        doc: '`status.failed`, on the same rule.'
+      start_time:
+        type: timestamp
+        nullable: true
+        doc: '`status.startTime`.'
+      completion_time:
+        type: timestamp
+        nullable: true
+        doc: >-
+          `status.completionTime`. Null while the job is still running, and also for one that
+          failed.
+      complete:
+        type: string
+        nullable: true
+        doc: >-
+          The `status` of the job's `Complete` condition, as the server spells it — `True`,
+          `False` or `Unknown`. Null when the job states no such condition, which is a different
+          state from stating it as false (§21.4).
+      failure_reason:
+        type: string
+        nullable: true
+        doc: >-
+          The `reason` of the job's `Failed` condition, such as `BackoffLimitExceeded` or
+          `DeadlineExceeded`. Null when the job has not failed, or has failed without stating a
+          reason.
+      controller:
+        type: string
+        nullable: true
+        doc: >-
+          The name of the owner reference marked `controller: true` — the CronJob that created
+          this job, where one did (§25.5). Owner-reference evidence.
+      controller_kind:
+        type: string
+        nullable: true
+        doc: 'That owner''s `kind`. Null when nothing controls the job.'
+      reconciliation:
+        type: map
+        required: true
+        doc: >-
+          Where the object stands between what was asked of it and what has been observed, derived
+          by the rule §37.2 requires to be kind-specific. Five keys: `state` in §37.5's own
+          wording, `rule` naming the derivation so a reader can look it up and disagree with it,
+          `evidence` listing every field the rule read and what it held, `verified_convergence`
+          which is true for exactly one of the five states, and `stage` — how far up §20.4's
+          ladder the evidence reaches, null where it establishes nothing and never `workload
+          externally healthy`, which no API read can establish. §37.3 is why
+          `verified_convergence` is separate from `state`: a matching `observedGeneration` says a
+          controller has seen the spec and says nothing about health.
+    default_view:
+      columns: [name, namespace, succeeded, failed, active, complete, created]
+
+  - id: io.github.godspeed-you.kubernetes.cronjob/1
+    name: KubernetesCronJob
+    summary: >-
+      A CronJob: its schedule, whether it is suspended, and what it has running now.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different CronJob.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      schedule:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.schedule`, verbatim. Never parsed into a next-run time: that would need the
+          cluster's time zone handling, and a wrong prediction here reads as a fact.
+      suspend:
+        type: bool
+        nullable: true
+        doc: >-
+          `spec.suspend`. Null when the field is absent rather than defaulted to false — the API
+          server's defaulting is the API server's business, and a suspended CronJob is the single
+          most common reason one stops firing.
+      concurrency_policy:
+        type: string
+        nullable: true
+        doc: '`spec.concurrencyPolicy` — `Allow`, `Forbid` or `Replace`.'
+      last_schedule_time:
+        type: timestamp
+        nullable: true
+        doc: >-
+          `status.lastScheduleTime` — when the controller last created a job for this schedule.
+      last_successful_time:
+        type: timestamp
+        nullable: true
+        doc: >-
+          `status.lastSuccessfulTime`. Behind `last_schedule_time` means the recent runs have not
+          succeeded.
+      active_jobs:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The names under `status.active` — the jobs running right now. This is the live set and
+          never a history: §25.5 says history limits and deleted children mean the graph may be
+          incomplete, and an absence here must not be reconstructed as a run that never happened.
+    default_view:
+      columns: [name, namespace, schedule, suspend, last_schedule_time, active_jobs]
+
+  - id: io.github.godspeed-you.kubernetes.configmap/1
+    name: KubernetesConfigMap
+    summary: >-
+      A ConfigMap's keys and whether it may still change.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different ConfigMap.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      keys:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The key names of `data`, sorted. Names only, exactly as for a Secret — not because a
+          ConfigMap is sensitive, but because a schema whose shape depends on whether the payload
+          is sensitive would make the redaction boundary a per-kind decision rather than a
+          boundary (§22, ADR-0003). Null when the object carries no `data` at all, which §21.4
+          keeps apart from a ConfigMap with no keys.
+      binary_keys:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The key names of `binaryData`, sorted. A separate field because binary and text entries
+          are consumed differently and a merged list would hide which is which.
+      immutable:
+        type: bool
+        nullable: true
+        doc: >-
+          `immutable`. §29.4 asks for this because it decides whether a prospective change is
+          possible at all. Null when the field is absent, never defaulted to false.
+    default_view:
+      columns: [name, namespace, keys, immutable, created]
 
   - id: io.github.godspeed-you.kubernetes.secret/1
     name: KubernetesSecret
@@ -365,6 +1241,411 @@ schemas:
           §21.4 keeps that apart from a Secret that carries no keys, which is `[]`.
     default_view:
       columns: [name, namespace, secret_type, keys, created]
+
+  - id: io.github.godspeed-you.kubernetes.serviceaccount/1
+    name: KubernetesServiceAccount
+    summary: A ServiceAccount, and the secrets it carries — never their contents.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different ServiceAccount.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      secrets:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The names under `secrets` (§32.1). A ServiceAccount's identity is namespace-local, so
+          these names are names in this object's own namespace and nowhere else (§24.2).
+      image_pull_secrets:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The names under `imagePullSecrets` — the credentials pods of this account pull images
+          with (§32.1). Names only; the relationship stays useful and the payload stays
+          unreachable (§22.4).
+      automount_token:
+        type: bool
+        nullable: true
+        doc: >-
+          `automountServiceAccountToken`. Null when the field is absent, which is not the same as
+          false: the pod spec may still override it either way, and this field states what the
+          account asked for rather than what any pod got.
+    default_view:
+      columns: [name, namespace, secrets, image_pull_secrets, created]
+
+  - id: io.github.godspeed-you.kubernetes.persistentvolumeclaim/1
+    name: KubernetesPersistentVolumeClaim
+    summary: >-
+      A claim: what it asked for, and which volume — if any — it is bound to.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different PersistentVolumeClaim.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      phase:
+        type: string
+        nullable: true
+        doc: '`status.phase` — `Pending`, `Bound` or `Lost`, verbatim.'
+      volume_name:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.volumeName` — the volume this claim is bound to. **Null is the whole point of this
+          field**: §30.2 says a Pending claim with no `volumeName` MUST NOT be treated as bound,
+          and nothing here fills the gap from the phase or from a storage class.
+      storage_class:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.storageClassName`. Null when the claim names none, in which case the cluster's
+          default class applies and this provider does not resolve which that is.
+      volume_mode:
+        type: string
+        nullable: true
+        doc: '`spec.volumeMode` — `Filesystem` or `Block`.'
+      access_modes:
+        type: list<string>
+        nullable: true
+        doc: '`spec.accessModes`, whole — what was asked for.'
+      requested_storage:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.resources.requests.storage`, as the quantity string the object states. Text rather
+          than a size, so a quantity this shell cannot parse is still shown.
+      bound_capacity:
+        type: string
+        nullable: true
+        doc: >-
+          `status.capacity.storage` — what the claim actually got, which may exceed what it asked
+          for. Null while the claim is unbound, and held apart from `requested_storage` because
+          asked-for and got are the desired-versus-observed pair for storage.
+    default_view:
+      columns: [name, namespace, phase, volume_name, requested_storage, storage_class]
+
+  - id: io.github.godspeed-you.kubernetes.persistentvolume/1
+    name: KubernetesPersistentVolume
+    summary: A volume, what happens to the storage when it is released, and which claim holds it.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different PersistentVolume.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      phase:
+        type: string
+        nullable: true
+        doc: '`status.phase` — `Available`, `Bound`, `Released` or `Failed`, verbatim.'
+      capacity:
+        type: string
+        nullable: true
+        doc: '`spec.capacity.storage`, as the quantity string the object states.'
+      storage_class:
+        type: string
+        nullable: true
+        doc: '`spec.storageClassName`.'
+      volume_mode:
+        type: string
+        nullable: true
+        doc: '`spec.volumeMode`.'
+      access_modes:
+        type: list<string>
+        nullable: true
+        doc: '`spec.accessModes`, whole.'
+      reclaim_policy:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.persistentVolumeReclaimPolicy` — `Retain`, `Delete` or `Recycle`. §30.5 requires
+          this to be visible when planning a deletion, because deleting a Kubernetes object may
+          destroy storage outside Kubernetes. `terminating` and `finalizers` are the other half of
+          that question and are on every record here.
+      claim:
+        type: string
+        nullable: true
+        doc: >-
+          The claim holding this volume, as `namespace/name` from `spec.claimRef` (§30.2). Null
+          for an unbound volume.
+      csi_driver:
+        type: string
+        nullable: true
+        doc: >-
+          `spec.csi.driver`, where the volume is provisioned through CSI (§30.4). Null for every
+          other volume source. The driver name only — resolving it to a cloud disk is a cross-
+          system resolver's work and not this provider's (§30.4, Gate K).
+    default_view:
+      columns: [name, phase, capacity, claim, storage_class, reclaim_policy]
+
+  - id: io.github.godspeed-you.kubernetes.storageclass/1
+    name: KubernetesStorageClass
+    summary: >-
+      A storage class: what provisions it, when it binds, and what happens on release.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      provisioner:
+        type: string
+        nullable: true
+        doc: '`provisioner` — which driver creates volumes of this class.'
+      reclaim_policy:
+        type: string
+        nullable: true
+        doc: >-
+          `reclaimPolicy` — what happens to a volume of this class when its claim goes away
+          (§30.3, §30.5).
+      volume_binding_mode:
+        type: string
+        nullable: true
+        doc: >-
+          `volumeBindingMode` — `Immediate` or `WaitForFirstConsumer`. It decides whether a claim
+          can be Pending for a reason that is entirely correct.
+      allow_volume_expansion:
+        type: bool
+        nullable: true
+        doc: >-
+          `allowVolumeExpansion` (§30.3). Null when the field is absent, never defaulted to false.
+      is_default:
+        type: bool
+        nullable: true
+        doc: >-
+          Whether the cluster treats this as its default class, from the
+          `storageclass.kubernetes.io/is-default-class` annotation — the only place Kubernetes
+          states it. Null when the annotation is absent, because a class that has never carried it
+          and one that carries `false` are the same state and neither is inferred from the other.
+      parameters:
+        type: map
+        nullable: true
+        doc: >-
+          `parameters`, whole and uninterpreted. They are the driver's vocabulary rather than
+          Kubernetes's, and this provider does not know what any given driver's keys mean.
+    default_view:
+      columns: [name, provisioner, reclaim_policy, volume_binding_mode, is_default]
+
+  - id: io.github.godspeed-you.kubernetes.networkpolicy/1
+    name: KubernetesNetworkPolicy
+    summary: >-
+      A network policy's intent, in the structure the API states it — never reduced to a verdict
+      about reachability (§31.2, §31.3).
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different NetworkPolicy.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      pod_selector:
+        type: map
+        nullable: true
+        doc: >-
+          `spec.podSelector`, whole — which pods of this namespace the policy governs (§31.1). An
+          empty selector selects every pod in the namespace, which is what the API means by it and
+          is preserved rather than translated.
+      policy_types:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `spec.policyTypes` — `Ingress`, `Egress` or both. Null when the object states none, in
+          which case Kubernetes infers them from which rule blocks are present, and this provider
+          does not perform that inference on the server's behalf.
+      rules:
+        type: map
+        nullable: true
+        doc: >-
+          `spec.ingress` and `spec.egress`, verbatim, under those two keys. **Not summarised, and
+          deliberately so.** §31.2 forbids reducing a policy to a misleading boolean such as
+          `internet_access = false`, because the peers combine namespace selectors, pod selectors
+          and IP blocks and no summary of them is true without complete coverage of every policy
+          that applies. And §31.3: the presence of this object is *intent*. Whether the installed
+          network implementation enforces it is not observable from the API, so nothing here is
+          named `enforced`.
+    default_view:
+      columns: [name, namespace, policy_types, pod_selector, created]
 
   - id: io.github.godspeed-you.kubernetes.resource/1
     name: KubernetesResource

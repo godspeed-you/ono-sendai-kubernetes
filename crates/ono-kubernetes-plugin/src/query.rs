@@ -30,19 +30,29 @@
 //! more" (§4 invariant 13, §21.4). The values already read are emitted — they are true — and the
 //! invocation then *fails* with what was missing, because the value stream of a contributed
 //! target carries records of one schema and has nowhere to put a coverage report.
+//!
+//! **`name` asks a different question of the cluster.** A query naming one takes §17.1's direct
+//! lookup against the object's own REST endpoint rather than the collection's, and the two are
+//! not interchangeable: the direct read needs `get` where the listing needs `list`, and §60.5's
+//! scenario — a Pod readable by name in a namespace nobody may enumerate — is exactly the case a
+//! provider that listed and filtered would report as a denial. Their failures differ for the
+//! same reason: a `404` on a collection is an API the cluster does not serve, and a `404` on one
+//! object is that object being absent, which is the only outcome in §21.4's vocabulary that is
+//! evidence of absence rather than a statement about what could not be seen (ADR-0012).
 
 use std::fmt;
 use std::sync::Arc;
 
 use ono_kuang_sdk::protocol::{WireError, method};
 use ono_kuang_sdk::{Ctx, EmitError, Outcome};
-use ono_provider_kubernetes::coverage::Scope;
+use ono_provider_kubernetes::coverage::{Outcome as Coverage, Scope};
 use ono_provider_kubernetes::discovery::{self, Discovery, Resource, Verb};
 use ono_provider_kubernetes::kubeconfig::{Credential, Kubeconfig, Secret, Trust};
+use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::tls::{Anchors, ClientIdentity, TlsError, TlsSettings, TlsStream};
 use ono_provider_kubernetes::transport::{
-    ApiError, ByteStream, Client, ListOptions, Listing, Request,
+    ApiError, ByteStream, Client, Freshness, ListOptions, Listing, Operation, Request,
 };
 use ono_value::Schema;
 use serde_json::{Map as JsonMap, Value as Json, json};
@@ -110,6 +120,12 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
     // Read before the connection opens, because the brokered stream borrows the context for as
     // long as it lives and the query's own words are needed after that.
     let selector = Selector::from_options(ctx.arguments());
+    let lookup = ctx
+        .arguments()
+        .get("name")
+        .and_then(Json::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
     let endpoint = match Endpoint::resolve(ctx) {
         Ok(endpoint) => endpoint,
         Err(error) => return Outcome::Failed(error),
@@ -120,7 +136,7 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
 
     // The brokered connection borrows the context for as long as it lives, so the whole
     // conversation with the API server happens inside this block and only its result escapes.
-    let (listing, handle, open) = {
+    let (answer, handle, open) = {
         let stream = match BrokeredStream::connect(ctx, &endpoint.host, endpoint.port) {
             Ok(stream) => stream,
             Err(error) => return Outcome::Failed(error),
@@ -131,16 +147,16 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
             // `kubectl proxy` speaks, and never what one reached directly does.
             None => {
                 let mut client = endpoint.client(stream);
-                let listing = read(&mut client, target, &endpoint, &selector);
+                let answer = read(&mut client, target, &endpoint, &selector, lookup.as_deref());
                 let open = client.into_stream().is_open();
-                (listing, handle, open)
+                (answer, handle, open)
             }
             Some(settings) => match TlsStream::connect(stream, &endpoint.server_name, settings) {
                 Ok(session) => {
                     let mut client = endpoint.client(session);
-                    let listing = read(&mut client, target, &endpoint, &selector);
+                    let answer = read(&mut client, target, &endpoint, &selector, lookup.as_deref());
                     let open = client.into_stream().into_inner().is_open();
-                    (listing, handle, open)
+                    (answer, handle, open)
                 }
                 // The handshake consumed the stream, so whether the host still holds the
                 // connection cannot be asked here. Not closing leaks a handle until the
@@ -156,11 +172,11 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
         let _ = ctx.host_call(method::NETWORK_CLOSE, json!({"connection": handle}));
     }
 
-    let (listing, shape) = match listing {
+    let (answer, shape) = match answer {
         Ok(answer) => answer,
         Err(error) => return Outcome::Failed(error),
     };
-    emit(ctx, target, &schema, &shape, listing)
+    emit(ctx, target, &schema, &shape, answer)
 }
 
 /// How the records of one answer are built.
@@ -182,18 +198,61 @@ enum Shape {
     },
 }
 
-/// Streams the listing's objects, then reports whatever the listing could not see.
+/// What the cluster answered, which is one of three things and never a blend of them.
+///
+/// The list and the get are separate variants rather than one vector of objects, because their
+/// *silences* mean different things and the difference has to survive as far as the outcome. A
+/// listing that came back short is incomplete (§18.3); a get that came back with nothing is a
+/// complete answer about one object.
+enum Answer {
+    /// A whole collection, as far as it could be read (§17.2, §18).
+    ///
+    /// Boxed for the same reason the transport boxes its `Status` payloads: a listing carries
+    /// its coverage, its continuity and its freshness beside its objects, and an enum sized to
+    /// its largest variant would make the answer that carries nothing as expensive as the one
+    /// that carries everything.
+    Listed(Box<Listing>),
+    /// One object, read at its own endpoint (§17.1).
+    Fetched(Box<(Object, Freshness)>),
+    /// The object's endpoint answered `404`, so the object is not there (§21.4 `absent`).
+    ///
+    /// The one outcome in §21.4's vocabulary that is evidence of absence rather than a statement
+    /// about what could not be seen — which is why it is an answer of no records and not a
+    /// failure. Every other way a get comes back empty is a refusal, and every refusal fails.
+    Absent,
+}
+
+/// Streams whatever the cluster answered, then reports whatever it could not see.
 fn emit(
     ctx: &mut Ctx<'_>,
     target: &'static Target,
     schema: &Arc<Schema>,
     shape: &Shape,
-    listing: Listing,
+    answer: Answer,
 ) -> Outcome {
-    let coverage = listing.coverage().describe();
-    let complete = listing.coverage().is_complete() && listing.continuity().is_intact();
-    let broken = !listing.continuity().is_intact();
-    for object in listing.into_objects() {
+    // §60.5 and §21.4 in the shape of a control flow: a named object that is not there is a
+    // complete answer with nothing in it, and it is reached without emitting anything, so
+    // nothing downstream has to distinguish it from a failure that emitted first.
+    let (objects, freshness, listed) = match answer {
+        Answer::Absent => return Outcome::Completed,
+        Answer::Fetched(read) => {
+            let (object, freshness) = *read;
+            (vec![object], freshness, None)
+        }
+        Answer::Listed(listing) => {
+            let listing = *listing;
+            let coverage = listing.coverage().describe();
+            let complete = listing.coverage().is_complete() && listing.continuity().is_intact();
+            let broken = !listing.continuity().is_intact();
+            let freshness = listing.freshness().clone();
+            (
+                listing.into_objects(),
+                freshness,
+                Some((complete, broken, coverage)),
+            )
+        }
+    };
+    for object in objects {
         // §62.12: a cancelled query stops promptly, and the cheapest place to notice is between
         // two objects.
         if ctx.cancelled() {
@@ -211,9 +270,9 @@ fn emit(
             }
         };
         let built = match shape {
-            Shape::Curated => record(target, schema, &guarded),
+            Shape::Curated => record(target, schema, &guarded, &freshness),
             Shape::Discovered { resource, typing } => {
-                dynamic_record(target, schema, resource, typing, &guarded)
+                dynamic_record(target, schema, resource, typing, &guarded, &freshness)
             }
         };
         let value = match built {
@@ -243,6 +302,11 @@ fn emit(
             }
         }
     }
+    let Some((complete, broken, coverage)) = listed else {
+        // A get answered, so there is no collection whose coverage could be partial: one object
+        // was asked for and one object arrived.
+        return Outcome::Completed;
+    };
     if complete {
         return Outcome::Completed;
     }
@@ -263,13 +327,14 @@ fn emit(
     ))
 }
 
-/// Discovers what serves the target's kind, then lists it.
+/// Discovers what serves the target's kind, then reads it — one object, or the collection.
 fn read<S: ByteStream>(
     client: &mut Client<S>,
     target: &'static Target,
     endpoint: &Endpoint,
     selector: &Selector,
-) -> Result<(Listing, Shape), WireError> {
+    lookup: Option<&str>,
+) -> Result<(Answer, Shape), WireError> {
     let core = document(client, endpoint, "/api")?;
     let groups = document(client, endpoint, "/apis")?;
     // Two passes over the same two documents rather than two round trips: the preferred version
@@ -318,6 +383,17 @@ fn read<S: ByteStream>(
         }
     };
 
+    // §9.2: a cluster-scoped resource has no namespace, and inventing one for it would be a
+    // request the server rejects for a reason that has nothing to do with what was asked.
+    let scope = match resource.scope() {
+        discovery::Scope::Cluster => Scope::cluster(),
+        discovery::Scope::Namespaced => endpoint.scope.clone(),
+    };
+
+    if let Some(name) = lookup {
+        return Ok((fetch(client, &resource, &scope, name)?, shape));
+    }
+
     if !resource.supports(Verb::List) {
         return Err(failure(
             UNSUPPORTED_CODE,
@@ -330,17 +406,65 @@ fn read<S: ByteStream>(
         ));
     }
 
-    // §9.2: a cluster-scoped resource has no namespace, and inventing one for it would be a
-    // request the server rejects for a reason that has nothing to do with what was asked.
-    let scope = match resource.scope() {
-        discovery::Scope::Cluster => Scope::cluster(),
-        discovery::Scope::Namespaced => endpoint.scope.clone(),
-    };
     let mut options = ListOptions::new().limit(PAGE_SIZE);
     if let Some(pages) = endpoint.max_pages {
         options = options.max_pages(pages);
     }
-    Ok((client.list(resource.gvr(), &scope, &options), shape))
+    Ok((
+        Answer::Listed(Box::new(client.list(resource.gvr(), &scope, &options))),
+        shape,
+    ))
+}
+
+/// One object, at the canonical endpoint discovery resolved for it (§17.1).
+///
+/// A direct lookup rather than a listing with a filter over it, and the difference is not an
+/// optimisation. The two requests need different permissions — §60.5's scenario is a Pod
+/// readable by name in a namespace nobody may enumerate — and a provider that answered `name` by
+/// listing would report that Pod as denied. `get` is also the only verb a resource may offer
+/// without offering `list` at all (§11.5).
+fn fetch<S: ByteStream>(
+    client: &mut Client<S>,
+    resource: &Resource,
+    scope: &Scope,
+    name: &str,
+) -> Result<Answer, WireError> {
+    if !resource.supports(Verb::Get) {
+        return Err(failure(
+            UNSUPPORTED_CODE,
+            UNSUPPORTED,
+            format!(
+                "the cluster serves `{}` but does not offer `get` on it",
+                resource.gvr()
+            ),
+            "A resource that cannot be read by name is not an object that is not there.",
+        ));
+    }
+    match client.get(resource.gvr(), scope, name) {
+        Ok(read) => {
+            let (object, freshness) = read.into_parts();
+            Ok(Answer::Fetched(Box::new((object, freshness))))
+        }
+        // §21.4, one outcome at a time. `absent` is the only one that is a fact about the
+        // cluster, and it is the only one that answers rather than refuses. Every other outcome
+        // is a statement about what could not be seen, and rendering any of them as an empty
+        // answer would tell an operator the object is gone.
+        Err(error) => match error.outcome(Operation::Get) {
+            Coverage::Absent => Ok(Answer::Absent),
+            outcome => Err(failure(
+                UNAVAILABLE_CODE,
+                UNAVAILABLE,
+                format!(
+                    "`{}` in {scope} did not answer for `{name}`: {} — {error}",
+                    resource.gvr(),
+                    outcome.as_str()
+                ),
+                "This is what happened instead of a read, and it is not the object being absent: \
+                 a refusal, an unreachable server and a failed request are three different \
+                 states, and only one of them means there is nothing there (§21.4).",
+            )),
+        },
+    }
 }
 
 /// The resource serving a kind this package named at build time (§15.2).

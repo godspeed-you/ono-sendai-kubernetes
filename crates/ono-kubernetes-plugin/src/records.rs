@@ -19,14 +19,26 @@
 
 use std::sync::Arc;
 
+use ono_provider_kubernetes::condition;
 use ono_provider_kubernetes::discovery::Resource;
-use ono_provider_kubernetes::object::Object;
+use ono_provider_kubernetes::object::{Object, OwnerReference};
 use ono_provider_kubernetes::redaction::Guarded;
+use ono_provider_kubernetes::relationship::Relation;
+use ono_provider_kubernetes::transport::{EndpointCategory, Freshness, Origin};
+use ono_provider_kubernetes::workload::{Endpoint as WorkloadEndpoint, Workload};
 use ono_value::{ErrorValue, MapValue, Provenance, RecordValue, Schema, Value, builtin_schemas};
 use serde_json::Value as Json;
 
 use crate::contributions::Target;
 use crate::dynamic::{self, Typing};
+
+/// The label by which an EndpointSlice says which Service it represents (§26.2).
+///
+/// Spelled here because the domain layer keeps it private: `workload.rs` uses it to build an edge
+/// from a Service to its slices, which needs both objects, and a record built from one slice has
+/// only the slice. The evidence class is the same one the edge carries — a *convention* rather
+/// than API structure (§23.4), and the schema documentation says so.
+const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
 /// Builds one record of `target`'s schema from a guarded object.
 ///
@@ -40,9 +52,9 @@ pub fn record(
     target: &Target,
     schema: &Arc<Schema>,
     guarded: &Guarded,
+    freshness: &Freshness,
 ) -> Result<Value, ErrorValue> {
-    let provenance = Provenance::local(crate::PACKAGE, schema.id().clone());
-    let mut builder = RecordValue::builder(Arc::clone(schema), provenance);
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
     for field in target.fields {
         builder = builder.set(field.name, field_value(field.name, guarded))?;
     }
@@ -74,12 +86,12 @@ pub fn dynamic_record(
     resource: &Resource,
     typing: &Typing,
     guarded: &Guarded,
+    freshness: &Freshness,
 ) -> Result<Value, ErrorValue> {
     let object = guarded.object();
     let projection = typing.project(object);
     let content = dynamic::content(&projection, object.native());
-    let provenance = Provenance::local(crate::PACKAGE, schema.id().clone());
-    let mut builder = RecordValue::builder(Arc::clone(schema), provenance);
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
     for field in target.fields {
         let value = match field.name {
             // --- what this is: §13.2's canonical host type, which one shared schema would
@@ -109,6 +121,106 @@ pub fn dynamic_record(
         builder = builder.set(field.name, value)?;
     }
     Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// The record's provenance, carrying what §17.1 requires a read to state about itself.
+///
+/// §17.1 asks a read to carry six things. `resourceVersion` is a field of the record, because it
+/// is a fact about the object. The other five — when it was observed, which provider instance
+/// asked, which scope was asked about, which REST surface answered, and whether this was a
+/// direct read or something a cache remembered — are facts about the *observation*, and the
+/// value model already has a place for those. Putting them in provenance rather than in five
+/// more schema fields means `inspect` shows them for every kind without each schema repeating
+/// them, and it keeps the record's fields about the Kubernetes object.
+///
+/// The host overwrites `provider` on the way through, because a package may not forge where a
+/// record came from (§31.80 of core's specification). It leaves `observed` and `source` alone,
+/// which is why they are the two this function fills.
+fn provenance(schema: &Arc<Schema>, freshness: &Freshness) -> Provenance {
+    let stated = Provenance::local(crate::PACKAGE, schema.id().clone()).from_source(&format!(
+        "provider_instance={} origin={} scope={} endpoint={} resource_version={}",
+        freshness.provider_instance(),
+        origin_word(freshness.origin()),
+        freshness.scope(),
+        endpoint_word(freshness.endpoint()),
+        freshness.resource_version().unwrap_or("unknown"),
+    ));
+    match instant(freshness.observed_at().unix_millis()) {
+        Value::Timestamp(observed) => stated.observed_at(observed),
+        // An instant this shell cannot build is unknown rather than fabricated: a wrong
+        // observation time is worse than none, because the freshness of a read is what a reader
+        // decides how much to trust it by (§20.2).
+        _ => stated,
+    }
+}
+
+/// How this provider came by the object (§20.2), in the word a reader sees.
+fn origin_word(origin: Origin) -> &'static str {
+    match origin {
+        Origin::DirectRead => "direct-read",
+        Origin::Cache => "cache",
+        Origin::WatchEvent => "watch-event",
+    }
+}
+
+/// Which REST surface answered — §17.1's source endpoint category.
+fn endpoint_word(endpoint: EndpointCategory) -> &'static str {
+    match endpoint {
+        EndpointCategory::Core => "core",
+        EndpointCategory::Group => "group",
+    }
+}
+
+/// A Unix millisecond instant, as the value model's timestamp.
+///
+/// Rendered as RFC 3339 and parsed back, because the value model builds a timestamp from text
+/// and this package has no date library of its own. The rendering is proleptic-Gregorian UTC,
+/// which is the calendar RFC 3339 defines and the one the API server's own timestamps are in.
+fn instant(unix_millis: u64) -> Value {
+    ono_value::from_json(
+        &serde_json::json!({"$timestamp": rfc3339(unix_millis)}),
+        builtin_schemas(),
+    )
+    .unwrap_or(Value::Null)
+}
+
+/// A Unix millisecond instant as RFC 3339 text in UTC.
+fn rfc3339(unix_millis: u64) -> String {
+    let seconds = i64::try_from(unix_millis / 1000).unwrap_or(i64::MAX);
+    let millis = unix_millis % 1000;
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    let time = seconds.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        time / 3600,
+        (time % 3600) / 60,
+        time % 60,
+    )
+}
+
+/// The civil date a count of days since 1970-01-01 names, in the proleptic Gregorian calendar.
+///
+/// Howard Hinnant's `civil_from_days`, which is exact for every day a 64-bit count can hold and
+/// needs no table. It is here rather than in a dependency because the only thing this package
+/// needs a calendar for is rendering one instant it already holds as a number.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    // Shift the epoch to 0000-03-01, so that the leap day is the last day of the year and the
+    // month arithmetic below has no special case in it.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// One field's value, by the name the schema declares it under.
@@ -153,17 +265,130 @@ fn field_value(name: &str, guarded: &Guarded) -> Value {
         "generation" => object.generation().map_or(Value::Null, integer),
         "observed_generation" => field_int(object, "/status/observedGeneration"),
 
-        // --- Secret: metadata only, and by construction there is no payload to reach ---
+        // --- the workload controllers, and Job: where an object stands between what was asked
+        // of it and what has been observed (§37.5, Gate G) ---
+        "reconciliation" => reconciliation(object),
+
+        // --- ReplicaSet, StatefulSet ---
+        "current_replicas" => field_int(object, "/status/replicas"),
+
+        // --- ReplicaSet, Job: the controller above this object (§24.3, §25.2, §25.5) ---
+        "controller" => text(controller(object).map(OwnerReference::name)),
+        "controller_kind" => text(controller(object).map(OwnerReference::kind)),
+
+        // --- StatefulSet (§25.3) ---
+        "service_name" => service_name(object),
+        "current_revision" => text(field_str(object, "/status/currentRevision")),
+        "update_revision" => text(field_str(object, "/status/updateRevision")),
+        "claim_templates" => claim_templates(object),
+
+        // --- DaemonSet: counted per node, which is why none of these is a replica (§25.4) ---
+        "desired_scheduled" => field_int(object, "/status/desiredNumberScheduled"),
+        "current_scheduled" => field_int(object, "/status/currentNumberScheduled"),
+        "ready_scheduled" => field_int(object, "/status/numberReady"),
+        "updated_scheduled" => field_int(object, "/status/updatedNumberScheduled"),
+        "available_scheduled" => field_int(object, "/status/numberAvailable"),
+        "misscheduled" => field_int(object, "/status/numberMisscheduled"),
+
+        // --- Service (§26.1, §26.5, §31.4) ---
+        "service_type" => text(field_str(object, "/spec/type")),
+        "cluster_ip" => text(field_str(object, "/spec/clusterIP")),
+        "external_ips" => strings(object, "/spec/externalIPs"),
+        "external_name" => text(field_str(object, "/spec/externalName")),
+        "selector" => map_field(object, "/spec/selector"),
+
+        // --- Service and Ingress: the addresses the outside world reaches them at ---
+        "load_balancer" => load_balancer(object),
+
+        // --- Service and EndpointSlice (§26.5, §31.4) ---
+        "ports" => ports(object),
+
+        // --- EndpointSlice (§26.2, §26.4) ---
+        "address_type" => text(field_str(object, "/addressType")),
+        "endpoint_count" => endpoint_count(object, |_| true),
+        "ready_endpoints" => endpoint_count(object, |endpoint| endpoint.is_ready() == Some(true)),
+        "addresses" => endpoint_addresses(object),
+        "targets" => endpoint_targets(object),
+
+        // --- Ingress (§27.1, §27.2) ---
+        "ingress_class" => text(
+            routed(object, Relation::UsesIngressClass)
+                .first()
+                .map(String::as_str),
+        ),
+        "hosts" => ingress_hosts(object),
+        "services" => list(routed(object, Relation::RoutesTo)),
+        "tls_secrets" => list(routed(object, Relation::UsesTlsSecret)),
+
+        // --- Job (§25.5) ---
+        "completions" => field_int(object, "/spec/completions"),
+        "parallelism" => field_int(object, "/spec/parallelism"),
+        "active" => field_int(object, "/status/active"),
+        "succeeded" => field_int(object, "/status/succeeded"),
+        "failed" => field_int(object, "/status/failed"),
+        "start_time" => timestamp(field_str(object, "/status/startTime")),
+        "completion_time" => timestamp(field_str(object, "/status/completionTime")),
+        "complete" => text(condition_status(object, "Complete")),
+        "failure_reason" => text(condition_reason(object, "Failed")),
+
+        // --- CronJob (§25.5) ---
+        "schedule" => text(field_str(object, "/spec/schedule")),
+        "suspend" => field_bool(object, "/spec/suspend"),
+        "concurrency_policy" => text(field_str(object, "/spec/concurrencyPolicy")),
+        "last_schedule_time" => timestamp(field_str(object, "/status/lastScheduleTime")),
+        "last_successful_time" => timestamp(field_str(object, "/status/lastSuccessfulTime")),
+        "active_jobs" => names_at(object, "/status/active"),
+
+        // --- ConfigMap (§29.4) ---
+        "binary_keys" => data_keys(object, "/binaryData"),
+        "immutable" => field_bool(object, "/immutable"),
+
+        // --- ServiceAccount (§32.1) ---
+        "secrets" => names_at(object, "/secrets"),
+        "image_pull_secrets" => names_at(object, "/imagePullSecrets"),
+        "automount_token" => field_bool(object, "/automountServiceAccountToken"),
+
+        // --- storage (§30) ---
+        "volume_name" => text(field_str(object, "/spec/volumeName")),
+        "storage_class" => text(field_str(object, "/spec/storageClassName")),
+        "volume_mode" => text(field_str(object, "/spec/volumeMode")),
+        "access_modes" => strings(object, "/spec/accessModes"),
+        "requested_storage" => text(field_str(object, "/spec/resources/requests/storage")),
+        "bound_capacity" => text(field_str(object, "/status/capacity/storage")),
+        "capacity" => text(field_str(object, "/spec/capacity/storage")),
+        // A PersistentVolume states it under `spec`, a StorageClass at the top level. One field
+        // because it is one question — what happens to the storage when the object is released
+        // (§30.5) — and no object carries both pointers.
+        "reclaim_policy" => text(
+            field_str(object, "/spec/persistentVolumeReclaimPolicy")
+                .or_else(|| field_str(object, "/reclaimPolicy")),
+        ),
+        "claim" => claim(object),
+        "csi_driver" => text(field_str(object, "/spec/csi/driver")),
+        "provisioner" => text(field_str(object, "/provisioner")),
+        "volume_binding_mode" => text(field_str(object, "/volumeBindingMode")),
+        "allow_volume_expansion" => field_bool(object, "/allowVolumeExpansion"),
+        "is_default" => is_default_storage_class(object),
+        "parameters" => map_field(object, "/parameters"),
+
+        // --- NetworkPolicy (§31.1, §31.2) ---
+        "pod_selector" => map_field(object, "/spec/podSelector"),
+        "policy_types" => strings(object, "/spec/policyTypes"),
+        "rules" => policy_rules(object),
+
+        // --- Secret and ConfigMap: key names only, and for a Secret there is by construction
+        // no payload left to reach ---
         "secret_type" => text(guarded.secret().and_then(|secret| secret.secret_type())),
-        "keys" => guarded.secret().map_or(Value::Null, |secret| {
-            Value::List(
+        "keys" => match guarded.secret() {
+            Some(secret) => Value::List(
                 secret
                     .keys()
                     .iter()
                     .map(|key| Value::String(key.as_str().into()))
                     .collect(),
-            )
-        }),
+            ),
+            None => data_keys(object, "/data"),
+        },
 
         _ => Value::Null,
     }
@@ -289,6 +514,369 @@ fn container_names(object: &Object) -> Value {
     )
 }
 
+// --- the fields the domain layer answers, rather than this module reading them again -----------
+
+/// Where the object stands between desired and observed state, with its rule and its evidence.
+///
+/// `condition::reconciliation` is the whole of the derivation; this function only turns its
+/// answer into a value. §37.5 requires the state to arrive with the fields it rests on, so the
+/// citations travel with it, and §37.3's rule — that a matching `observedGeneration` is not a
+/// claim of health — survives as `verified_convergence`, which is true for exactly one of the
+/// five states and never for `generation-observed-only`.
+///
+/// `stage` is §20.4's ladder: how far the evidence reaches. It is null where the evidence
+/// establishes nothing, and it is never `workload externally healthy`, which no API read can
+/// establish.
+fn reconciliation(object: &Object) -> Value {
+    let derived = condition::reconciliation(object);
+    let mut map = MapValue::new();
+    map.insert(
+        Arc::from("state"),
+        Value::String(derived.state().as_str().into()),
+    );
+    map.insert(Arc::from("rule"), Value::String(derived.rule().into()));
+    map.insert(
+        Arc::from("verified_convergence"),
+        Value::Bool(derived.state().is_verified_convergence()),
+    );
+    map.insert(
+        Arc::from("stage"),
+        derived
+            .state()
+            .established_stage()
+            .map_or(Value::Null, |stage| Value::String(stage.as_str().into())),
+    );
+    map.insert(
+        Arc::from("evidence"),
+        Value::List(
+            derived
+                .citations()
+                .iter()
+                .map(|citation| Value::String(citation.to_string().into()))
+                .collect(),
+        ),
+    );
+    Value::Map(Arc::new(map))
+}
+
+/// The owner reference that names this object's controller, where one does (§24.3).
+fn controller(object: &Object) -> Option<&OwnerReference> {
+    object
+        .owner_references()
+        .iter()
+        .find(|owner| owner.is_controller())
+}
+
+/// The Service this object belongs to, by whichever evidence its kind offers.
+///
+/// A StatefulSet states it as a field — `spec.serviceName`, §25.3's governing Service, which the
+/// domain layer turns into an edge with that field as its evidence. An EndpointSlice states it as
+/// the standard label instead (§26.2), which is *convention* evidence: an operator can relabel a
+/// slice, and this field is therefore weaker than the StatefulSet's. Both are recorded, and the
+/// schema documentation says which is which rather than the record pretending they are one class
+/// of evidence (§23, Gate D).
+fn service_name(object: &Object) -> Value {
+    if let Some(edge) = Workload::governing_service(object) {
+        return Value::String(edge.target().name().into());
+    }
+    text(object.label(SERVICE_NAME_LABEL))
+}
+
+/// The names of the claim templates a StatefulSet declares (§25.3).
+///
+/// Template intent, and never a list of PersistentVolumeClaims that exist: the specification
+/// requires the two to stay distinguishable, and the domain layer keeps them apart by giving the
+/// templates a type of their own rather than an edge.
+fn claim_templates(object: &Object) -> Value {
+    let templates = Workload::volume_claim_templates(object);
+    if templates.is_empty() {
+        return Value::Null;
+    }
+    Value::List(
+        templates
+            .iter()
+            .map(|template| Value::String(template.name().into()))
+            .collect(),
+    )
+}
+
+/// The names an Ingress's routing edges point at, for one relation (§27.1, §27.2).
+fn routed(object: &Object, relation: Relation) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for edge in Workload::ingress_edges(object) {
+        if edge.relation() == relation && !names.iter().any(|seen| seen == edge.target().name()) {
+            names.push(edge.target().name().to_owned());
+        }
+    }
+    names
+}
+
+/// The hosts an Ingress answers for, in the order it lists its rules (§27.1).
+fn ingress_hosts(object: &Object) -> Value {
+    let Some(rules) = object.field("/spec/rules").and_then(Json::as_array) else {
+        return Value::Null;
+    };
+    let mut hosts: Vec<String> = Vec::new();
+    for rule in rules {
+        if let Some(host) = rule.get("host").and_then(Json::as_str)
+            && !hosts.iter().any(|seen| seen == host)
+        {
+            hosts.push(host.to_owned());
+        }
+    }
+    list(hosts)
+}
+
+/// How many of a slice's endpoints satisfy `wanted` (§26.2).
+fn endpoint_count(object: &Object, wanted: impl Fn(&WorkloadEndpoint) -> bool) -> Value {
+    let endpoints = Workload::endpoints(object);
+    if endpoints.is_empty() && object.field("/endpoints").is_none() {
+        // No `endpoints` array at all is a kind that has none, not a slice with zero of them.
+        return Value::Null;
+    }
+    integer(i64::try_from(endpoints.iter().filter(|e| wanted(e)).count()).unwrap_or(i64::MAX))
+}
+
+/// Every address a slice's endpoints serve, in the slice's own order (§26.2).
+fn endpoint_addresses(object: &Object) -> Value {
+    let endpoints = Workload::endpoints(object);
+    if endpoints.is_empty() {
+        return Value::Null;
+    }
+    Value::List(
+        endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.addresses())
+            .map(|address| Value::String(address.as_str().into()))
+            .collect(),
+    )
+}
+
+/// The objects behind a slice's endpoints, where `targetRef` names one (§26.2, §26.4).
+///
+/// An endpoint with no target reference contributes nothing rather than a placeholder: §26.4
+/// keeps an external address an endpoint fact instead of forcing it into a Pod relationship, and
+/// a blank entry in this list would be exactly that forcing.
+fn endpoint_targets(object: &Object) -> Value {
+    let endpoints = Workload::endpoints(object);
+    if endpoints.is_empty() {
+        return Value::Null;
+    }
+    Value::List(
+        endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.pod_edge())
+            .map(|edge| Value::String(edge.target().name().into()))
+            .collect(),
+    )
+}
+
+// --- plain field projections -------------------------------------------------------------------
+
+/// The ports an object declares, keyed by name where it names them (§26.5, §31.4).
+///
+/// A Service states them under `spec`, an EndpointSlice at the top level. Structured rather than
+/// flattened into text, because §31.4 asks for fields a later layer can relate to a local socket
+/// or a cloud load balancer, and `"http 80/TCP"` is not one.
+fn ports(object: &Object) -> Value {
+    let entries = object
+        .field("/spec/ports")
+        .or_else(|| object.field("/ports"))
+        .and_then(Json::as_array);
+    let Some(entries) = entries else {
+        return Value::Null;
+    };
+    let mut map = MapValue::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let key = entry
+            .get("name")
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+            .or_else(|| entry.get("port").map(std::string::ToString::to_string))
+            .unwrap_or_else(|| index.to_string());
+        map.insert(Arc::from(key.as_str()), json_value(entry));
+    }
+    Value::Map(Arc::new(map))
+}
+
+/// The addresses a load balancer answers on, from `status.loadBalancer.ingress` (§26.5, §27.1).
+///
+/// An entry states an `ip` or a `hostname` and occasionally both; whichever it states is what is
+/// recorded, and an entry that states neither contributes nothing rather than an empty string.
+fn load_balancer(object: &Object) -> Value {
+    let Some(entries) = object
+        .field("/status/loadBalancer/ingress")
+        .and_then(Json::as_array)
+    else {
+        return Value::Null;
+    };
+    Value::List(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("ip")
+                    .or_else(|| entry.get("hostname"))
+                    .and_then(Json::as_str)
+            })
+            .map(|address| Value::String(address.into()))
+            .collect(),
+    )
+}
+
+/// The claim holding a volume, as `namespace/name` (§30.2).
+fn claim(object: &Object) -> Value {
+    let Some(reference) = object.field("/spec/claimRef") else {
+        return Value::Null;
+    };
+    let Some(name) = reference.get("name").and_then(Json::as_str) else {
+        return Value::Null;
+    };
+    match reference.get("namespace").and_then(Json::as_str) {
+        Some(namespace) => Value::String(format!("{namespace}/{name}").into()),
+        None => Value::String(name.into()),
+    }
+}
+
+/// Whether the cluster treats this StorageClass as its default (§30.3).
+///
+/// The annotation is the only place Kubernetes states it, and its absence is *not* `false`: a
+/// class that has never carried the annotation and one that carries `"false"` are the same state
+/// as far as provisioning goes, and both are stated rather than one being inferred.
+fn is_default_storage_class(object: &Object) -> Value {
+    object
+        .annotation("storageclass.kubernetes.io/is-default-class")
+        .map_or(Value::Null, |value| Value::Bool(value == "true"))
+}
+
+/// A NetworkPolicy's rules, in the structure the API states them (§31.2).
+///
+/// Verbatim and never reduced. §31.2 forbids collapsing ingress and egress peers into a boolean
+/// such as `internet_access = false`, because the peers combine namespace selectors, pod
+/// selectors and IP blocks and no summary of them is true without complete coverage. And §31.3:
+/// the presence of a policy object is intent, not proof that the installed network plugin
+/// enforces it — which is why nothing here is named `enforced`.
+fn policy_rules(object: &Object) -> Value {
+    let mut map = MapValue::new();
+    for (key, pointer) in [("ingress", "/spec/ingress"), ("egress", "/spec/egress")] {
+        if let Some(rules) = object.field(pointer) {
+            map.insert(Arc::from(key), json_value(rules));
+        }
+    }
+    if map.is_empty() {
+        return Value::Null;
+    }
+    Value::Map(Arc::new(map))
+}
+
+/// The `name` of each entry of an array of object references, in order.
+fn names_at(object: &Object, pointer: &str) -> Value {
+    let Some(entries) = object.field(pointer).and_then(Json::as_array) else {
+        return Value::Null;
+    };
+    Value::List(
+        entries
+            .iter()
+            .filter_map(|entry| entry.get("name")?.as_str())
+            .map(|name| Value::String(name.into()))
+            .collect(),
+    )
+}
+
+/// The key names of a data map, sorted, and never their values.
+///
+/// Sorted because a JSON object states no order and the API server's is an implementation
+/// detail; two reads of one ConfigMap should not differ in the order of this list.
+fn data_keys(object: &Object, pointer: &str) -> Value {
+    let Some(entries) = object.field(pointer).and_then(Json::as_object) else {
+        return Value::Null;
+    };
+    let mut keys: Vec<&str> = entries.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    Value::List(
+        keys.into_iter()
+            .map(|key| Value::String(key.into()))
+            .collect(),
+    )
+}
+
+/// A list of strings at a pointer, or null where the object has none.
+fn strings(object: &Object, pointer: &str) -> Value {
+    let Some(entries) = object.field(pointer).and_then(Json::as_array) else {
+        return Value::Null;
+    };
+    Value::List(
+        entries
+            .iter()
+            .filter_map(Json::as_str)
+            .map(|entry| Value::String(entry.into()))
+            .collect(),
+    )
+}
+
+/// A JSON object at a pointer, as a map, or null where the object has none.
+fn map_field(object: &Object, pointer: &str) -> Value {
+    match object.field(pointer) {
+        Some(value) if value.is_object() => json_value(value),
+        _ => Value::Null,
+    }
+}
+
+/// A list of owned strings, or null where there are none.
+///
+/// Null rather than an empty list, because an Ingress with no TLS block and one whose TLS block
+/// names no secret are the same observation, and neither is "this ingress has zero secrets" in
+/// any sense a reader would act on.
+fn list(entries: Vec<String>) -> Value {
+    if entries.is_empty() {
+        return Value::Null;
+    }
+    Value::List(
+        entries
+            .into_iter()
+            .map(|entry| Value::String(entry.as_str().into()))
+            .collect(),
+    )
+}
+
+/// Any JSON value, as the value model carries it, with nothing typed beyond its own shape.
+///
+/// Used for the fields a specification requires to keep their native structure — a Service's
+/// ports, a NetworkPolicy's peers — where flattening would lose exactly what makes them useful
+/// later (§31.2, §31.4). Nothing is interpreted here: a string stays a string, because no schema
+/// on this path claims otherwise.
+fn json_value(value: &Json) -> Value {
+    match value {
+        Json::Null => Value::Null,
+        Json::Bool(flag) => Value::Bool(*flag),
+        Json::Number(number) => number
+            .as_i64()
+            .map(integer)
+            .or_else(|| number.as_f64().map(Value::Float))
+            .unwrap_or(Value::Null),
+        Json::String(text) => Value::String(text.as_str().into()),
+        Json::Array(items) => Value::List(items.iter().map(json_value).collect()),
+        Json::Object(entries) => {
+            let map: MapValue = entries
+                .iter()
+                .map(|(name, item)| (Arc::from(name.as_str()), json_value(item)))
+                .collect();
+            Value::Map(Arc::new(map))
+        }
+    }
+}
+
+/// The `reason` of the named condition, where the object states one.
+fn condition_reason<'object>(object: &'object Object, condition: &str) -> Option<&'object str> {
+    object
+        .field("/status/conditions")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("type").and_then(Json::as_str) == Some(condition))?
+        .get("reason")?
+        .as_str()
+}
+
 /// The sum of every container's restart count, or null where the server sent no statuses.
 ///
 /// Null rather than zero, because a pod whose status has not been written yet has not restarted
@@ -306,4 +894,37 @@ fn restarts(object: &Object) -> Value {
         .filter_map(|status| status.get("restartCount")?.as_i64())
         .sum();
     integer(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rfc3339;
+
+    #[test]
+    fn should_render_an_instant_the_value_model_can_read_back() {
+        // The calendar is written out here rather than taken from a dependency, so it is checked
+        // rather than assumed. A wrong observation time is worse than none: freshness is what a
+        // reader decides how much to trust a read by (§20.2).
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339(1), "1970-01-01T00:00:00.001Z");
+        assert_eq!(rfc3339(86_399_999), "1970-01-01T23:59:59.999Z");
+        assert_eq!(rfc3339(86_400_000), "1970-01-02T00:00:00.000Z");
+        // A leap day, and a century year that *is* a leap year — the case a naive rule gets
+        // wrong, and the one this calendar is written out rather than assumed for.
+        assert_eq!(rfc3339(1_709_164_800_000), "2024-02-29T00:00:00.000Z");
+        assert_eq!(rfc3339(951_782_400_000), "2000-02-29T00:00:00.000Z");
+        assert_eq!(rfc3339(951_868_800_000), "2000-03-01T00:00:00.000Z");
+        assert_eq!(rfc3339(1_757_073_845_678), "2025-09-05T12:04:05.678Z");
+    }
+
+    #[test]
+    fn should_parse_back_into_the_value_model_s_own_timestamp() {
+        assert!(
+            matches!(
+                super::instant(1_757_073_845_678),
+                ono_value::Value::Timestamp(_)
+            ),
+            "an instant this package renders must be one the value model reads"
+        );
+    }
 }

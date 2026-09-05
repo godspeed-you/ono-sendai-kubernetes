@@ -248,7 +248,7 @@ const POD_FIELDS: [Field; 14] = with_metadata(
     ],
 );
 
-const DEPLOYMENT_FIELDS: [Field; 15] = with_metadata(
+const DEPLOYMENT_FIELDS: [Field; 16] = with_metadata(
     true,
     &[
         Field::nullable("desired_replicas", "int"),
@@ -257,6 +257,141 @@ const DEPLOYMENT_FIELDS: [Field; 15] = with_metadata(
         Field::nullable("available_replicas", "int"),
         Field::nullable("generation", "int"),
         Field::nullable("observed_generation", "int"),
+        RECONCILIATION,
+    ],
+);
+
+/// Where an object stands between what was asked of it and what has been observed (§37.5).
+///
+/// One field rather than three, and a map rather than a word, because §37.5 requires a derived
+/// state to arrive with the rule that derived it and the fields that rule read. A bare string
+/// would be a verdict nobody can check, and §37.3 is explicit that a matching
+/// `observedGeneration` is *not* a claim of health — which is why `verified_convergence` is a
+/// separate key from `state` and is true for exactly one of the five states.
+///
+/// Required rather than nullable: `condition::reconciliation` answers for every object, and its
+/// answer for one with no evidence is "unknown due to insufficient evidence", which is a
+/// statement rather than a gap.
+const RECONCILIATION: Field = Field::required("reconciliation", "map");
+
+const REPLICASET_FIELDS: [Field; 17] = with_metadata(
+    true,
+    &[
+        Field::nullable("desired_replicas", "int"),
+        Field::nullable("current_replicas", "int"),
+        Field::nullable("ready_replicas", "int"),
+        Field::nullable("available_replicas", "int"),
+        Field::nullable("generation", "int"),
+        Field::nullable("observed_generation", "int"),
+        Field::nullable("controller", "string"),
+        Field::nullable("controller_kind", "string"),
+    ],
+);
+
+const STATEFULSET_FIELDS: [Field; 19] = with_metadata(
+    true,
+    &[
+        Field::nullable("desired_replicas", "int"),
+        Field::nullable("current_replicas", "int"),
+        Field::nullable("ready_replicas", "int"),
+        Field::nullable("updated_replicas", "int"),
+        Field::nullable("available_replicas", "int"),
+        Field::nullable("service_name", "string"),
+        Field::nullable("current_revision", "string"),
+        Field::nullable("update_revision", "string"),
+        Field::nullable("claim_templates", "list<string>"),
+        RECONCILIATION,
+    ],
+);
+
+const DAEMONSET_FIELDS: [Field; 18] = with_metadata(
+    true,
+    &[
+        Field::nullable("desired_scheduled", "int"),
+        Field::nullable("current_scheduled", "int"),
+        Field::nullable("ready_scheduled", "int"),
+        Field::nullable("updated_scheduled", "int"),
+        Field::nullable("available_scheduled", "int"),
+        Field::nullable("misscheduled", "int"),
+        Field::nullable("generation", "int"),
+        Field::nullable("observed_generation", "int"),
+        RECONCILIATION,
+    ],
+);
+
+const SERVICE_FIELDS: [Field; 16] = with_metadata(
+    true,
+    &[
+        Field::nullable("service_type", "string"),
+        Field::nullable("cluster_ip", "string"),
+        Field::nullable("external_ips", "list<string>"),
+        Field::nullable("external_name", "string"),
+        Field::nullable("load_balancer", "list<string>"),
+        Field::nullable("ports", "map"),
+        Field::nullable("selector", "map"),
+    ],
+);
+
+const ENDPOINTSLICE_FIELDS: [Field; 16] = with_metadata(
+    true,
+    &[
+        Field::nullable("address_type", "string"),
+        Field::nullable("service_name", "string"),
+        Field::nullable("endpoint_count", "int"),
+        Field::nullable("ready_endpoints", "int"),
+        Field::nullable("addresses", "list<string>"),
+        Field::nullable("targets", "list<string>"),
+        Field::nullable("ports", "map"),
+    ],
+);
+
+const INGRESS_FIELDS: [Field; 14] = with_metadata(
+    true,
+    &[
+        Field::nullable("ingress_class", "string"),
+        Field::nullable("hosts", "list<string>"),
+        Field::nullable("services", "list<string>"),
+        Field::nullable("tls_secrets", "list<string>"),
+        Field::nullable("load_balancer", "list<string>"),
+    ],
+);
+
+const JOB_FIELDS: [Field; 21] = with_metadata(
+    true,
+    &[
+        Field::nullable("completions", "int"),
+        Field::nullable("parallelism", "int"),
+        Field::nullable("active", "int"),
+        Field::nullable("succeeded", "int"),
+        Field::nullable("failed", "int"),
+        Field::nullable("start_time", "timestamp"),
+        Field::nullable("completion_time", "timestamp"),
+        Field::nullable("complete", "string"),
+        Field::nullable("failure_reason", "string"),
+        Field::nullable("controller", "string"),
+        Field::nullable("controller_kind", "string"),
+        RECONCILIATION,
+    ],
+);
+
+const CRONJOB_FIELDS: [Field; 15] = with_metadata(
+    true,
+    &[
+        Field::nullable("schedule", "string"),
+        Field::nullable("suspend", "bool"),
+        Field::nullable("concurrency_policy", "string"),
+        Field::nullable("last_schedule_time", "timestamp"),
+        Field::nullable("last_successful_time", "timestamp"),
+        Field::nullable("active_jobs", "list<string>"),
+    ],
+);
+
+const CONFIGMAP_FIELDS: [Field; 12] = with_metadata(
+    true,
+    &[
+        Field::nullable("keys", "list<string>"),
+        Field::nullable("binary_keys", "list<string>"),
+        Field::nullable("immutable", "bool"),
     ],
 );
 
@@ -265,6 +400,63 @@ const SECRET_FIELDS: [Field; 11] = with_metadata(
     &[
         Field::nullable("secret_type", "string"),
         Field::nullable("keys", "list<string>"),
+    ],
+);
+
+const SERVICEACCOUNT_FIELDS: [Field; 12] = with_metadata(
+    true,
+    &[
+        Field::nullable("secrets", "list<string>"),
+        Field::nullable("image_pull_secrets", "list<string>"),
+        Field::nullable("automount_token", "bool"),
+    ],
+);
+
+const PERSISTENTVOLUMECLAIM_FIELDS: [Field; 16] = with_metadata(
+    true,
+    &[
+        Field::nullable("phase", "string"),
+        Field::nullable("volume_name", "string"),
+        Field::nullable("storage_class", "string"),
+        Field::nullable("volume_mode", "string"),
+        Field::nullable("access_modes", "list<string>"),
+        Field::nullable("requested_storage", "string"),
+        Field::nullable("bound_capacity", "string"),
+    ],
+);
+
+const PERSISTENTVOLUME_FIELDS: [Field; 16] = with_metadata(
+    false,
+    &[
+        Field::nullable("phase", "string"),
+        Field::nullable("capacity", "string"),
+        Field::nullable("storage_class", "string"),
+        Field::nullable("volume_mode", "string"),
+        Field::nullable("access_modes", "list<string>"),
+        Field::nullable("reclaim_policy", "string"),
+        Field::nullable("claim", "string"),
+        Field::nullable("csi_driver", "string"),
+    ],
+);
+
+const STORAGECLASS_FIELDS: [Field; 14] = with_metadata(
+    false,
+    &[
+        Field::nullable("provisioner", "string"),
+        Field::nullable("reclaim_policy", "string"),
+        Field::nullable("volume_binding_mode", "string"),
+        Field::nullable("allow_volume_expansion", "bool"),
+        Field::nullable("is_default", "bool"),
+        Field::nullable("parameters", "map"),
+    ],
+);
+
+const NETWORKPOLICY_FIELDS: [Field; 12] = with_metadata(
+    true,
+    &[
+        Field::nullable("pod_selector", "map"),
+        Field::nullable("policy_types", "list<string>"),
+        Field::nullable("rules", "map"),
     ],
 );
 
@@ -349,17 +541,24 @@ const CLUSTER_FIELDS: &[Field] = &[
     Field::required("latency_ms", "map"),
 ];
 
-/// The targets this package answers for today.
+/// The targets this package answers for.
 ///
-/// Five curated nouns and one dynamic one, of the twenty `package/contributions/targets.yaml`
-/// declares. The other fourteen are placeholders §31.68 already gives help and completion for;
-/// wiring a schema for a target nothing answers would be a claim the package cannot keep.
+/// **All nineteen of §15.2's Tier 1 set, in the order §15.2 lists them**, plus the dynamic noun
+/// and the instance diagnostic. Every word `package/contributions/targets.yaml` declares is now
+/// a word this package answers — which is what ADR-0005 asked for and deferred: a declared
+/// schema is a promise, so a schema arrives with the handler that keeps it, and there is no
+/// longer a placeholder naming a schema nothing emits.
 ///
-/// Each of the five curated ones proves something the others do not: `k8s-namespace` is the
-/// scope dimension, `k8s-node` is cluster-scoped so both scope shapes are exercised, `k8s-pod`
-/// is the noun the milestone names, `k8s-deployment` carries the desired-versus-observed pair of
-/// §14.4, and `k8s-secret` is where §22's redaction boundary is demonstrated rather than
-/// asserted.
+/// The order is §15.2's rather than alphabetical, because the list is a walk through workload
+/// troubleshooting — scope, machine, workload, controllers, routing, batch, configuration,
+/// identity, storage, policy — and the reader who wants a kind reaches it by remembering what it
+/// is near.
+///
+/// Each schema's fields are the ones an operator troubleshoots with, not every field the API
+/// carries (§15.5). Where a kind has a meaningful desired-versus-observed distinction — the four
+/// workload controllers and Job — the record carries a `reconciliation` map derived by
+/// `condition::reconciliation`, so the state arrives with the rule that produced it and the
+/// fields that rule read (§37.5) and never as a status word this package invented.
 ///
 /// `k8s-resource` is the floor beneath all of them (§15.1): it reads whatever the cluster serves
 /// and this package never heard of, so a curated noun is a *better* answer for a kind rather
@@ -422,6 +621,129 @@ pub static TARGETS: &[Target] = &[
         fields: &DEPLOYMENT_FIELDS,
     },
     Target {
+        name: "k8s-replicaset",
+        schema: "io.github.godspeed-you.kubernetes.replicaset/1",
+        schema_name: "KubernetesReplicaSet",
+        schema_summary: "A ReplicaSet, and the controller above it.",
+        summary: "ReplicaSets, which sit between a Deployment and its Pods.",
+        identity_doc: "Two observations are the same ReplicaSet when their `metadata.uid` \
+                       matches.",
+        reads: Reads::Kind {
+            group: "apps",
+            kind: "ReplicaSet",
+        },
+        fields: &REPLICASET_FIELDS,
+    },
+    Target {
+        name: "k8s-statefulset",
+        schema: "io.github.godspeed-you.kubernetes.statefulset/1",
+        schema_name: "KubernetesStatefulSet",
+        schema_summary: "A StatefulSet, its rollout revisions and the claims its templates ask \
+                         for.",
+        summary: "StatefulSets, and the claims their templates materialise.",
+        identity_doc: "Two observations are the same StatefulSet when their `metadata.uid` \
+                       matches.",
+        reads: Reads::Kind {
+            group: "apps",
+            kind: "StatefulSet",
+        },
+        fields: &STATEFULSET_FIELDS,
+    },
+    Target {
+        name: "k8s-daemonset",
+        schema: "io.github.godspeed-you.kubernetes.daemonset/1",
+        schema_name: "KubernetesDaemonSet",
+        schema_summary: "A DaemonSet, counted per node rather than per replica.",
+        summary: "DaemonSets, and their rollout across nodes.",
+        identity_doc: "Two observations are the same DaemonSet when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "apps",
+            kind: "DaemonSet",
+        },
+        fields: &DAEMONSET_FIELDS,
+    },
+    Target {
+        name: "k8s-service",
+        schema: "io.github.godspeed-you.kubernetes.service/1",
+        schema_name: "KubernetesService",
+        schema_summary: "A service: how it is addressed, on which ports, and what it selects.",
+        summary: "Services, and the Pods their selectors reach.",
+        identity_doc: "Two observations are the same service when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "",
+            kind: "Service",
+        },
+        fields: &SERVICE_FIELDS,
+    },
+    Target {
+        name: "k8s-endpointslice",
+        schema: "io.github.godspeed-you.kubernetes.endpointslice/1",
+        schema_name: "KubernetesEndpointSlice",
+        schema_summary: "An EndpointSlice: which addresses answer for a service, and which of \
+                         them are ready.",
+        summary: "EndpointSlices, the endpoints a Service is represented by.",
+        identity_doc: "Two observations are the same slice when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "discovery.k8s.io",
+            kind: "EndpointSlice",
+        },
+        fields: &ENDPOINTSLICE_FIELDS,
+    },
+    Target {
+        name: "k8s-ingress",
+        schema: "io.github.godspeed-you.kubernetes.ingress/1",
+        schema_name: "KubernetesIngress",
+        schema_summary: "An ingress: which hosts it answers for, which services it routes to, \
+                         and which secrets terminate its TLS.",
+        summary: "Ingresses, and the Services they route to.",
+        identity_doc: "Two observations are the same ingress when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "networking.k8s.io",
+            kind: "Ingress",
+        },
+        fields: &INGRESS_FIELDS,
+    },
+    Target {
+        name: "k8s-job",
+        schema: "io.github.godspeed-you.kubernetes.job/1",
+        schema_name: "KubernetesJob",
+        schema_summary: "A job, with what it was asked to complete beside what it has.",
+        summary: "Jobs, and the Pods they own.",
+        identity_doc: "Two observations are the same job when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "batch",
+            kind: "Job",
+        },
+        fields: &JOB_FIELDS,
+    },
+    Target {
+        name: "k8s-cronjob",
+        schema: "io.github.godspeed-you.kubernetes.cronjob/1",
+        schema_name: "KubernetesCronJob",
+        schema_summary: "A CronJob: its schedule, whether it is suspended, and what it has \
+                         running now.",
+        summary: "CronJobs, and the Jobs they create.",
+        identity_doc: "Two observations are the same CronJob when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "batch",
+            kind: "CronJob",
+        },
+        fields: &CRONJOB_FIELDS,
+    },
+    Target {
+        name: "k8s-configmap",
+        schema: "io.github.godspeed-you.kubernetes.configmap/1",
+        schema_name: "KubernetesConfigMap",
+        schema_summary: "A ConfigMap's keys and whether it may still change.",
+        summary: "ConfigMaps, and what consumes them.",
+        identity_doc: "Two observations are the same ConfigMap when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "",
+            kind: "ConfigMap",
+        },
+        fields: &CONFIGMAP_FIELDS,
+    },
+    Target {
         name: "k8s-secret",
         schema: "io.github.godspeed-you.kubernetes.secret/1",
         schema_name: "KubernetesSecret",
@@ -434,6 +756,74 @@ pub static TARGETS: &[Target] = &[
             kind: "Secret",
         },
         fields: &SECRET_FIELDS,
+    },
+    Target {
+        name: "k8s-serviceaccount",
+        schema: "io.github.godspeed-you.kubernetes.serviceaccount/1",
+        schema_name: "KubernetesServiceAccount",
+        schema_summary: "A ServiceAccount, and the secrets it carries — never their contents.",
+        summary: "ServiceAccounts, the identity a workload runs as.",
+        identity_doc: "Two observations are the same account when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "",
+            kind: "ServiceAccount",
+        },
+        fields: &SERVICEACCOUNT_FIELDS,
+    },
+    Target {
+        name: "k8s-persistentvolumeclaim",
+        schema: "io.github.godspeed-you.kubernetes.persistentvolumeclaim/1",
+        schema_name: "KubernetesPersistentVolumeClaim",
+        schema_summary: "A claim: what it asked for, and which volume — if any — it is bound to.",
+        summary: "PersistentVolumeClaims, and the volumes they bind.",
+        identity_doc: "Two observations are the same claim when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "",
+            kind: "PersistentVolumeClaim",
+        },
+        fields: &PERSISTENTVOLUMECLAIM_FIELDS,
+    },
+    Target {
+        name: "k8s-persistentvolume",
+        schema: "io.github.godspeed-you.kubernetes.persistentvolume/1",
+        schema_name: "KubernetesPersistentVolume",
+        schema_summary: "A volume, what happens to the storage when it is released, and which \
+                         claim holds it.",
+        summary: "PersistentVolumes, and the storage behind them.",
+        identity_doc: "Two observations are the same volume when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "",
+            kind: "PersistentVolume",
+        },
+        fields: &PERSISTENTVOLUME_FIELDS,
+    },
+    Target {
+        name: "k8s-storageclass",
+        schema: "io.github.godspeed-you.kubernetes.storageclass/1",
+        schema_name: "KubernetesStorageClass",
+        schema_summary: "A storage class: what provisions it, when it binds, and what happens on \
+                         release.",
+        summary: "StorageClasses, and what they provision.",
+        identity_doc: "Two observations are the same class when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "storage.k8s.io",
+            kind: "StorageClass",
+        },
+        fields: &STORAGECLASS_FIELDS,
+    },
+    Target {
+        name: "k8s-networkpolicy",
+        schema: "io.github.godspeed-you.kubernetes.networkpolicy/1",
+        schema_name: "KubernetesNetworkPolicy",
+        schema_summary: "A network policy's intent, in the structure the API states it — never \
+                         reduced to a verdict about reachability (§31.2, §31.3).",
+        summary: "NetworkPolicies, and the Pods their selectors govern.",
+        identity_doc: "Two observations are the same policy when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "networking.k8s.io",
+            kind: "NetworkPolicy",
+        },
+        fields: &NETWORKPOLICY_FIELDS,
     },
     Target {
         name: "k8s-resource",

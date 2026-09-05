@@ -47,6 +47,10 @@ ADR check and the instructions check. None of the document checks was dropped (A
 | `place` | §9, §35, §36 | addresses that round-trip; cluster and namespace scope are two grammars |
 | `diagnostics` | §8.5, §8.6, §10, §34.3 | which cluster this is, whether it answers, as whom, and what is unknown |
 
+**Section by section, with the evidence for each verdict: [`coverage.md`](coverage.md).** It is the
+only place the untouched sections are counted, and it holds the §4 invariant checklist. This board
+says what the last session did; that document says where the whole surface stands.
+
 The package reaches the API server through the host's brokered `network.connect` — a real
 `ByteStream` over `streams.emit` and `streams.next`, with no fixture fallback — and an end-to-end
 test drives the real binary under `ono_kuang_testhost::TestHost` against recorded API bytes. The

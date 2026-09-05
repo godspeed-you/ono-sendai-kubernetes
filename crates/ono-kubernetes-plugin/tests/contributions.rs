@@ -191,10 +191,98 @@ fn should_answer_for_the_pod_target_the_milestone_names() {
         "a Pod lives in the core API group, and the table names a kind rather than a resource: \
          which collection serves a Pod is discovery's answer, not a compile-time one (§13.1)"
     );
-    assert!(
-        target("k8s-endpointslice").is_none(),
-        "a target with no handler is a placeholder, and the package does not claim to answer it"
-    );
+}
+
+#[test]
+fn should_answer_for_every_target_the_static_document_declares() {
+    // ADR-0005's rule, now that the deferral it recorded is over: a declared schema is a promise,
+    // so every word the shell offers help and completion for has a handler and a schema behind
+    // it. A placeholder naming a schema no document declares loads happily and fails at its
+    // first emit, which is the failure mode furthest from where it was caused.
+    for entry in document(TARGETS_DOCUMENT, "targets") {
+        let name = text(&entry, "name");
+        let wired = target(&name).unwrap_or_else(|| {
+            panic!(
+                "`{name}` is declared in `contributions/targets.yaml`, so `get {name}` resolves \
+                 in a shell that has never loaded this package — and nothing answers it"
+            )
+        });
+        assert_eq!(wired.schema, text(&entry, "schema"));
+    }
+}
+
+#[test]
+fn should_cover_the_tier_one_operational_set_of_section_15_2() {
+    // §15.2 names nineteen resources as "the first complete operational target". The list is
+    // written out here rather than counted, so that dropping one is a test failure that names it.
+    for kind in [
+        "namespace",
+        "node",
+        "pod",
+        "deployment",
+        "replicaset",
+        "statefulset",
+        "daemonset",
+        "service",
+        "endpointslice",
+        "ingress",
+        "job",
+        "cronjob",
+        "configmap",
+        "secret",
+        "serviceaccount",
+        "persistentvolumeclaim",
+        "persistentvolume",
+        "storageclass",
+        "networkpolicy",
+    ] {
+        let wired = target(&format!("k8s-{kind}"))
+            .unwrap_or_else(|| panic!("§15.2's Tier 1 set includes {kind}, and nothing answers"));
+        assert!(
+            matches!(wired.reads, Reads::Kind { .. }),
+            "a curated noun reads one kind the table names; which collection serves it is still \
+             discovery's answer (§13.1)"
+        );
+    }
+}
+
+#[test]
+fn should_derive_a_reconciliation_state_only_where_desired_and_observed_differ_meaningfully() {
+    // §37.2: a reconciliation rule is kind-specific, and a kind with no meaningful
+    // desired-versus-observed distinction gets none rather than a rule invented for symmetry. A
+    // ConfigMap has no controller reconciling it towards anything; a Deployment does.
+    for name in [
+        "k8s-deployment",
+        "k8s-statefulset",
+        "k8s-daemonset",
+        "k8s-job",
+    ] {
+        let wired = target(name).unwrap_or_else(|| panic!("`{name}` is wired"));
+        assert!(
+            wired
+                .fields
+                .iter()
+                .any(|field| field.name == "reconciliation"),
+            "`{name}` reconciles a desired state towards an observed one, and §37.5 requires the \
+             derived state to arrive with the fields it rests on"
+        );
+    }
+    for name in [
+        "k8s-configmap",
+        "k8s-service",
+        "k8s-namespace",
+        "k8s-secret",
+    ] {
+        let wired = target(name).unwrap_or_else(|| panic!("`{name}` is wired"));
+        assert!(
+            !wired
+                .fields
+                .iter()
+                .any(|field| field.name == "reconciliation"),
+            "`{name}` has no controller reconciling it, and a state derived for symmetry would be \
+             a claim with no rule behind it (§37.2)"
+        );
+    }
 }
 
 #[test]

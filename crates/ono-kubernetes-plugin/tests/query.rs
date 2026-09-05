@@ -199,6 +199,16 @@ struct RecordedCluster {
     /// Whether the server serves the two invented API groups of the dynamic tests. Off for the
     /// curated tests, so that adding a CRD to this fixture cannot change what they prove.
     custom: bool,
+    /// Whether RBAC refuses `list` on the Pod collection while `get` on one Pod stays allowed.
+    /// §60.5's canonical scenario, and the reason a direct lookup is a different request rather
+    /// than a shortcut through the listing.
+    deny_pod_list: bool,
+    /// Whether RBAC refuses `get` on one Pod, which is a refused read and never an absence.
+    deny_pod_get: bool,
+    /// Whether the server serves the whole Tier 1 operational set of §15.2, rather than the
+    /// five kinds the earlier tests need. Off by default so that adding a kind to this fixture
+    /// cannot change what those tests prove.
+    tier_one: bool,
     /// The TLS identity this server presents, where it speaks HTTPS at all. `None` is the plain
     /// HTTP/1.1 an API server behind `kubectl proxy` speaks.
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -249,14 +259,44 @@ impl RecordedCluster {
         })
     }
 
+    /// A server whose RBAC allows `get` on one Pod and refuses `list` on the collection — the
+    /// scenario §60.5 names, and the one that decides whether `get` is its own request.
+    fn denying_pod_list() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            deny_pod_list: true,
+            ..Self::default()
+        })
+    }
+
+    /// A server whose RBAC refuses `get` on one Pod. A refused read is not an absent object.
+    fn denying_pod_get() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            deny_pod_get: true,
+            ..Self::default()
+        })
+    }
+
+    /// A server serving every kind of §15.2's Tier 1 operational set.
+    fn with_tier_one() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            tier_one: true,
+            ..Self::default()
+        })
+    }
+
     /// A server that speaks TLS, presenting `authority`'s certificate.
     fn over_tls(authority: &Authority) -> Arc<Self> {
         Arc::new(Self {
             pods: 2,
             apps: true,
-            custom: false,
             tls: Some(Arc::new(authority.server_config())),
-            heads: Arc::default(),
+            ..Self::default()
         })
     }
 
@@ -293,6 +333,37 @@ fn not_found(path: &str) -> Vec<u8> {
         body.len()
     )
     .into_bytes()
+}
+
+/// One `403`, as the API server writes a refusal: a `Status` naming the verb it refused.
+fn denied(path: &str, verb: &str) -> Vec<u8> {
+    let body = json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "message": format!("pods is forbidden: cannot {verb} resource at {path}"),
+        "reason": "Forbidden",
+        "code": 403,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// One object as the *object* endpoint sends it, which states its own `apiVersion` and `kind`.
+///
+/// A collection states them once in its envelope; a single object states them itself. The two
+/// endpoints therefore hand the provider different documents for the same object, and this is
+/// the fixture half of that.
+fn standalone(mut object: Json, api_version: &str, kind: &str) -> Json {
+    if let Some(map) = object.as_object_mut() {
+        map.insert("apiVersion".to_owned(), json!(api_version));
+        map.insert("kind".to_owned(), json!(kind));
+    }
+    object
 }
 
 fn pod(index: usize) -> Json {
@@ -491,11 +562,437 @@ fn custom_document(path: &str) -> Option<Json> {
     })
 }
 
+/// A cluster serving the whole Tier 1 set of §15.2, where it differs from the plain one.
+///
+/// Every object below is written so that a projection reading the wrong field is visible rather
+/// than merely wrong: counts differ from one another, one claim is deliberately unbound, one
+/// endpoint deliberately has no target reference, and one controller is deliberately behind its
+/// own generation.
+fn tier_one_document(path: &str) -> Option<Json> {
+    Some(match path {
+        "/apis" => json!({
+            "kind": "APIGroupList",
+            "groups": [
+                group("apps"),
+                group("batch"),
+                group("discovery.k8s.io"),
+                group("networking.k8s.io"),
+                group("storage.k8s.io"),
+            ],
+        }),
+        "/api/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "v1",
+            "resources": [
+                {"name": "namespaces", "kind": "Namespace", "namespaced": false,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "nodes", "kind": "Node", "namespaced": false,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "pods", "kind": "Pod", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "services", "kind": "Service", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "secrets", "kind": "Secret", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "configmaps", "kind": "ConfigMap", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "serviceaccounts", "kind": "ServiceAccount", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "persistentvolumeclaims", "kind": "PersistentVolumeClaim",
+                 "namespaced": true, "verbs": ["get", "list", "watch"]},
+                {"name": "persistentvolumes", "kind": "PersistentVolume", "namespaced": false,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+        "/apis/apps/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "apps/v1",
+            "resources": [
+                {"name": "deployments", "kind": "Deployment", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "replicasets", "kind": "ReplicaSet", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "statefulsets", "kind": "StatefulSet", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "daemonsets", "kind": "DaemonSet", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+        "/apis/batch/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "batch/v1",
+            "resources": [
+                {"name": "jobs", "kind": "Job", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "cronjobs", "kind": "CronJob", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+        "/apis/discovery.k8s.io/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "discovery.k8s.io/v1",
+            "resources": [
+                {"name": "endpointslices", "kind": "EndpointSlice", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+        "/apis/networking.k8s.io/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "networking.k8s.io/v1",
+            "resources": [
+                {"name": "ingresses", "kind": "Ingress", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "networkpolicies", "kind": "NetworkPolicy", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+        "/apis/storage.k8s.io/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "storage.k8s.io/v1",
+            "resources": [
+                {"name": "storageclasses", "kind": "StorageClass", "namespaced": false,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+
+        "/apis/apps/v1/namespaces/default/replicasets" => collection(
+            "ReplicaSet",
+            "apps/v1",
+            &[json!({
+                "metadata": {
+                    "name": "api-7d9f", "namespace": "default",
+                    "uid": "a1a1a1a1-0000-0000-0000-000000000001",
+                    "generation": 3,
+                    "creationTimestamp": "2026-08-20T08:00:00Z",
+                    "ownerReferences": [
+                        {"apiVersion": "apps/v1", "kind": "Deployment", "name": "api",
+                         "uid": "66666666-6666-6666-6666-666666666666", "controller": true},
+                    ],
+                },
+                "spec": {"replicas": 3},
+                "status": {"replicas": 3, "readyReplicas": 2, "availableReplicas": 2,
+                           "observedGeneration": 3},
+            })],
+        ),
+        "/apis/apps/v1/namespaces/default/statefulsets" => collection(
+            "StatefulSet",
+            "apps/v1",
+            &[json!({
+                "metadata": {
+                    "name": "ledger", "namespace": "default",
+                    "uid": "a2a2a2a2-0000-0000-0000-000000000001",
+                    "generation": 5,
+                    "creationTimestamp": "2026-08-20T08:00:00Z",
+                },
+                "spec": {
+                    "replicas": 3,
+                    "serviceName": "ledger-headless",
+                    "volumeClaimTemplates": [
+                        {"metadata": {"name": "data"},
+                         "spec": {"storageClassName": "fast",
+                                  "accessModes": ["ReadWriteOnce"],
+                                  "resources": {"requests": {"storage": "10Gi"}}}},
+                    ],
+                },
+                // Behind its own generation: the controller has not seen the latest spec, which
+                // §37.5 calls "desired state changed; controller not yet observed".
+                "status": {"replicas": 3, "readyReplicas": 3, "updatedReplicas": 1,
+                           "currentRevision": "ledger-6f4", "updateRevision": "ledger-9ab",
+                           "observedGeneration": 4},
+            })],
+        ),
+        "/apis/apps/v1/namespaces/default/daemonsets" => collection(
+            "DaemonSet",
+            "apps/v1",
+            &[json!({
+                "metadata": {
+                    "name": "node-agent", "namespace": "default",
+                    "uid": "a3a3a3a3-0000-0000-0000-000000000001",
+                    "generation": 2,
+                    "creationTimestamp": "2026-08-20T08:00:00Z",
+                },
+                "spec": {},
+                "status": {"desiredNumberScheduled": 5, "currentNumberScheduled": 5,
+                           "numberReady": 4, "updatedNumberScheduled": 3,
+                           "numberAvailable": 4, "numberMisscheduled": 1,
+                           "observedGeneration": 2},
+            })],
+        ),
+        "/api/v1/namespaces/default/services" => collection(
+            "Service",
+            "v1",
+            &[
+                json!({
+                    "metadata": {
+                        "name": "api", "namespace": "default",
+                        "uid": "a4a4a4a4-0000-0000-0000-000000000001",
+                        "creationTimestamp": "2026-08-20T08:00:00Z",
+                    },
+                    "spec": {
+                        "type": "LoadBalancer",
+                        "clusterIP": "10.96.0.42",
+                        "selector": {"app": "api"},
+                        "ports": [
+                            {"name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP"},
+                            {"port": 443, "targetPort": 8443, "protocol": "TCP"},
+                        ],
+                    },
+                    "status": {"loadBalancer": {"ingress": [{"hostname": "lb.example"}]}},
+                }),
+                // A headless, selector-less Service: §26.1's "no guessed Pod edges" case.
+                json!({
+                    "metadata": {
+                        "name": "ledger-headless", "namespace": "default",
+                        "uid": "a4a4a4a4-0000-0000-0000-000000000002",
+                        "creationTimestamp": "2026-08-20T08:00:00Z",
+                    },
+                    "spec": {"type": "ClusterIP", "clusterIP": "None"},
+                    "status": {"loadBalancer": {}},
+                }),
+            ],
+        ),
+        "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices" => collection(
+            "EndpointSlice",
+            "discovery.k8s.io/v1",
+            &[json!({
+                "metadata": {
+                    "name": "api-x7k2", "namespace": "default",
+                    "uid": "a5a5a5a5-0000-0000-0000-000000000001",
+                    "labels": {"kubernetes.io/service-name": "api"},
+                    "creationTimestamp": "2026-08-20T08:00:00Z",
+                },
+                "addressType": "IPv4",
+                "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}],
+                "endpoints": [
+                    {"addresses": ["10.1.2.3"], "conditions": {"ready": true},
+                     "targetRef": {"kind": "Pod", "name": "api-7d9f-abc",
+                                   "uid": "11111111-1111-1111-1111-111111111111"}},
+                    {"addresses": ["10.1.2.4"], "conditions": {"ready": false},
+                     "targetRef": {"kind": "Pod", "name": "api-7d9f-def",
+                                   "uid": "11111111-1111-1111-1111-111111111112"}},
+                    // §26.4: an external endpoint with no target reference stays an endpoint
+                    // fact rather than being forced into a Pod relationship.
+                    {"addresses": ["203.0.113.9"], "conditions": {"ready": true}},
+                ],
+            })],
+        ),
+        "/apis/networking.k8s.io/v1/namespaces/default/ingresses" => collection(
+            "Ingress",
+            "networking.k8s.io/v1",
+            &[json!({
+                "metadata": {
+                    "name": "public", "namespace": "default",
+                    "uid": "a6a6a6a6-0000-0000-0000-000000000001",
+                    "creationTimestamp": "2026-08-20T08:00:00Z",
+                },
+                "spec": {
+                    "ingressClassName": "nginx",
+                    "tls": [{"hosts": ["shop.example"], "secretName": "shop-tls"}],
+                    "rules": [{
+                        "host": "shop.example",
+                        "http": {"paths": [
+                            {"path": "/", "pathType": "Prefix",
+                             "backend": {"service": {"name": "api", "port": {"number": 80}}}},
+                            {"path": "/static", "pathType": "Prefix",
+                             "backend": {"service": {"name": "assets", "port": {"name": "http"}}}},
+                        ]},
+                    }],
+                },
+                "status": {"loadBalancer": {"ingress": [{"ip": "198.51.100.7"}]}},
+            })],
+        ),
+        "/apis/batch/v1/namespaces/default/jobs" => collection(
+            "Job",
+            "batch/v1",
+            &[json!({
+                "metadata": {
+                    "name": "nightly-28291", "namespace": "default",
+                    "uid": "a7a7a7a7-0000-0000-0000-000000000001",
+                    "generation": 1,
+                    "creationTimestamp": "2026-09-01T02:00:00Z",
+                    "ownerReferences": [
+                        {"apiVersion": "batch/v1", "kind": "CronJob", "name": "nightly",
+                         "uid": "a8a8a8a8-0000-0000-0000-000000000001", "controller": true},
+                    ],
+                },
+                "spec": {"completions": 1, "parallelism": 1},
+                "status": {
+                    "succeeded": 1,
+                    "startTime": "2026-09-01T02:00:01Z",
+                    "completionTime": "2026-09-01T02:03:11Z",
+                    "conditions": [{"type": "Complete", "status": "True"}],
+                    "observedGeneration": 1,
+                },
+            })],
+        ),
+        "/apis/batch/v1/namespaces/default/cronjobs" => collection(
+            "CronJob",
+            "batch/v1",
+            &[json!({
+                "metadata": {
+                    "name": "nightly", "namespace": "default",
+                    "uid": "a8a8a8a8-0000-0000-0000-000000000001",
+                    "creationTimestamp": "2026-08-01T00:00:00Z",
+                },
+                "spec": {"schedule": "0 2 * * *", "suspend": false,
+                         "concurrencyPolicy": "Forbid"},
+                "status": {
+                    "lastScheduleTime": "2026-09-01T02:00:00Z",
+                    "lastSuccessfulTime": "2026-09-01T02:03:11Z",
+                    "active": [{"kind": "Job", "name": "nightly-28291", "namespace": "default"}],
+                },
+            })],
+        ),
+        "/api/v1/namespaces/default/configmaps" => collection(
+            "ConfigMap",
+            "v1",
+            &[json!({
+                "metadata": {
+                    "name": "api-config", "namespace": "default",
+                    "uid": "a9a9a9a9-0000-0000-0000-000000000001",
+                    "creationTimestamp": "2026-08-01T00:00:00Z",
+                },
+                "immutable": true,
+                "data": {"log_level": "info", "endpoint": "https://upstream.example"},
+                "binaryData": {"seed.bin": "AAECAw=="},
+            })],
+        ),
+        "/api/v1/namespaces/default/serviceaccounts" => collection(
+            "ServiceAccount",
+            "v1",
+            &[json!({
+                "metadata": {
+                    "name": "api", "namespace": "default",
+                    "uid": "b1b1b1b1-0000-0000-0000-000000000001",
+                    "creationTimestamp": "2026-08-01T00:00:00Z",
+                },
+                "secrets": [{"name": "api-token"}],
+                "imagePullSecrets": [{"name": "registry-pull"}],
+                "automountServiceAccountToken": false,
+            })],
+        ),
+        "/api/v1/namespaces/default/persistentvolumeclaims" => collection(
+            "PersistentVolumeClaim",
+            "v1",
+            &[
+                json!({
+                    "metadata": {
+                        "name": "data-ledger-0", "namespace": "default",
+                        "uid": "b2b2b2b2-0000-0000-0000-000000000001",
+                        "creationTimestamp": "2026-08-01T00:00:00Z",
+                    },
+                    "spec": {"volumeName": "pv-0001", "storageClassName": "fast",
+                             "volumeMode": "Filesystem", "accessModes": ["ReadWriteOnce"],
+                             "resources": {"requests": {"storage": "10Gi"}}},
+                    "status": {"phase": "Bound", "capacity": {"storage": "10Gi"}},
+                }),
+                // §30.2: Pending, with no `volumeName`. It must not read as bound.
+                json!({
+                    "metadata": {
+                        "name": "data-ledger-1", "namespace": "default",
+                        "uid": "b2b2b2b2-0000-0000-0000-000000000002",
+                        "creationTimestamp": "2026-08-01T00:00:00Z",
+                    },
+                    "spec": {"storageClassName": "fast", "accessModes": ["ReadWriteOnce"],
+                             "resources": {"requests": {"storage": "10Gi"}}},
+                    "status": {"phase": "Pending"},
+                }),
+            ],
+        ),
+        "/api/v1/persistentvolumes" => collection(
+            "PersistentVolume",
+            "v1",
+            &[json!({
+                "metadata": {
+                    "name": "pv-0001",
+                    "uid": "b3b3b3b3-0000-0000-0000-000000000001",
+                    "creationTimestamp": "2026-08-01T00:00:00Z",
+                },
+                "spec": {
+                    "capacity": {"storage": "10Gi"},
+                    "storageClassName": "fast",
+                    "volumeMode": "Filesystem",
+                    "accessModes": ["ReadWriteOnce"],
+                    "persistentVolumeReclaimPolicy": "Retain",
+                    "claimRef": {"kind": "PersistentVolumeClaim", "namespace": "default",
+                                 "name": "data-ledger-0"},
+                    "csi": {"driver": "ebs.csi.aws.com", "volumeHandle": "vol-0abc"},
+                },
+                "status": {"phase": "Bound"},
+            })],
+        ),
+        "/apis/storage.k8s.io/v1/storageclasses" => collection(
+            "StorageClass",
+            "storage.k8s.io/v1",
+            &[json!({
+                "metadata": {
+                    "name": "fast",
+                    "uid": "b4b4b4b4-0000-0000-0000-000000000001",
+                    "annotations": {"storageclass.kubernetes.io/is-default-class": "true"},
+                    "creationTimestamp": "2026-08-01T00:00:00Z",
+                },
+                "provisioner": "ebs.csi.aws.com",
+                "reclaimPolicy": "Delete",
+                "volumeBindingMode": "WaitForFirstConsumer",
+                "allowVolumeExpansion": true,
+                "parameters": {"type": "gp3", "iops": "3000"},
+            })],
+        ),
+        "/apis/networking.k8s.io/v1/namespaces/default/networkpolicies" => collection(
+            "NetworkPolicy",
+            "networking.k8s.io/v1",
+            &[json!({
+                "metadata": {
+                    "name": "api-ingress", "namespace": "default",
+                    "uid": "b5b5b5b5-0000-0000-0000-000000000001",
+                    "creationTimestamp": "2026-08-01T00:00:00Z",
+                },
+                "spec": {
+                    "podSelector": {"matchLabels": {"app": "api"}},
+                    "policyTypes": ["Ingress"],
+                    "ingress": [{
+                        "from": [
+                            {"namespaceSelector": {"matchLabels": {"tier": "edge"}}},
+                            {"ipBlock": {"cidr": "10.0.0.0/8", "except": ["10.9.0.0/16"]}},
+                        ],
+                        "ports": [{"protocol": "TCP", "port": 8080}],
+                    }],
+                },
+            })],
+        ),
+        _ => return None,
+    })
+}
+
+/// One API group with a single preferred version.
+fn group(name: &str) -> Json {
+    json!({
+        "name": name,
+        "versions": [{"groupVersion": format!("{name}/v1"), "version": "v1"}],
+        "preferredVersion": {"groupVersion": format!("{name}/v1"), "version": "v1"},
+    })
+}
+
+/// A collection envelope, as the API server sends one.
+fn collection(kind: &str, api_version: &str, items: &[Json]) -> Json {
+    json!({
+        "kind": format!("{kind}List"),
+        "apiVersion": api_version,
+        "metadata": {"resourceVersion": "9100"},
+        "items": items,
+    })
+}
+
 fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let pods = cluster.pods;
     let path = path.split('?').next().unwrap_or(path);
     if cluster.custom
         && let Some(body) = custom_document(path)
+    {
+        return response(&body.to_string());
+    }
+    if cluster.tier_one
+        && let Some(body) = tier_one_document(path)
     {
         return response(&body.to_string());
     }
@@ -573,6 +1070,32 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
                 },
             }],
         }),
+        // §60.5: `list` refused while `get` on one object of the same collection is allowed.
+        "/api/v1/namespaces/default/pods" if cluster.deny_pod_list => {
+            return denied(path, "list");
+        }
+        "/api/v1/namespaces/default/pods/api-7d9f-abc" if cluster.deny_pod_get => {
+            return denied(path, "get");
+        }
+        // The canonical REST endpoint of one object (§17.1). It is deliberately a different
+        // route from the collection above, so a provider that reached it by listing and
+        // filtering would be visible in the request heads.
+        "/api/v1/namespaces/default/pods/api-7d9f-abc" => standalone(pod(0), "v1", "Pod"),
+        "/api/v1/namespaces/shop/pods/shop-till" => standalone(
+            json!({
+                "metadata": {
+                    "name": "shop-till",
+                    "namespace": "shop",
+                    "uid": "77777777-7777-7777-7777-777777777777",
+                    "resourceVersion": "4713",
+                    "creationTimestamp": "2026-09-01T10:00:00Z",
+                },
+                "spec": {"nodeName": "node-a", "containers": [{"name": "till"}]},
+                "status": {"phase": "Running", "podIP": "10.1.2.9"},
+            }),
+            "v1",
+            "Pod",
+        ),
         "/api/v1/namespaces/default/pods" => json!({
             "kind": "PodList",
             "apiVersion": "v1",
@@ -937,6 +1460,220 @@ async fn should_answer_a_secret_query_with_key_names_and_no_payload_anywhere() {
         !rendered.contains("Y2EtY2VydA=="),
         "and neither must the other key's: {rendered}"
     );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- get: one object by name (§17.1) -----------------------------------------------------------
+
+/// The package loaded against a cluster the test built.
+async fn loaded_against(cluster: Arc<RecordedCluster>) -> ono_kuang_supervisor::LoadedPlugin {
+    TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .host(cluster as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads under its own manifest")
+}
+
+#[tokio::test]
+async fn should_read_one_object_by_name_through_the_canonical_object_endpoint() {
+    // §17.1: a direct lookup uses the canonical REST resource endpoint resolved from discovery.
+    // Listing the collection and filtering it would answer the same question with a different
+    // request — one that needs `list` permission and reads every object in the namespace — so
+    // the request heads are what this test is really about.
+    let cluster = RecordedCluster::with_pods(2);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let invocation = plugin
+        .query("k8s-pod", at_cluster(&[("name", json!("api-7d9f-abc"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+
+    let records = records(&events);
+    assert_eq!(records.len(), 1, "a get answers one object or none");
+    let pod = &records[0];
+    assert_eq!(
+        pod.schema_id().to_string(),
+        "io.github.godspeed-you.kubernetes.pod/1",
+        "a get answers records of the same schema the listing does"
+    );
+    pod.validate().expect("the record conforms");
+    assert_eq!(
+        text_of(pod, "uid").as_deref(),
+        Some("11111111-1111-1111-1111-111111111111"),
+        "identity is the uid even when the query spelled a name (§16.1, §16.2)"
+    );
+    assert_eq!(text_of(pod, "phase").as_deref(), Some("Running"));
+
+    let heads = cluster.heads();
+    assert!(
+        heads
+            .iter()
+            .any(|head| head.starts_with("GET /api/v1/namespaces/default/pods/api-7d9f-abc ")),
+        "the object's own endpoint answered: {heads:?}"
+    );
+    assert!(
+        !heads
+            .iter()
+            .any(|head| head.starts_with("GET /api/v1/namespaces/default/pods ")),
+        "the collection was never asked for: a get that lists is a get that needs `list` \
+         permission it was never granted: {heads:?}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_read_one_object_by_name_where_the_collection_is_denied() {
+    // §60.5, end to end: allow `get` on one Pod, deny `list` on Pods, and check that the direct
+    // read succeeds while the inventory reports a denial. This is the whole reason `get` is a
+    // requirement of its own and not a convenience over the listing.
+    let cluster = RecordedCluster::denying_pod_list();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    let invocation = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert!(records(&events).is_empty(), "nothing was invented");
+    assert_eq!(
+        result.status,
+        InvokeStatus::Failed,
+        "a denied listing is not an empty namespace (§4 invariant 13, §21.4)"
+    );
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("list denied"),
+        "the refusal names the coverage outcome, and `list denied` is not `read denied`: {}",
+        error.message
+    );
+
+    let invocation = plugin
+        .query("k8s-pod", at_cluster(&[("name", json!("api-7d9f-abc"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "the direct read is a different request and RBAC answers it differently: {:?}",
+        result.error
+    );
+    assert_eq!(records(&events).len(), 1, "the object itself is readable");
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_say_a_named_object_that_is_not_there_is_absent_rather_than_unserved() {
+    // §21.4 through the `404` that means two different things. On a collection a `404` is an
+    // unserved API — a fact about what the cluster can answer at all — and the query fails.
+    // On one object it is absence, which is a fact about the cluster and the only outcome in
+    // §21.4's vocabulary that is evidence of absence. So the first refuses and the second
+    // completes with nothing, and a reader can tell them apart.
+    let plugin = loaded_with_custom_resources().await;
+
+    let invocation = plugin
+        .query("k8s-pod", at_cluster(&[("name", json!("no-such-pod"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "an object that is not there is an answer, not a failure: {:?}",
+        result.error
+    );
+    assert!(
+        records(&events).is_empty(),
+        "and the answer is that there is nothing"
+    );
+
+    let invocation = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[("kind", json!("Flywheel")), ("name", json!("no-such-pod"))]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert!(records(&events).is_empty());
+    assert_eq!(
+        result.status,
+        InvokeStatus::Failed,
+        "a kind the cluster does not serve is not an absent object of that kind"
+    );
+    assert_eq!(
+        result.error.expect("a structured refusal").name,
+        "provider.unsupported"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_say_a_denied_get_is_a_refused_read_rather_than_an_absence() {
+    // The mistake §21.4 exists to prevent, in its most expensive form: a `403` rendered as "not
+    // there" tells an operator the object was deleted.
+    let cluster = RecordedCluster::denying_pod_get();
+    let plugin = loaded_against(cluster).await;
+    let invocation = plugin
+        .query("k8s-pod", at_cluster(&[("name", json!("api-7d9f-abc"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(
+        result.status,
+        InvokeStatus::Failed,
+        "a refused read is not an empty answer"
+    );
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("read denied"),
+        "the refusal names §21.4's outcome, and it is not `absent`: {}",
+        error.message
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_carry_the_freshness_a_read_is_required_to_state() {
+    // §17.1: a get result MUST carry `observed_at`, `resourceVersion`, `provider_instance`,
+    // `scope`, the source endpoint category and its freshness. `resourceVersion` is a field of
+    // the record; the rest belong to the observation rather than to the object, and provenance
+    // is where the value model keeps those — so `inspect` shows them and a pipeline can read
+    // them without this package inventing a second place for them.
+    let plugin = loaded(2).await;
+    for options in [
+        at_cluster(&[]),
+        at_cluster(&[("name", json!("api-7d9f-abc"))]),
+    ] {
+        let invocation = plugin
+            .query("k8s-pod", options)
+            .await
+            .expect("the query starts");
+        let (events, result) = invocation.collect().await;
+        assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+        let records = records(&events);
+        let provenance = records[0].provenance();
+        assert!(
+            provenance.observed().is_some(),
+            "the read states when it was observed"
+        );
+        let source = provenance.source().unwrap_or_default().to_owned();
+        for expected in [
+            "provider_instance=kubernetes:recorded",
+            "scope=namespace/default",
+            "endpoint=core",
+            "origin=direct-read",
+        ] {
+            assert!(
+                source.contains(expected),
+                "the read states `{expected}`, and it says `{source}`"
+            );
+        }
+    }
     plugin.shutdown(ShutdownReason::Unload).await;
 }
 
@@ -1705,4 +2442,625 @@ fn should_name_the_invented_kind_nowhere_in_the_implementation() {
             );
         }
     }
+}
+
+// --- the Tier 1 operational set of §15.2 -------------------------------------------------------
+
+/// The package loaded against a cluster serving every kind of §15.2's Tier 1 set.
+async fn loaded_with_tier_one() -> ono_kuang_supervisor::LoadedPlugin {
+    TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .host(RecordedCluster::with_tier_one())
+        .load()
+        .await
+        .expect("the package loads under its own manifest")
+}
+
+/// Every record one target answers, with the schema and the conformance already checked.
+async fn answered(
+    plugin: &ono_kuang_supervisor::LoadedPlugin,
+    target: &str,
+    schema: &str,
+) -> Vec<Arc<RecordValue>> {
+    let invocation = plugin
+        .query(target, at_cluster(&[]))
+        .await
+        .unwrap_or_else(|error| panic!("`{target}` is a contributed target: {error:?}"));
+    let (events, result) = invocation.collect().await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "`{target}`: {:?}",
+        result.error
+    );
+    let records = records(&events);
+    assert!(!records.is_empty(), "`{target}` answered nothing");
+    for record in &records {
+        assert_eq!(
+            record.schema_id().to_string(),
+            schema,
+            "`{target}` answers records of the schema it declared"
+        );
+        record
+            .validate()
+            .unwrap_or_else(|error| panic!("`{target}` record does not conform: {error:?}"));
+    }
+    records
+}
+
+fn list_of(record: &RecordValue, field: &str) -> Option<Vec<String>> {
+    match record.get(field) {
+        Some(Value::List(entries)) => Some(
+            entries
+                .iter()
+                .map(|entry| match entry {
+                    Value::String(text) => text.to_string(),
+                    other => panic!("a list entry is text, and it is {other:?}"),
+                })
+                .collect(),
+        ),
+        Some(Value::Null) | None => None,
+        other => panic!("`{field}` is a list or null, and it is {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn should_answer_for_every_kind_of_the_tier_one_operational_set() {
+    // §15.2 names nineteen resources as the first complete operational target, and ADR-0005 held
+    // fourteen of them back because a declared schema nothing emits is a promise the package
+    // cannot keep. This is the test that makes the promise keepable: every declared word answers
+    // records of the schema it declared, over discovery, against one recorded cluster.
+    let plugin = loaded_with_tier_one().await;
+    for (target, schema) in [
+        ("k8s-namespace", "namespace"),
+        ("k8s-node", "node"),
+        ("k8s-pod", "pod"),
+        ("k8s-deployment", "deployment"),
+        ("k8s-replicaset", "replicaset"),
+        ("k8s-statefulset", "statefulset"),
+        ("k8s-daemonset", "daemonset"),
+        ("k8s-service", "service"),
+        ("k8s-endpointslice", "endpointslice"),
+        ("k8s-ingress", "ingress"),
+        ("k8s-job", "job"),
+        ("k8s-cronjob", "cronjob"),
+        ("k8s-configmap", "configmap"),
+        ("k8s-secret", "secret"),
+        ("k8s-serviceaccount", "serviceaccount"),
+        ("k8s-persistentvolumeclaim", "persistentvolumeclaim"),
+        ("k8s-persistentvolume", "persistentvolume"),
+        ("k8s-storageclass", "storageclass"),
+        ("k8s-networkpolicy", "networkpolicy"),
+    ] {
+        answered(
+            &plugin,
+            target,
+            &format!("io.github.godspeed-you.kubernetes.{schema}/1"),
+        )
+        .await;
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_name_the_controller_above_a_replica_set_from_its_owner_reference() {
+    // §25.2 and §24.3: the owner reference marked `controller: true` is the canonical evidence
+    // for which Deployment controls this ReplicaSet — the strongest evidence class §23 defines,
+    // and never a guess from a shared name prefix.
+    let plugin = loaded_with_tier_one().await;
+    let records = answered(
+        &plugin,
+        "k8s-replicaset",
+        "io.github.godspeed-you.kubernetes.replicaset/1",
+    )
+    .await;
+    let replicaset = &records[0];
+    assert_eq!(text_of(replicaset, "controller").as_deref(), Some("api"));
+    assert_eq!(
+        text_of(replicaset, "controller_kind").as_deref(),
+        Some("Deployment"),
+        "an owner reference names a kind, and the record does not assume which"
+    );
+    assert_eq!(replicaset.get("desired_replicas"), Some(&Value::Int(3)));
+    assert_eq!(replicaset.get("ready_replicas"), Some(&Value::Int(2)));
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_state_a_reconciliation_with_the_rule_and_the_fields_it_rests_on() {
+    // Gate G and §37.5: a derived state arrives with the rule that derived it and the fields that
+    // rule read. §37.3 is the sharper half — the StatefulSet below has a controller *behind* its
+    // own generation, and the Job has none of the evidence a convergence rule would need.
+    let plugin = loaded_with_tier_one().await;
+    let records = answered(
+        &plugin,
+        "k8s-statefulset",
+        "io.github.godspeed-you.kubernetes.statefulset/1",
+    )
+    .await;
+    let set = &records[0];
+    let Some(Value::Map(reconciliation)) = set.get("reconciliation") else {
+        panic!("`reconciliation` is a map");
+    };
+    assert_eq!(
+        reconciliation.get("state"),
+        Some(&Value::String(
+            "desired state changed; controller not yet observed".into()
+        )),
+        "observedGeneration 4 is behind generation 5, and that is what the state says"
+    );
+    assert_eq!(
+        reconciliation.get("rule"),
+        Some(&Value::String("generation-ahead-of-observed".into())),
+        "the rule is named so a reader can look it up and disagree with it"
+    );
+    assert_eq!(
+        reconciliation.get("verified_convergence"),
+        Some(&Value::Bool(false)),
+        "§37.3: nothing here is a claim of health"
+    );
+    let Some(Value::List(evidence)) = reconciliation.get("evidence") else {
+        panic!("the evidence is a list of citations");
+    };
+    assert!(
+        evidence
+            .iter()
+            .any(|entry| matches!(entry, Value::String(text)
+                if text.contains("/metadata/generation"))),
+        "every field the rule read is cited: {evidence:?}"
+    );
+    assert!(
+        !evidence.is_empty(),
+        "§37.5 forbids a derived state with no citations"
+    );
+
+    // The rollout state an operator actually reads, beside it.
+    assert_eq!(
+        text_of(set, "current_revision").as_deref(),
+        Some("ledger-6f4")
+    );
+    assert_eq!(
+        text_of(set, "update_revision").as_deref(),
+        Some("ledger-9ab"),
+        "different from the current revision means a rollout is in progress"
+    );
+    assert_eq!(
+        text_of(set, "service_name").as_deref(),
+        Some("ledger-headless"),
+        "§25.3's governing Service, from `spec.serviceName` and never from the set's own name"
+    );
+    assert_eq!(
+        list_of(set, "claim_templates"),
+        Some(vec!["data".to_owned()]),
+        "template intent, which §25.3 requires to stay distinguishable from materialised claims"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_count_a_daemon_set_per_node_rather_than_per_replica() {
+    // §25.4: a DaemonSet's rollout is measured across nodes. Every count below is deliberately
+    // different from every other, so a projection reading the wrong field is visible.
+    let plugin = loaded_with_tier_one().await;
+    let records = answered(
+        &plugin,
+        "k8s-daemonset",
+        "io.github.godspeed-you.kubernetes.daemonset/1",
+    )
+    .await;
+    let daemonset = &records[0];
+    assert_eq!(daemonset.get("desired_scheduled"), Some(&Value::Int(5)));
+    assert_eq!(daemonset.get("current_scheduled"), Some(&Value::Int(5)));
+    assert_eq!(daemonset.get("ready_scheduled"), Some(&Value::Int(4)));
+    assert_eq!(
+        daemonset.get("updated_scheduled"),
+        Some(&Value::Int(3)),
+        "how far the rollout has reached across the fleet"
+    );
+    assert_eq!(
+        daemonset.get("misscheduled"),
+        Some(&Value::Int(1)),
+        "running where it should no longer be, which is the signal a selector change leaves"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_a_service_s_ports_structured_and_its_absent_selector_null() {
+    // §31.4 asks for fields a later layer can relate to a socket or a load balancer, so the ports
+    // stay structured rather than becoming `http 80/TCP`. §26.1 is the other half: a
+    // selector-less Service must produce no guessed Pod edges, so its selector is null rather
+    // than an empty map that reads as "selects nothing in particular".
+    let plugin = loaded_with_tier_one().await;
+    let records = answered(
+        &plugin,
+        "k8s-service",
+        "io.github.godspeed-you.kubernetes.service/1",
+    )
+    .await;
+    let api = &records[0];
+    assert_eq!(
+        text_of(api, "service_type").as_deref(),
+        Some("LoadBalancer")
+    );
+    assert_eq!(text_of(api, "cluster_ip").as_deref(), Some("10.96.0.42"));
+    assert_eq!(
+        list_of(api, "load_balancer"),
+        Some(vec!["lb.example".to_owned()]),
+        "an entry states an `ip` or a `hostname`, and whichever it states is what is recorded"
+    );
+    let ports = map_of(api, "ports");
+    let Some(Value::Map(http)) = ports.get("http") else {
+        panic!(
+            "a named port is keyed by its name, and it is {:?}",
+            ports.get("http")
+        );
+    };
+    assert_eq!(http.get("port"), Some(&Value::Int(80)));
+    assert_eq!(http.get("targetPort"), Some(&Value::Int(8080)));
+    assert!(
+        ports.get("443").is_some(),
+        "an unnamed port is keyed by its number rather than dropped: {ports:?}"
+    );
+    let selector = map_of(api, "selector");
+    assert_eq!(selector.get("app"), Some(&Value::String("api".into())));
+
+    let headless = &records[1];
+    assert_eq!(
+        headless.get("selector"),
+        Some(&Value::Null),
+        "§26.1: a selector-less Service creates no guessed edges, and the null is what says so"
+    );
+    assert_eq!(
+        text_of(headless, "cluster_ip").as_deref(),
+        Some("None"),
+        "a headless Service is a deliberate configuration, not a missing address"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_an_endpoint_without_a_target_reference_an_endpoint_fact() {
+    // §26.4: an endpoint with no `targetRef` is an address that answers, and forcing it into a
+    // Pod relationship would invent one. So `addresses` is longer than `targets`, and the
+    // difference is exactly the external endpoint.
+    let plugin = loaded_with_tier_one().await;
+    let records = answered(
+        &plugin,
+        "k8s-endpointslice",
+        "io.github.godspeed-you.kubernetes.endpointslice/1",
+    )
+    .await;
+    let slice = &records[0];
+    assert_eq!(text_of(slice, "address_type").as_deref(), Some("IPv4"));
+    assert_eq!(
+        text_of(slice, "service_name").as_deref(),
+        Some("api"),
+        "§26.2's standard label, which is convention evidence rather than API structure"
+    );
+    assert_eq!(slice.get("endpoint_count"), Some(&Value::Int(3)));
+    assert_eq!(
+        slice.get("ready_endpoints"),
+        Some(&Value::Int(2)),
+        "an endpoint that states `ready: false` is not ready, and one that states nothing is not \
+         counted ready either"
+    );
+    assert_eq!(
+        list_of(slice, "addresses"),
+        Some(vec![
+            "10.1.2.3".to_owned(),
+            "10.1.2.4".to_owned(),
+            "203.0.113.9".to_owned(),
+        ])
+    );
+    assert_eq!(
+        list_of(slice, "targets"),
+        Some(vec!["api-7d9f-abc".to_owned(), "api-7d9f-def".to_owned()]),
+        "the external address contributes no target rather than a blank one"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_report_every_service_an_ingress_routes_to_and_the_secrets_it_terminates_with() {
+    // §27.1: routes-to, uses-tls-secret and the load-balancer address. Both backends are found —
+    // the default backend and every rule path — so an ingress with two services does not report
+    // one.
+    let plugin = loaded_with_tier_one().await;
+    let records = answered(
+        &plugin,
+        "k8s-ingress",
+        "io.github.godspeed-you.kubernetes.ingress/1",
+    )
+    .await;
+    let ingress = &records[0];
+    assert_eq!(text_of(ingress, "ingress_class").as_deref(), Some("nginx"));
+    assert_eq!(
+        list_of(ingress, "hosts"),
+        Some(vec!["shop.example".to_owned()])
+    );
+    assert_eq!(
+        list_of(ingress, "services"),
+        Some(vec!["api".to_owned(), "assets".to_owned()]),
+        "every rule path's backend, in the order the rules list them"
+    );
+    assert_eq!(
+        list_of(ingress, "tls_secrets"),
+        Some(vec!["shop-tls".to_owned()])
+    );
+    assert_eq!(
+        list_of(ingress, "load_balancer"),
+        Some(vec!["198.51.100.7".to_owned()])
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_say_what_a_job_completed_and_which_cron_job_created_it() {
+    // §25.5's ownership, and the desired-versus-observed pair a job actually has: what it was
+    // asked to complete beside what it has.
+    let plugin = loaded_with_tier_one().await;
+    let jobs = answered(
+        &plugin,
+        "k8s-job",
+        "io.github.godspeed-you.kubernetes.job/1",
+    )
+    .await;
+    let job = &jobs[0];
+    assert_eq!(job.get("completions"), Some(&Value::Int(1)));
+    assert_eq!(job.get("succeeded"), Some(&Value::Int(1)));
+    assert_eq!(
+        job.get("failed"),
+        Some(&Value::Null),
+        "the status is silent about failures, and that is unknown rather than zero"
+    );
+    assert_eq!(
+        text_of(job, "complete").as_deref(),
+        Some("True"),
+        "the condition's status verbatim: `True`, `False` and `Unknown` are three states"
+    );
+    assert_eq!(job.get("failure_reason"), Some(&Value::Null));
+    assert!(matches!(job.get("start_time"), Some(Value::Timestamp(_))));
+    assert_eq!(text_of(job, "controller").as_deref(), Some("nightly"));
+    assert_eq!(text_of(job, "controller_kind").as_deref(), Some("CronJob"));
+
+    let cronjobs = answered(
+        &plugin,
+        "k8s-cronjob",
+        "io.github.godspeed-you.kubernetes.cronjob/1",
+    )
+    .await;
+    let cronjob = &cronjobs[0];
+    assert_eq!(text_of(cronjob, "schedule").as_deref(), Some("0 2 * * *"));
+    assert_eq!(cronjob.get("suspend"), Some(&Value::Bool(false)));
+    assert_eq!(
+        list_of(cronjob, "active_jobs"),
+        Some(vec!["nightly-28291".to_owned()]),
+        "the live set, and never a history §25.5 forbids reconstructing"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_not_treat_a_pending_claim_with_no_volume_name_as_bound() {
+    // §30.2, stated as a null rather than as prose: the second claim is Pending and names no
+    // volume, and nothing fills that gap from its phase or its storage class.
+    let plugin = loaded_with_tier_one().await;
+    let claims = answered(
+        &plugin,
+        "k8s-persistentvolumeclaim",
+        "io.github.godspeed-you.kubernetes.persistentvolumeclaim/1",
+    )
+    .await;
+    let bound = &claims[0];
+    assert_eq!(text_of(bound, "phase").as_deref(), Some("Bound"));
+    assert_eq!(text_of(bound, "volume_name").as_deref(), Some("pv-0001"));
+    assert_eq!(
+        text_of(bound, "requested_storage").as_deref(),
+        Some("10Gi"),
+        "what was asked for"
+    );
+    assert_eq!(
+        text_of(bound, "bound_capacity").as_deref(),
+        Some("10Gi"),
+        "and what it got, kept apart because they can differ"
+    );
+
+    let pending = &claims[1];
+    assert_eq!(text_of(pending, "phase").as_deref(), Some("Pending"));
+    assert_eq!(
+        pending.get("volume_name"),
+        Some(&Value::Null),
+        "§30.2: a Pending claim with no volumeName MUST NOT be treated as bound"
+    );
+    assert_eq!(pending.get("bound_capacity"), Some(&Value::Null));
+
+    // The other end of the binding, and what deleting it would do to the storage (§30.5).
+    let volumes = answered(
+        &plugin,
+        "k8s-persistentvolume",
+        "io.github.godspeed-you.kubernetes.persistentvolume/1",
+    )
+    .await;
+    let volume = &volumes[0];
+    assert_eq!(
+        volume.get("namespace"),
+        None,
+        "a PersistentVolume is cluster-scoped, so its schema has no namespace at all (§9.2)"
+    );
+    assert_eq!(
+        text_of(volume, "claim").as_deref(),
+        Some("default/data-ledger-0")
+    );
+    assert_eq!(text_of(volume, "reclaim_policy").as_deref(), Some("Retain"));
+    assert_eq!(
+        text_of(volume, "csi_driver").as_deref(),
+        Some("ebs.csi.aws.com"),
+        "the driver name only: resolving it to a cloud disk belongs to a cross-system resolver \
+         and would link this package to a cloud SDK (§30.4, Gate K)"
+    );
+
+    let classes = answered(
+        &plugin,
+        "k8s-storageclass",
+        "io.github.godspeed-you.kubernetes.storageclass/1",
+    )
+    .await;
+    let class = &classes[0];
+    assert_eq!(
+        text_of(class, "volume_binding_mode").as_deref(),
+        Some("WaitForFirstConsumer"),
+        "which is why a Pending claim can be entirely correct"
+    );
+    assert_eq!(
+        text_of(class, "reclaim_policy").as_deref(),
+        Some("Delete"),
+        "a StorageClass states it at the top level where a volume states it under `spec`"
+    );
+    assert_eq!(class.get("is_default"), Some(&Value::Bool(true)));
+    assert_eq!(
+        map_of(class, "parameters").get("type"),
+        Some(&Value::String("gp3".into())),
+        "the driver's own vocabulary, uninterpreted"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_a_network_policy_s_peers_in_the_structure_the_api_states_them() {
+    // §31.2: the peers combine namespace selectors, pod selectors and IP blocks, and MUST NOT be
+    // reduced to a misleading boolean. §31.3: the object is intent, and no field here claims the
+    // installed network implementation enforces it.
+    let plugin = loaded_with_tier_one().await;
+    let records = answered(
+        &plugin,
+        "k8s-networkpolicy",
+        "io.github.godspeed-you.kubernetes.networkpolicy/1",
+    )
+    .await;
+    let policy = &records[0];
+    assert_eq!(
+        list_of(policy, "policy_types"),
+        Some(vec!["Ingress".to_owned()])
+    );
+    let selector = map_of(policy, "pod_selector");
+    let Some(Value::Map(labels)) = selector.get("matchLabels") else {
+        panic!("the selector keeps its native structure");
+    };
+    assert_eq!(labels.get("app"), Some(&Value::String("api".into())));
+
+    let rules = map_of(policy, "rules");
+    let Some(Value::List(ingress)) = rules.get("ingress") else {
+        panic!("the ingress rules survive as a list");
+    };
+    let Some(Value::Map(rule)) = ingress.first() else {
+        panic!("each rule survives as a map");
+    };
+    let Some(Value::List(from)) = rule.get("from") else {
+        panic!("the peers survive");
+    };
+    assert_eq!(
+        from.len(),
+        2,
+        "a namespace selector and an IP block, both kept"
+    );
+    let Some(Value::Map(block)) = from.get(1) else {
+        panic!("the IP block survives as a map");
+    };
+    let Some(Value::Map(cidr)) = block.get("ipBlock") else {
+        panic!("with its cidr and its exceptions");
+    };
+    assert_eq!(
+        cidr.get("cidr"),
+        Some(&Value::String("10.0.0.0/8".into())),
+        "the exceptions are what a boolean summary would lose (§31.2)"
+    );
+    assert_eq!(
+        rules.get("egress"),
+        None,
+        "a policy with no egress block states none"
+    );
+
+    let rendered = ono_value::to_json_string(&Value::Record(Arc::clone(policy)))
+        .expect("a record renders as JSON");
+    assert!(
+        !rendered.contains("enforced") && !rendered.contains("internet_access"),
+        "§31.3: nothing here claims the network plugin enforces this policy: {rendered}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_answer_a_config_map_with_its_key_names_and_whether_it_may_still_change() {
+    // §29.4: the immutable flag decides whether a prospective change is possible at all. And the
+    // keys come across the same boundary a Secret's do, because a schema whose shape depended on
+    // whether the payload is sensitive would make redaction a per-kind decision (ADR-0003).
+    let plugin = loaded_with_tier_one().await;
+    let records = answered(
+        &plugin,
+        "k8s-configmap",
+        "io.github.godspeed-you.kubernetes.configmap/1",
+    )
+    .await;
+    let configmap = &records[0];
+    assert_eq!(
+        list_of(configmap, "keys"),
+        Some(vec!["endpoint".to_owned(), "log_level".to_owned()]),
+        "sorted, because a JSON object states no order"
+    );
+    assert_eq!(
+        list_of(configmap, "binary_keys"),
+        Some(vec!["seed.bin".to_owned()]),
+        "binary and text entries are consumed differently, so they are two fields"
+    );
+    assert_eq!(configmap.get("immutable"), Some(&Value::Bool(true)));
+
+    let accounts = answered(
+        &plugin,
+        "k8s-serviceaccount",
+        "io.github.godspeed-you.kubernetes.serviceaccount/1",
+    )
+    .await;
+    let account = &accounts[0];
+    assert_eq!(
+        list_of(account, "secrets"),
+        Some(vec!["api-token".to_owned()])
+    );
+    assert_eq!(
+        list_of(account, "image_pull_secrets"),
+        Some(vec!["registry-pull".to_owned()]),
+        "§32.1's image-pull relationship, as names and never as payload"
+    );
+    assert_eq!(
+        account.get("automount_token"),
+        Some(&Value::Bool(false)),
+        "what the account asked for, which a pod spec may still override either way"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_read_any_tier_one_kind_by_name_as_well_as_by_collection() {
+    // §17.1 across the kinds this session wired: `--name` is an option on every one of them,
+    // not on the five that happened to exist first.
+    let cluster = RecordedCluster::with_tier_one();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let invocation = plugin
+        .query("k8s-service", at_cluster(&[("name", json!("api"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    // The recorded server has no object endpoint for it, so the answer is the honest one: the
+    // object is not there. What this test pins is that the *route* is the object endpoint.
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert!(records(&events).is_empty());
+    assert!(
+        cluster
+            .heads()
+            .iter()
+            .any(|head| head.starts_with("GET /api/v1/namespaces/default/services/api ")),
+        "the service's own endpoint was asked, not the collection: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
 }
