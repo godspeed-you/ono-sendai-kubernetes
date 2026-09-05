@@ -88,5 +88,12 @@ The gate was checked against the four regressions it exists to catch: an edited 
 specification missing from the path the manifest names, instructions that stop naming the
 specification, and a broken relative link. All four turn it red.
 
+`implementation` was created from `main` and pushed, both pointing at the same commit, mirroring
+core. It was missing at first: `AGENTS.md` §11 required the branch, the gate refused to run on
+`main` and named it as the way out, and CI triggered on it — while the branch did not exist. That
+still "worked", because `git switch --create` makes one on the spot, but a branch the policy
+depends on should exist deliberately rather than appear as a side effect of the first agent who
+reads the refusal.
+
 Next: nothing is claimed. Phase 1 of §64 is the work, and it needs a decision about where the
 implementation lives — a crate in this repository, or a KUANG/11 package — which is `ADR-0002`.
