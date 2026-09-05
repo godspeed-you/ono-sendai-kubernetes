@@ -18,14 +18,23 @@
 # null when `spec.unschedulable` is absent, not `false`, because the API server's defaulting is
 # the API server's business and asserting it here would report something the object never said.
 #
-# **Five schemas, not nineteen.** `targets.yaml` declares nineteen nouns; this document declares
-# the five the plugin emits records for today. A declared schema nothing emits is a claim the
-# package cannot keep, and §31.68's placeholders already give the other fourteen help and
-# completion without pretending they answer. The five are chosen so that each proves something
+# **A schema per noun that answers, and no more.** `targets.yaml` declares every noun this
+# package makes typeable; this document declares only the schemas the plugin emits records for. A declared schema nothing emits is a claim the package
+# cannot keep, and §31.68's placeholders already give the other fourteen help and completion
+# without pretending they answer. The five curated ones are chosen so that each proves something
 # different: `namespace` is the scope dimension itself, `node` and `namespace` are cluster-scoped
 # while the rest are namespaced, `pod` is the noun the milestone names, `deployment` carries the
 # desired-versus-observed pair of §14.4, and `secret` is where §22's redaction boundary is
 # demonstrated rather than asserted.
+#
+# **`resource` is the sixth, and it is one schema for every kind there will ever be** (§15.1,
+# §33.1, ADR-0010). A record may only claim a schema its package contributed at load, and the
+# contributions are written before the package has spoken to any cluster — so there is no moment
+# at which a schema named after a CRD could honestly be declared. The consequence is deliberate
+# and worth stating plainly: the Ono schema id does not distinguish one custom kind from another.
+# What distinguishes them is inside the record, as §13.2's canonical host type — `api_group`,
+# `kind`, `resource_name` and `scope` — and a consumer that wants only one kind filters on those
+# rather than on the schema.
 #
 # **What this document says and the handshake cannot.** `SchemaContribution` on the wire carries
 # `id`, `name`, `summary`, `identity` and the fields' names, types and nullability — it has no
@@ -356,3 +365,254 @@ schemas:
           §21.4 keeps that apart from a Secret that carries no keys, which is `[]`.
     default_view:
       columns: [name, namespace, secret_type, keys, created]
+
+  - id: io.github.godspeed-you.kubernetes.resource/1
+    name: KubernetesResource
+    summary: Any resource the cluster serves, typed by the schema the cluster publishes for it.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). It is the identity of a custom
+          resource for exactly the reason it is the identity of a Pod: the API server guarantees
+          it and a name is a label a human reuses.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.namespace`. Null for a cluster-scoped resource, which has no namespace
+          rather than an empty one (§9.2) — `scope` below says which it is.
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, as the object was read: `v1` for the core group, `group/version` otherwise.'
+      kind:
+        type: string
+        required: true
+        doc: >-
+          `kind`, as the server spells it. With `api_group` this is the object identity §13.5
+          requires, because kinds are not globally unique.
+      resource_version:
+        type: string
+        nullable: true
+        doc: '`metadata.resourceVersion`, opaque (§14.3).'
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      terminating:
+        type: bool
+        required: true
+        doc: Whether deletion was accepted and has not completed (Gate H).
+      api_group:
+        type: string
+        required: true
+        doc: >-
+          The API group, and the empty string for the core group (§13.3). Required and sometimes
+          empty rather than nullable: the core group is a group whose name is empty, which is a
+          known fact, and null would say nobody knows which group this is.
+      resource_name:
+        type: string
+        required: true
+        doc: >-
+          The plural REST resource discovery named — a GVR's third part, never a kind (§13.1,
+          §13.2). It is here because a query that started from a kind still has to be able to
+          say which collection answered.
+      scope:
+        type: enum
+        values: [namespaced, cluster]
+        required: true
+        doc: >-
+          Whether objects of this resource live in a namespace, as the server declared it
+          (§13.2). Discovered rather than inferred from whether this object happens to carry a
+          namespace.
+      schema_source:
+        type: enum
+        values: [openapi-v3, crd-structural, absent]
+        required: true
+        doc: >-
+          Where the field descriptions came from (§12.1). `absent` means nothing described this
+          resource — which is a statement about the server's documents and never a reason to
+          withhold the object (§12.3, §15.5).
+      precision:
+        type: enum
+        values: [structural, loose, unknown]
+        required: true
+        doc: >-
+          How well the content below is known, as the weakest of its parts (§12.3): `structural`
+          when a schema states every field's type, `loose` where a schema reaches a field and
+          declines to describe it, `unknown` where none reaches it. Metadata is excluded, because
+          this package projects metadata itself and a schema's silence about it leaves no gap.
+      spec:
+        type: map
+        nullable: true
+        doc: >-
+          `spec`, whole: what someone asked for (§4 invariant 8). Null when the object carries
+          none. Values are typed as far as the schema types them — a `date-time` format makes an
+          instant, and its absence leaves the same field as the text the server sent.
+      status:
+        type: map
+        nullable: true
+        doc: >-
+          `status`, whole: what a controller reported observing. Never merged with `spec`,
+          because desired and observed state are different claims (§33.6, §37).
+      other:
+        type: map
+        nullable: true
+        doc: >-
+          Every other top-level field — a ConfigMap's `data`, a Role's `rules` — so that a kind
+          keeping its content outside `spec` keeps it here rather than losing it (§12.5, §4
+          invariant 17). Null when the object has none. A Secret's payload is not among them: it
+          was destroyed at the redaction boundary before this record existed (§22, ADR-0003).
+      untyped:
+        type: list<string>
+        required: true
+        doc: >-
+          The JSON pointers of the content fields no schema described (§12.5). Those fields are
+          present and valued in `spec`, `status` and `other` all the same — this list says which
+          of them nothing vouches for, so that "shown" is never read as "understood". Empty
+          rather than null when a schema described everything: that is a known answer.
+    default_view:
+      columns: [name, namespace, kind, api_group, precision, created]
+
+  - id: io.github.godspeed-you.kubernetes.cluster/1
+    name: KubernetesCluster
+    summary: >-
+      One provider instance: which cluster it reaches, whether it answers, and who it is to it.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        required: true
+        doc: >-
+          The provider instance — `kubernetes:<context>` (§6.2, §10.1). Not a `metadata.uid`:
+          this record is not a Kubernetes object. It is the identity because it is what stays
+          stable across reconnects and what two instances pointed at one cluster differ in.
+          Keying on the cluster fingerprint instead would merge exactly the two instances §10.3
+          says MUST NOT be merged.
+      name:
+        type: string
+        required: true
+        doc: 'The context this instance was configured from. A locator, never an identity (§16.2).'
+      server:
+        type: string
+        nullable: true
+        doc: >-
+          The normalised API server origin — §10.2's first fingerprint signal, with the scheme's
+          default port dropped so that two spellings of one address compare equal.
+      reachable:
+        type: bool
+        required: true
+        doc: >-
+          Whether the API server answered anything at all. A `403` counts: a server that refuses
+          is a server that is there, and the two have different fixes (§21.4).
+      server_version:
+        type: string
+        nullable: true
+        doc: >-
+          `gitVersion` from `/version`, verbatim. Never interpreted: §5.3 forbids rejecting a
+          cluster whose version string is unfamiliar. Null when `/version` did not answer, and
+          `unknowns` then says why.
+      tls:
+        type: string
+        required: true
+        doc: >-
+          What protects the session: `verified`, `insecure: certificate verification disabled`,
+          or `none: plain HTTP/1.1`. §8.4 requires the active insecure state to be visible in
+          provider diagnostics, so this is stated rather than inferred from the URL.
+      fingerprint:
+        type: string
+        nullable: true
+        doc: >-
+          A non-secret digest over the fingerprint signals that were obtained (§10.2). Null when
+          none were — a hash of nothing is a stable value every unidentifiable cluster would
+          share. Two instances with the same fingerprint may be one cluster and are still two
+          instances (§10.3).
+      fingerprint_signals:
+        type: list<string>
+        required: true
+        doc: >-
+          Which of §10.2's signals the fingerprint above is composed of, so that one built from a
+          single signal is visibly weaker than one built from three. Empty rather than null when
+          nothing was obtainable: that is a known answer.
+      kube_system_uid:
+        type: string
+        nullable: true
+        doc: >-
+          The `kube-system` namespace UID, the strongest identifier Kubernetes offers (§10.2).
+          Null where the caller may not read it, and `unknowns` distinguishes a refusal from a
+          namespace that is not there.
+      server_key_fingerprint:
+        type: string
+        nullable: true
+        doc: >-
+          A SHA-256 over the server certificate's `SubjectPublicKeyInfo` (§10.2). The key rather
+          than the certificate, so an ordinary renewal is not reported as a cluster replacement
+          (§10.4). Null in this build, which does not surrender the verified certificate from its
+          TLS session; `unknowns` records it as `not queried` rather than as absent.
+      credential_identity:
+        type: string
+        nullable: true
+        doc: >-
+          The identity of the credential itself, before any impersonation (§8.5). Held apart from
+          `effective_identity` even while nothing impersonates, so that the day one does, no
+          reader of either field silently changes meaning.
+      effective_identity:
+        type: string
+        nullable: true
+        doc: >-
+          The username the API server associates with this session's requests, from
+          `SelfSubjectReview` (§8.6). Null where the cluster does not serve the review or refused
+          it — which §8.6 requires never to block an ordinary read, so it is an unknown here and
+          not an error.
+      effective_uid:
+        type: string
+        nullable: true
+        doc: 'The effective identity''s UID, where the authenticator provides one. Most do not.'
+      effective_groups:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The groups the API server resolved for this session. Null when the effective identity
+          was not obtained; an empty list would claim membership of none.
+      impersonating:
+        type: bool
+        required: true
+        doc: >-
+          Whether the session asks the API server to act as somebody else (§8.5). Always knowable
+          locally, so never an unknown.
+      impersonated_user:
+        type: string
+        nullable: true
+        doc: 'The subject being impersonated, and null when none is (§8.5).'
+      unknowns:
+        type: list<string>
+        required: true
+        doc: >-
+          Everything this diagnostic could not determine, each naming a subject and one of §21.4's
+          outcomes — `read denied`, `not served`, `namespace absent`, `disconnected`,
+          `not queried`. This is what makes a field the cluster refused distinguishable from one
+          it does not have. Empty rather than null when everything was determined.
+      probes:
+        type: map
+        required: true
+        doc: >-
+          Every request this diagnostic made, by source, with how it ended (§34.3). Per request
+          rather than per cluster, so that an aggregated API server with its own availability is
+          not reported as the cluster being unwell.
+      latency_ms:
+        type: map
+        required: true
+        doc: 'How long each request above took, in milliseconds (§34.3).'
+    default_view:
+      columns: [name, server, reachable, server_version, effective_identity, tls]

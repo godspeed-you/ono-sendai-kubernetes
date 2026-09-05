@@ -1278,6 +1278,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "serde",

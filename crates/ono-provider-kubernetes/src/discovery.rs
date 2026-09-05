@@ -354,6 +354,17 @@ impl Discovery {
         self.resources.contains_key(group_version)
     }
 
+    /// Every API group the server serves, the core group's empty name included (§13.3).
+    ///
+    /// The other accessors answer questions *about* a group whose name the caller already has.
+    /// This one exists for the query that names a kind and no group: the group is then the
+    /// answer rather than the question, and finding it means asking the server which groups it
+    /// serves rather than consulting a list compiled into this crate (§4 invariants 1–2, §11.1).
+    /// The empty name is yielded like any other, because the core group is a group (§13.3).
+    pub fn groups(&self) -> impl Iterator<Item = &str> {
+        self.versions.keys().map(String::as_str)
+    }
+
     /// Every version the server serves for a group.
     #[must_use]
     pub fn versions_of(&self, group: &str) -> Vec<String> {

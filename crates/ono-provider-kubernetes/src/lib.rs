@@ -19,12 +19,14 @@
 //! redaction     Secret payloads, destroyed at the boundary rather than filtered
 //! place         resources as addresses, and what is near them
 //! coverage      what a query observed, and what it did not
+//! diagnostics   which cluster this is, whether it answers, and who the provider is to it
 //! kubeconfig    a context becomes a connection identity
 //! tls           a TLS session, wrapping the brokered byte stream below HTTP
 //! ```
 
 pub mod condition;
 pub mod coverage;
+pub mod diagnostics;
 pub mod discovery;
 pub mod kubeconfig;
 pub mod object;

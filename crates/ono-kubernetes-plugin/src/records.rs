@@ -19,12 +19,14 @@
 
 use std::sync::Arc;
 
+use ono_provider_kubernetes::discovery::Resource;
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_value::{ErrorValue, MapValue, Provenance, RecordValue, Schema, Value, builtin_schemas};
 use serde_json::Value as Json;
 
 use crate::contributions::Target;
+use crate::dynamic::{self, Typing};
 
 /// Builds one record of `target`'s schema from a guarded object.
 ///
@@ -43,6 +45,68 @@ pub fn record(
     let mut builder = RecordValue::builder(Arc::clone(schema), provenance);
     for field in target.fields {
         builder = builder.set(field.name, field_value(field.name, guarded))?;
+    }
+    Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// Builds one record of a resource this package has never heard of (§15.1, §33.1, Gate A).
+///
+/// The shared metadata is filled by exactly the same code the curated targets use, because §14's
+/// projection is common to every Kubernetes object and a second copy of it would be a second
+/// chance to disagree about what `terminating` means. What the discovered resource adds is what
+/// only discovery and the cluster's schema can say: §13.2's type identity, how well the fields
+/// are known, and the fields themselves.
+///
+/// **The record claims `io.github.godspeed-you.kubernetes.resource/1` whatever kind it holds.**
+/// A record may only claim a schema its package contributed at load, and the contributions are
+/// fixed before the package has spoken to a cluster — so a schema id naming the kind is not a
+/// choice this package gets to make. The cost is that the Ono schema no longer distinguishes one
+/// custom kind from another; the record carries `api_group`, `kind`, `resource_name` and `scope`
+/// so that the *Kubernetes* type identity §13.2 requires survives that flattening. ADR-0010.
+///
+/// # Errors
+///
+/// [`ErrorValue`] when a field name is not one the schema declares — a drift between this crate's
+/// table and the schema built from it, never something a cluster can cause.
+pub fn dynamic_record(
+    target: &Target,
+    schema: &Arc<Schema>,
+    resource: &Resource,
+    typing: &Typing,
+    guarded: &Guarded,
+) -> Result<Value, ErrorValue> {
+    let object = guarded.object();
+    let projection = typing.project(object);
+    let content = dynamic::content(&projection, object.native());
+    let provenance = Provenance::local(crate::PACKAGE, schema.id().clone());
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance);
+    for field in target.fields {
+        let value = match field.name {
+            // --- what this is: §13.2's canonical host type, which one shared schema would
+            // otherwise lose ---
+            "api_group" => Value::String(resource.group().into()),
+            "resource_name" => Value::String(resource.plural().into()),
+            "scope" => Value::String(dynamic::scope_word(resource.scope()).into()),
+
+            // --- how well it is known (§12.3) ---
+            "schema_source" => Value::String(typing.source().as_str().into()),
+            "precision" => Value::String(content.precision.as_str().into()),
+
+            // --- what it holds, with desired and observed kept apart (§4 invariant 8, §33.6) ---
+            "spec" => content.desired.clone(),
+            "status" => content.observed.clone(),
+            "other" => content.other.clone(),
+            "untyped" => Value::List(
+                content
+                    .untyped
+                    .iter()
+                    .map(|pointer| Value::String(pointer.as_str().into()))
+                    .collect(),
+            ),
+
+            name => field_value(name, guarded),
+        };
+        builder = builder.set(field.name, value)?;
     }
     Ok(Value::Record(Arc::new(builder.build())))
 }

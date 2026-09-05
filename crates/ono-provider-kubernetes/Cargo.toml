@@ -20,6 +20,9 @@ base64 = { workspace = true }
 # provider, so the tree carries one TLS implementation rather than two.
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+# The SHA-256 under §10.2's cluster fingerprint. Already in the tree beneath `rustls`, so this
+# declares a dependency the build has rather than adding one.
+ring = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]

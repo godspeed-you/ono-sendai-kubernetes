@@ -2,11 +2,17 @@
 //!
 //! The shape of an answer is fixed by three things the specification does not leave open.
 //!
-//! **Discovery decides which collection is read.** The target table names a group and a kind —
+//! **Discovery decides which collection is read.** A curated target names a group and a kind —
 //! GVK identity — and nothing more. Which resource serves that kind, at which version, and
 //! whether it is namespaced is asked of the API server every time (§4 invariants 1–2, §5.2,
 //! §13.1). A hard-coded `/api/v1/pods` would be a compile-time claim about a cluster this code
 //! has never seen, and it is exactly the claim §33.1 forbids for custom resources.
+//!
+//! **`k8s-resource` takes the kind from the query instead of from the table**, and is otherwise
+//! the same path (§15.1, §33.1, ADR-0010). It exists because a document written before this
+//! package runs cannot name a kind invented after it, so the noun names the shape of the
+//! question. Its records carry the one schema the package can honestly declare for a kind it
+//! has never seen, and say which Kubernetes type they are in their fields (§13.2).
 //!
 //! **Every object crosses the boundary as a [`Guarded`].** There is no path from a listing to an
 //! emission that does not go through the redaction guard, so a Secret's payload is destroyed
@@ -31,7 +37,7 @@ use std::sync::Arc;
 use ono_kuang_sdk::protocol::{WireError, method};
 use ono_kuang_sdk::{Ctx, EmitError, Outcome};
 use ono_provider_kubernetes::coverage::Scope;
-use ono_provider_kubernetes::discovery::{self, Discovery, Verb};
+use ono_provider_kubernetes::discovery::{self, Discovery, Resource, Verb};
 use ono_provider_kubernetes::kubeconfig::{Credential, Kubeconfig, Secret, Trust};
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::tls::{Anchors, ClientIdentity, TlsError, TlsSettings, TlsStream};
@@ -42,21 +48,31 @@ use ono_value::Schema;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use crate::broker::{BrokeredStream, decode_hex};
-use crate::contributions::Target;
-use crate::records::record;
+use crate::contributions::{Reads, Target};
+use crate::dynamic::{self, Selector, Typing, Unresolved};
+use crate::records::{dynamic_record, record};
 
 /// `provider.unavailable`, as core's `docs/contracts/errors.yaml` publishes it.
 ///
 /// Spelled out rather than taken from `ono_core::ErrorCode`, which a package does not depend on.
 /// The KUANG taxonomy has no code for "this provider could not reach the system it fronts", and
 /// inventing one would put a code on the wire that no registry explains.
-const UNAVAILABLE_CODE: &str = "Ono-Sendai-E0401";
+pub(crate) const UNAVAILABLE_CODE: &str = "Ono-Sendai-E0401";
 /// The dotted name of [`UNAVAILABLE_CODE`].
-const UNAVAILABLE: &str = "provider.unavailable";
+pub(crate) const UNAVAILABLE: &str = "provider.unavailable";
 /// `provider.unsupported`, for a cluster that serves no such thing.
-const UNSUPPORTED_CODE: &str = "Ono-Sendai-E0402";
+pub(crate) const UNSUPPORTED_CODE: &str = "Ono-Sendai-E0402";
 /// The dotted name of [`UNSUPPORTED_CODE`].
-const UNSUPPORTED: &str = "provider.unsupported";
+pub(crate) const UNSUPPORTED: &str = "provider.unsupported";
+/// `resolve.ambiguous`, for a name that several served types share (§35.8, §13.5).
+///
+/// Core's own code for "the name matches more than one candidate and no namespace was given",
+/// which is exactly what a kind two API groups both serve is. Reusing it rather than inventing a
+/// Kubernetes-shaped one keeps §0.4: a shell that already knows how to render an ambiguity needs
+/// no Kubernetes special case to render this one.
+pub(crate) const AMBIGUOUS_CODE: &str = "Ono-Sendai-E0103";
+/// The dotted name of [`AMBIGUOUS_CODE`].
+pub(crate) const AMBIGUOUS: &str = "resolve.ambiguous";
 
 /// The port `kubectl proxy` listens on unless told otherwise.
 ///
@@ -91,6 +107,9 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
         Ok(schema) => Arc::new(schema),
         Err(error) => return Outcome::Failed(error.into()),
     };
+    // Read before the connection opens, because the brokered stream borrows the context for as
+    // long as it lives and the query's own words are needed after that.
+    let selector = Selector::from_options(ctx.arguments());
     let endpoint = match Endpoint::resolve(ctx) {
         Ok(endpoint) => endpoint,
         Err(error) => return Outcome::Failed(error),
@@ -112,14 +131,14 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
             // `kubectl proxy` speaks, and never what one reached directly does.
             None => {
                 let mut client = endpoint.client(stream);
-                let listing = read(&mut client, target, &endpoint);
+                let listing = read(&mut client, target, &endpoint, &selector);
                 let open = client.into_stream().is_open();
                 (listing, handle, open)
             }
             Some(settings) => match TlsStream::connect(stream, &endpoint.server_name, settings) {
                 Ok(session) => {
                     let mut client = endpoint.client(session);
-                    let listing = read(&mut client, target, &endpoint);
+                    let listing = read(&mut client, target, &endpoint, &selector);
                     let open = client.into_stream().into_inner().is_open();
                     (listing, handle, open)
                 }
@@ -137,11 +156,30 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
         let _ = ctx.host_call(method::NETWORK_CLOSE, json!({"connection": handle}));
     }
 
-    let listing = match listing {
-        Ok(listing) => listing,
+    let (listing, shape) = match listing {
+        Ok(answer) => answer,
         Err(error) => return Outcome::Failed(error),
     };
-    emit(ctx, target, &schema, listing)
+    emit(ctx, target, &schema, &shape, listing)
+}
+
+/// How the records of one answer are built.
+///
+/// The two cases differ in exactly one thing — where the field values come from — and share
+/// everything else: the same discovery, the same list, the same redaction boundary, the same
+/// coverage rules. Keeping the difference in one enum is what stops a dynamic resource becoming
+/// a second read path with its own bugs (§33.1's "CRDs are normal resources").
+enum Shape {
+    /// A curated noun: the table's fields, filled from the object (§15.2).
+    Curated,
+    /// A discovered resource: §13.2's type identity beside the cluster's own typing (§15.1).
+    Discovered {
+        /// What discovery said this resource is — the group, the plural and the scope no
+        /// record could otherwise carry once every kind shares one schema.
+        resource: Box<Resource>,
+        /// What the cluster publishes about its fields, which may be nothing (§12.3).
+        typing: Box<Typing>,
+    },
 }
 
 /// Streams the listing's objects, then reports whatever the listing could not see.
@@ -149,6 +187,7 @@ fn emit(
     ctx: &mut Ctx<'_>,
     target: &'static Target,
     schema: &Arc<Schema>,
+    shape: &Shape,
     listing: Listing,
 ) -> Outcome {
     let coverage = listing.coverage().describe();
@@ -171,7 +210,13 @@ fn emit(
                 ));
             }
         };
-        let value = match record(target, schema, &guarded) {
+        let built = match shape {
+            Shape::Curated => record(target, schema, &guarded),
+            Shape::Discovered { resource, typing } => {
+                dynamic_record(target, schema, resource, typing, &guarded)
+            }
+        };
+        let value = match built {
             Ok(value) => value,
             Err(error) => {
                 return Outcome::Failed(failure(
@@ -223,7 +268,8 @@ fn read<S: ByteStream>(
     client: &mut Client<S>,
     target: &'static Target,
     endpoint: &Endpoint,
-) -> Result<Listing, WireError> {
+    selector: &Selector,
+) -> Result<(Listing, Shape), WireError> {
     let core = document(client, endpoint, "/api")?;
     let groups = document(client, endpoint, "/apis")?;
     // Two passes over the same two documents rather than two round trips: the preferred version
@@ -241,62 +287,37 @@ fn read<S: ByteStream>(
             )
         })?
         .build();
-    let version = served.preferred_version(target.group).ok_or_else(|| {
-        failure(
-            UNSUPPORTED_CODE,
-            UNSUPPORTED,
-            format!(
-                "this cluster serves no version of the API group `{}`, so it serves no {}",
-                if target.group.is_empty() {
-                    "core"
-                } else {
-                    target.group
-                },
-                target.kind
-            ),
-            "An unserved API is not an empty result: nothing was asked, so nothing is known.",
-        )
-    })?;
-    let group_version = if target.group.is_empty() {
-        version.to_owned()
-    } else {
-        format!("{}/{version}", target.group)
-    };
-    let resources = document(
-        client,
-        endpoint,
-        &if target.group.is_empty() {
-            format!("/api/{version}")
-        } else {
-            format!("/apis/{group_version}")
-        },
-    )?;
-    let discovery = Discovery::builder()
-        .resources(&resources)
-        .map_err(|error| {
-            failure(
-                UNAVAILABLE_CODE,
-                UNAVAILABLE,
-                format!("the resource list of `{group_version}` did not read: {error}"),
-                "The endpoint answered, but not as a Kubernetes API server.",
-            )
-        })?
-        .build();
 
-    let resource = discovery
-        .by_kind(&group_version, target.kind)
-        .ok_or_else(|| {
-            failure(
+    let (resource, shape) = match target.reads {
+        Reads::Kind { group, kind } => {
+            let resource = curated(client, endpoint, &served, group, kind)?;
+            (resource, Shape::Curated)
+        }
+        // The instance diagnostic is not a listing of anything, so it never reaches this
+        // function: `answer` routes it before a collection is chosen. The arm exists so that
+        // adding a third way to read cannot silently fall through to a wrong one.
+        Reads::Instance => {
+            return Err(failure(
                 UNSUPPORTED_CODE,
                 UNSUPPORTED,
-                format!(
-                    "`{group_version}` serves no kind `{}` on this cluster",
-                    target.kind
-                ),
-                "Discovery is authoritative: this build makes no assumption about which APIs a \
-                 cluster serves.",
+                "the provider instance is not a collection of objects, so it cannot be listed"
+                    .to_owned(),
+                "This target reports on the session rather than on anything in the cluster.",
+            ));
+        }
+        Reads::Discovered => {
+            let resource = discovered(client, endpoint, &served, selector)?;
+            let typing = typing_of(client, endpoint, &resource)?;
+            (
+                resource.clone(),
+                Shape::Discovered {
+                    resource: Box::new(resource),
+                    typing: Box::new(typing),
+                },
             )
-        })?;
+        }
+    };
+
     if !resource.supports(Verb::List) {
         return Err(failure(
             UNSUPPORTED_CODE,
@@ -319,7 +340,268 @@ fn read<S: ByteStream>(
     if let Some(pages) = endpoint.max_pages {
         options = options.max_pages(pages);
     }
-    Ok(client.list(resource.gvr(), &scope, &options))
+    Ok((client.list(resource.gvr(), &scope, &options), shape))
+}
+
+/// The resource serving a kind this package named at build time (§15.2).
+fn curated<S: ByteStream>(
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    served: &Discovery,
+    group: &str,
+    kind: &str,
+) -> Result<Resource, WireError> {
+    let version = served.preferred_version(group).ok_or_else(|| {
+        failure(
+            UNSUPPORTED_CODE,
+            UNSUPPORTED,
+            format!(
+                "this cluster serves no version of the API group `{}`, so it serves no {kind}",
+                if group.is_empty() { "core" } else { group },
+            ),
+            "An unserved API is not an empty result: nothing was asked, so nothing is known.",
+        )
+    })?;
+    let group_version = group_version_of(group, version);
+    let discovery = resource_list(client, endpoint, &group_version)?;
+    discovery
+        .by_kind(&group_version, kind)
+        .cloned()
+        .ok_or_else(|| {
+            failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                format!("`{group_version}` serves no kind `{kind}` on this cluster"),
+                "Discovery is authoritative: this build makes no assumption about which APIs a \
+                 cluster serves.",
+            )
+        })
+}
+
+/// The resource the *query* named, resolved against what the cluster serves (§15.1, §33.1).
+///
+/// The search is over the preferred version of every group the server lists, unless the query
+/// narrowed it — which is what makes a kind nobody compiled in reachable by name alone, and what
+/// makes §35.8's ambiguity a real possibility rather than a theoretical one.
+fn discovered<S: ByteStream>(
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    served: &Discovery,
+    selector: &Selector,
+) -> Result<Resource, WireError> {
+    let group_versions = search_space(served, selector)?;
+    let mut builder = Discovery::builder();
+    for group_version in &group_versions {
+        let list = document(client, endpoint, &resource_list_path(group_version))?;
+        builder = builder.resources(&list).map_err(|error| {
+            failure(
+                UNAVAILABLE_CODE,
+                UNAVAILABLE,
+                format!("the resource list of `{group_version}` did not read: {error}"),
+                "The endpoint answered, but not as a Kubernetes API server.",
+            )
+        })?;
+    }
+    let discovery = builder.build();
+
+    dynamic::resolve(selector, &discovery)
+        .cloned()
+        .map_err(|unresolved| unresolved_failure(&unresolved, selector, &discovery))
+}
+
+/// Which group-versions the search covers.
+///
+/// One per group, because two served versions of one resource are one resource and counting them
+/// as two candidates would make §13.4's version choice look like §35.8's ambiguity. A query that
+/// wants a version other than the preferred one names the group too — a version on its own does
+/// not say which group's version it is.
+fn search_space(served: &Discovery, selector: &Selector) -> Result<Vec<String>, WireError> {
+    let Some(group) = selector.group() else {
+        if let Some(version) = selector.version() {
+            return Err(failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                format!("`version {version}` names no group, so there is no version to look for"),
+                "Two API groups may both serve a `v1`. Name `group` beside `version`, or leave \
+                 both out and take the version the server prefers (specification section 13.4).",
+            ));
+        }
+        let mut space: Vec<String> = served
+            .groups()
+            .filter_map(|group| {
+                served
+                    .preferred_version(group)
+                    .map(|version| group_version_of(group, version))
+            })
+            .collect();
+        space.sort();
+        space.dedup();
+        return Ok(space);
+    };
+    let version = match selector.version() {
+        Some(version) => {
+            let available = served.versions_of(group);
+            if !available.iter().any(|served| served == version) {
+                return Err(failure(
+                    UNSUPPORTED_CODE,
+                    UNSUPPORTED,
+                    format!(
+                        "this cluster serves no `{version}` of the API group `{}`",
+                        if group.is_empty() { "core" } else { group },
+                    ),
+                    &format!(
+                        "It serves: {}. A version the server does not offer is not an empty \
+                         collection.",
+                        if available.is_empty() {
+                            "no version of that group at all".to_owned()
+                        } else {
+                            available.join(", ")
+                        }
+                    ),
+                ));
+            }
+            version.to_owned()
+        }
+        None => served
+            .preferred_version(group)
+            .ok_or_else(|| {
+                failure(
+                    UNSUPPORTED_CODE,
+                    UNSUPPORTED,
+                    format!(
+                        "this cluster serves no version of the API group `{}`",
+                        if group.is_empty() { "core" } else { group },
+                    ),
+                    "An unserved API is not an empty result: nothing was asked, so nothing is \
+                     known.",
+                )
+            })?
+            .to_owned(),
+    };
+    Ok(vec![group_version_of(group, &version)])
+}
+
+/// What the cluster publishes about the resolved resource's fields (§12.1, §12.3, §33.3).
+///
+/// The API server's own OpenAPI v3 document, which carries a CRD's structural schema beside
+/// every built-in's — so one request types both and this package needs no permission on
+/// `customresourcedefinitions` to understand a custom resource. A server that does not publish
+/// one leaves the typing absent, and every field still projects (§12.5, Gate B).
+fn typing_of<S: ByteStream>(
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    resource: &Resource,
+) -> Result<Typing, WireError> {
+    let path = if resource.group().is_empty() {
+        format!("/openapi/v3/api/{}", resource.version())
+    } else {
+        format!(
+            "/openapi/v3/apis/{}/{}",
+            resource.group(),
+            resource.version()
+        )
+    };
+    let document = optional_document(client, endpoint, &path)?;
+    Ok(Typing::of(
+        document.as_deref(),
+        resource.group(),
+        resource.version(),
+        resource.kind(),
+    ))
+}
+
+/// One group-version's resource list, as a snapshot of its own.
+fn resource_list<S: ByteStream>(
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    group_version: &str,
+) -> Result<Discovery, WireError> {
+    let list = document(client, endpoint, &resource_list_path(group_version))?;
+    Ok(Discovery::builder()
+        .resources(&list)
+        .map_err(|error| {
+            failure(
+                UNAVAILABLE_CODE,
+                UNAVAILABLE,
+                format!("the resource list of `{group_version}` did not read: {error}"),
+                "The endpoint answered, but not as a Kubernetes API server.",
+            )
+        })?
+        .build())
+}
+
+/// `group/version`, or the bare version for the core group (§13.3).
+fn group_version_of(group: &str, version: &str) -> String {
+    if group.is_empty() {
+        version.to_owned()
+    } else {
+        format!("{group}/{version}")
+    }
+}
+
+/// Where a group-version's resource list lives: `/api` for the core group, `/apis` for the rest.
+fn resource_list_path(group_version: &str) -> String {
+    if group_version.contains('/') {
+        format!("/apis/{group_version}")
+    } else {
+        format!("/api/{group_version}")
+    }
+}
+
+/// A selector that did not name exactly one served, listable resource.
+fn unresolved_failure(
+    unresolved: &Unresolved,
+    selector: &Selector,
+    discovery: &Discovery,
+) -> WireError {
+    match unresolved {
+        Unresolved::Unasked => failure(
+            AMBIGUOUS_CODE,
+            AMBIGUOUS,
+            "the query named no `kind` and no `resource`, so it did not say which of the \
+             cluster's resources to read"
+                .to_owned(),
+            &format!(
+                "Pass `kind` (or `resource`, which takes a plural or a short name), and `group` \
+                 where two groups serve the same kind. This cluster serves:\n{}",
+                dynamic::catalogue(discovery).join("\n")
+            ),
+        ),
+        Unresolved::NotServed => failure(
+            UNSUPPORTED_CODE,
+            UNSUPPORTED,
+            format!(
+                "this cluster serves nothing matching {}",
+                selector.spelling()
+            ),
+            "Discovery is authoritative, and an unserved resource is not an empty collection: \
+             nothing was asked of the cluster, so nothing is known. A kind is spelled as the \
+             server spells it, capital and all.",
+        ),
+        Unresolved::NotListable { gvr } => failure(
+            UNSUPPORTED_CODE,
+            UNSUPPORTED,
+            format!("the cluster serves `{gvr}` but does not offer `list` on it"),
+            "A resource that cannot be listed is not an empty collection.",
+        ),
+        // §35.8: a name several types share must not resolve by an arbitrary type priority. The
+        // candidates travel with the refusal, because "be more specific" that does not say what
+        // the choices are leaves the operator worse off than before they asked.
+        Unresolved::Ambiguous { candidates } => failure(
+            AMBIGUOUS_CODE,
+            AMBIGUOUS,
+            format!(
+                "{} matches {} resources this cluster serves, and this provider does not choose \
+                 between them",
+                selector.spelling(),
+                candidates.len()
+            ),
+            &format!(
+                "Name the group as well. The candidates are:\n{}",
+                candidates.join("\n")
+            ),
+        ),
+    }
 }
 
 /// Fetches one JSON document that is not a Kubernetes object — a discovery response.
@@ -328,7 +610,7 @@ fn read<S: ByteStream>(
 /// straight to the connection rather than through `Client`'s default headers, so the credential
 /// has to be put on it here. A cluster that requires authentication for `/api` answers `401`
 /// otherwise, which reads as "not a Kubernetes API server" and is not what happened.
-fn document<S: ByteStream>(
+pub(crate) fn document<S: ByteStream>(
     client: &mut Client<S>,
     endpoint: &Endpoint,
     path: &str,
@@ -361,25 +643,47 @@ fn document<S: ByteStream>(
     })
 }
 
+/// One JSON document the query can do without.
+///
+/// `Ok(None)` for anything but a `200`, because the caller's question is "does this server
+/// publish it", and a `404` answers that. The connection failing is still an error: that is the
+/// transport breaking underneath the request rather than the server declining to answer it, and
+/// the difference decides whether the next request on the same connection can be made at all.
+fn optional_document<S: ByteStream>(
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    path: &str,
+) -> Result<Option<String>, WireError> {
+    let request = endpoint.authorise(Request::get(path).header("Accept", "application/json"));
+    let response = client
+        .connection()
+        .send(&request)
+        .map_err(|error| transport_failure(path, &error))?;
+    if response.status() != 200 {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(response.body().to_vec()).ok())
+}
+
 /// What the query was pointed at, how it proves who it is, and how much it asked about.
 ///
 /// `Debug` is written by hand. The credential is the obvious reason (§8.1), and the TLS state is
 /// the other: §8.4 requires an active insecure session to be visible in diagnostics, and a
 /// rendering that has to be pattern-matched to find out is not visible.
-struct Endpoint {
-    host: String,
-    port: u16,
+pub(crate) struct Endpoint {
+    pub(crate) host: String,
+    pub(crate) port: u16,
     /// The name the server certificate is checked against — the host from the kubeconfig's
     /// `server`, which stays what the operator wrote even where a proxy resolves it elsewhere.
-    server_name: String,
-    authority: String,
-    instance: String,
-    scope: Scope,
-    max_pages: Option<usize>,
+    pub(crate) server_name: String,
+    pub(crate) authority: String,
+    pub(crate) instance: String,
+    pub(crate) scope: Scope,
+    pub(crate) max_pages: Option<usize>,
     /// `None` is plain HTTP/1.1, which reaches an API server through `kubectl proxy` and nothing
     /// else. A `https://` server always carries settings.
-    tls: Option<TlsSettings>,
-    authorization: Option<Secret>,
+    pub(crate) tls: Option<TlsSettings>,
+    pub(crate) authorization: Option<Secret>,
 }
 
 impl fmt::Debug for Endpoint {
@@ -412,7 +716,7 @@ impl Endpoint {
     /// Three ways in, in this order: an explicit `host` (§7.3's explicit configuration, which
     /// automation and the test host use), a named `context` resolved through the kubeconfig
     /// (§7.4), or neither — which is refused rather than defaulted.
-    fn resolve(ctx: &mut Ctx<'_>) -> Result<Self, WireError> {
+    pub(crate) fn resolve(ctx: &mut Ctx<'_>) -> Result<Self, WireError> {
         let options = ctx.arguments().clone();
         let context = options
             .get("context")
@@ -555,7 +859,7 @@ impl Endpoint {
     }
 
     /// A client over `stream`, carrying whatever credential the context resolved to.
-    fn client<S: ByteStream>(&self, stream: S) -> Client<S> {
+    pub(crate) fn client<S: ByteStream>(&self, stream: S) -> Client<S> {
         let client = Client::new(stream, self.authority.clone(), self.instance.clone());
         match &self.authorization {
             None => client,
@@ -567,7 +871,7 @@ impl Endpoint {
 
     /// The same request, carrying the credential (§8.1: built at the call site, never stored on
     /// something that renders).
-    fn authorise(&self, request: Request) -> Request {
+    pub(crate) fn authorise(&self, request: Request) -> Request {
         match &self.authorization {
             None => request,
             Some(token) => request.header("Authorization", format!("Bearer {}", token.expose())),
@@ -850,7 +1154,7 @@ fn tls_configuration_failure(context: &str, error: &TlsError) -> WireError {
 }
 
 /// The handshake itself failed.
-fn handshake_failure(endpoint: &Endpoint, error: &TlsError) -> WireError {
+pub(crate) fn handshake_failure(endpoint: &Endpoint, error: &TlsError) -> WireError {
     failure(
         UNAVAILABLE_CODE,
         UNAVAILABLE,
@@ -880,7 +1184,7 @@ fn no_endpoint() -> WireError {
 }
 
 /// The connection or the protocol failed underneath a request.
-fn transport_failure(path: &str, error: &ApiError) -> WireError {
+pub(crate) fn transport_failure(path: &str, error: &ApiError) -> WireError {
     failure(
         UNAVAILABLE_CODE,
         UNAVAILABLE,
@@ -892,7 +1196,7 @@ fn transport_failure(path: &str, error: &ApiError) -> WireError {
 }
 
 /// One structured error, in the vocabulary of core's `docs/contracts/errors.yaml`.
-fn failure(code: &str, name: &str, message: String, help: &str) -> WireError {
+pub(crate) fn failure(code: &str, name: &str, message: String, help: &str) -> WireError {
     WireError {
         code: code.to_owned(),
         name: name.to_owned(),

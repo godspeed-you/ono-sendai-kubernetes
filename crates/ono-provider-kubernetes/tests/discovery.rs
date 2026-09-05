@@ -230,6 +230,27 @@ fn should_keep_every_served_version_rather_than_only_the_preferred_one() {
 }
 
 #[test]
+fn should_name_every_group_it_serves_including_the_core_group() {
+    // A query that names a kind and no group has to look in every group the server serves, and
+    // the list of groups is the server's answer rather than a table in this crate (§4
+    // invariants 1-2, §11.1). The core group is in it under its empty name, because §13.3 makes
+    // it a group rather than a gap.
+    let discovery = discovered();
+    let mut groups: Vec<&str> = discovery.groups().collect();
+    groups.sort_unstable();
+    assert!(
+        groups.contains(&""),
+        "the core group is served and is named by the empty string, got {groups:?}"
+    );
+    assert!(groups.contains(&"apps"));
+    assert!(groups.contains(&"example.io"));
+    assert!(
+        !groups.contains(&"batch"),
+        "a group the server never listed is not one it serves, got {groups:?}"
+    );
+}
+
+#[test]
 fn should_refuse_a_discovery_document_it_cannot_read() {
     // Discovery is the ground everything else stands on. Half-parsing it and carrying on would
     // make every later answer quietly incomplete.

@@ -7,11 +7,17 @@
 //! instance loads. Deriving both from one table is what stops them disagreeing about what the
 //! package contributes; `tests/contributions.rs` holds them to it.
 //!
-//! Each entry also carries the **group and kind** the target reads. Deliberately not a GVR: which
-//! REST collection serves a kind, and at which version, is discovery's answer and never a
-//! compile-time assumption (§4 invariants 1–2, §5.2, §13.1). A group and a kind are GVK identity,
-//! which is stable across the versions a server happens to serve, so naming them here decides
-//! nothing discovery is entitled to decide.
+//! Each entry also carries **what it reads** — [`Reads`]. For a curated noun that is a group and
+//! a kind. Deliberately not a GVR: which REST collection serves a kind, and at which version, is
+//! discovery's answer and never a compile-time assumption (§4 invariants 1–2, §5.2, §13.1). A
+//! group and a kind are GVK identity, which is stable across the versions a server happens to
+//! serve, so naming them here decides nothing discovery is entitled to decide.
+//!
+//! For `k8s-resource` it is [`Reads::Discovered`]: the kind is named by the *query* and resolved
+//! against the cluster's own discovery, so a CRD invented after this table was written is
+//! reachable without recompiling anything (§15.1, §33.1, Gate A). A document written before the
+//! package runs cannot name a kind invented after it, so the noun names the *shape* of the
+//! question instead of the answer — ADR-0010.
 
 use ono_kuang_sdk::protocol::{SchemaContribution, SchemaFieldContribution, TargetContribution};
 
@@ -50,6 +56,55 @@ impl Field {
     }
 }
 
+/// What a target reads, which is either one named kind or whatever the query names.
+///
+/// An enum rather than an optional group and kind, so that the two cases cannot be confused by a
+/// caller who forgets to check: a curated noun always has a kind and the dynamic noun never has
+/// one, and there is no third state in which a table entry is half-specified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reads {
+    /// One kind, named in this table (§15.2's curated tier).
+    Kind {
+        /// The API group the kind lives in; empty for the core group (§13.3).
+        group: &'static str,
+        /// The kind, as `apiVersion`/`kind` spells it. Half of a GVK, never a GVR (§13.1).
+        kind: &'static str,
+    },
+    /// Whatever kind the query names, resolved against the cluster's discovery (§15.1, §33.1).
+    ///
+    /// The one route by which a resource this package has never heard of is readable. It carries
+    /// no group and no kind because it has none until a query supplies them, and a default here
+    /// would be this package choosing a kind on the operator's behalf.
+    Discovered,
+    /// No Kubernetes object at all: the provider instance itself (§8.6, §10, §61.1).
+    ///
+    /// The diagnostic reads `/version`, the discovery documents, the `kube-system` namespace and
+    /// a `SelfSubjectReview` — none of which is a collection of objects, and all of which are
+    /// facts about the session rather than about anything in the cluster. A group and a kind here
+    /// would name a collection nobody lists.
+    Instance,
+}
+
+impl Reads {
+    /// The API group, where the table names one.
+    #[must_use]
+    pub const fn group(self) -> Option<&'static str> {
+        match self {
+            Self::Kind { group, .. } => Some(group),
+            Self::Discovered | Self::Instance => None,
+        }
+    }
+
+    /// The kind, where the table names one.
+    #[must_use]
+    pub const fn kind(self) -> Option<&'static str> {
+        match self {
+            Self::Kind { kind, .. } => Some(kind),
+            Self::Discovered | Self::Instance => None,
+        }
+    }
+}
+
 /// One noun this package answers for, with everything needed to declare it and to read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
@@ -65,10 +120,8 @@ pub struct Target {
     pub summary: &'static str,
     /// What makes two observations the same object, in prose.
     pub identity_doc: &'static str,
-    /// The API group the kind lives in; empty for the core group (§13.3).
-    pub group: &'static str,
-    /// The kind, as `apiVersion`/`kind` spells it. Half of a GVK, never a GVR (§13.1).
-    pub kind: &'static str,
+    /// Which resource the target reads, and whether the table or the query names it.
+    pub reads: Reads,
     /// The schema's fields, in declaration order.
     pub fields: &'static [Field],
 }
@@ -215,15 +268,103 @@ const SECRET_FIELDS: [Field; 11] = with_metadata(
     ],
 );
 
+/// The one schema every dynamically discovered resource's records carry.
+///
+/// **Why one schema and not one per kind.** A record may only claim a schema the package
+/// contributed at load, and the contributions are fixed before the package has spoken to any
+/// cluster — so there is no moment at which a schema named after a CRD could be declared. The
+/// host enforces this twice over: a record whose schema id is not in the handshake's registry
+/// does not decode at all, and one that decodes but does not match the target's declared schema
+/// is a `runtime.schema_violation`. A dynamic record therefore carries
+/// `io.github.godspeed-you.kubernetes.resource/1` whatever kind it holds, and says which
+/// Kubernetes type it *is* in its fields rather than in its schema id (§13.2). ADR-0010.
+///
+/// The fields after the shared metadata are three claims:
+///
+/// - **what this is** — `api_group`, `resource_name`, `scope`, which is §13.2's canonical host
+///   type, so that identity survives the flattening of every kind onto one schema;
+/// - **how well it is known** — `schema_source` and `precision`, because a projection that does
+///   not say where its typing came from invites the reader to trust all of it equally (§12.3);
+/// - **what it holds** — `spec`, `status` and `other`, kept apart because desired and observed
+///   state are different claims (§4 invariant 8, §33.6), plus `untyped`, the pointers of the
+///   fields no schema described. Those fields are *in* `spec`, `status` and `other` all the
+///   same: §12.5 preserves them, and `untyped` says which they are rather than hiding them.
+const RESOURCE_FIELDS: [Field; 18] = with_metadata(
+    true,
+    &[
+        Field::required("api_group", "string"),
+        Field::required("resource_name", "string"),
+        Field::required("scope", "enum<namespaced|cluster>"),
+        Field::required("schema_source", "enum<openapi-v3|crd-structural|absent>"),
+        Field::required("precision", "enum<structural|loose|unknown>"),
+        Field::nullable("spec", "map"),
+        Field::nullable("status", "map"),
+        Field::nullable("other", "map"),
+        Field::required("untyped", "list<string>"),
+    ],
+);
+
+/// What `k8s-cluster` answers: which cluster this is, whether it answers, and who the provider is
+/// to it (§8.5, §8.6, §10, §34.3, §61.1).
+///
+/// The shared metadata of every other schema is deliberately absent. There is no
+/// `metadata.uid` here because there is no Kubernetes object: the identity is the *provider
+/// instance* of §10.1 — `kubernetes:<context>` — which is what stays stable across reconnects and
+/// what two instances pointed at one cluster differ in. Keying this record on the cluster
+/// fingerprint instead would merge exactly the two instances §10.3 says MUST NOT be merged.
+///
+/// Four groups of fields, and the boundaries between them are the point:
+///
+/// - **which cluster** — `server`, `kube_system_uid`, `server_key_fingerprint` are §10.2's
+///   signals one by one, and `fingerprint` plus `fingerprint_signals` are what they compose to.
+///   A signal that was not obtained is `null` and names its reason in `unknowns`, so a fingerprint
+///   built from one signal is visibly weaker than one built from three;
+/// - **whether it answers** — `reachable`, `server_version`, `tls`, and the per-request `probes`
+///   and `latency_ms` §34.3 asks for, so that a slow aggregated API is not reported as "the
+///   cluster";
+/// - **who the provider is to it** — `credential_identity` and `effective_identity` are two
+///   fields rather than one, because §8.5 requires them to be impossible to confuse the day
+///   impersonation exists. `impersonating` says whether they can differ;
+/// - **what it could not determine** — `unknowns`, each entry naming a subject and one of §21.4's
+///   eight outcomes, so a field the cluster refused reads differently from one it does not have.
+const CLUSTER_FIELDS: &[Field] = &[
+    Field::required("uid", "string"),
+    Field::required("name", "string"),
+    Field::nullable("server", "string"),
+    Field::required("reachable", "bool"),
+    Field::nullable("server_version", "string"),
+    Field::required("tls", "string"),
+    Field::nullable("fingerprint", "string"),
+    Field::required("fingerprint_signals", "list<string>"),
+    Field::nullable("kube_system_uid", "string"),
+    Field::nullable("server_key_fingerprint", "string"),
+    Field::nullable("credential_identity", "string"),
+    Field::nullable("effective_identity", "string"),
+    Field::nullable("effective_uid", "string"),
+    Field::nullable("effective_groups", "list<string>"),
+    Field::required("impersonating", "bool"),
+    Field::nullable("impersonated_user", "string"),
+    Field::required("unknowns", "list<string>"),
+    Field::required("probes", "map"),
+    Field::required("latency_ms", "map"),
+];
+
 /// The targets this package answers for today.
 ///
-/// Five of the nineteen nouns `package/contributions/targets.yaml` declares. The other fourteen
-/// are placeholders §31.68 already gives help and completion for; wiring a schema for a target
-/// nothing answers would be a claim the package cannot keep. Each of the five proves something
-/// the others do not: `k8s-namespace` is the scope dimension, `k8s-node` is cluster-scoped so
-/// both scope shapes are exercised, `k8s-pod` is the noun the milestone names, `k8s-deployment`
-/// carries the desired-versus-observed pair of §14.4, and `k8s-secret` is where §22's redaction
-/// boundary is demonstrated rather than asserted.
+/// Five curated nouns and one dynamic one, of the twenty `package/contributions/targets.yaml`
+/// declares. The other fourteen are placeholders §31.68 already gives help and completion for;
+/// wiring a schema for a target nothing answers would be a claim the package cannot keep.
+///
+/// Each of the five curated ones proves something the others do not: `k8s-namespace` is the
+/// scope dimension, `k8s-node` is cluster-scoped so both scope shapes are exercised, `k8s-pod`
+/// is the noun the milestone names, `k8s-deployment` carries the desired-versus-observed pair of
+/// §14.4, and `k8s-secret` is where §22's redaction boundary is demonstrated rather than
+/// asserted.
+///
+/// `k8s-resource` is the floor beneath all of them (§15.1): it reads whatever the cluster serves
+/// and this package never heard of, so a curated noun is a *better* answer for a kind rather
+/// than the only answer for it. A curated noun that is deleted from this table costs its user a
+/// more verbose spelling and nothing else.
 pub static TARGETS: &[Target] = &[
     Target {
         name: "k8s-namespace",
@@ -232,8 +373,10 @@ pub static TARGETS: &[Target] = &[
         schema_summary: "A namespace, the primary scope dimension of a cluster.",
         summary: "Namespaces, the primary scope dimension of a cluster.",
         identity_doc: "Two observations are the same namespace when their `metadata.uid` matches.",
-        group: "",
-        kind: "Namespace",
+        reads: Reads::Kind {
+            group: "",
+            kind: "Namespace",
+        },
         fields: &NAMESPACE_FIELDS,
     },
     Target {
@@ -244,8 +387,10 @@ pub static TARGETS: &[Target] = &[
         summary: "Nodes, and the cloud instances underneath them.",
         identity_doc: "Two observations are the same node when their `metadata.uid` matches; a \
                        name reused after deletion is a new node.",
-        group: "",
-        kind: "Node",
+        reads: Reads::Kind {
+            group: "",
+            kind: "Node",
+        },
         fields: &NODE_FIELDS,
     },
     Target {
@@ -256,8 +401,10 @@ pub static TARGETS: &[Target] = &[
         summary: "Pods, the workload that actually runs.",
         identity_doc: "Two observations are the same pod when their `metadata.uid` matches. A \
                        recreated pod with the same name is a different pod.",
-        group: "",
-        kind: "Pod",
+        reads: Reads::Kind {
+            group: "",
+            kind: "Pod",
+        },
         fields: &POD_FIELDS,
     },
     Target {
@@ -268,8 +415,10 @@ pub static TARGETS: &[Target] = &[
         summary: "Deployments, and the ReplicaSets they control.",
         identity_doc: "Two observations are the same deployment when their `metadata.uid` \
                        matches.",
-        group: "apps",
-        kind: "Deployment",
+        reads: Reads::Kind {
+            group: "apps",
+            kind: "Deployment",
+        },
         fields: &DEPLOYMENT_FIELDS,
     },
     Target {
@@ -280,9 +429,38 @@ pub static TARGETS: &[Target] = &[
         summary: "Secret metadata — which keys exist and what mounts them, never the values \
                   (specification section 22).",
         identity_doc: "Two observations are the same secret when their `metadata.uid` matches.",
-        group: "",
-        kind: "Secret",
+        reads: Reads::Kind {
+            group: "",
+            kind: "Secret",
+        },
         fields: &SECRET_FIELDS,
+    },
+    Target {
+        name: "k8s-resource",
+        schema: "io.github.godspeed-you.kubernetes.resource/1",
+        schema_name: "KubernetesResource",
+        schema_summary: "Any resource the cluster serves, typed by the schema the cluster \
+                         publishes for it.",
+        summary: "Any resource this cluster serves, named by `kind` and `group` \
+                  (specification section 15.1).",
+        identity_doc: "Two observations are the same object when their `metadata.uid` matches, \
+                       whatever kind they are.",
+        reads: Reads::Discovered,
+        fields: &RESOURCE_FIELDS,
+    },
+    Target {
+        name: "k8s-cluster",
+        schema: "io.github.godspeed-you.kubernetes.cluster/1",
+        schema_name: "KubernetesCluster",
+        schema_summary: "One provider instance: which cluster it reaches, whether it answers, \
+                         and who it is to it.",
+        summary: "Which cluster this is, whether it can be reached, and who you are to it.",
+        identity_doc: "Two observations are the same provider instance when their `uid` — \
+                       `kubernetes:<context>` — matches. Two instances that reach one cluster \
+                       share a fingerprint and are never one instance (specification section \
+                       10.3).",
+        reads: Reads::Instance,
+        fields: CLUSTER_FIELDS,
     },
 ];
 

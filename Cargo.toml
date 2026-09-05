@@ -31,6 +31,9 @@ base64 = "0.22"
 # not requests (core ADR-0573, and ADR-0002 here).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 rustls-pemfile = "2"
+# The hash behind the cluster fingerprint of specification §10.2. `ring` rather than a second
+# digest crate because `rustls` above is already built on it: one supply chain, not two.
+ring = "0.17"
 webpki-roots = "0.26"
 
 # What a KUANG/11 package is written against. A git dependency because the SDK is not published;

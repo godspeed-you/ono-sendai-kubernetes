@@ -10,10 +10,14 @@
 # would decide a question that belongs to core. A prefixed noun is honest about who answers it
 # and costs a reader four characters.
 #
-# Custom resources are deliberately absent and not forgotten: a CRD invented after this package
-# was built cannot appear in a document written before it, which is the tension between §31.68's
-# static placeholders and §33.1's dynamic CRDs. Discovery reaches them at runtime; how they become
-# typeable nouns is an open question recorded in docs/STATE.md.
+# `k8s-resource` is how a custom resource becomes typeable, and it is the last entry rather than
+# the first because it is the floor rather than the headline. A CRD invented after this package
+# was built cannot appear in a document written before it — the tension between §31.68's static
+# placeholders and §33.1's dynamic CRDs — so the noun names the *shape of the question* instead of
+# the answer: `get k8s-resource --kind Widget --group example.io`. One word this document can
+# carry, reaching every kind discovery can find, at the cost of a more verbose spelling than a
+# curated noun. A curated noun above is then a better answer for a kind rather than the only
+# answer for it. ADR-0010 records why this rather than a target contributed at handshake time.
 
 targets:
   - name: k8s-namespace
@@ -92,3 +96,17 @@ targets:
     schema: io.github.godspeed-you.kubernetes.networkpolicy/1
     summary: "NetworkPolicies, and the Pods their selectors govern."
     identity_doc: "Two observations are the same policy when their `metadata.uid` matches."
+
+  - name: k8s-resource
+    schema: io.github.godspeed-you.kubernetes.resource/1
+    summary: "Any resource this cluster serves, named by `kind` and `group` (specification section 15.1)."
+    identity_doc: "Two observations are the same object when their `metadata.uid` matches, whatever kind they are."
+
+  # The provider instance itself rather than anything in the cluster: which cluster this is,
+  # whether it answers, and who you are to it (§8.5, §8.6, §10, §34.3). It is the one target here
+  # that is useful when the cluster is *not* reachable, which is why an unreachable API server
+  # gives it a record saying so rather than a failed invocation.
+  - name: k8s-cluster
+    schema: io.github.godspeed-you.kubernetes.cluster/1
+    summary: "Which cluster this is, whether it can be reached, and who you are to it."
+    identity_doc: "Two observations are the same provider instance when their `uid` — `kubernetes:<context>` — matches. Two instances that reach one cluster share a fingerprint and are never one instance (specification section 10.3)."

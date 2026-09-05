@@ -12,16 +12,17 @@ under *Found, not yet filed*, and the user triages it into an issue.
 
 ## Where the project is
 
-**The package runs, speaks TLS, and resolves the cluster it talks to from a kubeconfig context.**
-A contributed target answers from an API server over the host's brokered connection, over a
-session whose certificate it verified against the authority the context pinned.
+**The package runs, speaks TLS, resolves the cluster it talks to from a kubeconfig context, and
+can say which cluster that is and who it is to it.** A contributed target answers from an API
+server over the host's brokered connection, over a session whose certificate it verified against
+the authority the context pinned.
 
 | | |
 |---|---|
 | Specification | `docs/architecture/kubernetes-provider.md` — canonical here, immutable, checksummed |
-| Domain layer | `crates/ono-provider-kubernetes`, twelve modules, no host and no cluster |
-| Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, query, records |
-| Tests | 270 across the workspace, all green, no live cluster and no network |
+| Domain layer | `crates/ono-provider-kubernetes`, thirteen modules, no host and no cluster |
+| Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, query, dynamic, cluster, records |
+| Tests | 320 across the workspace, all green, no live cluster and no network |
 | Transport | HTTP/1.1 over a `rustls` session over the host's brokered `network.connect` |
 | Conformance level reached | **none claimed.** K0 is partly met; see below |
 | Licence | Apache-2.0 (core is MIT) |
@@ -44,6 +45,7 @@ ADR check and the instructions check. None of the document checks was dropped (A
 | `condition` | §37 | every derived reconciliation state cites the fields it rests on (Gate G) |
 | `redaction` | §22, §29.2 | Secret payload destroyed at the boundary, not filtered at the edge (Gate I) |
 | `place` | §9, §35, §36 | addresses that round-trip; cluster and namespace scope are two grammars |
+| `diagnostics` | §8.5, §8.6, §10, §34.3 | which cluster this is, whether it answers, as whom, and what is unknown |
 
 The package reaches the API server through the host's brokered `network.connect` — a real
 `ByteStream` over `streams.emit` and `streams.next`, with no fixture fallback — and an end-to-end
@@ -52,9 +54,19 @@ whole chain is exercised: handshake, capability broker, connection, HTTP/1.1, di
 redaction boundary, and the host's own stamp on the provenance of every record it accepts. No
 cluster is contacted (§59.1).
 
-Five of the nineteen declared targets carry a schema and a handler: `k8s-namespace`, `k8s-node`,
-`k8s-pod`, `k8s-deployment`, `k8s-secret`. The other fourteen are §31.68 placeholders with help
-and completion and no claim to answer — [ADR-0005](adr/ADR-0005-five-schemas-rather-than-nineteen-because-a-declared-schema-is-a-promise.md).
+Five of the declared targets carry a kind-specific schema and a handler: `k8s-namespace`,
+`k8s-node`, `k8s-pod`, `k8s-deployment`, `k8s-secret`. Fourteen more are §31.68 placeholders with
+help and completion and no claim to answer — [ADR-0005](adr/ADR-0005-five-schemas-rather-than-nineteen-because-a-declared-schema-is-a-promise.md).
+
+**`k8s-resource` answers for everything else the cluster serves.**
+`get k8s-resource --kind Sprocket --group menagerie.example` resolves the kind against the
+cluster's own discovery, types it from the OpenAPI document the server publishes for that
+group-version, and emits records of one statically declared schema —
+[ADR-0010](adr/ADR-0010-a-generic-noun-reaches-every-kind-because-a-static-document-cannot-name-one-invented-later.md).
+A document written before the package runs cannot name a kind invented after it, so the noun
+names the *shape of the question* instead of the answer. That is what makes §15.1 and §33.1
+reachable from a word §31.68 can register statically, and it costs the operator a more verbose
+spelling than a curated noun.
 
 ### Conformance, stated honestly
 
@@ -67,21 +79,54 @@ and completion and no claim to answer — [ADR-0005](adr/ADR-0005-five-schemas-r
 | provider instance isolation | partial. Every record carries `kubernetes:<context>` as provenance, and each query opens its own connection. Nothing is shared between queries yet, so there is nothing to cross over — and nothing that proves Gate J either |
 | dynamic API discovery | **yes.** `/api`, `/apis` and the resource list are read on every query. Version, GVR, namespaced-ness and `list` support come from the server; a cluster serving no `apps` group gets `provider.unsupported` rather than a guessed path |
 | cluster / namespace scopes | **yes.** A namespace is a deliberate request, `all_namespaces` is explicit (§9.4), and a cluster-scoped kind gets no namespace segment (§9.2) |
-| provider health / identity diagnostics | **no.** Nothing answers "which cluster is this, and can it be reached". There is no diagnostic surface at all |
+| provider health / identity diagnostics | **yes.** `get k8s-cluster` answers one record for the provider instance: the normalised API server origin, the `kube-system` namespace UID where readable, and the digest they compose, saying which signals it holds (§10.2); the server version and every request's source and latency (§34.3); the TLS posture, including an active insecure session (§8.4); the effective identity from `SelfSubjectReview` where the cluster serves it (§8.6); and `unknowns`, naming each thing it could not determine with one of §21.4's outcomes. Unreachable is an answer rather than a failure, and a refused review never blocks a read ([ADR-0011](adr/ADR-0011-the-cluster-diagnostic-is-keyed-on-the-provider-instance-so-two-aliases-cannot-merge.md)) |
 
-One of the six is unmet outright — there is no health or identity diagnostic — so **K0 is not
-reached.** What is missing is named rather than rounded up.
+Five of the six are met. **Provider instance isolation is the one that is not**, so K0 is still
+not claimed: every record carries `kubernetes:<context>` and each query opens its own connection,
+which means nothing is shared and therefore nothing crosses over — and equally that nothing proves
+Gate J. What is missing is named rather than rounded up.
 
-**K1 — dynamic read model (§61.2): not reached.** UID identity, metadata projection and
-pagination are real; `list` is wired and `get` is not; partial coverage and RBAC truth are modelled
-and do reach the user, as a failed invocation
-([ADR-0004](adr/ADR-0004-an-incomplete-read-fails-the-invocation-because-a-value-stream-cannot-carry-coverage.md)).
-The two requirements that decide the level are the two that are absent from the shell: §15.1's
-*arbitrary discovered readable resources* and CRD support. `schema.rs` projects an unknown CRD
-fully, with tests, and no target routes to it — a static list of nouns cannot name a kind invented
-after the package was built. That is the open question below, not a matter of adding more entries.
+The diagnostic makes the two identities of §10.3 visible without merging them: a record is keyed
+on the *provider instance*, so two contexts reaching one cluster produce two records with two
+identities and one fingerprint. The field that would merge them is deliberately not the field that
+identifies them.
 
-**Acceptance gates.** C, D, E, F, G and I are addressed at the domain level with tests that were
+**K1 — dynamic read model (§61.2): six of seven, and not claimed.** Seven things are required.
+
+| K1 requirement | State |
+|---|---|
+| arbitrary discovered readable resources | **yes.** `k8s-resource` resolves whatever the query names against the cluster's own discovery, over the preferred version of every group the server lists, and lists it. A kind two groups both serve is refused with the candidates rather than resolved by an arbitrary type priority (§35.8, §13.5), and *not served*, *not listable*, *ambiguous* and *empty* are four different answers (§11.5, §21.4) |
+| dynamic schema / unstructured fallback | **yes.** The API server's OpenAPI v3 document for the resolved group-version types the resource; the component is found by what it declares in `x-kubernetes-group-version-kind` (§13.2) rather than by a naming convention. A server that publishes none leaves the typing absent, and every field still projects with its precision saying so (§12.3, §12.5) |
+| UID identity | **yes.** Every record's identity field is `metadata.uid`, for a custom resource exactly as for a Pod (§16.1) |
+| metadata projection | **yes.** §14's common projection fills the same nine fields for every kind, curated or discovered, from one code path |
+| get / list / pagination | partial. `list` is wired, with pages and a budget; **`get` is not.** §17.1's direct lookup by name has no route |
+| partial coverage and RBAC truth | **yes**, as a failed invocation carrying what was missing ([ADR-0004](adr/ADR-0004-an-incomplete-read-fails-the-invocation-because-a-value-stream-cannot-carry-coverage.md)) |
+| CRD support | **yes.** A CRD invented after this package was built is discoverable, queryable and returns typed records without recompiling anything, and no source file of the plugin crate names the kind the test uses ([ADR-0010](adr/ADR-0010-a-generic-noun-reaches-every-kind-because-a-static-document-cannot-name-one-invented-later.md)) |
+
+**`get` is the one that is unmet**, so K1 is not claimed. The two requirements this session set out
+to close — §15.1's arbitrary discovered readable resources, and CRD support — are met, and are the
+two the level was previously blocked on. `get` is a smaller, well-understood gap: §17.1's direct
+lookup by the canonical REST endpoint, over the same discovery and the same redaction boundary.
+
+One caveat belongs beside that table and not inside it. Everything above is proven through
+`provider.query` — the protocol call a contributed target is answered by — under the real
+supervisor and the real binary. It is **not** reachable by typing `get k8s-resource --kind …` in a
+shell today, because core issues `provider.query` for a contributed target with an empty options
+map (core ADR-0582 says so, and the finding is recorded below). That blocks `--kind` exactly as it
+already blocks `--context` for `get k8s-pod`, so it bounds every target this package has rather
+than this one.
+
+**Acceptance gates.** A and B are now proven end to end through the package's protocol surface:
+`tests/query.rs` drives the real binary under `TestHost` against a recorded server offering an
+invented API group, kind, plural, short name and field set, and a test asserts that none of those
+words appears in any source file of the plugin crate — so the kind is reached because it is data
+and the test fails the day anyone special-cases it. Gate B is proven in both directions: with a
+published schema the record is structural typed values, and without one every field survives with
+its own shape while `precision`, `schema_source` and `untyped` say what nothing vouches for.
+Neither is *claimed*, on the same rule as the others: a gate is claimed when it is provable
+through the shell, and the empty-options finding below is what stands between the two.
+
+C, D, E, F, G and I are addressed at the domain level with tests that were
 each verified to bite. None is claimed, because a gate is claimed when it is provable end to end
 through the shell. Gate I comes closest — the end-to-end query test asserts the Secret payload
 appears nowhere in anything the host accepted — and it still waits, because §62.9 is about the
@@ -111,13 +156,21 @@ Phase 3  curated operational graph  semantic adapters and relationships for the 
 Phase 4  live observation           list/watch continuity, reconnect, 410 gaps, freshness.
 ```
 
-Phase 1 is the one in flight. TLS and the kubeconfig wiring are done; a health/identity diagnostic
-is what now stands between the package and K0.
+Phase 1 is nearly closed: TLS, the kubeconfig wiring and the health/identity diagnostic are done,
+and provider instance isolation — a test that proves Gate J — is the one thing left before K0.
+**Phase 2 is largely delivered ahead of it**, because the two K1 requirements the level waits on
+are the dynamic ones: the GVK/GVR registry, OpenAPI schema loading, unstructured conversion,
+metadata projection, UID identity and the CRD fixtures are all in place and driven end to end.
+What Phase 2 still owes is `get` (§17.1) and the schema cache (§12.4).
 
 ## In progress
 
-- **A health / identity diagnostic**: which cluster is this, can it be reached, and who am I to it
-  (§8.6, §10.2). The last unmet K0 requirement. Not started.
+- **Provider instance isolation (Gate J, §62.10).** Nothing is shared between queries, so nothing
+  can cross over; what is missing is the demonstration that two instances against two clusters
+  stay apart. The cluster diagnostic is what makes such a test writable: two instances now have
+  two identities and a fingerprint each.
+- **`get` (§17.1).** The last unmet K1 requirement: a direct lookup by name against the canonical
+  REST endpoint discovery resolved, over the same redaction boundary as the listing. Not started.
 
 ## The transport decision, and what it costs
 
@@ -147,11 +200,41 @@ both halves:
   `get` through a contributed *command*, which returns whatever it likes with no declared schema,
   no identity and no provenance. This provider therefore requires a core at or after that commit,
   and the compatibility table in `README.md` must say so once a version of core carries it.
-- **Fourteen static placeholders name schema ids that no schema document declares.**
-  `package/contributions/targets.yaml` declares nineteen nouns and `schemas.yaml` declares five.
-  Whether a host validates that pairing when it registers the static contributions is unverified —
-  the handshake half is tested and this half is not. If core does validate it, either those
-  entries lose their `schema` key or the placeholder list shrinks (ADR-0005).
+- **A contributed target is invoked with no options, so nothing a query says reaches the
+  package.** `ono-cli`'s `invoke_contributed` issues `plugin.query(target, Map::new())` on the
+  `.target.` branch, dropping the invocation's words entirely — while the command branch does
+  turn `--name value` into JSON. Core ADR-0582 names this as a deliberate later increment: "the
+  query is issued with no options … That needs the options half of `provider.query`, which is a
+  separate increment." The consequence here is that **no target this package contributes is usable
+  from a shell prompt yet**: `get k8s-pod` cannot receive `--context`, and `get k8s-resource`
+  cannot receive `--kind`. Everything is proven through `provider.query` itself, which is the same
+  call core will make once it fills the options in. This is the single largest thing standing
+  between this package and a claimed gate.
+- **Core registers an invocable target only from the on-disk document, never from the
+  handshake.** `ono-kuang-supervisor`'s `load()` validates a handshake target contribution and
+  mounts a `PluginProvider` for it; the thing that makes `get <word>` resolve is
+  `ono-cli`'s `plugin_registry::target_declarations()`, which reads `contributions/targets.yaml`
+  and synthesises one `ContributedCommand` per entry. A handshake-only target name therefore
+  yields a provider entry nothing can spell, and it is accepted silently — the reverse
+  disagreement (on disk, not answered at handshake) *is* refused, with a good message. This is
+  why a discovered CRD cannot earn a name today (ADR-0010), and the asymmetry is worth reporting
+  on its own.
+- **A target contribution has nowhere to declare its options, so `--kind` cannot be completed or
+  helped.** `docs/contracts/kuang/contributions.v1.yaml` gives a target `name`, `schema`,
+  `summary` and `identity_doc` and nothing else; the wire type matches and `TargetDocument` is
+  `deny_unknown_fields`, so adding an `options:` key is a hard parse failure. Contributed
+  *commands* have an `options` key in the contract and core drops it anyway
+  (`contract.rs`: "A contribution declares no selectors or options"). `k8s-resource --kind` is
+  therefore discoverable only through its `summary` line and this document.
+- **Fourteen static placeholders name schema ids that no schema document declares — and core does
+  not check the pairing at load.** The question ADR-0005 left open is answered: the supervisor
+  checks a contributed target's schema id only for a package-or-core *prefix*, never against the
+  package's contributed schemas. The check that bites is per record — a record whose schema id is
+  not in the handshake registry does not decode, and one that decodes but does not match the
+  target's declared schema is a `runtime.schema_violation`. So a placeholder naming an undeclared
+  schema loads happily and fails at its first emit, which it never reaches because nothing wires
+  it. The placeholders can stay; what would be caught is a *wired* target with an undeclared
+  schema, at runtime rather than at load.
 - **§18.4's "more may exist" does not reach the user.** A listing stopped by a page budget is
   coverage-complete by design, so the invocation completes and the `may_have_more` flag the domain
   layer sets is dropped. The value stream has nowhere to carry it, which is the same protocol
@@ -170,17 +253,42 @@ both halves:
 - **A kubeconfig `server` with a path prefix is refused.** Rancher-style endpoints
   (`https://host/k8s/clusters/c-xxx`) name one, and this build does not prepend it to its
   requests. Refusing is deliberate: dropping the prefix silently would query a different cluster.
+- **The server certificate's public key is modelled and not obtained.** `diagnostics.rs`
+  extracts a certificate's `SubjectPublicKeyInfo` and hashes it, with tests over certificates
+  generated in the test — and `tls::TlsStream` does not expose the certificate it verified, so
+  the plugin has no bytes to hand it. The signal reports `not queried`, which §21.4 keeps apart
+  from absence. One accessor on `tls.rs` promotes it from a stated unknown to §10.2's second
+  signal, and it was left to the change that owns that module (ADR-0011).
+- **§10.4's cache invalidation has no cache to invalidate.** Strong fingerprint evidence that
+  changes must invalidate cached object identities and watches before data is presented as
+  current. Nothing here caches across invocations yet, so the rule has nothing to bite on — and
+  the fingerprint that would trigger it now exists.
+- **Alias detection is a comparison, not a memory.** `Fingerprint::compare` answers whether two
+  instances may be one cluster; nothing persists a fingerprint between invocations, so the shell
+  is the only place two of them meet. `state.persist` is declared in the manifest and unused.
 - **`current-context` is not taken as a default.** §7.1 offers it as an optional default and §7.4
   forbids a command silently following it when it changes on disk. A context is named; whether a
   deliberate opt-in default is worth adding is open.
 
 ## Deferred / blocked
 
-- **How a CRD becomes a typeable noun is open.** §31.68's static placeholders are written before
-  the package runs; §33.1's custom resources are discovered while it runs, and a document written
-  first cannot name a kind invented later. `schema.rs` already projects an arbitrary object
-  against an arbitrary OpenAPI schema; what is missing is a target shape that names a kind at
-  runtime. This is what K1 waits on, and it wants an ADR before it wants code.
+- **A discovered CRD earning a *name* is still open**, and needs a change in core. `k8s-resource`
+  is the floor: every kind is reachable, spelled as options. The nicer shape — a discovered
+  `Sprocket` becoming its own word with its own help and completion — needs core to register a
+  target contributed at handshake time, which it does not do (see the finding below).
+  [ADR-0010](adr/ADR-0010-a-generic-noun-reaches-every-kind-because-a-static-document-cannot-name-one-invented-later.md)
+  is shaped so that adding it later takes nothing away.
+- **§34.2's failure isolation is not honoured on the dynamic search.** A query naming no `group`
+  reads the resource list of every group the server lists, and one that does not answer fails the
+  query rather than being skipped. That is deliberate — an incomplete search resolving to one
+  candidate is indistinguishable from an unambiguous one, and §35.8 is not worth trading for
+  convenience — but it means one broken aggregated API server makes an unqualified `--kind` search
+  fail. Naming `group` keeps it out of the search. What §34.2 wants instead is the search
+  continuing while *saying* which groups it could not read.
+- **§12.4's schema cache is not used.** Each query fetches the OpenAPI document for the resolved
+  group-version again, because nothing is shared between queries yet — the same reason provider
+  instance isolation is unproven. `schema.rs` has a `SchemaCache` keyed on a cluster fingerprint,
+  and the diagnostic now produces such a fingerprint, so the two halves exist and are not joined.
 - **`docs/contracts/` does not exist.** Whether this provider needs machine-readable contracts of
   its own, or registers everything through core's, is still open. The package's contributions live
   in `package/contributions/*.yaml` and are checked against the handshake by
@@ -294,3 +402,82 @@ discovery. 270 tests. [ADR-0009](adr/ADR-0009-an-insecure-tls-session-is-reachab
 records the decisions.
 
 Next: the health / identity diagnostic, which is the last thing K0 waits on.
+
+### 2026-09-05 — which cluster is this, and who am I to it
+
+`diagnostics.rs` and the `k8s-cluster` target. 19 domain tests and 6 end-to-end ones through the
+real binary under `TestHost`, against a recorded API server that answers `/version`, discovery,
+the `kube-system` namespace and a `SelfSubjectReview`.
+
+The shape that mattered was refusing to let one value stand for a cluster. A fingerprint is a set
+of *named* signals, each obtained or unavailable for a reason in `coverage::Outcome`'s vocabulary,
+because §10.2 says in one sentence that no single signal may be treated as universally available.
+So a cluster whose `kube-system` namespace the caller may not read still has a fingerprint — a
+weaker one, and `fingerprint_signals` says so — rather than none. The comparison that detects an
+alias runs signal by signal and names its evidence, and there is no operation anywhere that merges
+two of them: §10.3's prohibition is a function nobody can call.
+
+Three tests were watched to fail first, and one mutation was run to confirm the suite bites: a
+`403` on the review mapped to `not served` instead of `read denied` turns the partial-identity
+test red, which is the distinction §21.4 exists for.
+
+The credential identity and the effective identity are two fields although nothing sets
+impersonation. With none configured one review answers both and they agree; with one, they cannot.
+A single field would change meaning the day the second appeared, and so would every reader of it.
+
+[ADR-0011](adr/ADR-0011-the-cluster-diagnostic-is-keyed-on-the-provider-instance-so-two-aliases-cannot-merge.md)
+records why the record is keyed on the provider instance rather than on the cluster, and why an
+unreachable cluster answers a record rather than failing — the opposite trade from ADR-0004, for
+the opposite reason: there, the coverage had nowhere to go in a value stream; here, the coverage
+*is* the value.
+
+### 2026-09-05 — a kind the package has never heard of
+
+The two requirements K1 waited on are met: §15.1's arbitrary discovered readable resources, and
+CRD support. `schema.rs` had done the hard part since the previous session and nothing routed to
+it; this session is the route, and almost none of it is new Kubernetes knowledge.
+
+The decision it needed first was where a CRD's *name* comes from, and the honest answer was found
+by reading core rather than by preferring a shape. Two things were checked in a checkout of core
+before anything was written. A target contributed across the handshake never becomes an invocable
+word — only `plugin_registry::target_declarations()`, reading the on-disk document, does that.
+And the SDK fixes a `Plugin`'s contributions before `run()` opens the host session, so a package
+cannot know a cluster's CRDs at the moment it declares what it contributes. Handshake-time
+contribution is therefore not merely unregistered; it is unreachable. That settled it:
+**one static generic noun**, `k8s-resource`, whose kind is a query option.
+[ADR-0010](adr/ADR-0010-a-generic-noun-reaches-every-kind-because-a-static-document-cannot-name-one-invented-later.md).
+
+The subtlest part was the schema id, and it has a cost worth naming twice. A record may only
+claim a schema its package contributed, the contributions are fixed before any cluster is reached,
+and the host enforces this at two points — an unregistered schema id does not decode at all, and
+one that decodes but does not match the target's declaration is a `runtime.schema_violation`. So
+every dynamically read object, of every kind there will ever be, carries
+`io.github.godspeed-you.kubernetes.resource/1`. The Ono schema no longer distinguishes a
+`Sprocket` from a `Widget`; §13.2's canonical host type does, from inside the record —
+`api_group`, `kind`, `resource_name`, `scope`. A consumer that wants one kind filters on those.
+
+What the route does, and where each part comes from:
+
+| | |
+|---|---|
+| which resource | `dynamic::resolve` against the preferred version of every group the server lists. A kind two groups share is `resolve.ambiguous` with the candidates and the spelling that picks each — §35.8, never a type priority. Kinds exactly, plurals and short names case-insensitively (§13.5) |
+| which fields | the API server's own `/openapi/v3/...` for the resolved group-version, and the component that *declares* the GVK (§13.2). One request types a built-in and a CRD identically, so no permission on `customresourcedefinitions` is needed to understand a custom resource |
+| when nothing describes it | `Schema::absent()`. Every field still projects; `schema_source`, `precision` and `untyped` say what nothing vouches for (§12.3, §12.5) |
+| four ways to come back with nothing | not served, not listable, ambiguous, and a query that named no kind at all — which is answered with the cluster's own catalogue (§11.5, §21.4) |
+
+Gate A is proven by driving the real binary against a recorded server offering an invented group,
+kind, plural, short name and field set, with a test asserting that no source file of the plugin
+crate contains any of those words. Gate B is proven in both directions in one pair of tests: with
+the schema, `format: date-time` becomes an instant and `untyped` is empty; without it the same
+date stays text, every field survives, and each undescribed pointer is named. Three mutations were
+run to confirm the tests bite — preferring the first ambiguous candidate, always typing as absent,
+and dropping the non-`spec` payload — and each turned exactly the expected test red.
+
+320 tests. `discovery.rs` gained one accessor, `groups()`, because a query that names a kind and
+no group has to ask the server which groups it serves; nothing else in the domain layer changed.
+
+Three findings about core came out of the reading, and the first is the largest thing between this
+package and a claimed gate: **a contributed target is invoked with no options at all**, so
+`--kind` and `--context` alike never reach the package from a shell prompt. Core ADR-0582 names it
+as a deliberate later increment. Everything here is proven through `provider.query`, which is the
+call core will make once the options half lands.

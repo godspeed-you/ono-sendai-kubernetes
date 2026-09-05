@@ -12,7 +12,7 @@
     reason = "a failed precondition in a test should abort the test loudly"
 )]
 
-use ono_kubernetes_plugin::contributions::{IDENTITY, TARGETS, target};
+use ono_kubernetes_plugin::contributions::{IDENTITY, Reads, TARGETS, target};
 use ono_value::{Value, builtin_schemas, from_yaml};
 
 const SCHEMAS: &str = include_str!("../../../package/contributions/schemas.yaml");
@@ -33,6 +33,31 @@ fn field(value: &Value, key: &str) -> Option<Value> {
         Value::Map(map) => map.get(key).cloned(),
         _ => None,
     }
+}
+
+/// The field's type, as the wire spells it.
+///
+/// The one place the two vocabularies differ. A schema document is written in the language of
+/// core's `docs/contracts/schemas/*.v1.yaml`, where a closed set is `type: enum` with its
+/// members beside it; the wire has one string per type, so the same set is `enum<a|b>`. Core
+/// parses both — `ono_value`'s document reader and `parse_type_name` on the wire — into the same
+/// `FieldType`, so this is a spelling difference and not a second declaration.
+fn declared_type(value: &Value) -> String {
+    let declared = text(value, "type");
+    if declared != "enum" {
+        return declared;
+    }
+    let Some(Value::List(values)) = field(value, "values") else {
+        panic!("an `enum` field declares its `values`");
+    };
+    let members: Vec<String> = values
+        .iter()
+        .map(|member| match member {
+            Value::String(name) => name.to_string(),
+            other => panic!("an enum member is a name, and it is {other:?}"),
+        })
+        .collect();
+    format!("enum<{}>", members.join("|"))
 }
 
 fn text(value: &Value, key: &str) -> String {
@@ -86,7 +111,7 @@ fn should_declare_the_same_schemas_in_the_document_and_across_the_handshake() {
                 "schema `{}` declares its fields in the same order in both places",
                 contribution.id
             );
-            assert_eq!(text(declared.1, "type"), wire.field_type);
+            assert_eq!(declared_type(declared.1), wire.field_type);
             let required = matches!(field(declared.1, "required"), Some(Value::Bool(true)));
             let nullable = matches!(field(declared.1, "nullable"), Some(Value::Bool(true)));
             assert_eq!(required, wire.required, "field `{}`", wire.name);
@@ -157,14 +182,75 @@ fn should_answer_only_for_targets_the_package_declares_statically() {
 fn should_answer_for_the_pod_target_the_milestone_names() {
     let pod = target("k8s-pod").expect("the package answers for `k8s-pod`");
     assert_eq!(pod.schema, "io.github.godspeed-you.kubernetes.pod/1");
-    assert_eq!(pod.group, "", "a Pod lives in the core API group");
     assert_eq!(
-        pod.kind, "Pod",
-        "the table names a kind, never a resource: which collection serves a Pod is discovery's \
-         answer, not a compile-time one (§13.1)"
+        pod.reads,
+        Reads::Kind {
+            group: "",
+            kind: "Pod"
+        },
+        "a Pod lives in the core API group, and the table names a kind rather than a resource: \
+         which collection serves a Pod is discovery's answer, not a compile-time one (§13.1)"
     );
     assert!(
         target("k8s-endpointslice").is_none(),
         "a target with no handler is a placeholder, and the package does not claim to answer it"
     );
+}
+
+#[test]
+fn should_answer_for_a_resource_whose_kind_only_the_query_knows() {
+    // §15.1 and §33.1: a CRD invented after this table was written cannot be named in it, so the
+    // package declares one noun that takes the kind as a question instead (ADR-0010).
+    let dynamic = target("k8s-resource").expect("the package answers for `k8s-resource`");
+    assert_eq!(dynamic.reads, Reads::Discovered);
+    assert_eq!(
+        dynamic.reads.kind(),
+        None,
+        "a dynamic target names no kind, because it has none until a query supplies one"
+    );
+    assert_eq!(
+        dynamic.schema, "io.github.godspeed-you.kubernetes.resource/1",
+        "one declared schema for every kind there will ever be: a record may only claim a schema \
+         the package contributed, and the contributions are fixed before any cluster is reached"
+    );
+    for field in ["api_group", "kind", "resource_name", "scope"] {
+        assert!(
+            dynamic.fields.iter().any(|declared| declared.name == field),
+            "§13.2's canonical host type survives every kind sharing one schema: `{field}` is \
+             missing"
+        );
+    }
+    for field in ["schema_source", "precision", "untyped"] {
+        assert!(
+            dynamic.fields.iter().any(|declared| declared.name == field),
+            "a projection that does not say how well it is known invites equal trust in all of \
+             it (§12.3): `{field}` is missing"
+        );
+    }
+}
+
+#[test]
+fn should_name_no_kubernetes_kind_on_the_route_that_reads_an_unknown_one() {
+    // Gate A's real content: the dynamic route is code with no table of kinds in it. The five
+    // curated targets name theirs in `contributions.rs`, which is the one file allowed to.
+    const DYNAMIC: &str = include_str!("../src/dynamic.rs");
+    let code: String = DYNAMIC
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = code.split("#[cfg(test)]").next().unwrap_or_default();
+    for kind in [
+        "\"Pod\"",
+        "\"Deployment\"",
+        "\"Secret\"",
+        "\"Namespace\"",
+        "\"Node\"",
+    ] {
+        assert!(
+            !code.contains(kind),
+            "the dynamic route must resolve kinds from discovery rather than recognise them: \
+             it names {kind}"
+        );
+    }
 }

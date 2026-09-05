@@ -196,6 +196,9 @@ struct RecordedCluster {
     /// Whether the server serves the `apps` group at all. A cluster without it is not an
     /// unusual cluster — it is any cluster whose API surface this build has never seen.
     apps: bool,
+    /// Whether the server serves the two invented API groups of the dynamic tests. Off for the
+    /// curated tests, so that adding a CRD to this fixture cannot change what they prove.
+    custom: bool,
     /// The TLS identity this server presents, where it speaks HTTPS at all. `None` is the plain
     /// HTTP/1.1 an API server behind `kubectl proxy` speaks.
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -232,11 +235,26 @@ impl RecordedCluster {
         })
     }
 
+    /// A server serving two API groups this package has never heard of, both of which offer a
+    /// kind of the same name.
+    ///
+    /// Nothing about them is compiled into the provider — the group names, the kind, its plural,
+    /// its short name and its fields exist only in this file and in the bytes below (Gate A).
+    fn with_custom_resources() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            custom: true,
+            ..Self::default()
+        })
+    }
+
     /// A server that speaks TLS, presenting `authority`'s certificate.
     fn over_tls(authority: &Authority) -> Arc<Self> {
         Arc::new(Self {
             pods: 2,
             apps: true,
+            custom: false,
             tls: Some(Arc::new(authority.server_config())),
             heads: Arc::default(),
         })
@@ -318,9 +336,169 @@ fn pod(index: usize) -> Json {
     })
 }
 
+/// One object of the invented kind, as its server sends it.
+///
+/// Its fields are invented too: nothing in the provider knows what a `teeth` is, and the only
+/// reason the record below carries an instant rather than a string is that the schema document
+/// says `format: date-time` (Gate B).
+fn custom_object(index: usize) -> Json {
+    json!({
+        "apiVersion": "menagerie.example/v1",
+        "kind": "Sprocket",
+        "metadata": {
+            "name": format!("sprocket-{index}"),
+            "namespace": "default",
+            "uid": format!("aaaaaaaa-aaaa-aaaa-aaaa-{index:012}"),
+            "resourceVersion": "5100",
+            "creationTimestamp": "2026-09-02T07:00:00Z",
+            "labels": {"line": "north"},
+        },
+        "spec": {
+            "teeth": 24,
+            "renewAt": "2026-12-24T18:00:00Z",
+            "mode": "idle",
+            "tolerances": [{"axis": "x", "microns": 5}],
+        },
+        "status": {
+            "phase": "Spinning",
+            "observedTeeth": 24,
+        },
+    })
+}
+
+/// The API server's OpenAPI v3 document for the invented group.
+///
+/// The component key is deliberately not derived from the group or the kind: the provider finds
+/// the component by what it *declares* in `x-kubernetes-group-version-kind` (§13.2), which is
+/// the only rule that works for an arbitrary CRD.
+fn custom_openapi() -> Json {
+    json!({
+        "openapi": "3.0.0",
+        "components": {"schemas": {
+            "some.vendors.own.naming.Convention": {
+                "type": "object",
+                "x-kubernetes-group-version-kind": [
+                    {"group": "menagerie.example", "version": "v1", "kind": "Sprocket"},
+                ],
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "required": ["teeth"],
+                        "properties": {
+                            "teeth": {"type": "integer", "description": "How many."},
+                            "renewAt": {"type": "string", "format": "date-time"},
+                            "mode": {"type": "string"},
+                            "tolerances": {"type": "array", "items": {
+                                "type": "object",
+                                "properties": {
+                                    "axis": {"type": "string"},
+                                    "microns": {"type": "integer"},
+                                },
+                            }},
+                        },
+                    },
+                    "status": {
+                        "type": "object",
+                        "properties": {
+                            "phase": {"type": "string"},
+                            "observedTeeth": {"type": "integer"},
+                        },
+                    },
+                },
+            },
+        }},
+    })
+}
+
+/// What a cluster with two invented API groups answers, where it differs from the plain one.
+///
+/// `None` falls through to the ordinary document, so the core group, the pods and the secret of
+/// every other test are unchanged and a dynamic query reaches them by the same route.
+fn custom_document(path: &str) -> Option<Json> {
+    Some(match path {
+        "/apis" => json!({
+            "kind": "APIGroupList",
+            "groups": [
+                {
+                    "name": "apps",
+                    "versions": [{"groupVersion": "apps/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"},
+                },
+                {
+                    "name": "menagerie.example",
+                    "versions": [{"groupVersion": "menagerie.example/v1", "version": "v1"}],
+                    "preferredVersion": {
+                        "groupVersion": "menagerie.example/v1", "version": "v1",
+                    },
+                },
+                {
+                    "name": "industrial.example",
+                    "versions": [{"groupVersion": "industrial.example/v1", "version": "v1"}],
+                    "preferredVersion": {
+                        "groupVersion": "industrial.example/v1", "version": "v1",
+                    },
+                },
+            ],
+        }),
+        "/apis/menagerie.example/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "menagerie.example/v1",
+            "resources": [
+                {"name": "sprockets", "kind": "Sprocket", "namespaced": true,
+                 "verbs": ["get", "list", "watch"], "shortNames": ["spr"]},
+                // Served, and not listable: §11.5's third state, which is neither "no such
+                // resource" nor "an empty collection".
+                {"name": "escapements", "kind": "Escapement", "namespaced": true,
+                 "verbs": ["get"]},
+            ],
+        }),
+        // The same kind, in a second group, at cluster scope — so that a kind on its own is
+        // genuinely ambiguous (§13.5) and the scope of the answer is not a coincidence.
+        "/apis/industrial.example/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "industrial.example/v1",
+            "resources": [
+                {"name": "sprockets", "kind": "Sprocket", "namespaced": false,
+                 "verbs": ["get", "list"], "shortNames": ["spr"]},
+            ],
+        }),
+        "/openapi/v3/apis/menagerie.example/v1" => custom_openapi(),
+        // This group publishes no schema document at all, which is §12.3's gap rather than a
+        // broken server.
+        "/apis/menagerie.example/v1/namespaces/default/sprockets" => json!({
+            "kind": "SprocketList",
+            "apiVersion": "menagerie.example/v1",
+            "metadata": {"resourceVersion": "9100"},
+            "items": [custom_object(1), custom_object(2)],
+        }),
+        "/apis/industrial.example/v1/sprockets" => json!({
+            "kind": "SprocketList",
+            "apiVersion": "industrial.example/v1",
+            "metadata": {"resourceVersion": "9101"},
+            "items": [{
+                "apiVersion": "industrial.example/v1",
+                "kind": "Sprocket",
+                "metadata": {
+                    "name": "heavy",
+                    "uid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                    "creationTimestamp": "2026-09-02T08:00:00Z",
+                },
+                "spec": {"teeth": 96, "renewAt": "2027-01-01T00:00:00Z"},
+                "payload": {"note": "not under spec, and still here"},
+            }],
+        }),
+        _ => return None,
+    })
+}
+
 fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let pods = cluster.pods;
     let path = path.split('?').next().unwrap_or(path);
+    if cluster.custom
+        && let Some(body) = custom_document(path)
+    {
+        return response(&body.to_string());
+    }
     let body = match path {
         "/api" => json!({"kind": "APIVersions", "versions": ["v1"]}),
         "/apis" if !cluster.apps => json!({"kind": "APIGroupList", "groups": []}),
@@ -332,6 +510,9 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
                 "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"},
             }],
         }),
+        // Reached only when the cluster serves no custom groups: `custom_document` answers
+        // `/apis` before this does, because the group list has to name them.
+        "/openapi/v3/api/v1" | "/openapi/v3/apis/apps/v1" => return not_found(path),
         "/api/v1" => json!({
             "kind": "APIResourceList",
             "groupVersion": "v1",
@@ -1124,4 +1305,404 @@ contexts:
 
     plugin.shutdown(ShutdownReason::Unload).await;
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+// --- a resource this package has never heard of (Gates A and B) --------------------------------
+
+/// The package loaded against a cluster serving two invented API groups.
+async fn loaded_with_custom_resources() -> ono_kuang_supervisor::LoadedPlugin {
+    TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .host(RecordedCluster::with_custom_resources())
+        .load()
+        .await
+        .expect("the package loads under its own manifest")
+}
+
+fn map_of<'record>(record: &'record RecordValue, field: &str) -> &'record ono_value::MapValue {
+    match record.get(field) {
+        Some(Value::Map(map)) => map,
+        other => panic!("`{field}` is a map, and it is {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn should_read_a_kind_this_package_has_never_heard_of() {
+    // Gate A (§62.1), as far as a test without a cluster can carry it: the kind, its group, its
+    // plural, its short name and every one of its fields exist only in this file. Nothing was
+    // recompiled to reach it — the same binary that answers `k8s-pod` answers this.
+    let plugin = loaded_with_custom_resources().await;
+    let invocation = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[
+                ("kind", json!("Sprocket")),
+                ("group", json!("menagerie.example")),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+
+    let records = records(&events);
+    assert_eq!(records.len(), 2, "both objects of the collection arrived");
+    let first = &records[0];
+    assert_eq!(
+        first.schema_id().to_string(),
+        "io.github.godspeed-you.kubernetes.resource/1",
+        "a record may only claim a schema the package contributed, and a schema named after a \
+         kind invented later could never have been contributed (ADR-0010)"
+    );
+    assert_eq!(
+        first.provenance().provider(),
+        format!("plugin:{PACKAGE}"),
+        "provenance is the host's stamp on a dynamic record like any other (§31.80)"
+    );
+    first
+        .validate()
+        .expect("a dynamic record conforms to the one schema it claims");
+
+    // §13.2: one schema for every kind means the Kubernetes type identity has to live in the
+    // record, or it is lost.
+    assert_eq!(text_of(first, "kind").as_deref(), Some("Sprocket"));
+    assert_eq!(
+        text_of(first, "api_group").as_deref(),
+        Some("menagerie.example")
+    );
+    assert_eq!(
+        text_of(first, "api_version").as_deref(),
+        Some("menagerie.example/v1")
+    );
+    assert_eq!(
+        text_of(first, "resource_name").as_deref(),
+        Some("sprockets"),
+        "the plural discovery named, which is a GVR's part and never a kind (§13.1)"
+    );
+    assert_eq!(text_of(first, "scope").as_deref(), Some("namespaced"));
+    assert_eq!(text_of(first, "namespace").as_deref(), Some("default"));
+    assert_eq!(
+        text_of(first, "uid").as_deref(),
+        Some("aaaaaaaa-aaaa-aaaa-aaaa-000000000001"),
+        "identity is the uid for a custom resource exactly as for a Pod (§16.1)"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_type_an_unknown_kind_from_the_schema_the_cluster_publishes() {
+    // Gate B (§62.2): where the server publishes a schema, the resource is typed structure
+    // rather than raw JSON — and the typing came from the cluster, because this build has never
+    // seen the field names it is typing.
+    let plugin = loaded_with_custom_resources().await;
+    let invocation = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[
+                ("kind", json!("Sprocket")),
+                ("group", json!("menagerie.example")),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let records = records(&events);
+    let record = &records[0];
+
+    assert_eq!(
+        text_of(record, "schema_source").as_deref(),
+        Some("openapi-v3"),
+        "the record says where its typing came from (§12.1)"
+    );
+    assert_eq!(
+        text_of(record, "precision").as_deref(),
+        Some("structural"),
+        "a structural schema reaches every content field"
+    );
+    assert_eq!(
+        record.get("untyped"),
+        Some(&Value::List([].into())),
+        "nothing is undescribed, and the empty list says so rather than null"
+    );
+
+    let spec = map_of(record, "spec");
+    assert_eq!(spec.get("teeth"), Some(&Value::Int(24)));
+    assert_eq!(
+        spec.get("mode"),
+        Some(&Value::String("idle".into())),
+        "a described string is a string"
+    );
+    assert!(
+        matches!(spec.get("renewAt"), Some(Value::Timestamp(_))),
+        "the schema's `format: date-time` is what makes this an instant rather than text: {:?}",
+        spec.get("renewAt")
+    );
+    let Some(Value::List(tolerances)) = spec.get("tolerances") else {
+        panic!("a described list of objects survives as a list");
+    };
+    let Some(Value::Map(entry)) = tolerances.first() else {
+        panic!("its entries survive as maps");
+    };
+    assert_eq!(entry.get("microns"), Some(&Value::Int(5)));
+
+    // §4 invariant 8 and §33.6: what was asked for and what was observed are never merged.
+    let status = map_of(record, "status");
+    assert_eq!(status.get("observedTeeth"), Some(&Value::Int(24)));
+    assert_eq!(
+        spec.get("observedTeeth"),
+        None,
+        "the observed count is not in the spec, and the spec's is not in the status"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_every_field_of_an_unknown_kind_the_cluster_describes_nowhere() {
+    // Gate B's second half (§12.3, §12.5): a schema gap degrades precision and never removes a
+    // field. The second invented group publishes no OpenAPI document at all.
+    let plugin = loaded_with_custom_resources().await;
+    let invocation = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[
+                ("kind", json!("Sprocket")),
+                ("group", json!("industrial.example")),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let records = records(&events);
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    record
+        .validate()
+        .expect("an undescribed record still conforms");
+
+    assert_eq!(
+        text_of(record, "schema_source").as_deref(),
+        Some("absent"),
+        "nothing described this resource, and the record says so rather than implying typing"
+    );
+    assert_eq!(text_of(record, "precision").as_deref(), Some("unknown"));
+    assert_eq!(
+        text_of(record, "scope").as_deref(),
+        Some("cluster"),
+        "the scope is the server's declaration, and this group's Sprocket is cluster-scoped"
+    );
+    assert_eq!(
+        record.get("namespace"),
+        Some(&Value::Null),
+        "§9.2: a cluster-scoped object has no namespace rather than an invented one"
+    );
+
+    let spec = map_of(record, "spec");
+    assert_eq!(
+        spec.get("teeth"),
+        Some(&Value::Int(96)),
+        "the field is present and valued with no schema in sight (§12.5)"
+    );
+    assert_eq!(
+        spec.get("renewAt"),
+        Some(&Value::String("2027-01-01T00:00:00Z".into())),
+        "and it is text, because nothing claimed it was an instant — precision degraded, the \
+         field did not"
+    );
+    let Some(Value::List(untyped)) = record.get("untyped") else {
+        panic!("the undescribed fields are named");
+    };
+    assert!(
+        untyped.contains(&Value::String("/spec/renewAt".into())),
+        "each undescribed field is addressable by pointer: {untyped:?}"
+    );
+
+    // §12.5 again, for a kind whose content is neither desired nor observed state.
+    let other = map_of(record, "other");
+    assert!(
+        other.get("payload").is_some(),
+        "a top-level field outside spec and status is kept rather than dropped: {other:?}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_an_ambiguous_kind_and_name_the_candidates() {
+    // §35.8: a name several types share must not resolve by an arbitrary type priority. Two
+    // invented groups both serve a `Sprocket`, and neither of them wins.
+    let plugin = loaded_with_custom_resources().await;
+    let invocation = plugin
+        .query("k8s-resource", at_cluster(&[("kind", json!("Sprocket"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(
+        records(&events).is_empty(),
+        "nothing was answered from a group nobody chose"
+    );
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert_eq!(error.name, "resolve.ambiguous");
+    let help = error.help.unwrap_or_default();
+    assert!(
+        help.contains("menagerie.example") && help.contains("industrial.example"),
+        "the refusal carries the candidates, because `be more specific` without them is a dead \
+         end: {help}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_resolve_a_short_name_the_cluster_offers_once_the_group_settles_it() {
+    // §13.5: a short name is a typing convenience, and it becomes usable exactly when it is
+    // unambiguous — never by this provider picking a winner for it.
+    let plugin = loaded_with_custom_resources().await;
+    let invocation = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[
+                ("resource", json!("spr")),
+                ("group", json!("menagerie.example")),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(records(&events).len(), 2);
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_say_a_kind_is_not_served_rather_than_answer_with_nothing() {
+    // §11.5 and §21.4: an unserved resource and an empty collection are different states, and a
+    // provider that returned an empty stream would be claiming the cluster has none of them.
+    let plugin = loaded_with_custom_resources().await;
+    let invocation = plugin
+        .query("k8s-resource", at_cluster(&[("kind", json!("Flywheel"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(
+        result.status,
+        InvokeStatus::Failed,
+        "an unserved kind is a refusal, not a complete answer of length zero"
+    );
+    let error = result.error.expect("a structured refusal");
+    assert_eq!(error.name, "provider.unsupported");
+    assert!(
+        error.message.contains("Flywheel"),
+        "the refusal quotes what was asked for: {}",
+        error.message
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_say_a_served_resource_that_cannot_be_listed_is_not_an_empty_collection() {
+    let plugin = loaded_with_custom_resources().await;
+    let invocation = plugin
+        .query("k8s-resource", at_cluster(&[("kind", json!("Escapement"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert_eq!(error.name, "provider.unsupported");
+    assert!(
+        error.message.contains("list"),
+        "the refusal says which verb the server does not offer: {}",
+        error.message
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_answer_a_query_that_names_no_kind_with_the_cluster_s_own_catalogue() {
+    // The honest answer to "which resource?" from a provider that compiles in no list of them:
+    // ask the cluster. §15.5 wants what is readable stated rather than assumed.
+    let plugin = loaded_with_custom_resources().await;
+    let invocation = plugin
+        .query("k8s-resource", at_cluster(&[]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert_eq!(error.name, "resolve.ambiguous");
+    let help = error.help.unwrap_or_default();
+    assert!(
+        help.contains("Sprocket") && help.contains("Pod"),
+        "the catalogue is the cluster's, and it holds the invented kind beside the built-in \
+         one: {help}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_the_redaction_boundary_on_the_dynamic_route() {
+    // Gate I is about *every* read path, and a new one is exactly where a payload leaks. A
+    // Secret reached generically goes through the same `Guarded` as one reached by name, so
+    // there is nothing left to find by the time a record is built (§22, ADR-0003).
+    let plugin = loaded_with_custom_resources().await;
+    let invocation = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[("kind", json!("Secret")), ("group", json!(""))]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let records = records(&events);
+    assert_eq!(records.len(), 1);
+
+    let rendered = ono_value::to_json_string(&Value::Record(Arc::clone(&records[0])))
+        .expect("a record renders as JSON");
+    assert!(
+        !rendered.contains(TOKEN_PAYLOAD),
+        "the payload must not survive the generic route either: {rendered}"
+    );
+    assert!(
+        rendered.contains("api-token"),
+        "the Secret is still readable as an object; it is the values that are gone: {rendered}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[test]
+fn should_name_the_invented_kind_nowhere_in_the_implementation() {
+    // The claim the tests above rest on: the provider reaches this kind because it is data, not
+    // because anything recognises it (§33.1, Gate A). The moment someone special-cases it, this
+    // fails.
+    for (file, source) in [
+        ("lib.rs", include_str!("../src/lib.rs")),
+        ("contributions.rs", include_str!("../src/contributions.rs")),
+        ("dynamic.rs", include_str!("../src/dynamic.rs")),
+        ("query.rs", include_str!("../src/query.rs")),
+        ("records.rs", include_str!("../src/records.rs")),
+        ("broker.rs", include_str!("../src/broker.rs")),
+    ] {
+        let code = source.split("#[cfg(test)]").next().unwrap_or_default();
+        for invented in [
+            "Sprocket",
+            "menagerie.example",
+            "industrial.example",
+            "teeth",
+        ] {
+            assert!(
+                !code.contains(invented),
+                "`{file}` names `{invented}`, which exists only in this test: a kind reached by \
+                 recognition is not a kind reached dynamically"
+            );
+        }
+    }
 }

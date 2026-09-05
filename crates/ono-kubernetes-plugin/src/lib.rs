@@ -6,9 +6,11 @@
 //! testable without a host and this crate testable without a cluster.
 //!
 //! ```text
-//! contributions   what the package declares: targets, schemas, the group and kind each reads
+//! contributions   what the package declares: targets, schemas, what each one reads
 //! broker          the host's brokered connection, seen as a byte stream
 //! query           one `provider.query`: discovery, list, redact, emit
+//! cluster         the diagnostic: which cluster, reachable, as whom, and what is unknown
+//! dynamic         a resource nobody compiled in: resolving it, and typing it from the cluster
 //! records         one Kubernetes object, as a record of the target's schema
 //! ```
 //!
@@ -16,7 +18,9 @@
 //! conformance test can drive the real binary while the unit tests reach the same code directly.
 
 pub mod broker;
+pub mod cluster;
 pub mod contributions;
+pub mod dynamic;
 pub mod query;
 pub mod records;
 
@@ -46,7 +50,15 @@ pub fn plugin() -> Plugin {
         plugin = plugin
             .contribute_schema(target.schema_contribution())
             .contribute_target(target.target_contribution())
-            .provider(target.name, move |ctx| query::answer(target, ctx));
+            // Which handler answers is decided by what the target *reads*, so a table entry
+            // cannot be wired to a handler that does not fit it. The diagnostic reads the session
+            // rather than a collection, and there is no listing path it could take.
+            .provider(target.name, move |ctx| match target.reads {
+                contributions::Reads::Instance => cluster::answer(target, ctx),
+                contributions::Reads::Kind { .. } | contributions::Reads::Discovered => {
+                    query::answer(target, ctx)
+                }
+            });
     }
     plugin
 }
