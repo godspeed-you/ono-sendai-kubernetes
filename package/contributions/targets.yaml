@@ -1,0 +1,94 @@
+# The nouns this package answers for, readable before any of its code runs (spec §31.68).
+#
+# The Tier 1 operational set of specification §15.2 — the resources everyday workload
+# troubleshooting crosses. They are declared statically so that `get k8s-pod`, its help page and
+# its completion answer on a shell that has never loaded this package, and so that the package
+# loads on first use rather than on every start.
+#
+# The `k8s-` prefix is deliberate. `pod` and `node` are reserved in core's `docs/contracts/
+# targets.yaml` as provider-qualified words with no schema yet, and claiming them from a package
+# would decide a question that belongs to core. A prefixed noun is honest about who answers it
+# and costs a reader four characters.
+#
+# Custom resources are deliberately absent and not forgotten: a CRD invented after this package
+# was built cannot appear in a document written before it, which is the tension between §31.68's
+# static placeholders and §33.1's dynamic CRDs. Discovery reaches them at runtime; how they become
+# typeable nouns is an open question recorded in docs/STATE.md.
+
+targets:
+  - name: k8s-namespace
+    schema: io.github.godspeed-you.kubernetes.namespace/1
+    summary: "Namespaces, the primary scope dimension of a cluster."
+    identity_doc: "Two observations are the same namespace when their `metadata.uid` matches."
+  - name: k8s-node
+    schema: io.github.godspeed-you.kubernetes.node/1
+    summary: "Nodes, and the cloud instances underneath them."
+    identity_doc: "Two observations are the same node when their `metadata.uid` matches; a name reused after deletion is a new node."
+  - name: k8s-pod
+    schema: io.github.godspeed-you.kubernetes.pod/1
+    summary: "Pods, the workload that actually runs."
+    identity_doc: "Two observations are the same pod when their `metadata.uid` matches. A recreated pod with the same name is a different pod."
+  - name: k8s-deployment
+    schema: io.github.godspeed-you.kubernetes.deployment/1
+    summary: "Deployments, and the ReplicaSets they control."
+    identity_doc: "Two observations are the same deployment when their `metadata.uid` matches."
+  - name: k8s-replicaset
+    schema: io.github.godspeed-you.kubernetes.replicaset/1
+    summary: "ReplicaSets, which sit between a Deployment and its Pods."
+    identity_doc: "Two observations are the same ReplicaSet when their `metadata.uid` matches."
+  - name: k8s-statefulset
+    schema: io.github.godspeed-you.kubernetes.statefulset/1
+    summary: "StatefulSets, and the claims their templates materialise."
+    identity_doc: "Two observations are the same StatefulSet when their `metadata.uid` matches."
+  - name: k8s-daemonset
+    schema: io.github.godspeed-you.kubernetes.daemonset/1
+    summary: "DaemonSets, and their rollout across nodes."
+    identity_doc: "Two observations are the same DaemonSet when their `metadata.uid` matches."
+  - name: k8s-service
+    schema: io.github.godspeed-you.kubernetes.service/1
+    summary: "Services, and the Pods their selectors reach."
+    identity_doc: "Two observations are the same service when their `metadata.uid` matches."
+  - name: k8s-endpointslice
+    schema: io.github.godspeed-you.kubernetes.endpointslice/1
+    summary: "EndpointSlices, the endpoints a Service is represented by."
+    identity_doc: "Two observations are the same slice when their `metadata.uid` matches."
+  - name: k8s-ingress
+    schema: io.github.godspeed-you.kubernetes.ingress/1
+    summary: "Ingresses, and the Services they route to."
+    identity_doc: "Two observations are the same ingress when their `metadata.uid` matches."
+  - name: k8s-job
+    schema: io.github.godspeed-you.kubernetes.job/1
+    summary: "Jobs, and the Pods they own."
+    identity_doc: "Two observations are the same job when their `metadata.uid` matches."
+  - name: k8s-cronjob
+    schema: io.github.godspeed-you.kubernetes.cronjob/1
+    summary: "CronJobs, and the Jobs they create."
+    identity_doc: "Two observations are the same CronJob when their `metadata.uid` matches."
+  - name: k8s-configmap
+    schema: io.github.godspeed-you.kubernetes.configmap/1
+    summary: "ConfigMaps, and what consumes them."
+    identity_doc: "Two observations are the same ConfigMap when their `metadata.uid` matches."
+  - name: k8s-secret
+    schema: io.github.godspeed-you.kubernetes.secret/1
+    summary: "Secret metadata — which keys exist and what mounts them, never the values (specification section 22)."
+    identity_doc: "Two observations are the same secret when their `metadata.uid` matches."
+  - name: k8s-serviceaccount
+    schema: io.github.godspeed-you.kubernetes.serviceaccount/1
+    summary: "ServiceAccounts, the identity a workload runs as."
+    identity_doc: "Two observations are the same account when their `metadata.uid` matches."
+  - name: k8s-persistentvolumeclaim
+    schema: io.github.godspeed-you.kubernetes.persistentvolumeclaim/1
+    summary: "PersistentVolumeClaims, and the volumes they bind."
+    identity_doc: "Two observations are the same claim when their `metadata.uid` matches."
+  - name: k8s-persistentvolume
+    schema: io.github.godspeed-you.kubernetes.persistentvolume/1
+    summary: "PersistentVolumes, and the storage behind them."
+    identity_doc: "Two observations are the same volume when their `metadata.uid` matches."
+  - name: k8s-storageclass
+    schema: io.github.godspeed-you.kubernetes.storageclass/1
+    summary: "StorageClasses, and what they provision."
+    identity_doc: "Two observations are the same class when their `metadata.uid` matches."
+  - name: k8s-networkpolicy
+    schema: io.github.godspeed-you.kubernetes.networkpolicy/1
+    summary: "NetworkPolicies, and the Pods their selectors govern."
+    identity_doc: "Two observations are the same policy when their `metadata.uid` matches."

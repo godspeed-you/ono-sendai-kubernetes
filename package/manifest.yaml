@@ -1,0 +1,56 @@
+# The KUANG/11 package this repository ships (spec §31.5–§31.7).
+#
+# `native-process` rather than `wasm-component`: the provider speaks HTTPS to an API server, and
+# under ADR-0573 in core that protocol is the package's own over a brokered byte connection. A
+# component would still need TLS and HTTP of its own, and would additionally have to carry them
+# under the WASI restrictions, so the isolation gained does not yet pay for what it costs. The
+# tier is a decision to revisit once the transport exists and its dependency surface is known.
+format: kuang-package/1
+
+package:
+  # Reverse-DNS under a publisher namespace that can actually be checked (spec §31.5). The
+  # `ono.*` namespace is refused at parse time for every package, so this one does not claim it
+  # even though the Ono-Sendai project ships it.
+  id: io.github.godspeed-you.kubernetes
+  name: kubernetes
+  version: 0.1.0
+  description: Kubernetes as typed resources, relationships and places rather than a command namespace.
+  publisher: io.github.godspeed-you
+  license: Apache-2.0
+
+compatibility:
+  kuang_api: ">=11.1 <12"
+  ono_language: ">=0.2"
+  platforms: [linux-amd64, linux-arm64]
+
+runtime:
+  kind: native-process
+  entry: runtime/ono-kubernetes
+  memory_max: 256MiB
+  cpu_budget: interactive
+  startup: lazy
+
+roles: [provider]
+
+capabilities:
+  optional:
+    # The API server, over the brokered connection. `hosts` cannot be pinned in the package: the
+    # endpoint comes from whichever kubeconfig context the operator chose, so the scope is
+    # granted per instance by the operator rather than declared here (§27.2 of the generic
+    # provider contract allows a broader but still bounded grant for dynamic endpoints).
+    - network.connect
+    # kubeconfig, read from the conventional path and nothing else. §27.3 forbids blanket
+    # filesystem access merely to read provider configuration.
+    - filesystem.read:
+        paths: ["~/.kube/config", "~/.kube/*.yaml"]
+    # Tokens and client keys are brokered; the package holds handles rather than material (§8.1).
+    - secret.use
+    - clock.read
+    - state.persist
+
+network:
+  # Every byte leaves through the broker, which is where the operator's scope is enforced.
+  outbound: brokered
+
+contributions:
+  targets: [contributions/targets.yaml]
