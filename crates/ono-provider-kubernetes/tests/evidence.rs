@@ -176,13 +176,30 @@ fn should_name_no_cloud_vendor_anywhere_in_the_module() {
 #[test]
 fn should_link_the_package_to_no_cloud_sdk() {
     // Gate K's other half (§60.8 step 4, §59.5). The module can stay clean while a dependency
-    // quietly makes the package a cloud client; the manifest is where that would show first.
-    let manifest = include_str!("../Cargo.toml").to_lowercase();
-    for vendor in VENDORS {
-        assert!(
-            !mentions(&manifest, vendor),
-            "the package manifest names `{vendor}`; Gate K keeps this package free of cloud SDKs"
-        );
+    // quietly makes the package a cloud client; a manifest is where that would show first.
+    //
+    // **All four manifests**, not just this crate's. Gate K is about the thing an operator
+    // installs, and that is `ono-kubernetes-plugin` — this test read only the domain crate's own
+    // `Cargo.toml`, so a cloud SDK added to the package, or to the workspace's shared
+    // dependencies, would have left it green. A dependency test that reads the wrong file proves
+    // the file rather than the property.
+    let manifests = [
+        ("this crate", include_str!("../Cargo.toml")),
+        (
+            "the package an operator installs",
+            include_str!("../../ono-kubernetes-plugin/Cargo.toml"),
+        ),
+        ("the workspace", include_str!("../../../Cargo.toml")),
+        ("the lock file", include_str!("../../../Cargo.lock")),
+    ];
+    for (which, manifest) in manifests {
+        let manifest = manifest.to_lowercase();
+        for vendor in VENDORS {
+            assert!(
+                !mentions(&manifest, vendor),
+                "{which} names `{vendor}`; Gate K keeps this package free of cloud SDKs"
+            );
+        }
     }
 }
 
