@@ -577,22 +577,13 @@ both halves:
 
 ## Deferred / blocked
 
-- **The session's shell died on a full `/tmp`, and one increment is uncommitted because of it
-  (2026-09-06).** `/tmp` on this machine is a 30.4 GB tmpfs mounted `usrquota`, and uid 1000
-  reached its quota during the day's work — a docker image build with a 56 GB repository as its
-  context, two `kind` clusters and the test suites' scratch directories between them. Every write
-  under `/tmp` then returns `EDQUOT`, and the agent harness stages each shell command there, so
-  every command — down to `true` — exits 1 with no output. Diagnosed with `Read`/`Write` probes
-  after the shell stopped answering: a six-byte write to `/tmp` gives `EDQUOT`, the same write to
-  `/home` and to `/dev/shm` succeeds, `/proc/meminfo` shows `Shmem: 24 GB`, and `/` is not full.
-
-  Nothing is lost: the work is on disk and the gate was green over it. What is owed is one commit,
-  after a shell outside the session runs `du -xh --max-depth=1 /tmp | sort -h | tail` and clears
-  the scratch entries — which also returns the 24 GB to RAM, `/tmp` being tmpfs. What to keep
-  while clearing: `/tmp/claude-*`. **The lesson worth keeping**: `scripts/acceptance.sh` builds
-  with the repository root as the docker context, and `target/` in this tree and in core's is
-  56 GB of it. A `.dockerignore` naming `target/` would have prevented the whole failure, and it
-  belongs in core beside the Dockerfile.
+- **~~The session's shell died on a full `/tmp`.~~ Cleared 2026-09-06, and the increment is
+  committed.** `/tmp` on this machine is a 30.4 GB tmpfs mounted `usrquota`, uid 1000 reached its
+  quota, and every write under it returned `EDQUOT` — which killed the agent harness, because it
+  stages each shell command there. The user cleared it. **The lesson worth keeping**:
+  `scripts/acceptance.sh` builds with the repository root as the docker context, and `target/` in
+  this tree and in core's is 56 GB of it. A `.dockerignore` naming `target/` would have prevented
+  the whole failure, and it belongs in core beside the Dockerfile.
 
 - **A discovered CRD earning a *name* is still open**, and needs a change in core. `k8s-resource`
   is the floor: every kind is reachable, spelled as options. The nicer shape — a discovered
@@ -600,19 +591,17 @@ both halves:
   target contributed at handshake time, which it does not do (see the finding below).
   [ADR-0010](adr/ADR-0010-a-generic-noun-reaches-every-kind-because-a-static-document-cannot-name-one-invented-later.md)
   is shaped so that adding it later takes nothing away.
-- **A Kubernetes object is not a place, and core is no longer the reason.** `ADR-0584` in core
-  makes a contributed target a kind of place and `ADR-0585` runs a contributed relation between
-  two contributed kinds — the two closures that used to shut `enter`, `near`, `up` and `map` out
-  of Kubernetes. This package declares neither, and `place.rs` already builds every address the
-  contributions would carry. Deferred rather than blocked, and it is the largest item on the board
-  because Gate A, K1's claim and K2's spatial requirement all turn on it.
-- **§34.2's failure isolation is not honoured on the dynamic search.** A query naming no `group`
-  reads the resource list of every group the server lists, and one that does not answer fails the
-  query rather than being skipped. That is deliberate — an incomplete search resolving to one
-  candidate is indistinguishable from an unambiguous one, and §35.8 is not worth trading for
-  convenience — but it means one broken aggregated API server makes an unqualified `--kind` search
-  fail. Naming `group` keeps it out of the search. What §34.2 wants instead is the search
-  continuing while *saying* which groups it could not read.
+- **~~A Kubernetes object is not a place.~~ Closed.** `ADR-0584` and `ADR-0585` in core opened the
+  vocabulary; this package declares both, and `enter`, `near` and `follow` reach a cluster through
+  the real `ono` binary. A CRD invented after the build is entered as a place keyed on the
+  cluster's own `uid` — Gate A's fifth verb, proven against a live cluster
+  (`should_enter_a_custom_kind_the_cluster_learned_after_this_package_was_built`). `up` still
+  refuses, because the space above a namespace is an aggregate no single package can declare.
+- **~~§34.2's failure isolation is not honoured on the dynamic search.~~ Closed.** The search now
+  fails soft per group-version and `Searched` makes it impossible to hand on the groups that
+  answered without the ones that did not, so one broken aggregated API server no longer fails an
+  unqualified `--kind` search — it narrows it and says which groups it could not read. Four tests
+  pin it, and it is what closed §4 invariant 16.
 - **~~§12.4's schema cache has an owner the plugin does not hold.~~ Joined.** The package holds
   the session, the OpenAPI document for a resolved group-version is fetched once, and an *absent*
   schema is cached too, because "this server publishes none" is an answer about this cluster and
