@@ -5,14 +5,15 @@ reference KUANG/11 external-system provider.
 
 > Kubernetes is not a command namespace inside Ono. It is a system Ono can understand.
 
-**There is no release, and no Kubernetes version is supported.** What exists is a KUANG/11
-package that builds from this repository and runs: it speaks HTTPS to an API server over the
-host's brokered connection, reads any kind the cluster serves, walks relationships with the
-evidence under each edge, watches a collection live, and — under a declared risk and an operator's
-grant — predicts or makes one bounded change. It is proven against recorded API bytes and has
-never been run against a production cluster.
-[`docs/coverage.md`](docs/coverage.md) says section by section how far it goes, and
-[`docs/STATE.md`](docs/STATE.md) says what is next.
+**There is no release.** What exists is a KUANG/11 package that builds from this repository and
+runs: it speaks HTTPS to an API server over the host's brokered connection, reads any kind the
+cluster serves, walks relationships with the evidence under each edge, watches a collection live
+at a terminal, and — under a declared risk and an operator's grant — predicts or makes one bounded
+change. Most of it is proven against recorded API bytes, and a suite of integration tests runs the
+real `ono` binary against ephemeral `kind` clusters at the declared oldest and newest supported
+Kubernetes minor versions, on a machine with no `kubectl` installed. It has not been run against a
+production cluster. [`docs/coverage.md`](docs/coverage.md) says section by section how far it
+goes, and [`docs/STATE.md`](docs/STATE.md) says what is next.
 
 | | |
 |---|---|
@@ -123,15 +124,30 @@ Both are canonical in that repository and are deliberately not copied here.
 | | |
 |---|---|
 | KUANG/11 package format | `kuang-package/1`, `kuang_api >=11.1 <12` |
-| Ono-Sendai core, to build | the SDK revision `Cargo.lock` pins. It predates `ADR-0586 (core)`, so this package answers **one invocation at a time** and cannot yet prove §62.10's *concurrent* two-context isolation |
-| Ono-Sendai core, to run | **at or after `ADR-0582 (core)`.** Before it, a contributed target could only be answered through a contributed command, which returns values carrying no declared schema, no identity and no provenance |
-| Kubernetes versions | **none is supported.** The specification was written against the API model of 2026-09-03 and targets the then-supported v1.35 – v1.37 (§0.5, §5.1); that is a specification target, not a support claim, and no CI job runs against any Kubernetes version (§5.5, Gate N) |
-| Kubernetes versions actually exercised | none. Every test runs against recorded API bytes; nothing in this repository has contacted a cluster (§59.1) |
+| Ono-Sendai core, to build | the revision `Cargo.toml` pins, which carries `ADR-0588 (core)` — a contributed target declares whether its answer ends, which is what lets a watch reach the shell as a live stream rather than as a table that never arrives |
+| Ono-Sendai core, to run | **at or after `ADR-0588 (core)`.** Earlier hosts answer everything else; `get k8s-change` and `get k8s-log --follow` are the two words that need it, because an earlier host collects an answer that has no end |
+| Kubernetes versions | **v1.35 – v1.37**, which is what upstream maintained on the specification's snapshot date (§0.5, §5.1). The claim is a tested matrix rather than a parser guard: nothing in the provider inspects `gitVersion`, and a cluster outside the window may work perfectly (§5.2) |
+| Kubernetes versions actually exercised | **v1.35.8 and v1.37.0**, the declared oldest and newest, on ephemeral `kind` clusters in CI and on demand through `scripts/cluster.sh` (§5.5, §59.3, Gate N). §5.5's optional intermediate release is not run |
 | Releases of this provider | none |
 
 The provider is discovery-first by construction: every REST path is built from what the connected
-API server says it serves, and no endpoint is compiled in (§5.2). A tested compatibility matrix
-replaces this table when there is CI to support one.
+API server says it serves, and no endpoint is compiled in (§5.2). The matrix above is what CI
+runs, not what the code permits.
+
+## Seeing it work
+
+```bash
+scripts/demo.sh              # or --version v1.35.8, or --keep to poke at the cluster afterwards
+```
+
+Builds an ephemeral `kind` cluster, installs the package the way an operator installs one, and
+runs §65's whole "useful Kubernetes provider" list at an ordinary `ono` prompt: connect, enter,
+discover a CRD invented minutes ago, inspect the fields the schema does not describe, walk
+`Deployment → ReplicaSet → Pod → Node` and `Service → EndpointSlice → Pod` with the evidence under
+each hop, watch a collection live, meet a denial that is not an emptiness, export a Node's machine
+identity, plan a change, hit a field-manager conflict, take ownership with a written reason, and
+read a log — with `kubectl` nowhere in the path. It narrates; the assertions are in
+`crates/ono-kubernetes-plugin/tests/live_cluster.rs`.
 
 ## What is supported, along five axes
 
