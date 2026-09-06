@@ -41,9 +41,8 @@ handler, `spatial-relations`, is registered at handshake and is not a command: i
 host's request for the relation shapes the manifest declares (`ADR-0585 (core)`), and it is
 counted in the sixty rather than in the two.
 
-**933 tests across the workspace — 662 in the domain crate and 271 in the package — all green**,
-over 83,306 lines of source. Twenty-two announce a skip when there is no cluster and no `ono`
-binary, and every one of them is declared in
+**946 tests across the workspace, all green**, over 84,000 lines of source. Twenty-two announce a
+skip when there is no cluster and no `ono` binary, and every one of them is declared in
 [`docs/contracts/expected_test_skips.yaml`](contracts/expected_test_skips.yaml), checked in both
 directions by the gate.
 

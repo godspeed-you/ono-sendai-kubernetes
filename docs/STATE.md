@@ -30,7 +30,7 @@ the last two that were not, reach a reader through `changes.rs` and `query.rs`.
 | Domain layer | `crates/ono-provider-kubernetes`, twenty-four modules, no host and no cluster |
 | Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations, audit, spatial |
 | Contributions | 47 targets, 2 commands, 48 schemas, 60 relation shapes, **zero verbs of this package's own** |
-| Tests | 933 across the workspace, all green; 22 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
+| Tests | 946 across the workspace, all green; 22 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
 | Live proof | 14 tests in `live_cluster.rs` against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine. Thirteen of them announce a skip without one; the fourteenth is a static source scan that never does |
 | Transport | HTTP/1.1 over a `rustls` session over the host's brokered `network.connect` |
 | Conformance level reached | **none claimed.** §0.1 binds a claim to the gates; see `docs/coverage.md` for the requirement-by-requirement map |
@@ -922,9 +922,14 @@ workflow's three legs, the README's compatibility row and `scripts/cluster.sh`'s
 claim. A sibling pins the core revision CI builds the shell from against *every* manifest, after a
 bump that touched only the workspace left two revisions of `ono-kuang-protocol` in one graph.
 
-Counts, so the next re-derivation has something to disagree with: 933 tests (662 domain, 271
-package), 47 targets, 2 commands, 48 schemas, 22 declared skips, 31 sections implemented and 35
-partial, 22 of 22 invariants, **14 of 14 gates**.
+Counts, so the next re-derivation has something to disagree with: 946 tests, 47 targets, 2
+commands, 48 schemas, 24 of 24 domain modules imported, 22 declared skips, 54 ADRs, 31 sections
+implemented and 35 partial, 22 of 22 invariants, **14 of 14 gates**.
 
-Next: exec credential plugins (§8.2, §8.3), which is what stands between this provider and most
-managed clusters.
+Later the same day, §8.2 and §8.3 landed too — a managed cloud's kubeconfig connects, under a
+`process.exec` grant an operator makes deliberately (ADR-0054) — and an independent skeptical
+review of this document and the coverage map found nine things overstated, every one of which is
+corrected in the commits above. Two of its findings were tests weaker than the rows citing them,
+including one that had no failing input at all.
+
+Next: §8.3's credential refresh, which is a session question rather than a credential one.
