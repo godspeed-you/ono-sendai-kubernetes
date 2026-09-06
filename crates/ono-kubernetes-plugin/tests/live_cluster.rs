@@ -1184,6 +1184,92 @@ fn should_observe_a_real_create_on_a_watch_of_a_kind_invented_for_the_test() {
 }
 
 #[test]
+fn should_answer_for_the_platform_operation_tier_against_a_real_cluster() {
+    // §15.3's seventeen kinds, against a cluster nobody wrote the fixture for. The recorded suite
+    // proves each projection reads the right pointer; this proves each *target resolves* — the
+    // plural, the group and the preferred version that discovery hands back on a real API server,
+    // which is precisely what a hand-written table gets wrong and a fixture written from the same
+    // table cannot catch.
+    //
+    // Two halves, because a cluster out of the box is not stocked with every kind. Seven of the
+    // seventeen have objects on any cluster and are read for real. The other ten are asked for
+    // and answer with a complete, empty collection — which is the whole point of §21.4 stated the
+    // other way round: a kind the cluster serves and has none of is a *complete* answer, and it
+    // is what proves the GVR resolved.
+    let live = match Live::open() {
+        Ok(live) => live,
+        Err(missing) => {
+            return announce_skip(
+                "should_answer_for_the_platform_operation_tier_against_a_real_cluster",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let home = plugin_home(&live, "tier-two");
+
+    // The seven with objects on any cluster: RBAC's four, a Lease, a PriorityClass and the CSINode
+    // the kubelet registers for its own node.
+    for (target, scope) in [
+        ("k8s-clusterrole", ""),
+        ("k8s-clusterrolebinding", ""),
+        ("k8s-role", "--namespace kube-system"),
+        ("k8s-rolebinding", "--namespace kube-system"),
+        ("k8s-lease", "--namespace kube-node-lease"),
+        ("k8s-priorityclass", ""),
+        ("k8s-csinode", ""),
+    ] {
+        let run = shell(
+            &live,
+            &home,
+            &format!(
+                "get {target} {} {scope} | take 1 | select name uid | to json",
+                as_admin(&home)
+            ),
+        );
+        let row = run.only();
+        assert!(
+            row["name"].as_str().is_some_and(|name| !name.is_empty()),
+            "`{target}` reads an object this cluster serves: {row}"
+        );
+        assert!(
+            row["uid"].as_str().is_some_and(|uid| !uid.is_empty()),
+            "and it carries the lifetime identity every record is keyed on (§16.1): {row}"
+        );
+    }
+
+    // The other ten. `count` on an empty collection is the assertion: the query *completed*, so
+    // the kind resolved and the collection answered. A kind that did not resolve refuses, and a
+    // refusal is not a count.
+    for (target, scope) in [
+        ("k8s-horizontalpodautoscaler", "--all_namespaces true"),
+        ("k8s-poddisruptionbudget", "--all_namespaces true"),
+        ("k8s-resourcequota", "--all_namespaces true"),
+        ("k8s-limitrange", "--all_namespaces true"),
+        ("k8s-runtimeclass", ""),
+        ("k8s-csidriver", ""),
+        ("k8s-volumeattachment", ""),
+        ("k8s-mutatingwebhookconfiguration", ""),
+        ("k8s-validatingwebhookconfiguration", ""),
+        ("k8s-validatingadmissionpolicy", ""),
+    ] {
+        let run = shell(
+            &live,
+            &home,
+            &format!("get {target} {} {scope} | count | to json", as_admin(&home)),
+        );
+        // `last_json` panics unless a `to json` document reached stdout, so a refusal fails here
+        // before the assertion runs. The assertion is what the document has to *be*: a count.
+        let counted = run.only();
+        assert!(
+            counted.is_number(),
+            "`{target}` resolved against this cluster's own discovery and the collection \
+             answered — an empty one is a complete answer and a refusal is not a count: {run:?}"
+        );
+    }
+}
+
+#[test]
 fn should_answer_a_live_read_on_a_machine_with_no_kubectl() {
     // Gate M (§62.13): "core conformance works on a machine where `kubectl` is absent". Asserted
     // rather than assumed — the test looks for the binary on `PATH` itself and fails the run when

@@ -72,8 +72,11 @@ is the property §15.1 asks curation to preserve.
 discovery resolves it or refuses it by name, which is the same answer every kind gets on a cluster
 that does not serve it (§11.5).
 
-The seventeen are proven against a recorded server serving one object of each kind, every object
-stating a value no other object states — so a projection reading the wrong pointer produces a
-visibly wrong record rather than a plausible one. They are not yet proven against a live cluster;
-a `kind` cluster serves eight of the seventeen out of the box, and the fixtures for the rest would
-be a second pass over `scripts/cluster.sh`.
+The seventeen are proven twice. Against a recorded server serving one object of each kind, every
+object stating a value no other object states — so a projection reading the wrong pointer produces
+a visibly wrong record rather than a plausible one. And against a live cluster nobody wrote the
+fixture for, which is where a hand-written table of plurals, groups and versions actually fails: a
+fixture written from the same table cannot catch a wrong plural, and real discovery can. Seven of
+the seventeen have objects on any cluster and are read for real; the other ten answer with a
+complete, empty collection, which is §21.4 stated the other way round — a kind the cluster serves
+and has none of is a complete answer, and a refusal is not a count.
