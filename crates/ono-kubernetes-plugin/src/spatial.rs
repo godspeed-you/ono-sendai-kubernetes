@@ -540,6 +540,10 @@ impl Conversation for InventoryOf<'_> {
             if let Some(pages) = self.endpoint.max_pages {
                 options = options.max_pages(pages);
             }
+            // An inventory, so buffered by construction: a neighbour is decided by evaluating
+            // one object's selector against every candidate, and a candidate that arrived after
+            // the decision would be reported as unselected. The bound is `max_pages` and the
+            // budget, which is what keeps it finite (§18.4, §49.1).
             let listing = client.list(resource.gvr(), &scope, &options);
             objects.insert((group.to_owned(), kind.to_owned()), listing.into_objects());
         }

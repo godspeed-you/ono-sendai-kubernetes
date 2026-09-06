@@ -196,6 +196,11 @@ pub(crate) fn read<S: ByteStream>(
     if let Some(pages) = endpoint.max_pages {
         options = options.max_pages(pages);
     }
+    // Buffered rather than walked, and §18.5 is not being ignored here. The question is "what
+    // happened to *this object*", and answering it means asking the whole bag of Events whether
+    // it observed that identity — §38.6's `Found::NotObserved`, which is the difference between
+    // "no Events about it" and "no Events read". A streaming reader would have to answer that
+    // question before it had seen the last Event, which is to say guess at it.
     let listing = client.list(resource.gvr(), &scope, &options);
     let coverage = listing.coverage().clone();
     let freshness = listing.freshness().clone();

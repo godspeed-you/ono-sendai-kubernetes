@@ -671,6 +671,10 @@ impl Conversation for Acquire<'_> {
             ));
         }
         let scope = scope_of(self.endpoint, &resource);
+        // §19.4 step 1's acquisition: the state the watch will report changes *against*, and the
+        // `resourceVersion` it resumes from. It is one whole listing on purpose — a watch opened
+        // against a checkpoint from a half-read collection would report a change to an object it
+        // never established a baseline for, which is a change against nothing.
         let listing = client.list(resource.gvr(), &scope, &ListOptions::new().limit(PAGE_SIZE));
         Ok((resource, listing))
     }
