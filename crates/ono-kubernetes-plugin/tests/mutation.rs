@@ -320,6 +320,30 @@ fn claim(terminating: bool) -> Json {
     object
 }
 
+/// The CustomResourceDefinition behind `example.io/v1 Widget`.
+///
+/// A write to this object is a write to what the cluster serves, which is the one mutation whose
+/// blast radius reaches the discovery snapshot rather than an object cache (§33.2).
+fn crd() -> Json {
+    json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {
+            "name": "widgets.example.io",
+            "uid": "77777777-7777-7777-7777-777777777777",
+            "resourceVersion": "6000",
+            "creationTimestamp": "2026-08-01T00:00:00Z",
+            "labels": {"team": "platform"},
+        },
+        "spec": {
+            "group": "example.io",
+            "names": {"kind": "Widget", "plural": "widgets", "singular": "widget"},
+            "scope": "Namespaced",
+            "versions": [{"name": "v1", "served": true, "storage": true}],
+        },
+    })
+}
+
 /// A ConfigMap nothing holds: its deletion finishes, and a later read establishes that.
 fn configmap() -> Json {
     json!({
@@ -377,15 +401,27 @@ fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     const CLAIM: &str = "/api/v1/namespaces/default/persistentvolumeclaims/data";
     const CONFIGMAP: &str = "/api/v1/namespaces/default/configmaps/settings";
     const LEGACY: &str = "/api/v1/namespaces/default/configmaps/legacy";
+    const CRD: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.io";
 
     match (method, path_only) {
         ("GET", "/api") => ok(&json!({"kind": "APIVersions", "versions": ["v1"]})),
         ("GET", "/apis") => {
-            let mut groups = vec![json!({
-                "name": "apps",
-                "versions": [{"groupVersion": "apps/v1", "version": "v1"}],
-                "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"},
-            })];
+            let mut groups = vec![
+                json!({
+                    "name": "apps",
+                    "versions": [{"groupVersion": "apps/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"},
+                }),
+                json!({
+                    "name": "apiextensions.k8s.io",
+                    "versions": [{
+                        "groupVersion": "apiextensions.k8s.io/v1", "version": "v1",
+                    }],
+                    "preferredVersion": {
+                        "groupVersion": "apiextensions.k8s.io/v1", "version": "v1",
+                    },
+                }),
+            ];
             // §5.2: what the cluster serves is learnt rather than assumed, and a cluster that
             // serves no review API is an ordinary cluster rather than an error.
             if cluster.authorization != Authorization::Unserved {
@@ -445,6 +481,17 @@ fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
                  "verbs": ["get", "list", "watch"], "shortNames": ["no"]},
             ],
         })),
+        ("GET", "/apis/apiextensions.k8s.io/v1") => ok(&json!({
+            "kind": "APIResourceList",
+            "groupVersion": "apiextensions.k8s.io/v1",
+            "resources": [{
+                "name": "customresourcedefinitions", "kind": "CustomResourceDefinition",
+                "namespaced": false,
+                "verbs": ["get", "list", "watch", "patch", "delete"], "shortNames": ["crd"],
+            }],
+        })),
+        ("GET", CRD) => ok(&crd()),
+        ("PATCH", CRD) => ok(&crd()),
         ("GET", "/apis/apps/v1") => ok(&json!({
             "kind": "APIResourceList",
             "groupVersion": "apps/v1",
@@ -637,6 +684,28 @@ fn content_length(head: &str) -> usize {
                 .then(|| value.trim().parse().ok())?
         })
         .unwrap_or(0)
+}
+
+/// How many times the recorded server was asked for one exact path.
+fn asked_for(cluster: &RecordedCluster, path: &str) -> usize {
+    cluster
+        .heads()
+        .iter()
+        .filter(|head| head.split_whitespace().nth(1) == Some(path))
+        .count()
+}
+
+/// The arguments that label the recorded CustomResourceDefinition.
+fn label_the_crd(extra: &[(&str, Json)]) -> JsonMap<String, Json> {
+    let mut map = at_cluster(&[
+        ("kind", json!("CustomResourceDefinition")),
+        ("name", json!("widgets.example.io")),
+        ("set", json!({"/metadata/labels/team": "storage"})),
+    ]);
+    for (key, value) in extra {
+        map.insert((*key).to_owned(), value.clone());
+    }
+    map
 }
 
 /// A loaded instance against a recorded cluster, with the grant the operator makes.
@@ -1455,5 +1524,141 @@ async fn should_refuse_a_mutation_the_cluster_does_not_offer_on_that_resource() 
     assert!(
         cluster.requests("PATCH").is_empty(),
         "and nothing was sent to find out"
+    );
+}
+
+// --- §20.5, §11.4 and §33.2: what a write makes this session ask again ---------------------------
+
+#[tokio::test]
+async fn should_ask_what_the_cluster_serves_again_after_it_wrote_a_custom_resource_definition() {
+    // §20.5 and §16.5 of the generic provider contract at the boundary: after a successful
+    // mutation the provider invalidates the cached facts the change could have reached. For every
+    // other kind that is an object cache; for a `CustomResourceDefinition` it is also the
+    // discovery snapshot, because what the cluster serves is a cached fact (§20.1) and this write
+    // is part of the answer to it.
+    //
+    // The proof is at the far end of the wire, which is the only place a cache can be caught
+    // answering: `/apis` is asked once per invocation that still has to learn what is served, so
+    // asking it twice across two invocations means the first invocation's write invalidated what
+    // the first invocation had learnt. §11.4's "without restarting Ono" is this, seen from the
+    // one process that never restarted.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+
+    let (events, result) = plugin
+        .invoke(SET, label_the_crd(&[("dry_run", json!(false))]))
+        .await
+        .expect("it runs")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(text(&records(&events)[0], "acceptance"), "persisted");
+    assert_eq!(
+        asked_for(&cluster, "/apis"),
+        1,
+        "the first invocation learnt what the cluster serves"
+    );
+
+    let (_, second) = plugin
+        .invoke(SET, label_the_crd(&[("dry_run", json!(false))]))
+        .await
+        .expect("it runs")
+        .collect()
+        .await;
+    assert_eq!(second.status, InvokeStatus::Completed, "{:?}", second.error);
+
+    assert_eq!(
+        asked_for(&cluster, "/apis"),
+        2,
+        "and the second asked again, because the first one changed what the answer is about"
+    );
+}
+
+#[tokio::test]
+async fn should_not_ask_what_the_cluster_serves_again_after_a_dry_run() {
+    // The narrow half, and the one that keeps §50.2 from being paid twice for nothing. A dry run
+    // persisted nothing, so no cached fact of this session became wrong — and §16.5 invalidates
+    // after a *successful mutation* rather than after every attempt at one. An implementation
+    // that invalidated on the way *in*, before knowing what the API server did with the request,
+    // would spend three round trips on every preview.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+
+    for _ in 0..2 {
+        let (events, result) = plugin
+            .invoke(SET, label_the_crd(&[]))
+            .await
+            .expect("it runs")
+            .collect()
+            .await;
+        assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+        assert_eq!(text(&records(&events)[0], "acceptance"), "dry run");
+    }
+
+    assert_eq!(
+        asked_for(&cluster, "/apis"),
+        1,
+        "the second preview answered from what the first one learnt"
+    );
+}
+
+#[tokio::test]
+async fn should_declare_what_a_deletion_invalidated_and_what_it_could_not_name() {
+    // §16.5 of the generic provider contract invalidates "according to declared impact", and this
+    // is the declaration. A cascading deletion reaches objects the API server names in neither the
+    // request nor the answer, so this session cannot say which of its caches hold one — and the
+    // honest move is to leave those caches exactly as they are, still carrying their own
+    // `observed_at` and still saying they came from a cache (§20.2), while saying out loud that
+    // they were not invalidated. The alternative is to empty every cache in the session on the
+    // chance, which pays §50.2 for collections the write demonstrably did not touch and is still
+    // a guess (§45.2, §45.5).
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let (events, result) = plugin
+        .invoke(
+            REMOVE,
+            at_cluster(&[
+                ("kind", json!("ConfigMap")),
+                ("name", json!("settings")),
+                ("namespace", json!("default")),
+                ("dry_run", json!(false)),
+            ]),
+        )
+        .await
+        .expect("it runs")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let statement = text(&records(&events)[0], "statement");
+
+    assert!(
+        statement.contains("invalidated"),
+        "a write that persisted says what it made this session forget: {statement}"
+    );
+    assert!(
+        statement.contains("not named in the answer"),
+        "and it says what it could not reach rather than implying it reached everything: \
+         {statement}"
+    );
+}
+
+#[tokio::test]
+async fn should_declare_no_invalidation_for_a_change_that_was_never_made() {
+    // The control, and the sentence that would be a lie: a dry run persisted nothing, so nothing
+    // this session holds became wrong and there is nothing to have invalidated.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let (events, result) = plugin
+        .invoke(SET, scale_down(&[]))
+        .await
+        .expect("it runs")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let statement = text(&records(&events)[0], "statement");
+
+    assert!(
+        !statement.contains("invalidated"),
+        "nothing was written, so nothing was invalidated: {statement}"
     );
 }

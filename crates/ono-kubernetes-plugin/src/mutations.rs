@@ -42,7 +42,7 @@ use ono_provider_kubernetes::mutation::{
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::plan::{Plan, Preflight, VerificationRule};
 use ono_provider_kubernetes::redaction::Guarded;
-use ono_provider_kubernetes::session::Session;
+use ono_provider_kubernetes::session::{Invalidation, Session};
 use ono_provider_kubernetes::transport::{
     ByteStream, Client, ObservedAt, Operation, Request, Response,
 };
@@ -227,6 +227,8 @@ pub(crate) struct Made {
     deletion: Option<Deletion>,
     verification: Option<Verification>,
     admission: Vec<String>,
+    /// What the write made this session forget, where it was a write at all (§20.5).
+    invalidated: Option<Invalidation>,
 }
 
 /// The exchange a mutation is: discovery, one read, the write, and one look afterwards.
@@ -247,10 +249,15 @@ impl Conversation for Mutating<'_> {
         // place for a precondition to go missing (§46.1, §56).
         let planned = plan_on(self.session, client, self.endpoint, self.intent)?;
         refuse_a_denied_change(&planned.plan)?;
-        match self.writes {
+        let made = match self.writes {
             Writes::Fields => apply(client, self.endpoint, &planned, self.how),
             Writes::Object => delete(client, self.endpoint, &planned, self.how),
-        }
+        }?;
+        Ok(invalidate_what_the_write_reached(
+            self.session,
+            &planned,
+            made,
+        ))
     }
 }
 
@@ -312,6 +319,7 @@ fn apply<S: ByteStream>(
         deletion: None,
         verification,
         admission,
+        invalidated: None,
     })
 }
 
@@ -340,7 +348,37 @@ fn delete<S: ByteStream>(
         deletion,
         verification,
         admission: Vec::new(),
+        invalidated: None,
     })
+}
+
+/// Invalidates what this session cached about the object the write changed (§20.5, §16.5).
+///
+/// **After the answer, and only for an answer that says something was written.** §16.5 of the
+/// generic provider contract invalidates after a *successful* mutation, and the API server is the
+/// only thing that knows whether there was one: a dry run persisted nothing, a conflict changed
+/// nothing, a refusal never happened. Invalidating on the way in — before the request, on the
+/// intent — would make every preview cost this session its caches, and would still be wrong,
+/// because the write it was anticipating may not have happened.
+///
+/// **Before anything is presented as current, which here means before the record exists.** The
+/// record this invocation emits is built from the value this returns, so there is no ordering in
+/// which a caller could read a stale cache between the write and the invalidation. The one read
+/// made in between is §46.3's verification, and it goes to the API server by name rather than
+/// through any cache.
+///
+/// Nothing is written *into* the cache. What the API server returned is in the record and in the
+/// verification; putting it into the object cache would make the next read of it a cached
+/// observation of a write this provider made, which is the synthetic result §20.5 forbids.
+fn invalidate_what_the_write_reached(
+    session: &mut Session,
+    planned: &Planned,
+    mut made: Made,
+) -> Made {
+    if made.outcome.is_persisted() {
+        made.invalidated = Some(session.mutated(planned.resource.gvr(), planned.scope.namespace()));
+    }
+    made
 }
 
 /// Looks at the target once, and says what that look establishes about the change (§46.3).
@@ -630,6 +668,27 @@ fn statement(made: &Made) -> String {
              applied is: {}",
             made.plan.verification_rule()
         )),
+    }
+    if let Some(invalidated) = &made.invalidated {
+        lines.push(invalidated.describe());
+        // §45.2 and §45.5 read as a cache rule: a cascading deletion reaches objects whose
+        // identities are in neither the request nor the answer, so this session cannot name the
+        // caches they would be in. What it holds about them is left exactly as it was — an
+        // observation of a moment before the deletion, carrying that moment and saying it came
+        // from a cache (§20.2) — and the alternative is to guess at a set of collections to
+        // empty, which costs §50.2 for every one of them and is still a guess.
+        if made
+            .deletion
+            .as_ref()
+            .is_some_and(|deletion| deletion.propagation().removes_dependents())
+        {
+            lines.push(
+                "the objects the collector removes along with this one are not named in the \
+                 answer, so nothing this session may hold about them was invalidated: those \
+                 remain observations of a moment before the deletion and say so"
+                    .to_owned(),
+            );
+        }
     }
     if made.plan.verification_rule() == VerificationRule::NoneKnown {
         lines.push(

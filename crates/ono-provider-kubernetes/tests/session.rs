@@ -21,6 +21,8 @@
     reason = "a test states its preconditions directly (AGENTS.md section 16)"
 )]
 
+use std::time::Duration;
+
 use ono_provider_kubernetes::coverage::Scope;
 use ono_provider_kubernetes::diagnostics::{
     Fingerprint, Identity, Known, Subject, TlsPosture, normalised_origin,
@@ -28,10 +30,12 @@ use ono_provider_kubernetes::diagnostics::{
 use ono_provider_kubernetes::discovery::{Discovery, Gvk, Gvr};
 use ono_provider_kubernetes::kubeconfig::{Connection, Credential, Kubeconfig};
 use ono_provider_kubernetes::schema::Schema;
-use ono_provider_kubernetes::session::{Capability, ClusterChange, Lookup, Session, SyncRefused};
+use ono_provider_kubernetes::session::{
+    Capability, ClusterChange, DISCOVERY_VALIDITY, Lookup, Session, SyncRefused,
+};
 use ono_provider_kubernetes::tls::{Anchors, TlsSettings};
 use ono_provider_kubernetes::transport::{
-    Client, FixedClock, FixtureStream, ListOptions, Listing, Origin,
+    Client, Clock, FixedClock, FixtureStream, ListOptions, Listing, ObservedAt, Origin,
 };
 use ono_provider_kubernetes::watch::SyncState;
 
@@ -174,6 +178,118 @@ fn pod_frame_object(name: &str, uid: &str, resource_version: &str) -> String {
         r#"{{"apiVersion":"v1","kind":"Pod","metadata":{{"name":"{name}","namespace":"shop","uid":"{uid}","resourceVersion":"{resource_version}"}}}}"#
     )
 }
+
+/// The collection identities and kinds the invalidation tests are written against.
+fn configmaps() -> Gvr {
+    Gvr::new("", "v1", "configmaps")
+}
+
+/// The collection a write to which changes what the whole cluster serves (§33.2).
+fn crds() -> Gvr {
+    Gvr::new("apiextensions.k8s.io", "v1", "customresourcedefinitions")
+}
+
+fn widget_gvk() -> Gvk {
+    Gvk::new("example.io", "v1", "Widget")
+}
+
+fn gadget_gvk() -> Gvk {
+    Gvk::new("example.io", "v1", "Gadget")
+}
+
+fn nebula_gvk() -> Gvk {
+    Gvk::new("astro.example.dev", "v1", "Nebula")
+}
+
+/// One object, listed under the collection identity and scope a test names.
+///
+/// `one_pod_listing` fixes both, which is what the freshness assertions around it need; an
+/// invalidation test needs several collections and several scopes in one session, because the
+/// whole question is which of them a write reaches.
+fn one_object_listing(gvr: &Gvr, scope: &Scope, namespace: &str) -> Listing {
+    let body = format!(
+        r#"{{"apiVersion":"v1","kind":"List","metadata":{{"resourceVersion":"18010"}},
+            "items":[{{"metadata":{{"name":"one","namespace":"{namespace}","uid":"uid-one",
+            "resourceVersion":"18005"}}}}]}}"#
+    );
+    let mut client = Client::with_clock(
+        FixtureStream::replaying(&[ok(&body)]),
+        HOST,
+        "kubernetes:dev",
+        clock(),
+    );
+    client.list(gvr, scope, &ListOptions::new())
+}
+
+/// A clock a test moves by hand, for the one behaviour that is about time passing.
+///
+/// [`FixedClock`] cannot express it: a validity window is the difference between two instants,
+/// and a clock that answers one instant makes every document eternally fresh — which is the
+/// behaviour these tests exist to disprove.
+#[derive(Debug, Clone)]
+struct SteppingClock {
+    at: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl SteppingClock {
+    fn at(unix_millis: u64) -> Self {
+        Self {
+            at: std::rc::Rc::new(std::cell::Cell::new(unix_millis)),
+        }
+    }
+
+    fn advance(&self, by: Duration) {
+        let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        self.at.set(self.at.get().saturating_add(by));
+    }
+}
+
+impl Clock for SteppingClock {
+    fn now(&self) -> ObservedAt {
+        ObservedAt::from_unix_millis(self.at.get())
+    }
+}
+
+/// `/apis`, from a cluster serving a custom group at two versions beside an unrelated one.
+const APIS_WITH_WIDGETS: &str = r#"{"kind":"APIGroupList","groups":[
+  {"name":"example.io",
+   "versions":[{"groupVersion":"example.io/v1","version":"v1"},
+               {"groupVersion":"example.io/v2","version":"v2"}],
+   "preferredVersion":{"groupVersion":"example.io/v2","version":"v2"}},
+  {"name":"astro.example.dev",
+   "versions":[{"groupVersion":"astro.example.dev/v1","version":"v1"}],
+   "preferredVersion":{"groupVersion":"astro.example.dev/v1","version":"v1"}}]}"#;
+
+/// The same `/apis`, after the CRD behind `example.io` was deleted.
+const APIS_WITHOUT_WIDGETS: &str = r#"{"kind":"APIGroupList","groups":[
+  {"name":"astro.example.dev",
+   "versions":[{"groupVersion":"astro.example.dev/v1","version":"v1"}],
+   "preferredVersion":{"groupVersion":"astro.example.dev/v1","version":"v1"}}]}"#;
+
+/// The same `/apis`, after `example.io/v1` stopped being served.
+const APIS_WIDGETS_V2_ONLY: &str = r#"{"kind":"APIGroupList","groups":[
+  {"name":"example.io",
+   "versions":[{"groupVersion":"example.io/v2","version":"v2"}],
+   "preferredVersion":{"groupVersion":"example.io/v2","version":"v2"}},
+  {"name":"astro.example.dev",
+   "versions":[{"groupVersion":"astro.example.dev/v1","version":"v1"}],
+   "preferredVersion":{"groupVersion":"astro.example.dev/v1","version":"v1"}}]}"#;
+
+/// `/apis/example.io/v1`, as the CRD first published it.
+const WIDGETS_V1: &str = r#"{"kind":"APIResourceList","groupVersion":"example.io/v1","resources":[
+  {"name":"widgets","kind":"Widget","namespaced":true,"verbs":["get","list","watch"]},
+  {"name":"gadgets","kind":"Gadget","namespaced":true,"verbs":["get","list","watch"]}]}"#;
+
+/// The same list, after the CRD behind `Widget` was updated and the kind gained a verb.
+const WIDGETS_V1_PATCHABLE: &str = r#"{"kind":"APIResourceList","groupVersion":"example.io/v1","resources":[
+  {"name":"widgets","kind":"Widget","namespaced":true,"verbs":["get","list","watch","patch"]},
+  {"name":"gadgets","kind":"Gadget","namespaced":true,"verbs":["get","list","watch"]}]}"#;
+
+/// The same list, after a CRD was installed beside the two that were already there.
+const WIDGETS_V1_WITH_SPROCKET: &str = r#"{"kind":"APIResourceList","groupVersion":"example.io/v1","resources":[
+  {"name":"widgets","kind":"Widget","namespaced":true,"verbs":["get","list","watch"]},
+  {"name":"gadgets","kind":"Gadget","namespaced":true,"verbs":["get","list","watch"]},
+  {"name":"sprockets","kind":"Sprocket","namespaced":true,"verbs":["get","list","watch"]}]}"#;
 
 // --- §6.3: what a session is ---------------------------------------------------------------------
 
@@ -793,4 +909,287 @@ fn should_say_when_it_last_observed_a_watched_collection() {
         None,
         "another scope is another stream (§6.5)"
     );
+}
+
+// --- §20.5 and generic §16.5: a write invalidates what it changed --------------------------------
+
+#[test]
+fn should_stop_answering_from_a_cache_the_write_it_made_moved_past() {
+    // §20.5, and §16.5 of the generic provider contract: after a successful mutation the provider
+    // MUST invalidate or mark potentially affected cached facts as stale. Nothing did, and the
+    // consequence was not subtle — a session that had watched a collection kept answering for the
+    // object it had just written to, from a cache filled before the write, with `origin=cache` on
+    // the record. That reads as a confirmed observation of a cluster this session itself knows it
+    // has changed, which is exactly the sentence §16.5's second half forbids.
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), one_pod_listing())
+        .expect("a complete listing seeds the cache");
+    assert!(matches!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::Cached(_)
+    ));
+
+    session.mutated(&pods(), Some("shop"));
+
+    assert_eq!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::NotWatched,
+        "the next read observes rather than recalls"
+    );
+}
+
+#[test]
+fn should_not_read_an_invalidated_cache_as_an_absence_or_fill_it_with_what_the_write_asked_for() {
+    // The two ways of getting §20.5 wrong in opposite directions, in one test.
+    //
+    // Dropping the *object* from the cache and keeping the cache live would answer
+    // `ConfirmedAbsent` — a write reported as having deleted what it changed (§4 invariant 13).
+    // Writing the applied document into the cache would answer `Cached` with an object no server
+    // ever returned, which is §20.5's `MUST NOT` in as many words: a synthetic result labelled as
+    // a server observation.
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), one_pod_listing())
+        .expect("a complete listing seeds the cache");
+
+    session.mutated(&pods(), Some("shop"));
+
+    let after = session.lookup(&pods(), &shop(), Some("shop"), "checkout-1");
+    assert!(
+        !after.is_answer(),
+        "an invalidated cache answers neither the object nor its absence: {after:?}"
+    );
+    assert!(
+        after.read().is_none(),
+        "nothing was put into the cache in place of what the write asked for"
+    );
+}
+
+#[test]
+fn should_leave_a_cache_the_write_could_not_have_reached_alone() {
+    // "Potentially affected" is the object and the collection entry that holds it — not every
+    // cache in the session. Emptying the lot would satisfy §16.5 and pay for it with §50.2's cost
+    // on every other collection, and it would assert that writing to a Pod in `shop` told this
+    // session something about ConfigMaps and about Pods in `payments`. It did not.
+    let mut session = session("dev");
+    for (gvr, scope, namespace) in [
+        (pods(), shop(), "shop"),
+        (pods(), Scope::all_namespaces(), "shop"),
+        (pods(), Scope::in_namespace("payments"), "payments"),
+        (configmaps(), shop(), "shop"),
+    ] {
+        session
+            .synchronise(&gvr, &scope, one_object_listing(&gvr, &scope, namespace))
+            .expect("a complete listing seeds the cache");
+    }
+
+    session.mutated(&pods(), Some("shop"));
+
+    assert_eq!(
+        session.lookup(&pods(), &shop(), Some("shop"), "one"),
+        Lookup::NotWatched,
+        "the collection the object lives in is invalidated"
+    );
+    assert_eq!(
+        session.lookup(&pods(), &Scope::all_namespaces(), Some("shop"), "one"),
+        Lookup::NotWatched,
+        "and so is every other watched scope that could be holding the same object"
+    );
+    assert!(
+        matches!(
+            session.lookup(
+                &pods(),
+                &Scope::in_namespace("payments"),
+                Some("payments"),
+                "one"
+            ),
+            Lookup::Cached(_)
+        ),
+        "another namespace's cache was not made wrong by this write"
+    );
+    assert!(
+        matches!(
+            session.lookup(&configmaps(), &shop(), Some("shop"), "one"),
+            Lookup::Cached(_)
+        ),
+        "and neither was another collection's"
+    );
+}
+
+#[test]
+fn should_re_read_what_the_cluster_serves_after_it_wrote_a_custom_resource_definition() {
+    // §33.2's first and last facts — a CRD added, a CRD deleted — observed at the one place this
+    // provider can be certain of them: it made the change itself. What the cluster serves is a
+    // cached fact like any other (§20.1), and a write to `customresourcedefinitions` is the write
+    // that makes it wrong.
+    //
+    // The pre-change copy is *kept* rather than dropped, and that is deliberate: it may never be
+    // served again, and it is the only baseline against which the refreshed document can say
+    // which group stopped being served (§33.2, §12.4).
+    let mut session = session("dev");
+    session.cache_discovery_document("/apis", APIS_WITH_WIDGETS);
+    assert_eq!(session.discovery_document("/apis"), Some(APIS_WITH_WIDGETS));
+
+    session.mutated(&crds(), None);
+
+    assert_eq!(
+        session.discovery_document("/apis"),
+        None,
+        "a snapshot of what the cluster served before this session changed it is not an answer"
+    );
+}
+
+#[test]
+fn should_not_invalidate_what_the_cluster_serves_for_an_ordinary_write() {
+    // The narrow half of the rule above. A Pod is not a statement about what the API server
+    // serves, and re-running discovery after every write would pay §50.2's three round trips for
+    // a fact no write of that kind can change.
+    let mut session = session("dev");
+    session.cache_discovery_document("/apis", APIS_WITH_WIDGETS);
+
+    session.mutated(&pods(), Some("shop"));
+
+    assert_eq!(session.discovery_document("/apis"), Some(APIS_WITH_WIDGETS));
+}
+
+// --- §11.4 and §33.2: discovery is refreshed, and the refresh is what invalidates ---------------
+
+#[test]
+fn should_re_read_a_discovery_document_once_its_validity_window_has_passed() {
+    // §11.4's `MUST`: the provider MUST support discovery invalidation and refresh *without
+    // restarting Ono*. Until this window existed, the only thing that cleared a discovery
+    // document was a cluster **replacement** — so a CRD installed while a shell session was live
+    // stayed invisible for the life of the process, which is precisely the restart §11.4 forbids
+    // as the remedy. §16.2 of the generic contract asks a cache for explicit invalidation *and
+    // expiry* semantics, and §50.2 asks for discovery to be "cached and incrementally refreshed
+    // rather than downloaded before every query" — both halves are this window.
+    let clock = SteppingClock::at(OBSERVED);
+    let mut session = Session::with_clock(connection("dev"), clock.clone());
+    session.cache_discovery_document("/apis", APIS_WITH_WIDGETS);
+
+    clock.advance(DISCOVERY_VALIDITY - Duration::from_millis(1));
+
+    assert_eq!(
+        session.discovery_document("/apis"),
+        Some(APIS_WITH_WIDGETS),
+        "inside the window the second question of a session is still free (§50.2)"
+    );
+
+    clock.advance(Duration::from_millis(1));
+
+    assert_eq!(
+        session.discovery_document("/apis"),
+        None,
+        "past it, the next question that needs discovery asks the API server again"
+    );
+}
+
+#[test]
+fn should_forget_the_schemas_of_a_group_a_refreshed_group_list_no_longer_serves() {
+    // §33.2's "CRD deleted", detected the way §33.2 asks for it — "through discovery/schema
+    // invalidation". The refreshed `/apis` *is* the observation: the group was served, and it is
+    // not. §12.4's second bullet then says what follows, and it is not optional, because a schema
+    // held for a kind nobody serves is a set of fields with nothing behind them.
+    let mut session = session("dev");
+    session.cache_discovery_document("/apis", APIS_WITH_WIDGETS);
+    session.cache_discovery_document("/apis/example.io/v1", WIDGETS_V1);
+    session.cache_schema(widget_gvk(), Schema::absent());
+    session.cache_schema(nebula_gvk(), Schema::absent());
+
+    session.cache_discovery_document("/apis", APIS_WITHOUT_WIDGETS);
+
+    assert!(
+        session.schema(&widget_gvk()).is_none(),
+        "the withdrawn group's schemas go with it"
+    );
+    assert!(
+        session.schema(&nebula_gvk()).is_some(),
+        "a group that is still served keeps its schemas"
+    );
+    assert_eq!(
+        session.discovery_document("/apis/example.io/v1"),
+        None,
+        "§11.5: the resource list of a group that is no longer served must not answer for it — \
+         the next question goes to the API server and gets `not served` from the server"
+    );
+}
+
+#[test]
+fn should_forget_only_the_group_version_a_refreshed_group_list_stopped_serving() {
+    // §33.2's "served version added/removed", and §12.4's second bullet at the grain the
+    // specification writes it in: the group is still there, one of its versions is not.
+    let mut session = session("dev");
+    session.cache_discovery_document("/apis", APIS_WITH_WIDGETS);
+    session.cache_schema(widget_gvk(), Schema::absent());
+    session.cache_schema(Gvk::new("example.io", "v2", "Widget"), Schema::absent());
+
+    session.cache_discovery_document("/apis", APIS_WIDGETS_V2_ONLY);
+
+    assert!(session.schema(&widget_gvk()).is_none());
+    assert!(
+        session
+            .schema(&Gvk::new("example.io", "v2", "Widget"))
+            .is_some(),
+        "only the version that stopped being served is forgotten"
+    );
+}
+
+#[test]
+fn should_forget_the_schema_of_a_kind_a_refreshed_resource_list_changed() {
+    // §33.2's "schema changed" and "storage version changed" reach a resource list as a changed
+    // entry — a verb gained, a subresource appearing, a scope corrected. The cached schema was
+    // read for the kind as it was described then, so it is a description of something the server
+    // has since restated. Only that kind's, though: a CRD updated in one group-version says
+    // nothing about the kind next to it.
+    let mut session = session("dev");
+    session.cache_discovery_document("/apis/example.io/v1", WIDGETS_V1);
+    session.cache_schema(widget_gvk(), Schema::absent());
+    session.cache_schema(gadget_gvk(), Schema::absent());
+
+    session.cache_discovery_document("/apis/example.io/v1", WIDGETS_V1_PATCHABLE);
+
+    assert!(
+        session.schema(&widget_gvk()).is_none(),
+        "the kind the server described differently is re-read"
+    );
+    assert!(
+        session.schema(&gadget_gvk()).is_some(),
+        "the kind it described the same way is not"
+    );
+}
+
+#[test]
+fn should_keep_every_schema_a_refreshed_resource_list_did_not_change() {
+    // The half a cautious implementation gets wrong: a CRD *installed* invalidates nothing at
+    // all. Every schema this session holds is still about a kind the server still serves exactly
+    // as it did, and emptying the cache because the document changed would pay §50.2's cost
+    // again every time anybody in the cluster installs anything.
+    let mut session = session("dev");
+    session.cache_discovery_document("/apis/example.io/v1", WIDGETS_V1);
+    session.cache_schema(widget_gvk(), Schema::absent());
+    session.cache_schema(gadget_gvk(), Schema::absent());
+
+    session.cache_discovery_document("/apis/example.io/v1", WIDGETS_V1_WITH_SPROCKET);
+
+    assert!(session.schema(&widget_gvk()).is_some());
+    assert!(session.schema(&gadget_gvk()).is_some());
+    assert_eq!(
+        session.discovery_document("/apis/example.io/v1"),
+        Some(WIDGETS_V1_WITH_SPROCKET),
+        "and the kind installed since the snapshot was taken is the one now on offer (§33.1)"
+    );
+}
+
+#[test]
+fn should_learn_nothing_from_a_document_that_is_the_first_of_its_path() {
+    // A document with no predecessor is not a change. The mistake it guards against is treating
+    // the first read of a path as "everything I hold about this group is stale", which would make
+    // the first query of every session throw away the schemas the same query just cached.
+    let mut session = session("dev");
+    session.cache_schema(widget_gvk(), Schema::absent());
+
+    session.cache_discovery_document("/apis/example.io/v1", WIDGETS_V1);
+
+    assert!(session.schema(&widget_gvk()).is_some());
 }
