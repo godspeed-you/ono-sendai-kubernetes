@@ -179,10 +179,12 @@ run "$LOAD; set k8s-resource $KUBE --namespace ono-alpha --kind Deployment --nam
 say "15. logs, with the bounds of the read on every line"
 note "§42.1: a log is never complete, and each line says what bounded it. \`--follow\` makes the"
 note "same read a live stream that accumulates nothing (§42.2) and stops when the operator does."
-POD="$("$ONO" -c "$LOAD; get k8s-pod $KUBE --namespace ono-alpha | take 1 | select name | to json" \
+note "CoreDNS rather than the demo workload: the fixture runs \`pause\`, which prints nothing by"
+note "design, and the provider refuses an empty read rather than showing one (§21.4, ADR-0025)."
+POD="$("$ONO" -c "$LOAD; get k8s-pod $KUBE --namespace kube-system --selector 'k8s-app=kube-dns' | take 1 | select name | to json" \
   | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)"
 if [[ -n "$POD" ]]; then
-  run "$LOAD; get k8s-log $KUBE --namespace ono-alpha --name $POD --tail_lines 3 | select line text bounds | to json"
+  run "$LOAD; get k8s-log $KUBE --namespace kube-system --name $POD --tail_lines 3 | select line text bounds | to json"
 else
   note "no Pod to read a log from"
 fi
