@@ -494,6 +494,9 @@ struct Fixture {
     beta: Arc<Cluster>,
     directory: std::path::PathBuf,
     kubeconfig: std::path::PathBuf,
+    /// The kubeconfig this fixture wrote, kept so that a test can ask whether the file on disk
+    /// is still the one it wrote rather than another fixture's.
+    document: String,
 }
 
 impl Fixture {
@@ -548,17 +551,15 @@ contexts:
             alpha.namespace,
             beta.namespace,
         );
-        let directory = std::env::temp_dir().join(format!(
-            "ono-kubernetes-isolation-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.as_nanos())
-                .unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&directory).expect("the test may write a temporary directory");
+        let directory = std::env::temp_dir().join(temporary_directory_name());
+        // `create_dir` rather than `create_dir_all`: the name has to be this fixture's alone, and
+        // the difference between the two is whether that is checked or assumed. `create_dir_all`
+        // accepts a directory somebody else already made, which is how a name collision turns
+        // into two tests sharing one kubeconfig instead of into a failure that names itself.
+        std::fs::create_dir(&directory)
+            .expect("the temporary directory of this fixture is not another fixture's");
         let kubeconfig = directory.join("config");
-        std::fs::write(&kubeconfig, document).expect("the kubeconfig is written");
+        std::fs::write(&kubeconfig, &document).expect("the kubeconfig is written");
 
         Self {
             fleet: Fleet {
@@ -568,6 +569,7 @@ contexts:
             beta,
             directory,
             kubeconfig,
+            document,
         }
     }
 
@@ -607,12 +609,101 @@ contexts:
     }
 }
 
+/// A directory name no other fixture in this process can take.
+///
+/// It used to be the process id and a nanosecond clock reading, and that is not a unique name.
+/// The three tests in this file run on three threads of *one* process, so the process id tells
+/// them apart not at all, and `SystemTime` is only as fine as the host's clock: on a Hyper-V
+/// guest it advances in steps of 100 nanoseconds, and two fixtures that reach this line in the
+/// same step get the same name. Both then wrote their kubeconfig to the same path, and whichever
+/// test read it afterwards got the *other* test's certificate authority — issued for the same
+/// server name, so carrying the same issuer name, and holding a different key. The handshake
+/// that followed failed with `BadSignature` in a test that had nothing wrong with it, one run in
+/// four under a loaded machine. A counter cannot tie, so it is the counter that makes the name
+/// unique; the clock and the process id stay only to keep a leftover directory from an earlier
+/// run out of the way.
+fn temporary_directory_name() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "ono-kubernetes-isolation-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Whatever `cluster` was asked, as one blob a test can search for what should not be in it.
 fn transcript(cluster: &Cluster) -> String {
     cluster.heads().join("\n")
 }
 
 // --- the tests ---------------------------------------------------------------------------------
+
+/// The three tests below build their fixtures on three threads at once, and each fixture's
+/// kubeconfig must survive that.
+///
+/// This is a regression test with a history. The temporary directory used to be named after the
+/// process id and a nanosecond clock reading; the process id is the same for all three tests,
+/// and the clock on a Hyper-V guest advances in steps of 100 nanoseconds, so two fixtures
+/// regularly got the same name. Both wrote `config` there, and the test that read it afterwards
+/// got the other one's `certificate-authority-data`: a different key under the same issuer name,
+/// because [`Authority::issuing`] names its authority after the server. The handshake then failed
+/// with `invalid peer certificate: BadSignature` — in whichever test lost the race, against a
+/// cluster that was serving a perfectly valid certificate, about one full-workspace run in four.
+///
+/// So the assertion is the invariant that was broken rather than the symptom it produced: names
+/// that cannot collide, and a kubeconfig on disk that is still the one this fixture wrote.
+#[test]
+fn should_give_every_fixture_a_kubeconfig_no_other_fixture_can_overwrite() {
+    const THREADS: usize = 3;
+    const NAMES_PER_THREAD: usize = 200;
+
+    // The names first, and many of them, because one name per thread would only have caught the
+    // old scheme a few runs in a hundred. Three threads asking for two hundred names each
+    // collided dozens of times on every measured run.
+    let naming: Vec<Vec<String>> = (0..THREADS)
+        .map(|_| {
+            std::thread::spawn(|| {
+                (0..NAMES_PER_THREAD)
+                    .map(|_| temporary_directory_name())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|thread| thread.join().expect("the naming thread finishes"))
+        .collect();
+    let names: std::collections::HashSet<&String> = naming.iter().flatten().collect();
+    assert_eq!(
+        names.len(),
+        THREADS * NAMES_PER_THREAD,
+        "two concurrent fixtures were given the same temporary directory, and the second one \
+         to write its kubeconfig there would decide which certificate authority the first \
+         one trusts"
+    );
+
+    // And then the thing that actually matters: a fixture's kubeconfig is still its own.
+    let fixtures: Vec<Fixture> = (0..THREADS)
+        .map(|_| std::thread::spawn(Fixture::build))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|thread| thread.join().expect("the fixture builds"))
+        .collect();
+    for fixture in &fixtures {
+        let on_disk = std::fs::read_to_string(&fixture.kubeconfig).expect("the kubeconfig is read");
+        assert_eq!(
+            on_disk, fixture.document,
+            "another fixture wrote over this one's kubeconfig, so the certificate authority \
+             it names is not the one this fixture's servers are issued by"
+        );
+    }
+    for fixture in fixtures {
+        fixture.discard();
+    }
+}
 
 #[tokio::test]
 async fn should_answer_two_contexts_in_one_session_without_crossover() {

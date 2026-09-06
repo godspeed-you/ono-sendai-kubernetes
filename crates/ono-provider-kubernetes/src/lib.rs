@@ -26,6 +26,8 @@
 //! kubeconfig    a context becomes a connection identity
 //! live          a bounded view of a watch, and the states it may honestly show
 //! logs          container logs as observations, and the remote sessions this cannot open
+//! plan          a change described before it is made, and what it refuses to claim
+//! mutation      what a change is sent as, what came back, and what that still does not prove
 //! tls           a TLS session, wrapping the brokered byte stream below HTTP
 //! session       what one provider instance holds between two invocations
 //! ```
@@ -40,8 +42,10 @@ pub mod evidence;
 pub mod kubeconfig;
 pub mod live;
 pub mod logs;
+pub mod mutation;
 pub mod object;
 pub mod place;
+pub mod plan;
 pub mod redaction;
 pub mod relationship;
 pub mod schema;
