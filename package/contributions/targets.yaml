@@ -28,6 +28,10 @@
 #                collection (§17.1). A different request with different permissions, and its
 #                `404` means the object is absent where a collection's means the API is not
 #                served — ADR-0012
+#   selector, field_selector   Kubernetes selectors, pushed to the API server exactly as written
+#                (§17.3, §17.4) — there is no translation, so there is nothing for a translation
+#                to change. A field selector this server will not index is refused by name, never
+#                answered with an empty collection (§17.5). ADR-0049
 #   max_pages    a page budget: a decision to stop consuming, which §18.4 says is not
 #                incompleteness — the records say more exists upstream and the answer completes
 #   max_requests, max_scopes, budget_ms   what one query may spend (§49.5), over the conservative

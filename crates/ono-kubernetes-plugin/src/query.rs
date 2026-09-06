@@ -955,7 +955,10 @@ fn unindexed_field_selector(
         UNSUPPORTED_CODE,
         UNSUPPORTED,
         format!("`{gvr}` cannot be selected on `{written}`: {said}"),
-        "Field selector support varies by resource and by server, and this server does not offer          it for that field. Nothing was listed and nothing was filtered, so this is not an empty          collection: drop the field selector to read the collection, or narrow it with a label          selector, which every resource supports.",
+        "Field selector support varies by resource and by server, and this server does not offer it \
+         for that field. Nothing was listed and nothing was filtered, so this is not an empty \
+         collection: drop the field selector to read the collection, or narrow it with a label \
+         selector, which every resource supports.",
     )
 }
 
