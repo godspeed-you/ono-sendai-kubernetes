@@ -536,10 +536,13 @@ impl Target {
     }
 }
 
-/// What a log read may narrow (§42.1).
+/// What a log read may narrow, and the one option that unbounds it (§42.1).
 ///
-/// No `follow` here: it is declared by the target that streams, and `k8s-log` is the bounded
-/// read. See [`FOLLOW`].
+/// `follow` is last because it is not a narrowing: every other option here cuts the answer
+/// shorter and adds an entry to the record's `bounds`, and this one keeps the body open instead.
+/// It is refused together with `previous` — the API server accepts that pair and answers it by
+/// closing the body at once, which a caller watching for more lines reads as a container it has
+/// just seen stop (ADR-0030).
 const LOG_OPTIONS: &[Parameter] = &[
     Parameter::new(
         "container",
@@ -570,6 +573,13 @@ const LOG_OPTIONS: &[Parameter] = &[
         "limit_bytes",
         "int",
         "Stop after N bytes. The stop is coverage, never a silently short log.",
+    ),
+    Parameter::new(
+        "follow",
+        "bool",
+        "Keep the body open and answer with each line as the container writes it, until the \
+         query is cancelled. Refused with `previous`: a run that has already ended cannot \
+         produce another line.",
     ),
 ];
 

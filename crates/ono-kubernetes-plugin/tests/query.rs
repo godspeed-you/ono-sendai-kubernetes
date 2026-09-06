@@ -1685,6 +1685,11 @@ fn log_response(path: &str) -> Option<Vec<u8>> {
     if route != "/api/v1/namespaces/default/pods/api-7d9f-abc/log" {
         return None;
     }
+    // A followed log: the head, and a body that has not ended and will not. Every line arrives
+    // later, from the connection task, one per release (§42.1 follow mode).
+    if query.contains("follow=true") {
+        return Some(held_open_log());
+    }
     let mut lines = log_lines();
     if query.contains("tailLines=2") {
         lines.remove(0);
@@ -1717,6 +1722,24 @@ fn chunked_bytes(body: &[u8]) -> Vec<u8> {
     }
     wire.extend_from_slice(b"0\r\n\r\n");
     wire
+}
+
+/// The head of a followed log: chunked, `200 OK`, and carrying nothing at all.
+///
+/// No line and no terminating chunk. Both would make the assertion weaker in the same way the
+/// watch fixtures describe: an implementation that has to read a body to its end before it can
+/// emit cannot answer against this server, and a line that was already on the wire when the
+/// request returned could have been buffered rather than followed.
+fn held_open_log() -> Vec<u8> {
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec()
+}
+
+/// The lines a followed log delivers, one per release.
+fn followed_lines() -> Vec<String> {
+    vec![
+        "the first line, written while the body was open\n".to_owned(),
+        "the second line, written after the first was taken\n".to_owned(),
+    ]
 }
 
 /// One API group with a single preferred version.
@@ -1989,6 +2012,23 @@ impl HostServices for RecordedCluster {
                             for frame in paced_frames() {
                                 gate.notified().await;
                                 let bytes = chunk_of(&frame).into_bytes();
+                                let chunk = json!({"bytes": {"$bytes": encode_hex(&bytes)}});
+                                if sender.send(Ok(chunk)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                    // A followed log is paced the same way, and keyed on the request rather than
+                    // on a script the server plays: `follow=true` is the whole difference between
+                    // reading a log and following one, and it lives nowhere but in the query.
+                    if cluster.observations && path.contains("follow=true") {
+                        let sender = inbound.clone();
+                        let gate = Arc::clone(&cluster.release);
+                        tokio::spawn(async move {
+                            for line in followed_lines() {
+                                gate.notified().await;
+                                let bytes = chunk_of(&line).into_bytes();
                                 let chunk = json!({"bytes": {"$bytes": encode_hex(&bytes)}});
                                 if sender.send(Ok(chunk)).await.is_err() {
                                     return;
@@ -6092,6 +6132,171 @@ async fn should_refuse_to_answer_an_empty_log_with_an_empty_stream() {
     assert!(
         said.contains("rotated and truncated"),
         "and it names the bound that was already on the read: {said}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_emit_a_log_line_as_it_arrives_rather_than_when_the_stream_ends() {
+    // §42.1's follow mode, and the reason `k8s-log` had no `follow` until now: a followed log is
+    // a live stream with the same shape as `k8s-change`, and a word that promised one while
+    // answering with a bounded read would close the body at once — which a reader takes for a
+    // container that has just stopped.
+    //
+    // The recorded server answers with the head of a chunked body and nothing else. Each line
+    // goes on the wire only when this test releases it, and the terminating chunk is never sent
+    // at all, so a record can only arrive here if the package emitted it while the body was
+    // still open (§62.12, ADR-0023).
+    let cluster = RecordedCluster::with_observations();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let mut invocation = plugin
+        .query(
+            "k8s-log",
+            at_cluster(&[
+                ("name", json!("api-7d9f-abc")),
+                ("container", json!("api")),
+                ("follow", json!(true)),
+            ]),
+        )
+        .await
+        .expect("the follow starts");
+
+    // Nothing has been written down the log yet. This is what puts the first line on the wire.
+    cluster.release.notify_one();
+    let first = next_record(&mut invocation, "the first line").await;
+    first
+        .validate()
+        .expect("the record conforms to the schema it carries");
+    assert_eq!(
+        text_of(&first, "text").as_deref(),
+        Some("the first line, written while the body was open")
+    );
+    assert_eq!(int_of(&first, "line"), Some(1));
+    assert_eq!(
+        text_of(&first, "ending").as_deref(),
+        Some("the stream is still open"),
+        "a record written while the body is open says so, rather than claiming an ending that \
+         has not happened"
+    );
+    let bounds = list_of(&first, "bounds").expect("a followed line states its bounds too");
+    assert!(
+        bounds
+            .iter()
+            .any(|bound| bound.contains("rotated and truncated")),
+        "following does not make a log complete: the runtime truncated it before anybody \
+         followed it (§42.1): {bounds:?}"
+    );
+    assert_eq!(
+        bool_of(&first, "may_contain_secrets"),
+        Some(true),
+        "§42.2 holds on a followed line exactly as it does on a read one"
+    );
+
+    // The second line did not exist on the wire until now, so the record below cannot have been
+    // built from anything buffered while the first one was read.
+    cluster.release.notify_one();
+    let second = next_record(&mut invocation, "the second line").await;
+    assert_eq!(
+        text_of(&second, "text").as_deref(),
+        Some("the second line, written after the first was taken")
+    );
+    assert_eq!(
+        int_of(&second, "line"),
+        Some(2),
+        "the ordinal counts the follow, so a reader can tell one line from the next"
+    );
+
+    invocation.cancel().await;
+    let result = tokio::time::timeout(SOON, invocation.finish())
+        .await
+        .expect("a cancelled follow answers rather than hanging");
+    assert_eq!(result.status, InvokeStatus::Cancelled);
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_stop_a_followed_log_promptly_when_the_host_cancels_it() {
+    // §62.12, Gate L, on the last of the four operations it names. A followed log has no natural
+    // end — the operator ends it — so cancellation is how almost every follow finishes, and the
+    // two things that have to hold are the same two a live watch has to hold: it is observed
+    // between chunks rather than at the end of a body that never comes, and the brokered
+    // connection is given back rather than abandoned or closed twice.
+    let cluster = RecordedCluster::with_observations();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let mut invocation = plugin
+        .query(
+            "k8s-log",
+            at_cluster(&[
+                ("name", json!("api-7d9f-abc")),
+                ("container", json!("api")),
+                ("follow", json!(true)),
+            ]),
+        )
+        .await
+        .expect("the follow starts");
+    cluster.release.notify_one();
+    next_record(&mut invocation, "the first line").await;
+
+    invocation.cancel().await;
+    let result = tokio::time::timeout(SOON, invocation.finish())
+        .await
+        .expect("a cancelled follow terminates promptly rather than at the read deadline");
+    assert_eq!(
+        result.status,
+        InvokeStatus::Cancelled,
+        "cancellation is observed and answered, and a follow the operator stopped after any \
+         number of lines is never the refusal an empty bounded read makes (§63.6)"
+    );
+
+    // The instance survived, which is what says the connection was given back rather than
+    // abandoned or closed twice.
+    let (events, later) = plugin
+        .query("k8s-namespace", at_cluster(&[]))
+        .await
+        .expect("a later query still works")
+        .collect()
+        .await;
+    assert_eq!(later.status, InvokeStatus::Completed, "{:?}", later.error);
+    assert_eq!(records(&events).len(), 1);
+    assert!(
+        cluster
+            .heads()
+            .iter()
+            .any(|head| head.contains("/log?container=api&follow=true")),
+        "the log was followed rather than read, which is what there was to cancel: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_to_follow_a_run_that_has_already_ended() {
+    // §42.1. The API server accepts `follow` together with `previous` and answers it by closing
+    // the body at once, because the prior run has stopped growing — and a caller watching for
+    // more lines reads that as a container it has just seen stop. The pair is refused here
+    // rather than sent, so the misreading cannot happen.
+    let plugin = loaded_with_observations().await;
+    let (records, result) = asked(
+        &plugin,
+        "k8s-log",
+        &[
+            ("name", json!("api-7d9f-abc")),
+            ("container", json!("api")),
+            ("follow", json!(true)),
+            ("previous", json!(true)),
+        ],
+    )
+    .await;
+    assert!(records.is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let said = refusal(&result);
+    assert!(
+        said.contains("cannot be followed"),
+        "the refusal names the pair it will not send: {said}"
+    );
+    assert!(
+        said.contains("already ended"),
+        "and says why the server's own answer would mislead: {said}"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

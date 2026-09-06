@@ -391,6 +391,34 @@ fn should_not_read_a_closed_body_as_a_container_that_stopped() {
     );
 }
 
+/// A body that ends mid-line ends mid-line. The plausible mistake is a follow that drops what it
+/// was holding when the connection went away, so the last thing the container wrote disappears —
+/// silently, and exactly where a reader is looking hardest. It is handed over as an unterminated
+/// line, which is what the bounded read already does with the same bytes.
+#[test]
+fn should_hand_over_what_a_followed_body_ended_mid_line_on() {
+    let request = LogRequest::new(target()).following();
+    let mut follow = LogFollow::open(request);
+
+    assert_eq!(follow.receive(b"whole\nhalf of a").len(), 1);
+    follow.closed();
+
+    let rest = follow
+        .finish()
+        .expect("the bytes held back when the body ended are a line, not nothing");
+    assert_eq!(rest.bytes(), b"half of a");
+    assert!(
+        !rest.is_terminated(),
+        "the server never sent the newline that would end it, and saying it did would show half \
+         a message as one the container finished writing"
+    );
+    assert_eq!(follow.delivered_lines(), 2);
+    assert!(
+        follow.finish().is_none(),
+        "and there is nothing left to hand over twice"
+    );
+}
+
 /// Provenance survives the follow, because the lines outlive the request that produced them.
 #[test]
 fn should_hand_a_follow_over_as_a_retrieval_that_still_names_its_target() {

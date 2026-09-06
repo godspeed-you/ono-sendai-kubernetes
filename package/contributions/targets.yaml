@@ -372,8 +372,11 @@ targets:
   # the Pod has several, `previous` reads the one prior run the kubelet retains, `timestamps` asks
   # the server to prefix each line, and `tail_lines`, `since_seconds` and `limit_bytes` bound the
   # answer — each of them adding an entry to every record's `bounds`. `bounds` is never empty, and
-  # that is the point: a retrieved log is not the container's output. There is deliberately no
-  # `follow`, which is a live stream and would need `k8s-change`'s machinery to answer honestly.
+  # that is the point: a retrieved log is not the container's output. `follow` keeps the body open
+  # and answers with each line as it arrives, on `k8s-change`'s machinery: the invocation is live,
+  # nothing is accumulated, and the operator ends it. It is refused with `previous`, because the
+  # server answers that pair by closing at once and a caller reads that as a container that just
+  # stopped (ADR-0030).
   - name: k8s-log
     schema: io.github.godspeed-you.kubernetes.log/1
     summary: >-
@@ -421,6 +424,9 @@ targets:
       - name: limit_bytes
         type: int
         doc: "Stop after N bytes. The stop is coverage, never a silently short log."
+      - name: follow
+        type: bool
+        doc: "Keep the body open and answer with each line as the container writes it, until the query is cancelled. Refused with `previous`: a run that has already ended cannot produce another line."
   # What is known to have happened to one object, and by whose clock (§39). Options are the object's:
   # `kind`/`group`/`version`/`resource` and `name`. Every record carries the window this provider
   # observed in, on its own clock, and both kinds of hole in it — the stretches nobody observed and

@@ -672,6 +672,20 @@ impl LogFollow {
         lines
     }
 
+    /// Hands over what the body ended mid-line on, as an unterminated line.
+    ///
+    /// [`None`] where the body ended on a line boundary, which is the ordinary case. The bounded
+    /// read already does this with the same bytes, and a follow that dropped them instead would
+    /// lose the last thing the container wrote at exactly the moment a reader cares most about
+    /// it — a connection that went away mid-message.
+    pub fn finish(&mut self) -> Option<LogLine> {
+        let rest = self.decoder.finish();
+        if rest.is_some() {
+            self.delivered += 1;
+        }
+        rest
+    }
+
     /// Stops the follow because the reader asked (§61.5, Gate L).
     pub fn cancel(&mut self) {
         if self.state.is_streaming() {
