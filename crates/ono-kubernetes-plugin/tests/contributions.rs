@@ -12,6 +12,8 @@
     reason = "a failed precondition in a test should abort the test loudly"
 )]
 
+use std::collections::BTreeSet;
+
 use ono_kuang_sdk::protocol::{Capability, CommandDocument, ParameterContribution, TargetDocument};
 use ono_kubernetes_plugin::contributions::{
     COMMAND_SCHEMAS, COMMANDS, IDENTITY, Reads, TARGETS, target,
@@ -592,6 +594,9 @@ const CI: &str = include_str!("../../../.github/workflows/ci.yml");
 /// The workspace manifest, which pins the revision this package is built against.
 const WORKSPACE: &str = include_str!("../../../Cargo.toml");
 
+/// This crate's own manifest, which pins two more of core's crates than the workspace does.
+const PACKAGE_MANIFEST: &str = include_str!("../Cargo.toml");
+
 #[test]
 fn should_build_the_shell_from_the_revision_this_package_is_built_against() {
     // Gate N's whole evidence rests on the live legs having run, and they run the package against
@@ -603,15 +608,32 @@ fn should_build_the_shell_from_the_revision_this_package_is_built_against() {
     // It had drifted: the workflow still named the revision that was current when the harness
     // landed. Nothing said so, because a green leg against the wrong shell looks exactly like a
     // green leg.
-    let pinned = WORKSPACE
-        .lines()
-        .find_map(|line| {
+    //
+    // **Every manifest**, not just the workspace's. `ono-kuang-testhost` and
+    // `ono-kuang-supervisor` are pinned in this crate's own `Cargo.toml`, so a bump that touched
+    // only the workspace left two revisions of `ono-kuang-protocol` in one dependency graph and
+    // the build stopped compiling — which is the loud failure. The quiet one is the reverse: the
+    // workspace lagging while these two moved, with the live legs green against a pair that never
+    // ships together. So the assertion is that there is exactly *one* revision anywhere.
+    let revisions: BTreeSet<&str> = [WORKSPACE, PACKAGE_MANIFEST]
+        .iter()
+        .flat_map(|manifest| manifest.lines())
+        .filter_map(|line| {
             line.split_once("rev = \"")?
                 .1
                 .split_once('"')
                 .map(|(rev, _)| rev)
         })
-        .expect("the workspace pins a revision of core");
+        .collect();
+    assert_eq!(
+        revisions.len(),
+        1,
+        "one revision of core across every manifest, and these are {revisions:?}"
+    );
+    let pinned = revisions
+        .iter()
+        .next()
+        .expect("the manifests pin a revision of core");
     let built = CI
         .lines()
         .find_map(|line| line.trim().strip_prefix("ONO_CORE_REV:"))
@@ -619,7 +641,7 @@ fn should_build_the_shell_from_the_revision_this_package_is_built_against() {
         .expect("the workflow names the revision it builds the shell from");
 
     assert_eq!(
-        built, pinned,
+        &built, pinned,
         "`.github/workflows/ci.yml` builds `ono` from a different revision of core than \
          `Cargo.toml` builds this package against, so the live legs prove nothing about the pair \
          that ships"
