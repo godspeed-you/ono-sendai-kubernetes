@@ -83,6 +83,12 @@ targets:
       - name: name
         type: string
         doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: selector
+        type: string
+        doc: "A Kubernetes label selector, e.g. `app=api,tier!=cache` or `env in (staging, prod)`. Pushed to the API server verbatim, so the semantics are Kubernetes' own (specification section 17.4)."
+      - name: field_selector
+        type: string
+        doc: "A Kubernetes field selector, e.g. `status.phase=Running`. Support varies by resource and by server; one this server will not index is refused by name rather than answered with an empty collection (specification section 17.5)."
       - name: max_pages
         type: int
         doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
@@ -225,6 +231,12 @@ targets:
       - name: name
         type: string
         doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: selector
+        type: string
+        doc: "A Kubernetes label selector, e.g. `app=api,tier!=cache` or `env in (staging, prod)`. Pushed to the API server verbatim, so the semantics are Kubernetes' own (specification section 17.4)."
+      - name: field_selector
+        type: string
+        doc: "A Kubernetes field selector, e.g. `status.phase=Running`. Support varies by resource and by server; one this server will not index is refused by name rather than answered with an empty collection (specification section 17.5)."
       - name: max_pages
         type: int
         doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
@@ -381,7 +393,60 @@ targets:
       of its own; what it regards is a field of it. An aggregated Event is one Event however many
       occurrences it counts.
 
-    options: *named-in-a-discovered-collection
+    # Written out rather than sharing `k8s-resource`'s anchor, which it did until the two
+    # diverged: §17.3's `selector` and `field_selector` are pushed by the listing route in
+    # `query.rs`, and `k8s-event` reads its collection through `events.rs`, which does not push
+    # them. An alias would have declared two arguments this target's handler never reads.
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: all_namespaces
+        type: bool
+        doc: "Every namespace the caller can see. Deliberate rather than implied: there is no silent fan-out (specification section 9.4)."
+      - name: kind
+        type: string
+        doc: "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery."
+      - name: group
+        type: string
+        doc: "The API group, e.g. `example.io`. Written empty it names the core group; omitted it searches every group the server lists."
+      - name: version
+        type: string
+        doc: "One served version instead of the group's preferred one (specification section 13.4)."
+      - name: resource
+        type: string
+        doc: "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: max_pages
+        type: int
+        doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
+      - name: max_requests
+        type: int
+        doc: "How many requests this query may send to the API server before it stops and says so. Default 64, which is what an interactive question costs (specification section 49.5)."
+      - name: max_scopes
+        type: int
+        doc: "How many distinct scopes — namespaces, API group-versions — the query may reach into. Checked against the estimated breadth before the first request rather than halfway through (specification section 17.6). Default 32."
+      - name: budget_ms
+        type: int
+        doc: "How long the query may take before it stops with what it has. Default 10000: an interactive answer is one somebody is waiting for (specification section 50.1)."
+  # What one object is related to. Not a resource: an edge has no `metadata.uid` and no collection
+  # to be fetched from, so this noun names an object with `kind` and `name` and answers one record
+  # per edge — with the evidence class and the fields that decided it, which is Gate D (§62.4).
+  # `relation` narrows to one of §35.7's words. ADR-0014.
   # What an object states about the systems around Kubernetes, exported for someone else to resolve
   # (§28.3 to §28.5, §47). Four kinds state such a thing and each states a different one — the
   # machine under a Node (§47.2), the containers and images of a Pod (§47.3, §47.6), the

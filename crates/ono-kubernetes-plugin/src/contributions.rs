@@ -213,6 +213,33 @@ const EVIDENCE_KIND: Parameter = Parameter::defaulting(
 );
 
 /// A page budget for a listing (§18.4).
+/// Server-side filtering, pushed to the API server exactly as written (§17.3 to §17.5).
+///
+/// Two parameters rather than one, because the API server treats them differently and so must a
+/// caller: every resource supports label selection, while field selector support "varies by
+/// resource type and server implementation" (§17.5) — so a rejected field selector is refused with
+/// the field named, and never turned into an empty collection.
+///
+/// The syntax is Kubernetes' own, undocumented here on purpose. §17.4 requires that "Kubernetes
+/// label selector semantics MUST remain Kubernetes semantics", and the way to keep a translation
+/// from changing meaning is to have no translation: what the operator writes goes on the wire.
+const SELECTORS: &[Parameter] = &[
+    Parameter::new(
+        "selector",
+        "string",
+        "A Kubernetes label selector, e.g. `app=api,tier!=cache` or `env in (staging, prod)`. Pushed \
+         to the API server verbatim, so the semantics are Kubernetes' own (specification section \
+         17.4).",
+    ),
+    Parameter::new(
+        "field_selector",
+        "string",
+        "A Kubernetes field selector, e.g. `status.phase=Running`. Support varies by resource and by \
+         server; one this server will not index is refused by name rather than answered with an \
+         empty collection (specification section 17.5).",
+    ),
+];
+
 const MAX_PAGES: Parameter = Parameter::new(
     "max_pages",
     "int",
@@ -561,6 +588,7 @@ impl Target {
             Reads::Kind { .. } => {
                 options.extend_from_slice(SCOPE);
                 options.push(NAMED);
+                options.extend_from_slice(SELECTORS);
                 options.push(MAX_PAGES);
                 options.extend_from_slice(BUDGET);
             }
@@ -569,6 +597,7 @@ impl Target {
                 options.extend_from_slice(SCOPE);
                 options.extend_from_slice(RESOURCE);
                 options.push(NAMED);
+                options.extend_from_slice(SELECTORS);
                 options.push(MAX_PAGES);
                 options.extend_from_slice(BUDGET);
             }

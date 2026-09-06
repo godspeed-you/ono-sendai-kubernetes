@@ -256,6 +256,13 @@ struct RecordedCluster {
     /// The test holds it. A frame that is not on the wire cannot have been buffered by anything,
     /// so a record built from it proves the package emitted while the body was still open.
     release: Arc<tokio::sync::Notify>,
+    /// Whether the server refuses a `fieldSelector` it does not index, as a real one does.
+    ///
+    /// §17.5's whole subject: "field selector availability varies by resource type and server
+    /// implementation". The API server answers `400` with a `Status` naming the field label it
+    /// will not select on, and the mistake the specification forbids is turning that into an
+    /// empty collection.
+    reject_field_selector: bool,
     /// The TLS identity this server presents, where it speaks HTTPS at all. `None` is the plain
     /// HTTP/1.1 an API server behind `kubectl proxy` speaks.
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -482,6 +489,16 @@ impl RecordedCluster {
         })
     }
 
+    /// A server that will not select on the field label a query names (§17.5).
+    fn refusing_field_selection() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            reject_field_selector: true,
+            ..Self::default()
+        })
+    }
+
     /// A server whose Pod collection comes in two pages, and what becomes of the second.
     fn paginating(paging: Paging) -> Arc<Self> {
         Arc::new(Self {
@@ -686,6 +703,25 @@ fn denied(path: &str, verb: &str) -> Vec<u8> {
     .to_string();
     format!(
         "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// One `400`, as the API server writes a field selector it will not select on (§17.5).
+fn unindexed_field(selector: &str) -> Vec<u8> {
+    let field = selector.split('=').next().unwrap_or(selector);
+    let body = json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "message": format!("field label not supported: {field}"),
+        "reason": "BadRequest",
+        "code": 400,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .into_bytes()
@@ -2073,6 +2109,16 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
         && let Some(bytes) = log_response(path)
     {
         return bytes;
+    }
+    // §17.5: a field selector this server does not index, refused before anything is listed —
+    // read here for the same reason as the watch above, because it lives only in the query.
+    if cluster.reject_field_selector
+        && let Some(query) = path.split('?').nth(1)
+        && let Some(selector) = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("fieldSelector="))
+    {
+        return unindexed_field(selector);
     }
     // §18: which page of the collection this is lives in the query string, exactly as `watch=true`
     // does, so it is answered before the query is dropped.
@@ -8022,4 +8068,170 @@ async fn should_contribute_no_edge_without_the_relation_write_grant() {
     );
 
     plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- §17.3 to §17.5: filtering that belongs on the API server ------------------------------------
+
+#[tokio::test]
+async fn should_push_a_label_selector_to_the_api_server_exactly_as_it_was_written() {
+    // §17.3: "the provider SHOULD push supported label selectors and field selectors to the API
+    // server when Ono query semantics map exactly", and MUST NOT push one "when the translation
+    // changes semantics". §17.4: "Kubernetes label selector semantics MUST remain Kubernetes
+    // semantics", and the provider MUST NOT invent logical OR and silently fan out.
+    //
+    // The design that keeps all three is to not translate at all. What the operator writes is
+    // what goes on the wire, so `environment in (staging, prod)` is the API server's `in` — a set
+    // operator this package neither reimplemented nor decomposed into two requests. There is no
+    // translation, so there is nothing for a translation to change.
+    let cluster = RecordedCluster::with_pods(2);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let invocation = plugin
+        .query(
+            "k8s-pod",
+            at_cluster(&[
+                ("namespace", json!("default")),
+                (
+                    "selector",
+                    json!("environment in (staging, prod),tier!=cache"),
+                ),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert!(!records(&events).is_empty(), "the collection answered");
+
+    let listing = cluster
+        .heads()
+        .into_iter()
+        .find(|head| head.contains("/api/v1/namespaces/default/pods"))
+        .expect("the Pod collection was listed");
+    // Percent-encoded, because a selector is a query-string value and a comma, a space and a
+    // parenthesis all have to survive the trip. What must not survive is a *rewrite*.
+    let target = listing
+        .split_whitespace()
+        .nth(1)
+        .expect("the request line names a target");
+    let selector = target
+        .split('?')
+        .nth(1)
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("labelSelector="))
+        })
+        .expect("the label selector travelled: {listing}");
+    let decoded = percent_decode(selector);
+    assert_eq!(
+        decoded, "environment in (staging, prod),tier!=cache",
+        "the selector reaches the API server as the operator wrote it, got `{decoded}`"
+    );
+
+    // And it went as one request. §17.4's named failure is fanning a set operator out into
+    // several listings without preserving completeness metadata; the way not to do that is not to
+    // fan out.
+    assert_eq!(
+        cluster
+            .heads()
+            .iter()
+            .filter(|head| head.contains("/api/v1/namespaces/default/pods"))
+            .count(),
+        1,
+        "one selector is one request: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_ask_for_nothing_where_a_query_wrote_no_selector() {
+    // The other half of §17.3, and the one a `filter(|written| !written.is_empty())` exists for.
+    // An API server reads an absent `labelSelector` and an empty one identically, so a package
+    // that sent `labelSelector=` for a caller who typed nothing would be truthful on the wire and
+    // misleading in every request log an operator later reads.
+    let cluster = RecordedCluster::with_pods(2);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let invocation = plugin
+        .query(
+            "k8s-pod",
+            at_cluster(&[("namespace", json!("default")), ("selector", json!(""))]),
+        )
+        .await
+        .expect("the query starts");
+    let (_, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert!(
+        !cluster
+            .heads()
+            .iter()
+            .any(|head| head.contains("labelSelector")),
+        "a selector nobody wrote is not on the wire: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_not_turn_a_field_selection_the_server_will_not_index_into_an_empty_collection() {
+    // §17.5, which is the `MUST` in this neighbourhood: "field selector availability varies by
+    // resource type and server implementation … Unsupported field selection MUST not become an
+    // empty result."
+    //
+    // The failure this forbids is the cheapest one to write. A `400` on the listing, caught and
+    // treated as "no matching objects", produces a query that completes with an empty table — and
+    // an operator reading it concludes that nothing on the cluster matches, when in truth nothing
+    // was ever selected. It is §21.4's central prohibition wearing a query-string costume.
+    let cluster = RecordedCluster::refusing_field_selection();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let invocation = plugin
+        .query(
+            "k8s-pod",
+            at_cluster(&[
+                ("namespace", json!("default")),
+                ("field_selector", json!("spec.schedulerName=custom")),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(
+        records(&events).is_empty(),
+        "nothing was invented from a listing that never happened"
+    );
+    assert_ne!(
+        result.status,
+        InvokeStatus::Completed,
+        "a refused selection is not a complete answer with nothing in it — which is exactly what \
+         §17.5 forbids it from becoming"
+    );
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("spec.schedulerName")
+            || error.help.clone().unwrap_or_default().contains("field"),
+        "the refusal names what the server would not select on, so the operator can drop it: \
+         {error:?}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+/// A percent-decoded query-string value, for asserting what actually travelled.
+fn percent_decode(encoded: &str) -> String {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).expect("a decoded selector is text")
 }

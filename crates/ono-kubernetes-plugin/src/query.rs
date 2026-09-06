@@ -901,10 +901,62 @@ fn read<S: ByteStream>(
     if let Some(pages) = endpoint.max_pages {
         options = options.max_pages(pages);
     }
+    // §17.3: pushed to the API server, because that is where filtering a hundred thousand objects
+    // belongs, and pushed *verbatim*, because §17.4 requires Kubernetes selector semantics to stay
+    // Kubernetes semantics and the way to keep a translation from changing meaning is to have no
+    // translation. Nothing here is filtered again locally: a residual filter is only correct after
+    // a server-side subset, and this is not a subset of the caller's question — it is the
+    // question.
+    if let Some(written) = &endpoint.selector {
+        options = options.label_selector(written.clone());
+    }
+    if let Some(written) = &endpoint.field_selector {
+        options = options.field_selector(written.clone());
+    }
     // §17.6 and §9.4: the namespace, or every namespace, counted as the breadth it is.
     client.ledger().enter_scope(&scope).map_err(over_budget)?;
     let listing = client.walk(resource.gvr(), &scope, &options, &mut streamed);
+    // §17.5, and the reason it is a `MUST` rather than a `SHOULD`: "unsupported field selection
+    // MUST not become an empty result". A `400` here means the API server would not select on the
+    // field label, so nothing was ever filtered and nothing was ever listed — and the cheapest
+    // handling, letting it fall through as one more incomplete listing, tells an operator only
+    // that a request failed. This says which field, because the fix is to drop it and that is not
+    // a fix anyone can find from `request failed`.
+    if let Some(written) = &endpoint.field_selector
+        && listing
+            .error()
+            .is_some_and(|error| error.code() == Some(400))
+    {
+        return Ok(Outcome::Failed(unindexed_field_selector(
+            written,
+            resource.gvr(),
+            listing.error().and_then(ApiError::status),
+        )));
+    }
     Ok(streamed.finish(&listing, &unread))
+}
+
+/// A field selector the API server would not select on (§17.5).
+///
+/// The distinction it exists to keep is the one §21.4 is built around, applied to a query string:
+/// *no objects matched* and *no selection happened* look identical in an empty table and have
+/// nothing else in common. So this is a refusal rather than a result, it names the selector the
+/// operator wrote, and it repeats what the server said about it — the server knows which field
+/// labels it indexes for this resource and this package does not.
+fn unindexed_field_selector(
+    written: &str,
+    gvr: &ono_provider_kubernetes::discovery::Gvr,
+    status: Option<&ono_provider_kubernetes::transport::Status>,
+) -> WireError {
+    let said = status
+        .and_then(ono_provider_kubernetes::transport::Status::message)
+        .unwrap_or("the request was refused");
+    failure(
+        UNSUPPORTED_CODE,
+        UNSUPPORTED,
+        format!("`{gvr}` cannot be selected on `{written}`: {said}"),
+        "Field selector support varies by resource and by server, and this server does not offer          it for that field. Nothing was listed and nothing was filtered, so this is not an empty          collection: drop the field selector to read the collection, or narrow it with a label          selector, which every resource supports.",
+    )
 }
 
 /// The answer to a query that named one object: nothing to stream, and one thing to say.
@@ -1950,6 +2002,20 @@ pub(crate) struct Endpoint {
     pub(crate) instance: String,
     pub(crate) scope: Scope,
     pub(crate) max_pages: Option<usize>,
+    /// A Kubernetes label selector, passed to the API server exactly as written (§17.3, §17.4).
+    ///
+    /// Verbatim is the whole design. §17.3 forbids pushing a filter "when the translation changes
+    /// semantics" and §17.4 requires that "Kubernetes label selector semantics MUST remain
+    /// Kubernetes semantics" — and the safest way to keep a translation from changing meaning is
+    /// not to translate. What the operator writes is what goes on the wire, so `app in (api, web)`
+    /// is the API server's `in`, not something this package reimplemented.
+    pub(crate) selector: Option<String>,
+    /// A Kubernetes field selector, likewise verbatim (§17.5).
+    ///
+    /// Kept apart from [`Self::selector`] because the API server treats them differently: field
+    /// selector support "varies by resource type and server implementation", so a rejected field
+    /// selector has a fallback and a rejected label selector does not.
+    pub(crate) field_selector: Option<String>,
     /// What one query answered from this endpoint may cost (§49.1, §49.5, §50.1).
     ///
     /// Resolved per invocation from the query's own words over conservative defaults, and never
@@ -2065,6 +2131,8 @@ impl Endpoint {
             instance,
             scope: scope_of(options, None),
             max_pages: max_pages(options),
+            selector: selector(options, "selector"),
+            field_selector: selector(options, "field_selector"),
             budget: budget_of(options),
             // Deliberately no TLS on this path, and deliberately no option to ask for it: an
             // explicit host with no kubeconfig behind it has no trust anchors, and a session
@@ -2202,6 +2270,8 @@ impl Endpoint {
             // query beats it because it is the more recent deliberate choice.
             scope: scope_of(options, connection.namespace()),
             max_pages: max_pages(options),
+            selector: selector(options, "selector"),
+            field_selector: selector(options, "field_selector"),
             budget: budget_of(options),
             tls,
             authorization,
@@ -2336,6 +2406,21 @@ fn bound(options: &JsonMap<String, Json>, name: &str) -> Option<u64> {
         .get(name)
         .and_then(Json::as_u64)
         .filter(|value| *value > 0)
+}
+
+/// A selector the query wrote, as text, or [`None`] where it wrote none.
+///
+/// Empty text is `None` rather than an empty selector, because the API server reads an empty
+/// `labelSelector` as "everything" and so does the absence of one — but a caller who typed
+/// nothing meant the second, and a package that spelled the two differently on the wire would
+/// make an empty argument look like a deliberate filter in a request log.
+fn selector(options: &JsonMap<String, Json>, name: &str) -> Option<String> {
+    options
+        .get(name)
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|written| !written.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// A page budget, where the query set one.
