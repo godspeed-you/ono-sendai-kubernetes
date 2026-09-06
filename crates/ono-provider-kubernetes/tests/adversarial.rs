@@ -46,8 +46,8 @@ use ono_provider_kubernetes::redaction::{Guarded, REDACTED};
 use ono_provider_kubernetes::relationship::Evidence;
 use ono_provider_kubernetes::schema::{Projection, Schema};
 use ono_provider_kubernetes::transport::{
-    ApiError, Client, FixedClock, FixtureStream, HttpConnection, ListOptions, Page, Reader,
-    Request, Status, Walk, collection_path, object_path,
+    ApiError, BreakReason, Client, Continuity, FixedClock, FixtureStream, HttpConnection,
+    ListOptions, Page, Reader, Request, Status, Walk, collection_path, object_path,
 };
 use ono_provider_kubernetes::watch::{FrameError, WatchDecoder, WatchEvent};
 
@@ -387,14 +387,12 @@ fn should_type_a_secret_by_the_collection_it_came_from_rather_than_by_what_the_i
     // §22 keyed on the object's *self-declared* kind is a decision the adversary gets to make.
     // A `GET /api/v1/namespaces/shop/secrets` whose items each carry `"kind":"ConfigMap"` — which
     // a hostile aggregated API server (§34) may send, and which §34.2 requires this provider to
-    // survive — is answered by an object that never reaches `redaction::is_payload_protected`.
+    // survive — used to produce an object that never reached `redaction::is_payload_protected`,
+    // and `get k8s-secret` completed with the plaintext in the record.
     //
-    // FINDING (transport.rs, not this file's to repair): `transport::identify` deliberately lets
-    // an item's own `kind` win over the list envelope's, so redaction is decided by the payload's
-    // author. The requested GVR is known at this point and is the honest authority: an item of
-    // the `secrets` collection is a Secret whatever it calls itself, and redaction.rs's own rule
-    // applies — over-redaction costs a reader some detail, under-redaction cannot be taken back.
-    // The assertion below records what happens today so the gap is visible rather than latent.
+    // The collection decides now, and an item that disagrees is refused rather than overridden:
+    // this is not a mixed list that needs interpreting, it is a server contradicting itself about
+    // the page, and nothing on that page is trustworthy about its own identity (§48.1).
     let list = serde_json::json!({
         "apiVersion": "v1", "kind": "SecretList",
         "metadata": {"resourceVersion": "1"},
@@ -407,38 +405,36 @@ fn should_type_a_secret_by_the_collection_it_came_from_rather_than_by_what_the_i
     .to_string();
 
     let mut client = client(&[response("200 OK", &list)]);
-    let page = client
+    let refused = client
         .list_page(
             &secrets(),
             &Scope::in_namespace("shop"),
             &ListOptions::new(),
         )
-        .expect("the page reads");
-    let object = page.objects().first().expect("one item").clone();
-    let guarded = Guarded::hold(object).expect("it crosses the boundary");
+        .expect_err("an item of the `secrets` collection may not choose to be a ConfigMap");
 
+    let said = refused.to_string();
     assert!(
-        !guarded.is_payload_protected(),
-        "today the item's own claim decides, and the payload is not protected"
+        said.contains("Secret") && said.contains("ConfigMap"),
+        "the refusal names both readings, because which one is wrong is the server's to explain: \
+         {said}"
     );
     assert!(
-        discloses(&format!("{:?}", guarded.object())),
-        "so the payload of an object read from the `secrets` collection is handed out whole"
+        !discloses(&said),
+        "and the refusal does not carry the payload it was protecting: {said}"
     );
 }
 
 #[test]
 fn should_not_leave_an_item_kindless_when_the_envelope_is_a_generic_list() {
-    // The same rule as the test above, reached by a second route. `transport::identify` gives an
-    // item the envelope's kind with `List` stripped off the end, so a generic `v1 List` — what an
-    // aggregated API server or a mixed collection produces — leaves every item with the kind `""`.
-    // An empty kind is not `Secret`, so §22 does not apply to any of them.
+    // The same rule reached by a second route. The item's kind used to come from the envelope's
+    // with `List` stripped off the end, so a generic `v1 List` — what an aggregated API server or
+    // a mixed collection produces — left every item with the kind `""`. An empty kind is not
+    // `Secret`, so §22 applied to none of them.
     //
-    // FINDING (transport.rs, not this file's to repair): `strip_suffix("List")` on a kind that is
-    // exactly `List` yields nothing, and nothing is not a kind. §13.5 makes canonical identity
-    // group-plus-kind, and an object with neither is not identified at all — the item should keep
-    // the requested GVR's kind, or the envelope should be refused as one this provider cannot
-    // type.
+    // A collection this provider cannot say the kind of is refused rather than guessed at. §13.5
+    // makes canonical identity group-plus-kind, and an object with neither is not identified at
+    // all — so there is nothing to guess *from*, and the safe reading and the honest one agree.
     let list = serde_json::json!({
         "apiVersion": "v1", "kind": "List",
         "metadata": {"resourceVersion": "1"},
@@ -450,26 +446,20 @@ fn should_not_leave_an_item_kindless_when_the_envelope_is_a_generic_list() {
     .to_string();
 
     let mut client = client(&[response("200 OK", &list)]);
-    let page = client
+    let refused = client
         .list_page(
             &secrets(),
             &Scope::in_namespace("shop"),
             &ListOptions::new(),
         )
-        .expect("the page reads");
-    let object = page.objects().first().expect("one item").clone();
+        .expect_err("a generic list names no kind its items are of");
 
-    assert_eq!(
-        object.gvk().kind(),
-        "",
-        "today the item comes back with no kind at all"
-    );
-    let guarded = Guarded::hold(object).expect("it crosses the boundary");
+    let said = refused.to_string();
     assert!(
-        !guarded.is_payload_protected(),
-        "and an object with no kind is not a Secret, so the payload is not protected"
+        said.contains("List"),
+        "the refusal quotes what the envelope did say: {said}"
     );
-    assert!(discloses(&format!("{:?}", guarded.object())));
+    assert!(!discloses(&said), "and does not carry the payload: {said}");
 }
 
 #[test]
@@ -502,17 +492,16 @@ fn should_leave_no_secret_payload_in_a_status_message_this_provider_composes() {
 }
 
 #[test]
-fn should_show_a_submitted_secret_value_in_an_admission_difference() {
-    // §44.6's admission diff is built from two halves. The *returned* half is guarded on purpose
-    // (`mutation::admission_differences_of` exists for exactly that), so an admission webhook
-    // that rewrote a payload cannot report the rewritten bytes. The *requested* half is not.
+fn should_redact_both_halves_of_an_admission_difference_over_a_secret() {
+    // §44.6's admission diff is built from two halves, and both of them carry payload. The
+    // *returned* half is guarded by the caller — `mutation::admission_differences_of` takes a
+    // guarded object for exactly that reason — and the *submitted* half is guarded inside it.
     //
-    // FINDING (mutation.rs, not this file's to repair): §22.3 says "Secret bytes MUST NOT flow
-    // into ordinary command history, terminal scrollback capture or provider logs by default",
-    // and it does not say "unless the operator typed them". A `k8s-apply` of a Secret whose
-    // payload admission left alone reports no difference and leaks nothing; one that admission
-    // *changed* reports the submitted value verbatim beside `<redacted>`. The submitted side of a
-    // change under a payload-bearing pointer should be redacted the same way the returned side is.
+    // §22.3 says "Secret bytes MUST NOT flow into ordinary command history, terminal scrollback
+    // capture or provider logs by default", and it does not say "unless the operator typed them".
+    // A `k8s-apply` of a Secret whose payload admission rewrote would otherwise report the
+    // submitted value verbatim beside `<redacted>`, which is the same disclosure §42.2 forbids
+    // for a log line, one field to the left.
     let requested = serde_json::json!({
         "apiVersion": "v1", "kind": "Secret",
         "metadata": {"name": "db", "namespace": "shop"},
@@ -524,12 +513,45 @@ fn should_show_a_submitted_secret_value_in_an_admission_difference() {
     let differences = admission_differences_of(&requested, returned.object());
     let rendered = format!("{differences:?}");
     assert!(
-        discloses(&rendered),
-        "today the submitted half of the diff carries the payload: {rendered}"
+        !discloses(&rendered),
+        "neither half of the diff carries the payload: {rendered}"
     );
+
+    // And no difference is *claimed* over the payload either. Both halves are `<redacted>` by the
+    // time they are compared, so they compare equal — which is the honest answer to a question
+    // this provider is not allowed to hold the operands of. The alternative it replaces was
+    // worse than incomplete: `CIPHERTEXT -> <redacted>` was reported as a rewrite whether or not
+    // admission had touched anything, and it carried the value that made it a disclosure.
+    let payload: Vec<&str> = differences
+        .iter()
+        .map(ono_provider_kubernetes::plan::FieldChange::path)
+        .filter(|path| path.starts_with("/data/"))
+        .collect();
     assert!(
-        rendered.contains(REDACTED),
-        "the returned half is redacted, which is the half `admission_differences_of` was written for"
+        payload.is_empty(),
+        "nothing is claimed about a value neither half may hold: {payload:?}"
+    );
+
+    // Everything that is not payload compares as it always did.
+    let plain = serde_json::json!({
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": "settings", "namespace": "shop"},
+        "data": {"colour": "blue"},
+    });
+    let held = Object::parse(
+        INSTANCE,
+        r#"{"apiVersion":"v1","kind":"ConfigMap",
+            "metadata":{"name":"settings","namespace":"shop"},
+            "data":{"colour":"green"}}"#,
+    )
+    .expect("the object reads");
+    let ordinary = admission_differences_of(&plain, &held);
+    assert_eq!(ordinary.len(), 1);
+    assert_eq!(ordinary[0].path(), "/data/colour");
+    assert_eq!(
+        ordinary[0].from().and_then(serde_json::Value::as_str),
+        Some("blue"),
+        "a kind §22 does not protect keeps both of its values"
     );
 }
 
@@ -736,24 +758,23 @@ fn should_not_let_a_path_shaped_namespace_or_name_climb_the_rest_path() {
     // server's authorizer ever sees the request, so a `GET` of a Pod named `../../secrets/admin`
     // reads a Secret under a Pod's RBAC decision.
     //
-    // FINDING (transport.rs, not this file's to repair): neither `collection_path` nor
-    // `object_path` validates or percent-encodes its components, although `Request::target`
-    // already percent-encodes every query value for the same class of reason. A name and a
-    // namespace belong in the path's unreserved set or in `%XX`, and `.`/`..` belong nowhere.
+    // Both components are percent-encoded now, by the same conservative encoder the query string
+    // has always used: what a cluster called something is one segment's worth of text and never a
+    // place to put something.
     let traversing = object_path(
         &pods(),
         &Scope::in_namespace("shop"),
         "../../secrets/admin-token",
     );
     assert_eq!(
-        traversing, "/api/v1/namespaces/shop/pods/../../secrets/admin-token",
-        "today the components are pasted in raw"
+        traversing, "/api/v1/namespaces/shop/pods/..%2F..%2Fsecrets%2Fadmin-token",
+        "a name that looks like a path stays one segment"
     );
 
     let climbing = collection_path(&pods(), &Scope::in_namespace("../../../api/v1/secrets"));
     assert_eq!(
-        climbing, "/api/v1/namespaces/../../../api/v1/secrets/pods",
-        "and a namespace is pasted in raw too"
+        climbing, "/api/v1/namespaces/..%2F..%2F..%2Fapi%2Fv1%2Fsecrets/pods",
+        "and so does a namespace"
     );
 }
 
@@ -764,21 +785,23 @@ fn should_not_let_a_name_carrying_crlf_forge_a_header_or_a_second_request() {
     // keep-alive connection. §51.2 bounds this provider to the configured API server; it does not
     // bound what it may be made to *ask* that server for.
     //
-    // FINDING (transport.rs, not this file's to repair): `Request::serialise` writes
-    // `{method} {target} HTTP/1.1\r\n` with an unencoded target, and writes header values
-    // unencoded too. A name is data; it must be percent-encoded before it becomes protocol.
+    // The name is encoded before it becomes protocol, so the carriage return and the line feed
+    // are `%0D%0A` and the request line is one line.
     let smuggled = "x HTTP/1.1\r\nX-Remote-User: cluster-admin\r\n\r\nGET /api/v1/secrets";
     let request = Request::get(object_path(&pods(), &Scope::in_namespace("shop"), smuggled));
     let wire = String::from_utf8(request.serialise(HOST)).expect("the wire is text");
 
     assert!(
-        wire.contains("X-Remote-User: cluster-admin"),
-        "today a name can write a header: {wire:?}"
+        !wire
+            .lines()
+            .any(|line| line.trim_start().starts_with("X-Remote-User")),
+        "a name may not write a header — the bytes survive inside the path, percent-encoded, \
+         which is the whole difference between data and protocol: {wire:?}"
     );
     assert_eq!(
         wire.lines().filter(|line| line.starts_with("GET ")).count(),
-        2,
-        "and a second request line, which on a keep-alive connection is a second request"
+        1,
+        "and may not open a second request on a keep-alive connection"
     );
 
     // The query string is the half that is already right, and it is the model for the fix.
@@ -791,35 +814,73 @@ fn should_not_let_a_name_carrying_crlf_forge_a_header_or_a_second_request() {
 }
 
 #[test]
-fn should_report_the_object_the_server_actually_sent_rather_than_the_one_that_was_asked_for() {
+fn should_refuse_an_answer_that_is_a_different_object_than_the_one_that_was_asked_for() {
     // §17.1's get addresses one object by name. A server that answers with a different object —
-    // a different name, a different kind, a different namespace — is either broken or hostile,
-    // and either way the provider must not present the answer under the question's identity.
+    // a different name, a different namespace, a different group-version — is either broken or
+    // hostile, and either way the provider must not present the answer under the question's
+    // identity.
     //
-    // FINDING (transport.rs, not this file's to repair): `Client::get` performs no cross-check
-    // between the requested locator and the returned object's `metadata`. Combined with the
-    // kind-from-the-item rule above, that is how a hostile aggregated API server chooses which
-    // §22 rule applies to the bytes it is sending. The identity below is honest about what
-    // arrived, which is the right half; what is missing is the mismatch being *reported*.
+    // The request is the authority for *which* object was asked for, and the response body is
+    // the authority only for what that object holds. A disagreement is a malformed answer (§48),
+    // never a silent substitution and never an absence: `404` would be a claim about the cluster
+    // made out of a claim about the answer, and §21.4 keeps those apart. It is the same defect
+    // `identify` guards a page deeper, where a list item's self-declared kind would otherwise
+    // choose which §22 rule applies to the bytes it arrived in.
     let body = serde_json::json!({
         "apiVersion": "v1", "kind": "Secret",
         "metadata": {"name": "somebody-else", "namespace": "kube-system", "uid": "s-9"},
         "data": {"password": CIPHERTEXT},
     })
     .to_string();
-    let mut client = client(&[response("200 OK", &body)]);
-    let read = client
+    let mut substituting = client(&[response("200 OK", &body)]);
+    let error = substituting
         .get(&pods(), &Scope::in_namespace("shop"), "checkout")
-        .expect("the read succeeds");
+        .expect_err("an answer about somebody else is not an answer");
 
-    assert_eq!(read.object().name(), "somebody-else");
-    assert_eq!(read.object().namespace(), Some("kube-system"));
-    assert_eq!(read.object().gvk().kind(), "Secret");
-    // The one thing that does hold: crossing the boundary is keyed on what arrived, so the
-    // payload of the substituted object is still destroyed.
-    let guarded = Guarded::hold(read.into_parts().0).expect("it crosses the boundary");
-    assert!(guarded.is_payload_protected());
-    assert!(!discloses(&format!("{:?}", guarded.object())));
+    assert!(
+        matches!(error, ApiError::Malformed(_)),
+        "the answer is malformed rather than the object that was asked for: {error:?}"
+    );
+    assert!(
+        !matches!(error, ApiError::NotFound(_)),
+        "and it is not absence either: nothing here says the Pod is not there"
+    );
+    assert!(
+        error.to_string().contains("checkout") && error.to_string().contains("somebody-else"),
+        "the refusal names what was asked and what arrived: {error}"
+    );
+    assert!(
+        !discloses(&error.to_string()),
+        "and it carries none of the payload it refused to report"
+    );
+
+    // The namespace on its own is enough: same name, somewhere else, is a different object
+    // (§16.2's locator is instance, kind, namespace and name).
+    let elsewhere = serde_json::json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "checkout", "namespace": "kube-system", "uid": "p-9"},
+    })
+    .to_string();
+    let mut next_door = client(&[response("200 OK", &elsewhere)]);
+    assert!(
+        matches!(
+            next_door.get(&pods(), &Scope::in_namespace("shop"), "checkout"),
+            Err(ApiError::Malformed(_))
+        ),
+        "a Pod of the same name in another namespace is not the Pod that was addressed"
+    );
+
+    // And the answer that agrees with the question is still an ordinary read.
+    let agreed = serde_json::json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "checkout", "namespace": "shop", "uid": "p-1"},
+    })
+    .to_string();
+    let mut agreeing = client(&[response("200 OK", &agreed)]);
+    let read = agreeing
+        .get(&pods(), &Scope::in_namespace("shop"), "checkout")
+        .expect("the object that was asked for is the object that is reported");
+    assert_eq!(read.object().uid(), Some("p-1"));
 }
 
 // --- 4. malformed and hostile API responses (§48.1, §18.1) --------------------------------------
@@ -993,18 +1054,17 @@ fn should_read_a_status_whose_message_is_enormous_without_losing_its_structured_
 }
 
 #[test]
-fn should_follow_a_continue_token_that_never_advances_until_something_else_stops_it() {
+fn should_break_continuity_when_a_continue_token_answers_with_itself() {
     // §18.1 says a `continue` token means the collection is incomplete. It does not say what to
     // do when the token never changes — and a server that echoes one, whether by a bug in an
     // aggregated API server (§34.2) or on purpose, turns a list into a loop.
     //
-    // FINDING (transport.rs, not this file's to repair): `Client::walk` re-sends whatever token
-    // arrives with no comparison against the one it just sent, and `Client::new` starts on
-    // `Budget::unlimited()`, so nothing bounds the repetition. Against a real socket this does
-    // not terminate; here it stops only because the recorded bytes run out. Core §12.3 asks a
-    // provider to "prevent duplicate emission where provider pagination semantics permit stable
-    // deduplication" — a token identical to the one just sent is exactly that signal, and it
-    // should break continuity (`BreakReason`) rather than loop.
+    // §18.2's vocabulary is the answer: a continuation that does not continue is a *broken
+    // snapshot* rather than a long one, so the sequence ends at the repetition with
+    // `Continuity::Broken(BreakReason::TokenRepeated)` and the malformed answer attached. Core
+    // §12.3 asks a provider to "prevent duplicate emission where provider pagination semantics
+    // permit stable deduplication" — a token identical to the one just sent is exactly that
+    // signal, and the repeated page is refused rather than emitted a second time.
     let page = serde_json::json!({
         "apiVersion": "v1", "kind": "PodList",
         "metadata": {"resourceVersion": "1", "continue": "never-advances"},
@@ -1024,25 +1084,40 @@ fn should_follow_a_continue_token_that_never_advances_until_something_else_stops
 
     assert_eq!(
         listing.pages(),
-        24,
-        "every recorded page was followed, and only the end of the bytes stopped it"
+        2,
+        "the second page is the one that repeats the token, and nothing asked for a third"
     );
     assert_eq!(
         reader.names.len(),
-        24,
-        "and the same object was emitted once per page: {:?}",
-        reader.names.first()
+        1,
+        "and the page that did advance stands, while its copy is refused: {:?}",
+        reader.names
+    );
+    assert_eq!(reader.names.first().map(String::as_str), Some("checkout"));
+    assert_eq!(
+        listing.continuity(),
+        &Continuity::Broken(BreakReason::TokenRepeated),
+        "the repetition is reported in the vocabulary §18.2 already has"
     );
     assert!(
-        reader.names.iter().all(|name| name == "checkout"),
-        "twenty-four copies of one Pod"
+        !listing.coverage().is_complete(),
+        "and the collection is incomplete rather than finished: {}",
+        listing.coverage().describe()
+    );
+    let error = listing
+        .error()
+        .expect("a malformed continuation is attached to the collection (§18.3)");
+    assert!(
+        matches!(error, ApiError::Malformed(_)),
+        "a server that cannot continue its own snapshot answered malformedly: {error:?}"
     );
     assert!(
-        listing.continuity().is_intact(),
-        "and nothing reported the repetition: the sequence still looks continuous"
+        error.to_string().contains("never-advances"),
+        "and the sentence names the token that repeated: {error}"
     );
 
-    // A page budget is what stops it today, and it has to be asked for.
+    // Nothing about it depends on a budget being asked for: the repetition is caught before any
+    // page bound is reached, which is what makes the bound a policy rather than the only guard.
     let mut bounded_client = client(&responses);
     let mut reader = Everything::default();
     let bounded = bounded_client.walk(
@@ -1051,10 +1126,14 @@ fn should_follow_a_continue_token_that_never_advances_until_something_else_stops
         &ListOptions::new().max_pages(3),
         &mut reader,
     );
-    assert_eq!(bounded.pages(), 3);
+    assert_eq!(bounded.pages(), 2);
     assert!(
-        bounded.coverage().may_have_more(),
-        "§18.4: stopping is a decision, and the stream is told more exists upstream"
+        !bounded.continuity().is_intact(),
+        "the loop ends as a break in the snapshot rather than as a decision to stop"
+    );
+    assert!(
+        !bounded.coverage().may_have_more(),
+        "§18.4's `more upstream` is what a *decision* leaves behind, and no decision was made"
     );
 }
 
@@ -1257,11 +1336,21 @@ fn should_read_a_collection_of_a_hundred_thousand_objects_and_say_what_it_bounde
         .collect();
     let page = serde_json::json!({
         "apiVersion": "v1", "kind": "PodList",
-        "metadata": {"resourceVersion": "1", "continue": format!("page-{}", 1)},
+        "metadata": {"resourceVersion": "1", "continue": "page-00"},
         "items": items,
     })
     .to_string();
-    let responses: Vec<String> = std::iter::repeat_n(response("200 OK", &page), 50).collect();
+    // The token advances, and it is the same width on every page so the recorded `Content-Length`
+    // stays true. A fixture that repeated one token would be testing the continuity break of
+    // `should_break_continuity_when_a_continue_token_answers_with_itself` instead of scale.
+    let responses: Vec<String> = (0..50)
+        .map(|index| {
+            response(
+                "200 OK",
+                &page.replace("page-00", &format!("page-{index:02}")),
+            )
+        })
+        .collect();
 
     /// A reader that counts and keeps nothing, which is what §18.5 asks a forwarding caller to be.
     #[derive(Default)]
@@ -1538,14 +1627,11 @@ fn should_round_trip_every_json_pointer_token_a_kubernetes_key_can_be() {
 }
 
 #[test]
-fn should_encode_a_hostile_container_name_and_not_a_hostile_pod_name() {
+fn should_encode_a_hostile_name_wherever_it_lands_in_the_request() {
     // §42.1's subresource path is composed from a namespace, a Pod name and a container name.
-    // The container travels as a query parameter and the Pod as a path segment, so one request
-    // shows both halves of the encoding story side by side — which makes it the clearest place
-    // to state what the fix for the path looks like: it looks like the query.
-    //
-    // FINDING (`transport::collection_path` / `object_path`, not this file's to repair): the Pod
-    // name reaches the request line unencoded.
+    // The container travels as a query parameter and the Pod as a path segment, and both are now
+    // encoded by the same function — which is the point of the test: one request, the same
+    // hostile bytes in two places, and no way to tell them apart on the wire.
     let target = PodTarget::new(INSTANCE, "shop", HOSTILE).in_container(HOSTILE);
     let request = LogRequest::new(target)
         .http_request()
@@ -1554,12 +1640,16 @@ fn should_encode_a_hostile_container_name_and_not_a_hostile_pod_name() {
     let line = wire.lines().next().expect("a request has a request line");
 
     assert!(
-        line.contains('\u{1b}'),
-        "today the Pod name is pasted into the path raw: {line:?}"
+        !line.contains('\u{1b}'),
+        "no escape reaches the request line: {line:?}"
+    );
+    assert!(
+        line.contains("pods/ok%1B%5B2J"),
+        "the Pod name is encoded as a path segment: {line:?}"
     );
     assert!(
         line.contains("container=ok%1B%5B2J"),
-        "and the container name — the same bytes, one field to the right — is encoded: {line:?}"
+        "and the container name — the same bytes, one field to the right — the same way: {line:?}"
     );
     assert!(
         !wire

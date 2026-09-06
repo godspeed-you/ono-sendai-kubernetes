@@ -49,24 +49,30 @@ use ono_kuang_sdk::protocol::{WireError, method};
 use ono_provider_kubernetes::transport::{ByteStream, StreamError};
 use serde_json::{Value as Json, json};
 
-/// How long one read of a request/response exchange waits for the first byte, in seconds.
-const REQUEST_DEADLINE_SECONDS: f64 = 30.0;
-
-/// How many empty deadline windows such a read tolerates before it calls the connection dead.
+/// How long one read waits before it comes back with nothing, in seconds.
 ///
-/// One is not enough: a host under load can answer an inbound pull with nothing and still have a
-/// live socket. Unbounded is worse — a hung server would hang the invocation, and §62.12 wants a
-/// query that terminates. Three windows is a bound with a reason rather than a round number.
-const IDLE_WINDOWS: u32 = 3;
-
-/// How long one read of an open watch waits before it comes back with nothing, in seconds.
+/// **One window for both conversations, and it is short for one reason: this is the window in
+/// which a cancellation is observed.** The host serves one call at a time, so an invocation
+/// parked in a read cannot be told the operator has stopped it until that read returns.
 ///
-/// Short, and short for one reason: this is the window in which a cancellation is observed. The
-/// host serves one call at a time, so an invocation parked in a thirty-second read cannot be
-/// told that the operator has stopped it until that read returns — and a watch spends almost all
-/// of its life parked in a read. A quarter of a second costs four cheap host calls a second on
-/// an idle watch and buys §62.12's "promptly".
-const WATCH_POLL_SECONDS: f64 = 0.25;
+/// It used to be thirty seconds on the request path, where the same constant was doing two jobs
+/// — how long to wait for a byte, and how long before noticing anything else — and the second
+/// job set the price. A large listing cancelled while the server was thinking took *sixty
+/// seconds* to stop, which is §62.12's first named operation failing §62.12 while the watch and
+/// the followed log, which had the short window, stopped in under half a second.
+///
+/// A quarter of a second costs four cheap host calls a second on a connection that is waiting,
+/// and buys "promptly" on every path rather than on two of the three.
+const POLL_SECONDS: f64 = 0.25;
+
+/// How long a request/response exchange tolerates complete silence before the connection is dead.
+///
+/// A separate number from [`POLL_SECONDS`], because they answer different questions: one is how
+/// often this package looks up, the other is how long an API server may say nothing after
+/// accepting a request before it is broken rather than slow. Ninety seconds is what three
+/// thirty-second windows used to mean, kept deliberately — the defect was never this tolerance,
+/// it was that noticing a cancellation cost the same wait.
+const REQUEST_PATIENCE_SECONDS: f64 = 90.0;
 
 /// How many chunks one `streams.next` asks for.
 const CHUNKS_PER_READ: u64 = 16;
@@ -95,8 +101,16 @@ impl ReadPolicy {
     #[must_use]
     pub const fn request() -> Self {
         Self {
-            deadline_seconds: REQUEST_DEADLINE_SECONDS,
-            idle_windows: Some(IDLE_WINDOWS),
+            deadline_seconds: POLL_SECONDS,
+            // The patience, expressed in windows of the poll above. A host under load can answer
+            // an inbound pull with nothing and still have a live socket, so one window is not a
+            // verdict; unbounded is worse, because a hung server would hang the invocation.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "both constants are positive literals and their ratio is a small integer"
+            )]
+            idle_windows: Some((REQUEST_PATIENCE_SECONDS / POLL_SECONDS) as u32),
             quiet_windows: None,
         }
     }
@@ -115,7 +129,7 @@ impl ReadPolicy {
     #[must_use]
     pub const fn watch() -> Self {
         Self {
-            deadline_seconds: WATCH_POLL_SECONDS,
+            deadline_seconds: POLL_SECONDS,
             idle_windows: None,
             quiet_windows: Some(1),
         }
@@ -340,9 +354,9 @@ impl ByteStream for BrokeredStream<'_, '_, '_> {
                 }
                 if self.policy.idle_windows.is_some_and(|limit| idle >= limit) {
                     return Err(StreamError::new(format!(
-                        "the API server sent nothing for {}s across {idle} reads, and the \
-                         connection is still open — a silent peer is not an end of stream",
-                        self.policy.deadline_seconds
+                        "the API server sent nothing for {REQUEST_PATIENCE_SECONDS}s across \
+                         {idle} reads, and the connection is still open — a silent peer is not \
+                         an end of stream"
                     )));
                 }
             }

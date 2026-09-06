@@ -98,7 +98,7 @@ here, is the point: a suite where every number is an assertion becomes a suite p
 | A synchronised informer cache of 20 000 Pods | 20 000 objects, ~10 560 000 bytes |
 | 10 000 watch events over 2 250 000 bytes | applied in 233 ms; change log grows to **10 000 entries** |
 | One `LiveView::refresh` over 10 000 objects | 14.4 ms; the 8 000 withheld identities cost ~368 000 bytes of names alone |
-| Cancelling a listing blocked on a server that has gone silent | **59.99 s** |
+| Cancelling a listing blocked on a server that has gone silent | **59.99 s (**fixed: 492 ms** — ADR-0046)** |
 
 ### 4. Wall-clock is asserted only for cancellation, and only in seconds
 
@@ -149,7 +149,7 @@ statistical.
   `Budget::interactive` refuses the listing that would seed it — a bound on the transfer rather
   than on the cache.
 - **Suite runtime: ~64 s** — 4.5 s for the provider suite, 60 s for the plugin suite, of which
-  59.99 s is the single test that documents finding (1). The other six plugin tests finish in
+  59.99 s (**fixed: 492 ms** — ADR-0046) is the single test that documents finding (1). The other six plugin tests finish in
   under a second between them. That one test is the most expensive thing this work adds to a
   seven-minute gate, and it becomes fast the moment finding (1) is fixed: its ceiling is a
   regression guard against "never terminates", not a floor that locks the latency in.

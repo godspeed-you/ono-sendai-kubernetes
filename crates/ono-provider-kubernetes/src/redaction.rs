@@ -347,6 +347,28 @@ impl Guarded {
     }
 }
 
+/// Takes a *document* across the same boundary [`Guarded`] takes an object across (§22.3).
+///
+/// The half of an admission comparison that was submitted is a request body rather than something
+/// the cluster sent back, and §22.3 does not care which direction the bytes were travelling in:
+/// "Secret bytes MUST NOT flow into ordinary command history, terminal scrollback capture or
+/// provider logs by default" has no exception for a payload the operator typed. A mutation record
+/// that reported the returned value as `<redacted>` beside the submitted value verbatim would
+/// leak it under the sibling rule §42.2 states for logs.
+///
+/// The door is the same one, which is the point: a document that reads as an object is held by
+/// [`Guarded::hold`], so the rule for which kinds are payload-bearing is not written twice. A
+/// document that does not read as one — a fragment, a body with no `kind` — is redacted anyway,
+/// because over-redaction costs a reader some detail and under-redaction cannot be taken back
+/// (§3.7).
+#[must_use]
+pub fn guarded_document(provider_instance: &str, document: &Json) -> Json {
+    match Object::from_json(provider_instance, document.clone()).map(Guarded::hold) {
+        Ok(Ok(guarded)) => guarded.object().native().clone(),
+        _ => redacted_document(document),
+    }
+}
+
 /// Every Secret one object refers to, derived without reading any payload (§22.4).
 ///
 /// Ordinary [`Edge`]s in the ordinary vocabulary. A reference to a Secret is a relationship like

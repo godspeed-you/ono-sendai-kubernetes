@@ -725,30 +725,29 @@ async fn should_terminate_a_listing_blocked_on_a_silent_server_rather_than_hangi
 
     let started = Instant::now();
     invocation.cancel().await;
-    let result = tokio::time::timeout(Duration::from_secs(150), invocation.finish())
+    let result = tokio::time::timeout(Duration::from_secs(30), invocation.finish())
         .await
         .expect("a cancelled listing terminates rather than hanging on a silent server");
     let elapsed = started.elapsed();
     println!("cancelled listing (server silent) terminated in {elapsed:?}");
     assert_eq!(result.status, InvokeStatus::Cancelled);
 
-    // FINDING: this takes about sixty seconds — two windows of
-    // `broker::REQUEST_DEADLINE_SECONDS`, measured at 59.99s on the machine this was written on.
-    // A listing parked in `BrokeredStream::read` cannot be told the operator stopped it until the
-    // `streams.next` it is inside returns, and `ReadPolicy::request` parks it for a full
-    // thirty-second window; the cancellation is not observed in the window it arrives in, so it
-    // costs two. §62.12's "terminate promptly" therefore holds for a watch (`ReadPolicy::watch`,
-    // a quarter-second window, measured below at under half a second) and for a followed log, and
-    // does not hold for the operation Gate L names *first*. The fix is the one the watch already
-    // has: poll in short windows and let the loop in `read` re-check `Lease::cancelled` between
-    // them, rather than asking one constant to be both a liveness deadline and a cancellation
-    // window. Left for the owner of `broker.rs`.
+    // This took sixty seconds when it was written — two windows of what was then a
+    // thirty-second `ReadPolicy::request`, measured at 59.99s. A listing parked in
+    // `BrokeredStream::read` cannot be told the operator stopped it until the `streams.next` it
+    // is inside returns, and one constant was serving as both the liveness deadline and the
+    // cancellation window; the cancellation was not observed in the window it arrived in, so it
+    // cost two. §62.12's "terminate promptly" held for the watch and the followed log, which had
+    // the short window, and not for the operation Gate L names *first*.
     //
-    // The ceiling is deliberately far above the measurement: it is a regression guard against
-    // "never terminates", and it must keep passing — faster — once the latency is fixed.
+    // The window is a quarter of a second on every path now, and the ninety seconds of patience
+    // a silent API server is given is a separate number. The ceiling below stays far above the
+    // measurement on purpose — it is a guard against "never terminates" rather than a latency
+    // budget, and a machine under load may take several windows.
     assert!(
-        elapsed < Duration::from_secs(120),
-        "a cancelled listing terminates rather than waiting for the connection to die: {elapsed:?}"
+        elapsed < Duration::from_secs(5),
+        "a cancelled listing terminates in the window the cancellation arrived in, not when the \
+         connection dies: {elapsed:?}"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

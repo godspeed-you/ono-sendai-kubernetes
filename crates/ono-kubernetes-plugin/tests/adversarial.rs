@@ -485,37 +485,29 @@ async fn should_answer_a_secret_query_with_no_payload_anywhere_in_the_stream() {
 }
 
 #[tokio::test]
-async fn should_disclose_a_secret_payload_when_the_item_claims_another_kind() {
-    // §22 is decided on the object's *self-declared* `kind`, which is a field the payload's
-    // author writes. A `GET /api/v1/namespaces/shop/secrets` whose items each carry
-    // `"kind":"ConfigMap"` — what a hostile aggregated API server (§34) sends, and what §34.2
-    // requires this provider to survive — produces objects that never reach the redaction rule.
+async fn should_refuse_a_secret_collection_whose_items_claim_another_kind() {
+    // Gate I, at the one place it was defeated. §22's protection is keyed on the object's kind,
+    // and the kind is a field the payload's author writes — so a `GET .../secrets` whose items
+    // each carry `"kind":"ConfigMap"`, which is what a hostile aggregated API server sends and
+    // what §34.2 requires this provider to survive, used to reach a user as a completed listing
+    // with the plaintext in the record.
     //
-    // FINDING (`transport::identify`, not this worker's to repair): the rule "an aggregated or
-    // mixed list is entitled to disagree with its envelope" lets an adversary choose which §22
-    // rule applies to their own bytes. The requested GVR is known at that point and is the
-    // honest authority — an item of the `secrets` collection is payload-bearing whatever it
-    // calls itself — and `redaction.rs`'s own principle applies: over-redaction costs a reader
-    // some detail, under-redaction cannot be taken back.
+    // The collection decides now. This test asserts the *outcome a user sees*, not the mechanism:
+    // whatever else changes, a default listing of Secrets may not complete carrying a payload.
     let cluster = Cluster::new(Answers::WithItemsThatClaimAnotherKind);
     let answer = ask(&cluster, "k8s-secret", at("shop")).await;
 
     let everything = answer.everything();
-    assert_eq!(
+    assert!(
+        !everything.contains(CIPHERTEXT),
+        "no route out of a `secrets` collection may carry the payload: {everything}"
+    );
+    assert_ne!(
         answer.status,
         InvokeStatus::Completed,
-        "today the query succeeds, which is half of what makes this bad"
+        "and a server contradicting itself about the page is not a page that answered: \
+         {everything}"
     );
-    assert_eq!(answer.records().len(), 1, "and it answers with a record");
-    assert!(
-        everything.contains(CIPHERTEXT),
-        "and the record carries the payload the collection was serving: {everything}"
-    );
-
-    // When this is repaired, the three assertions above invert: either the payload is redacted
-    // because the collection decided (the fix this file argues for), or the item is refused
-    // because it is not the kind the target reads. Both are answers; what Gate I forbids is the
-    // one recorded here — a completed default listing with the payload in it.
 }
 
 // --- injection (§14.5, and where the render boundary is) ----------------------------------------
@@ -618,28 +610,26 @@ async fn should_not_let_a_namespace_argument_climb_the_rest_path() {
     // of Pods in namespace `../../../api/v1/secrets` is a request for the cluster's Secrets
     // carried by a Pod-shaped RBAC decision.
     //
-    // FINDING (`transport::collection_path` / `Request::serialise`, not this worker's to
-    // repair): path components are neither validated nor percent-encoded, although query values
-    // already are. A namespace is a DNS label (§9.2) and anything that is not one belongs in a
-    // refusal; failing that, the component belongs in `%XX`.
+    // The component is percent-encoded, so it stays one segment and the mux has nothing to
+    // resolve. A namespace that is not a DNS label is still not refused here — the API server is
+    // the authority on what its names are (§21.1) — but it can no longer be structure.
     let cluster = Cluster::new(Answers::Honestly);
     let answer = ask(&cluster, "k8s-pod", at("../../../api/v1/secrets")).await;
 
     let lines = cluster.request_lines();
-    let climbed: Vec<&String> = lines
-        .iter()
-        .filter(|line| line.contains("/namespaces/../"))
-        .collect();
     assert!(
-        !climbed.is_empty(),
-        "today the argument reaches the wire as path segments: {lines:?}"
+        !lines.iter().any(|line| line.contains("/namespaces/../")),
+        "no request climbs out of the collection it named: {lines:?}"
     );
-
-    // The one thing that does hold: the recorded server does not resolve `..`, so it answers 404
-    // and the query says the collection was not read rather than that it was empty.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("/namespaces/..%2F..%2F..%2Fapi%2Fv1%2Fsecrets/pods")),
+        "the argument travels as one segment's worth of text: {lines:?}"
+    );
     assert!(
         answer.records().is_empty(),
-        "nothing was found at the traversed path here"
+        "and there is no such namespace, so nothing was found"
     );
 }
 
@@ -649,8 +639,9 @@ async fn should_send_a_hostile_namespace_as_one_request_rather_than_as_two() {
     // begins a header — or, on the keep-alive connection this package uses for a whole session, a
     // second request the operator never asked for.
     //
-    // FINDING (`Request::serialise`, not this worker's to repair). The assertion below is the
-    // *observation*: it counts what the server saw. A namespace is data until it is encoded.
+    // The assertion counts what the server *saw*, which is the only place this could be checked
+    // honestly: a unit test of the encoder proves the encoder, and what matters is that nothing
+    // between the argument and the socket puts the bytes back.
     let cluster = Cluster::new(Answers::Honestly);
     let smuggled = "shop\r\nX-Remote-User: cluster-admin";
     let _ = ask(&cluster, "k8s-pod", at(smuggled)).await;
@@ -661,8 +652,14 @@ async fn should_send_a_hostile_namespace_as_one_request_rather_than_as_two() {
         .map(|heads| heads.join("\n---\n"))
         .unwrap_or_default();
     assert!(
-        heads.contains("X-Remote-User: cluster-admin"),
-        "today a namespace argument can write a header: {heads}"
+        !heads
+            .lines()
+            .any(|line| line.trim_start().starts_with("X-Remote-User")),
+        "a namespace argument may not write a header: {heads}"
+    );
+    assert!(
+        heads.contains("shop%0D%0AX-Remote-User"),
+        "it arrives as text in the path instead, which is what it always was: {heads}"
     );
 }
 
@@ -703,17 +700,12 @@ async fn should_end_an_invocation_whose_server_never_stops_paginating() {
     // promise a hostile or broken aggregated API server (§34.2) does not keep. A provider that
     // followed it would never come back, and §50.1 makes an unresponsive shell a defect.
     //
-    // What stops it today is the query budget of §49.5 — `Budget::interactive`'s sixteen pages —
-    // rather than any recognition that the token repeated. That is a real bound and this test is
-    // the proof that it is wired to the live path. It is not the whole answer: core §12.3 asks a
-    // provider to "prevent duplicate emission where provider pagination semantics permit stable
-    // deduplication", and sixteen copies of one Pod is duplicate emission that arrived under a
-    // budget rather than under a continuity break.
-    //
-    // FINDING (`transport::walk`, not this worker's to repair): a `continue` token identical to
-    // the one just sent should break continuity (`BreakReason`) rather than be followed, and
-    // `Client::new`'s own default is still `Budget::unlimited()`, so a caller other than the
-    // plugin — a future watch acquisition, a relationship walk — inherits no bound at all.
+    // What stops it is `transport::walk` recognising the repetition: a page that answers with the
+    // token that asked for it breaks continuity (§18.2), so the walk ends at the second page
+    // rather than at the sixteenth that §49.5's query budget would otherwise allow. Core §12.3
+    // asks a provider to "prevent duplicate emission where provider pagination semantics permit
+    // stable deduplication", and this is that: the repeated page is refused instead of delivered
+    // as a second copy of the first.
     let cluster = Cluster::new(Answers::WithAContinueTokenThatNeverAdvances);
     let answer = ask(&cluster, "k8s-pod", at("shop")).await;
 
@@ -730,15 +722,13 @@ async fn should_end_an_invocation_whose_server_never_stops_paginating() {
         .iter()
         .filter(|line| line.contains("/pods"))
         .count();
-    assert!(
-        (2..=17).contains(&pages),
-        "the budget stopped it after a bounded number of pages, and it read {pages}"
+    assert_eq!(
+        pages, 2,
+        "the repetition ended it on the second page, with no budget involved"
     );
 
     assert!(
-        answer.error.contains("budget")
-            || answer.error.contains("page")
-            || answer.error.contains("incomplete"),
+        answer.error.contains("continuity"),
         "and it says why it stopped rather than simply stopping: {}",
         answer.error
     );

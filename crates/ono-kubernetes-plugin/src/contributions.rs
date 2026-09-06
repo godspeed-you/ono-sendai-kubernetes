@@ -1582,7 +1582,7 @@ const CHANGE_FIELDS: &[Field] = &[
     // --- what was not observed, for the one class that is about a period ---
     Field::nullable(
         "gap_reason",
-        "enum<watch_expired_410|watch_denied|restarted_without_checkpoint>",
+        "enum<watch_expired_410|watch_denied|restarted_without_checkpoint|change_log_trimmed>",
     ),
     Field::nullable("gap_detail", "string"),
 ];

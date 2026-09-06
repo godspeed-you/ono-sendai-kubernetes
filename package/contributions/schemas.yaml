@@ -2643,11 +2643,19 @@ schemas:
           them are still there.
       gap_reason:
         type: enum
-        values: [watch_expired_410, watch_denied, restarted_without_checkpoint]
+        values:
+          [
+            watch_expired_410,
+            watch_denied,
+            restarted_without_checkpoint,
+            change_log_trimmed,
+          ]
         nullable: true
         doc: >-
           Why continuity broke, in Appendix D.4's vocabulary. Null on every record but the one
-          that reports a break.
+          that reports a break. `change_log_trimmed` is the one that is not a period nobody
+          watched: the events were seen and reported, and the *record* of them dropped its oldest
+          entries at the bound `watch.rs` holds them under (§18.5, §50.1).
       gap_detail:
         type: string
         nullable: true

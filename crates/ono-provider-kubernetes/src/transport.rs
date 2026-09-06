@@ -1805,7 +1805,9 @@ pub fn collection_path(gvr: &Gvr, scope: &Scope) -> String {
         return base;
     };
     match base.rsplit_once('/') {
-        Some((prefix, resource)) => format!("{prefix}/namespaces/{namespace}/{resource}"),
+        Some((prefix, resource)) => {
+            format!("{prefix}/namespaces/{}/{resource}", path_segment(namespace))
+        }
         None => base,
     }
 }
@@ -1813,7 +1815,25 @@ pub fn collection_path(gvr: &Gvr, scope: &Scope) -> String {
 /// Where one object lives: its collection, then its name (§17.1).
 #[must_use]
 pub fn object_path(gvr: &Gvr, scope: &Scope, name: &str) -> String {
-    format!("{}/{}", collection_path(gvr, scope), name)
+    format!("{}/{}", collection_path(gvr, scope), path_segment(name))
+}
+
+/// One path segment, encoded so that what a cluster called something cannot become structure.
+///
+/// **A name and a namespace are attacker-chosen.** Anyone who can create an object in a cluster
+/// names it, and an aggregated API server can answer with whatever it likes; both then arrive
+/// here as the path of the *next* request. Unencoded, a namespace of `../../../api/v1/secrets`
+/// walks the URL out of its collection — Go's mux normalises `..` before the authorizer sees the
+/// path — and a namespace containing a carriage return and a line feed ends the request line and
+/// starts a header, which put `X-Remote-User: cluster-admin` on the wire against a recorded
+/// server.
+///
+/// [`percent_encode`] is deliberately the same conservative encoder the query string uses: every
+/// byte outside RFC 3986's unreserved set, so `/`, `%`, `\r`, `\n` and everything else is one
+/// segment's worth of text rather than a place to put something. §51.2's network scope bounds
+/// which host may be reached; this bounds what may be asked of it.
+fn path_segment(value: &str) -> String {
+    percent_encode(value)
 }
 
 /// The request that reads one object.
@@ -1911,6 +1931,61 @@ impl Read {
     }
 }
 
+/// Whether the object a `GET` came back with is the object the request addressed (§16.2, §48.1).
+///
+/// The request is the authority for *which* object was asked for: §17.1's read names a
+/// group-version, a scope and a name, and the answer is entitled to say what that object holds
+/// rather than which object it is. A body whose `metadata` disagrees with the locator that
+/// fetched it is a malformed answer — a broken aggregated API server (§34.2), a proxy that
+/// resolved the path somewhere else, or a server choosing which §22 rule applies to the bytes it
+/// is sending by relabelling them (see [`identify`], which is the same defect a page deeper).
+///
+/// It is reported as malformed and never as absence: the object asked for may well exist, and
+/// `404` would be a claim about the cluster made out of a claim about the answer (§21.4, §4
+/// invariant 13). The `kind` is not compared, because a GVR names a REST collection and deriving
+/// the kind its items are of belongs to discovery (§13.1) rather than to a string rule here.
+fn answers_the_question(
+    gvr: &Gvr,
+    scope: &Scope,
+    name: &str,
+    object: &Object,
+) -> Result<(), ApiError> {
+    let mismatch = |what: &str, asked: &str, got: &str| {
+        Err(ApiError::Malformed(format!(
+            "a read addressed by {what} `{asked}` was answered with `{got}`, which is a different \
+             object than the one that was asked for"
+        )))
+    };
+    if object.name() != name {
+        return mismatch("name", name, object.name());
+    }
+    // Only a stated disagreement. A body that says nothing about its namespace has not claimed to
+    // be somewhere else, and §17.1's path already fixed the scope the read was made in.
+    match (scope.namespace(), object.namespace()) {
+        (Some(asked), Some(got)) if asked != got => return mismatch("namespace", asked, got),
+        (None, Some(got)) if *scope == Scope::cluster() => {
+            return mismatch("scope", "cluster", got);
+        }
+        _ => {}
+    }
+    let asked = api_version(gvr.group(), gvr.version());
+    let got = api_version(object.gvk().group(), object.gvk().version());
+    if asked != got {
+        return mismatch("apiVersion", &asked, &got);
+    }
+    Ok(())
+}
+
+/// A group and a version as an `apiVersion` is written: `v1` in the core group, `group/version`
+/// beyond it.
+fn api_version(group: &str, version: &str) -> String {
+    if group.is_empty() {
+        version.to_owned()
+    } else {
+        format!("{group}/{version}")
+    }
+}
+
 /// One page of a collection, with the list metadata §17.2 requires kept.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page {
@@ -1988,6 +2063,16 @@ pub enum BreakReason {
     /// A page came back from a different collection `resourceVersion` than the sequence started
     /// in.
     SnapshotChanged,
+    /// A page answered a continuation with the very token that asked for it, so the sequence
+    /// stopped advancing (§18.1, §18.2).
+    ///
+    /// Kubernetes' `continue` token names a position *after* the page it arrives with, and a
+    /// server that hands back the token it was given is claiming that position is the one it
+    /// already answered from. Following it asks the same question forever, and the answer that
+    /// looks like a long collection is one page repeated. Core §12.3 asks a provider to prevent
+    /// duplicate emission where pagination semantics permit stable deduplication; a token
+    /// identical to the one just sent is exactly that signal.
+    TokenRepeated,
 }
 
 /// Whether the pages of a listing form one consistent snapshot (§18.2).
@@ -2256,6 +2341,7 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
             .map_err(|error| ApiError::Malformed(error.to_string()))?;
         let object = Object::parse(&self.provider_instance, text)
             .map_err(|error| ApiError::Malformed(error.to_string()))?;
+        answers_the_question(gvr, scope, name, &object)?;
         let freshness = Freshness::direct_read(
             observed_at,
             object.resource_version().map(str::to_owned),
@@ -2292,8 +2378,26 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
             .and_then(Json::as_i64);
 
         let item_api_version = text(document.get("apiVersion"));
-        let item_kind = text(document.get("kind"))
-            .map(|kind| kind.strip_suffix("List").unwrap_or(&kind).to_owned());
+        // The kind the *collection* is of, which is the only authority here. A collection
+        // endpoint answers with `<Kind>List`; anything else — a generic `List`, an empty kind, a
+        // missing one — is not a collection this provider can say the kind of, and it must not
+        // guess, because what depends on the answer is §22 (see [`identify`]).
+        let item_kind = match text(document.get("kind")) {
+            Some(envelope) => match envelope.strip_suffix("List") {
+                Some(kind) if !kind.is_empty() => kind.to_owned(),
+                _ => {
+                    return Err(ApiError::Malformed(format!(
+                        "a collection answered with kind `{envelope}`, which names no kind its \
+                         items are of"
+                    )));
+                }
+            },
+            None => {
+                return Err(ApiError::Malformed(
+                    "the collection does not say which kind it is of".to_owned(),
+                ));
+            }
+        };
         let items = document
             .get("items")
             .and_then(Json::as_array)
@@ -2301,11 +2405,7 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
 
         let mut objects = Vec::with_capacity(items.len());
         for item in items {
-            let item = identify(
-                item.clone(),
-                item_api_version.as_deref(),
-                item_kind.as_deref(),
-            );
+            let item = identify(item.clone(), item_api_version.as_deref(), &item_kind)?;
             objects.push(
                 Object::from_json(&self.provider_instance, item)
                     .map_err(|error| ApiError::Malformed(error.to_string()))?,
@@ -2419,6 +2519,23 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
                         _ => {}
                     }
                     let token = page.continue_token().map(str::to_owned);
+                    // §18.1 and §18.2: a continuation that does not continue is a broken
+                    // snapshot rather than a long one. The page is refused rather than handed
+                    // on — it is the copy of the previous one that the repetition produces, and
+                    // a reader cannot unsend a record — while every page that crossed before it
+                    // stands, as §18.3 requires.
+                    if let (Some(sent), Some(returned)) =
+                        (page_options.continue_token(), token.as_deref())
+                        && sent == returned
+                    {
+                        continuity = Continuity::Broken(BreakReason::TokenRepeated);
+                        coverage.record(Gap::new(scope.clone(), Outcome::RequestFailed));
+                        error = Some(ApiError::Malformed(format!(
+                            "the collection answered the continue token `{sent}` with the same \
+                             token, so the page after it is the page before it"
+                        )));
+                        break;
+                    }
                     coverage.observed(scope.clone());
                     let walk = reader.page(page);
                     let Some(token) = token else {
@@ -2493,15 +2610,28 @@ impl<S: ByteStream, C: Clock> fmt::Debug for Client<S, C> {
     }
 }
 
-/// Gives a list item the `apiVersion` and `kind` the list's own identity implies.
+/// Gives a list item the `apiVersion` and `kind` the collection's own identity implies.
 ///
 /// The API server omits both on the items of a collection, because the list states them once.
-/// Reading the items bare would lose the GVK altogether; taking the list's kind verbatim would
-/// type every Pod as a `PodList`. Neither is overwritten where the server did send one — an
-/// aggregated or mixed list is entitled to disagree with its envelope.
-fn identify(mut item: Json, api_version: Option<&str>, kind: Option<&str>) -> Json {
+/// Reading the items bare would lose the GVK altogether, and taking the list's kind verbatim
+/// would type every Pod as a `PodList`.
+///
+/// **The collection decides, and an item that disagrees is refused.** This used to read "an
+/// aggregated or mixed list is entitled to disagree with its envelope", which was true of the
+/// wire and wrong about the consequence: §22's protection is keyed on the kind, so an item of the
+/// `secrets` collection that called itself a `ConfigMap` chose that its own payload needed no
+/// protecting — and `get k8s-secret` completed with the plaintext in the record. §34.2 requires
+/// surviving a hostile aggregated API server, and the item's `kind` is a field its author writes.
+///
+/// # Errors
+///
+/// [`ApiError::Malformed`] when an item is not an object, or states a kind that is not the
+/// collection's.
+fn identify(mut item: Json, api_version: Option<&str>, kind: &str) -> Result<Json, ApiError> {
     let Some(object) = item.as_object_mut() else {
-        return item;
+        return Err(ApiError::Malformed(
+            "a collection item is not an object".to_owned(),
+        ));
     };
     if !object.contains_key("apiVersion")
         && let Some(api_version) = api_version
@@ -2511,10 +2641,28 @@ fn identify(mut item: Json, api_version: Option<&str>, kind: Option<&str>) -> Js
             Json::String(api_version.to_owned()),
         );
     }
-    if !object.contains_key("kind")
-        && let Some(kind) = kind
-    {
-        object.insert("kind".to_owned(), Json::String(kind.to_owned()));
+    match text(object.get("kind")) {
+        // The item states a kind and it is not the collection's. **This is refused rather than
+        // resolved**, and the reason is §22: `redaction::is_payload_protected` is keyed on the
+        // kind, so an item of the `secrets` collection that calls itself a ConfigMap would decide
+        // that its own payload needs no protecting. A field the payload's author writes must not
+        // choose which rule applies to their bytes.
+        //
+        // Refusing the page rather than overriding the kind, because the two readings are a real
+        // disagreement about what the server sent and this provider is not entitled to pick one:
+        // §5.4 asks it to preserve an object's actual `apiVersion` when it reads one, and §48.1
+        // asks it to report what the server said. A collection endpoint answering with an item of
+        // another kind is a server contradicting itself about the page, and nothing on that page
+        // is trustworthy about its own identity.
+        Some(stated) if stated != kind => {
+            return Err(ApiError::Malformed(format!(
+                "an item of a `{kind}` collection states that it is a `{stated}`"
+            )));
+        }
+        Some(_) => {}
+        None => {
+            object.insert("kind".to_owned(), Json::String(kind.to_owned()));
+        }
     }
-    item
+    Ok(item)
 }

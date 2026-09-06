@@ -46,7 +46,8 @@ use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::session::{Session, SyncRefused};
 use ono_provider_kubernetes::transport::{
-    ApiError, ByteStream, Client, Freshness, ListOptions, Listing, SystemClock, watch_request,
+    ApiError, ByteStream, Client, Clock, Freshness, ListOptions, Listing, ObservedAt, SystemClock,
+    watch_request,
 };
 use ono_provider_kubernetes::watch::{
     Backoff, Reception, SyncState, WatchDecoder, WatchEvent, WatchFailure,
@@ -93,6 +94,20 @@ const STALE_AFTER: Duration = Duration::from_secs(30);
 /// operator watches by hand and small enough that a runaway namespace cannot exhaust the
 /// instance's 256 MiB.
 const VIEW_CAPACITY: usize = 2_000;
+
+/// How often the view's *rows* are rebuilt while records are being emitted.
+///
+/// The state a record carries is taken from the stream on every event — `LiveView::observe` is a
+/// constant, and §41.4's honesty about `live`, `reconnecting`, `stale` and a gap is what a reader
+/// acts on. Rebuilding the rows is a walk over the whole watched collection, and doing that once
+/// per emitted record multiplies the collection by the event rate: a ten-thousand-object
+/// namespace under a busy controller would spend the invocation rebuilding a table nothing in
+/// this package reads, which is the freeze §50.1 forbids.
+///
+/// A quarter of a second is below the interval a person perceives as a step, and the only thing
+/// that lags by it is the `withheld` count — a property of the view rather than a claim about the
+/// cluster.
+const VIEW_ROWS_EVERY: Duration = Duration::from_millis(250);
 
 /// Answers a `k8s-change` query: acquire the collection, watch it, and account for the gaps.
 #[must_use]
@@ -145,6 +160,7 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
                 budget,
                 emitted: 0,
                 view: None,
+                rows_refreshed_at: None,
                 clock: SystemClock,
                 stale_after,
             };
@@ -410,6 +426,8 @@ struct Emitter {
     /// of. `watch.rs` knows five of §41.4's six words without a clock; the sixth — `stale` — is
     /// the view's, because it is a statement about how long ago rather than about the connection.
     view: Option<LiveView>,
+    /// When the view's rows were last rebuilt, for [`VIEW_ROWS_EVERY`].
+    rows_refreshed_at: Option<ObservedAt>,
     /// The clock the staleness window is measured against. `live.rs` takes it as a parameter and
     /// has a test that it never reaches for one of its own, so this is where the wall clock
     /// enters.
@@ -522,22 +540,37 @@ impl Emitter {
 }
 
 impl Emitter {
-    /// Refreshes the view against the session's stream and answers what a reader is looking at.
+    /// Reads the view against the session's stream and answers what a reader is looking at.
     ///
     /// Built lazily, because the collection is not known until the acquisition has resolved it,
-    /// and rebuilt on every emission because that is where the clock is read: `LiveView` does no
-    /// timing of its own, so a view refreshed once and asked twice would go stale between the two
+    /// and *observed* on every emission because that is where the clock is read: `LiveView` does
+    /// no timing of its own, so a view read once and asked twice would go stale between the two
     /// asks rather than because anything happened.
+    ///
+    /// The rows behind it are rebuilt on [`VIEW_ROWS_EVERY`] rather than on every record. What a
+    /// record carries — the state, the gaps and the staleness — comes from the observation and is
+    /// therefore always this event's; the row bound and its `withheld` count are the view's own
+    /// bookkeeping and may be a quarter of a second old.
     fn refresh(&mut self, session: &Session, gvr: &Gvr, scope: &Scope) -> (ViewState, usize) {
         let Some(stream) = session.watch_stream(gvr, scope) else {
             // No stream yet is the acquisition, and §20.3 is explicit that a view which has not
             // synchronised is `syncing` rather than a cluster with nothing in it.
             return (ViewState::Syncing, 0);
         };
+        let now = self.clock.now();
+        let due = self.rows_refreshed_at.is_none_or(|last| {
+            now.unix_millis().saturating_sub(last.unix_millis())
+                >= u64::try_from(VIEW_ROWS_EVERY.as_millis()).unwrap_or(u64::MAX)
+        });
         let view = self.view.get_or_insert_with(|| {
             LiveView::new(gvr.clone(), scope.clone(), VIEW_CAPACITY, self.stale_after)
         });
-        view.refresh(stream, &self.clock);
+        if due {
+            view.refresh(stream, &self.clock);
+            self.rows_refreshed_at = Some(now);
+        } else {
+            view.observe(stream, &self.clock);
+        }
         (view.state(&self.clock), view.withheld().len())
     }
 

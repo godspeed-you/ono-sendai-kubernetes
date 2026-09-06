@@ -40,9 +40,10 @@ use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::schema::Schema;
 use ono_provider_kubernetes::session::Session;
 use ono_provider_kubernetes::transport::{
-    ApiError, Client, FixedClock, FixtureStream, ListOptions, Page, Reader, Walk,
+    ApiError, BreakReason, Client, Continuity, FixedClock, FixtureStream, ListOptions, Page,
+    Reader, Walk,
 };
-use ono_provider_kubernetes::watch::ResourceVersion;
+use ono_provider_kubernetes::watch::{CHANGE_LOG_CAPACITY, GapReason, ResourceVersion};
 
 const INSTANCE: &str = "kubernetes:prod-eu";
 const HOST: &str = "kubernetes.default.svc";
@@ -334,15 +335,15 @@ fn should_stop_a_two_hundred_page_collection_at_the_page_budget_the_query_named(
 }
 
 #[test]
-fn should_stop_a_collection_whose_continue_token_never_changes_at_the_interactive_page_bound() {
-    // §18.1 again, and §49.1's bound. A server that answers every continued request with the same
-    // `continue` token describes a collection that is never fully consumed, so §18.1's "until all
-    // required pages have been consumed" is a condition that never becomes true. The clause that
-    // saves the shell is the second one — "or the operation is explicitly cancelled/limited" —
-    // and this asserts that the *default* interactive budget is such a limit.
+fn should_stop_a_collection_whose_continue_token_never_changes_at_the_repetition() {
+    // §18.1 again. A server that answers every continued request with the same `continue` token
+    // describes a collection that is never fully consumed, so §18.1's "until all required pages
+    // have been consumed" is a condition that never becomes true.
     //
-    // Sixteen pages is `Budget::interactive`'s page bound. The fixture offers forty, so nothing
-    // but the budget can be what stopped the walk.
+    // The bound that ends it is a property of the loop rather than a policy somebody remembered
+    // to ask for: the second page repeats the token the first one produced, so the sequence stops
+    // there with §18.2's continuity broken. `Budget::interactive`'s sixteen pages never come into
+    // it, and neither does the forty the fixture holds.
     let mut client = serving(&stuck_token(40, 100));
     client.spend(Budget::interactive());
     let mut reader = Counting::default();
@@ -355,43 +356,49 @@ fn should_stop_a_collection_whose_continue_token_never_changes_at_the_interactiv
 
     assert_eq!(
         listing.pages(),
-        16,
-        "the interactive page bound stopped a walk that had no other end"
+        2,
+        "one page, and the page that answered with the token that asked for it"
     );
-    let overrun = listing
-        .overrun()
-        .expect("a walk stopped by a budget says a budget stopped it");
-    assert_eq!(overrun.allowed(), 16);
+    assert_eq!(
+        requests(client.stream()),
+        2,
+        "a repeated token costs two round trips rather than sixteen"
+    );
+    assert_eq!(
+        reader.objects, 100,
+        "and the hundred objects that did arrive stand, without the copy the repetition makes"
+    );
+    assert_eq!(
+        listing.continuity(),
+        &Continuity::Broken(BreakReason::TokenRepeated)
+    );
+    assert!(
+        listing.overrun().is_none(),
+        "nothing was stopped by a budget: the answer was malformed, and the cluster is entitled \
+         to be told apart from a policy (§49.1)"
+    );
     assert!(
         !listing.coverage().is_complete(),
         "and what it did not read is a stated gap rather than silence: {}",
         listing.coverage().describe()
     );
 
-    // FINDING: nothing in `Client::walk` notices that the token it was handed is the token it
-    // just sent. Under `Budget::unlimited` and with no `max_pages`, the walk below consumes every
-    // page the fixture holds and stops only because the recorded bytes ran out — against a real
-    // server it would repeat forever. The bound is the operator's default rather than a property
-    // of the loop, so a caller that legitimately raises `max_pages` for a large collection raises
-    // the ceiling on this too. A cheap fix is to break continuity when a page returns the token
-    // that produced it, the way `Continuity::Broken(BreakReason::SnapshotChanged)` already
-    // handles the other malformed-pagination case. Left for the owner of `transport.rs`.
+    // The same, with no budget at all. Nothing here depends on an operator having asked for one,
+    // which is the whole difference: a caller that legitimately raises `max_pages` for a large
+    // collection no longer raises the ceiling on a loop.
     let mut unbounded = serving(&stuck_token(40, 100));
     let mut counting = Counting::default();
     let ran_on = unbounded.walk(
         &pods(),
         &shop(),
-        &ListOptions::new().limit(100),
+        &ListOptions::new().limit(100).max_pages(1_000),
         &mut counting,
     );
-    assert_eq!(
-        ran_on.pages(),
-        40,
-        "with no bound the walk follows the same token for as many pages as it is given"
-    );
+    assert_eq!(ran_on.pages(), 2);
     assert!(
-        ran_on.error().is_some(),
-        "and it ends because the connection did, not because it noticed"
+        matches!(ran_on.error(), Some(ApiError::Malformed(_))),
+        "and it ends because it noticed, not because the connection did: {:?}",
+        ran_on.error()
     );
 }
 
@@ -686,17 +693,49 @@ fn should_apply_ten_thousand_watch_events_without_discarding_one() {
         "a ceiling loose enough that only a change of asymptotic behaviour reaches it: {elapsed:?}"
     );
 
-    // FINDING: the change log is unbounded. `Segment::changes` grows by one `ObservedChange` per
-    // event and is never trimmed, so a watch left open overnight retains one entry per event for
-    // the lifetime of the session — about a hundred bytes each here, and §19.4's segment model
-    // needs the *segment boundaries* rather than every change inside them. The generic contract's
-    // §30.4 ("MUST avoid retaining entire remote inventories when streaming semantics suffice")
-    // reads on this as much as on a listing. A bound with a reported `withheld`, the way
-    // `LiveView` bounds its rows, would keep §19.4 intact. Left for the owner of `watch.rs`.
+    // The change log is bounded, and the bound is the collection's business rather than the
+    // stream's lifetime: `Segment::changes` keeps the most recent `CHANGE_LOG_CAPACITY` and drops
+    // what is older, so a watch left open overnight retains a window rather than a night. The
+    // generic contract's §30.4 — "MUST avoid retaining entire remote inventories when streaming
+    // semantics suffice" — reads on a change log as much as on a listing.
+    assert!(
+        stream.continuous_changes().len() <= CHANGE_LOG_CAPACITY,
+        "the log never exceeds its bound: {} entries",
+        stream.continuous_changes().len()
+    );
     assert_eq!(
-        stream.continuous_changes().len(),
+        stream.trimmed_changes() + stream.continuous_changes().len(),
         10_000,
-        "one retained change per event, with nothing trimming it"
+        "and every event is accounted for: what is not held is counted"
+    );
+
+    // And a trimmed log says so, in the three places an interrupted one says it (§19.4). A
+    // history that quietly forgets its beginning is the continuity lie the segment model exists
+    // to prevent, so the trim is a gap with both of its edges rather than a shorter list.
+    assert!(
+        !stream.is_gap_free(),
+        "a record that begins later than the period it belongs to is not a whole record"
+    );
+    let trim = stream
+        .gaps()
+        .iter()
+        .find(|gap| gap.reason() == GapReason::ChangeLogTrimmed)
+        .expect("the trim is reported as a gap");
+    assert_eq!(trim.reason().as_str(), "change_log_trimmed");
+    assert_eq!(
+        trim.after().map(ResourceVersion::as_str),
+        Some("90210"),
+        "the period began where the listing did"
+    );
+    assert!(
+        trim.resumed_at().is_some(),
+        "and the retained record begins where the oldest entry it still holds does: {}",
+        trim.describe()
+    );
+    assert!(
+        stream.describe_continuity().contains("change_log_trimmed"),
+        "the one line a reader gets names it: {}",
+        stream.describe_continuity()
     );
 }
 
@@ -727,6 +766,7 @@ fn should_bound_a_live_view_at_its_capacity_and_name_everything_it_did_not_admit
     let started = Instant::now();
     view.refresh(&stream, &clock());
     let refreshed_in = started.elapsed();
+    let built = view.rebuilt_rows();
 
     assert_eq!(
         view.row_count(),
@@ -750,22 +790,76 @@ fn should_bound_a_live_view_at_its_capacity_and_name_everything_it_did_not_admit
         view.withheld().len()
     );
 
-    // FINDING: `LiveView::refresh` is O(objects in the stream) and clones up to `capacity`
-    // objects, and the package's change query calls it *once per emitted record*. A watched
-    // collection of ten thousand objects therefore pays ten thousand object clones per change
-    // event; the observation above is one refresh, and a live view emitting a thousand events
-    // pays it a thousand times. Nothing here is wrong per §41, and §50.1's "MUST NOT freeze" is
-    // the requirement it strains. Rebuilding only the rows a change touched, or refreshing on a
-    // cadence rather than per record, would remove the multiplication. Left for the owners of
-    // `live.rs` and `changes.rs`.
+    // The number the package pays, which is the one that multiplies: `changes.rs` reads the view
+    // once per emitted record, so what a live query costs is this refresh rather than the first.
+    stream.observe(ono_provider_kubernetes::watch::WatchEvent::Modified(
+        Object::parse(
+            INSTANCE,
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"api-000005","namespace":"shop","uid":"00000000-0000-0000-0000-000000000005","resourceVersion":"2"},"spec":{}}"#,
+        )
+        .expect("the object parses"),
+    ));
+    let started = Instant::now();
+    view.refresh(&stream, &clock());
+    let again_in = started.elapsed();
+    println!("live view: one change later, refreshed again in {again_in:?}");
+
     assert!(
         refreshed_in.as_secs() < 10,
         "a ceiling loose enough that only a change of asymptotic behaviour reaches it: \
          {refreshed_in:?}"
     );
 
-    // And the second half of the finding: the withheld list is itself proportional to the
-    // collection. Eight thousand identities is the bound's own cost, and it is not bounded.
+    // What a refresh costs is what a change costs, and not what the collection costs. The
+    // package's change query reads the view once per emitted record (§41.4 has to be current on
+    // every one), so a refresh that rebuilt `capacity` rows would multiply ten thousand objects
+    // by the event rate — the freeze §50.1 forbids. A row at the same lifetime and the same
+    // `resourceVersion` is the same observation (§14.3), so it is kept rather than rebuilt.
+    assert_eq!(
+        built, 2_000,
+        "the first refresh has nothing to keep, so it builds every row it admits"
+    );
+    assert_eq!(
+        view.row_count(),
+        2_000,
+        "and the second changed one row and kept one thousand nine hundred and ninety-nine"
+    );
+    assert_eq!(
+        view.rebuilt_rows(),
+        1,
+        "one object changed, so one row was rebuilt: {again_in:?} for the whole refresh"
+    );
+    assert!(
+        again_in < refreshed_in,
+        "a refresh after one change costs less than the refresh that built the view: \
+         {again_in:?} against {refreshed_in:?}"
+    );
+    assert_eq!(
+        view.withheld().len(),
+        8_000,
+        "and the bound's own cost — an identity per object that did not fit — is compared \
+         against the stream rather than rebuilt from it"
+    );
+    // And the constant the package pays per record. `changes.rs` observes the view on every event
+    // — that is where §41.4's state, gaps and staleness come from — and rebuilds the rows on a
+    // cadence, so the per-record cost is this rather than the refresh above.
+    let started = Instant::now();
+    for _ in 0..1_000 {
+        view.observe(&stream, &clock());
+    }
+    let observed_in = started.elapsed();
+    println!("live view: 1 000 observations without a rebuild in {observed_in:?}");
+    assert!(
+        observed_in < refreshed_in,
+        "a thousand observations cost less than one rebuild of the rows: {observed_in:?} \
+         against {refreshed_in:?}"
+    );
+    assert_eq!(
+        view.row_count(),
+        2_000,
+        "and an observation moves no row: it is the state that is being taken, not the table"
+    );
+
     let withheld_bytes: usize = view
         .withheld()
         .iter()

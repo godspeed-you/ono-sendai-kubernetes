@@ -190,6 +190,7 @@ pub struct Segment {
     started_at: ResourceVersion,
     closed_at: Option<ResourceVersion>,
     changes: Vec<ObservedChange>,
+    trimmed: usize,
 }
 
 impl Segment {
@@ -211,12 +212,82 @@ impl Segment {
         self.closed_at.is_none()
     }
 
-    /// The changes seen in this period, in the order they arrived.
+    /// The changes this period still holds, in the order they arrived.
+    ///
+    /// The most recent [`CHANGE_LOG_CAPACITY`] of them. A watch on a busy collection produces
+    /// events for as long as it is open, and §18.5 and §50.1 both forbid a structure that grows
+    /// with the *stream* rather than with the collection — so the oldest entries are dropped, and
+    /// [`Self::trimmed`] and the [`GapReason::ChangeLogTrimmed`] gap on the stream are what stop
+    /// that being a silent shortening of a history (§19.4).
     #[must_use]
     pub fn changes(&self) -> &[ObservedChange] {
         &self.changes
     }
+
+    /// How many changes this period saw and no longer holds.
+    ///
+    /// Zero for every segment that stayed inside the bound, which is nearly all of them. Where it
+    /// is not zero, [`Self::changes`] begins later than [`Self::started_at`] and the difference is
+    /// the part of the history that was forgotten rather than the part that never happened.
+    #[must_use]
+    pub fn trimmed(&self) -> usize {
+        self.trimmed
+    }
+
+    /// Whether this period's change log has forgotten its beginning.
+    #[must_use]
+    pub fn is_trimmed(&self) -> bool {
+        self.trimmed > 0
+    }
+
+    /// The version the retained changes begin at, where the log was trimmed.
+    ///
+    /// [`None`] while nothing has been dropped: the log begins where the segment does, and saying
+    /// so twice would invite a reader to believe it when it is not true.
+    #[must_use]
+    pub fn retained_from(&self) -> Option<&ResourceVersion> {
+        self.is_trimmed()
+            .then(|| {
+                self.changes
+                    .first()
+                    .and_then(ObservedChange::resource_version)
+            })
+            .flatten()
+    }
+
+    /// Adds one change, dropping the oldest ones once the bound is reached.
+    ///
+    /// Trimmed in blocks rather than one at a time, so a full log costs one move of a quarter of
+    /// itself every [`TRIM_BLOCK`] events instead of a move of the whole of itself on every event.
+    /// What a reader is told does not depend on the block: the log never exceeds
+    /// [`CHANGE_LOG_CAPACITY`], and [`Self::trimmed`] counts every entry that left.
+    fn push(&mut self, change: ObservedChange) -> bool {
+        let mut trimmed = false;
+        if self.changes.len() >= CHANGE_LOG_CAPACITY {
+            self.changes.drain(..TRIM_BLOCK);
+            self.trimmed += TRIM_BLOCK;
+            trimmed = true;
+        }
+        self.changes.push(change);
+        trimmed
+    }
 }
+
+/// The most changes one observation period keeps (§18.5, §50.1).
+///
+/// A watch is open for as long as an operator watches, and the collection bounds the *cache*
+/// while nothing bounds the number of events that pass through it: ten thousand modifications of
+/// five hundred Pods are five hundred objects and ten thousand changes. §19.4's segment model
+/// needs the segment boundaries and the recent history inside them; the generic contract's §30.4
+/// — "MUST avoid retaining entire remote inventories when streaming semantics suffice" — reads on
+/// a change log as much as on a listing.
+///
+/// A thousand and twenty-four is roughly what a reader can scroll and comfortably more than the
+/// two thousand rows [`crate::live::LiveView`] shows at once would generate between two glances.
+pub const CHANGE_LOG_CAPACITY: usize = 1_024;
+
+/// How much of a full change log is dropped when it reaches its bound.
+const TRIM_BLOCK: usize = CHANGE_LOG_CAPACITY / 4;
 
 /// Why observation stopped being continuous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +299,15 @@ pub enum GapReason {
     /// State was re-acquired by listing rather than resumed from a checkpoint, so the changes
     /// that produced the new state were never seen.
     RestartedWithoutCheckpoint,
+    /// The change log reached [`CHANGE_LOG_CAPACITY`] and dropped its oldest entries, so the
+    /// record of this period begins later than the period does.
+    ///
+    /// Unlike the other three this is not a period nobody watched: the events were observed,
+    /// applied to the cache and reported to whoever was reading at the time, and it is the
+    /// *record* of them that has a hole at its beginning. It is reported as a gap all the same,
+    /// because a reader asking what happened in this period gets an answer that starts in the
+    /// middle, and §19.4 exists to stop exactly that being handed over as a whole history.
+    ChangeLogTrimmed,
 }
 
 impl GapReason {
@@ -238,6 +318,7 @@ impl GapReason {
             Self::Expired => "watch_expired_410",
             Self::AccessDenied => "watch_denied",
             Self::RestartedWithoutCheckpoint => "restarted_without_checkpoint",
+            Self::ChangeLogTrimmed => "change_log_trimmed",
         }
     }
 }
@@ -393,6 +474,11 @@ pub struct WatchStream {
     objects: BTreeMap<CacheKey, Object>,
     segments: Vec<Segment>,
     gaps: Vec<WatchGap>,
+    /// Where the current period's trim gap sits in [`Self::gaps`], once it has one.
+    ///
+    /// One gap per period, updated as the hole grows. An index rather than a search over the
+    /// gaps, so that a trim in this period can never be mistaken for the trim in the last one.
+    trim_gap: Option<usize>,
     discarded: usize,
 }
 
@@ -412,6 +498,7 @@ impl WatchStream {
             objects: BTreeMap::new(),
             segments: Vec::new(),
             gaps: Vec::new(),
+            trim_gap: None,
             discarded: 0,
         }
     }
@@ -470,7 +557,9 @@ impl WatchStream {
             started_at: collection_version,
             closed_at: None,
             changes: Vec::new(),
+            trimmed: 0,
         });
+        self.trim_gap = None;
         self.state = SyncState::Live;
     }
 
@@ -580,6 +669,18 @@ impl WatchStream {
         self.segments.last().map_or(&[], Segment::changes)
     }
 
+    /// How many changes of the current period the log has dropped (§18.5, §50.1).
+    ///
+    /// Zero until [`CHANGE_LOG_CAPACITY`] is reached. Above zero, [`Self::continuous_changes`]
+    /// begins later than the period does, [`Self::gaps`] holds a
+    /// [`GapReason::ChangeLogTrimmed`] gap saying between which two versions, and
+    /// [`Self::is_gap_free`] is false — a bounded history says so in the same three places an
+    /// interrupted one does.
+    #[must_use]
+    pub fn trimmed_changes(&self) -> usize {
+        self.segments.last().map_or(0, Segment::trimmed)
+    }
+
     /// Whether one unbroken period covers everything this stream has observed.
     #[must_use]
     pub fn is_gap_free(&self) -> bool {
@@ -636,10 +737,47 @@ impl WatchStream {
                 self.objects.remove(&key);
             }
         }
-        if let Some(segment) = self.segments.last_mut() {
-            segment.changes.push(change);
+        if let Some(segment) = self.segments.last_mut()
+            && segment.push(change)
+        {
+            self.record_trim();
         }
         Reception::Applied
+    }
+
+    /// Says that the current period's change log has forgotten its beginning (§19.4).
+    ///
+    /// One gap for the period rather than one per trim: the hole grows, and a list of them would
+    /// be the unbounded structure the trim exists to prevent. `after` is where the period began
+    /// and `resumed_at` is where its retained record now begins, which is the same pair of edges
+    /// every other gap carries — a reader placing an observation either side of it needs no new
+    /// vocabulary.
+    fn record_trim(&mut self) {
+        let Some(segment) = self.segments.last() else {
+            return;
+        };
+        let started_at = segment.started_at().clone();
+        // Where the retained record now begins. A change that carried no `resourceVersion` cannot
+        // name it, and the version the period began at is then the earliest position this can
+        // honestly point at — an understatement of the hole rather than an invention.
+        let resumed_at = Some(
+            segment
+                .retained_from()
+                .cloned()
+                .unwrap_or_else(|| started_at.clone()),
+        );
+        if let Some(index) = self.trim_gap
+            && let Some(gap) = self.gaps.get_mut(index)
+        {
+            gap.resumed_at = resumed_at;
+            return;
+        }
+        self.trim_gap = Some(self.gaps.len());
+        self.gaps.push(WatchGap {
+            reason: GapReason::ChangeLogTrimmed,
+            after: Some(started_at),
+            resumed_at,
+        });
     }
 
     fn fail(&mut self, failure: &WatchFailure) -> Reception {
@@ -669,6 +807,7 @@ impl WatchStream {
             after: self.checkpoint.take(),
             resumed_at: None,
         });
+        self.trim_gap = None;
         self.state = state;
         Reception::ContinuityBroken
     }

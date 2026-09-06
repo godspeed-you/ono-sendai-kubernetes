@@ -290,6 +290,7 @@ pub struct LiveView {
     sync: SyncState,
     gaps: Vec<String>,
     last_live_at: Option<ObservedAt>,
+    rebuilt: usize,
 }
 
 impl LiveView {
@@ -309,6 +310,7 @@ impl LiveView {
             sync: SyncState::Syncing,
             gaps: Vec::new(),
             last_live_at: None,
+            rebuilt: 0,
         }
     }
 
@@ -324,24 +326,78 @@ impl LiveView {
     /// the precise thing §41.4 forbids: a frozen table with a heartbeat.
     pub fn refresh(&mut self, stream: &WatchStream, clock: &impl Clock) {
         let now = clock.now();
+        self.take_state(stream, now);
+        self.rebuild(stream, now);
+    }
+
+    /// Takes the stream's state, its record and the fact that it is alive, and nothing else.
+    ///
+    /// The half of [`Self::refresh`] that is a constant rather than a walk over the collection.
+    /// Every question a reader puts to a view between two arrivals — [`Self::state`],
+    /// [`Self::is_stale`], [`Self::gaps`], [`Self::notice`] — is answered from what this takes,
+    /// so a caller that is emitting one record per watch event can keep §41.4's honesty current
+    /// on every event and pay for the rows on a cadence instead.
+    ///
+    /// What it does not do is admit a new object, retire a departed one or move the boundary
+    /// between the rows and [`Self::withheld`]. A view that has only been observed holds the rows
+    /// of its last refresh.
+    pub fn observe(&mut self, stream: &WatchStream, clock: &impl Clock) {
+        self.take_state(stream, clock.now());
+    }
+
+    fn take_state(&mut self, stream: &WatchStream, now: ObservedAt) {
         self.sync = stream.state();
         self.gaps = stream.gaps().iter().map(|gap| gap.describe()).collect();
         if self.sync == SyncState::Live {
             self.last_live_at = Some(now);
         }
+    }
 
+    /// Rebuilds the rows against the stream, keeping every row the stream did not change.
+    ///
+    /// The bound is re-applied against whatever the stream holds at this moment, so the answer is
+    /// the same one a rebuild from nothing would give: an object that had no room a minute ago is
+    /// admitted as soon as one frees, and [`Self::withheld`] is the exact set that did not fit.
+    ///
+    /// What is different is the cost. A row whose object is at the same lifetime and the same
+    /// `resourceVersion` is the same observation — §14.3 makes that the one thing the version is
+    /// for — so it is moved across rather than rebuilt from a clone of an object the view already
+    /// holds. A watched collection of ten thousand objects therefore costs one row per change
+    /// instead of `capacity` clones per event.
+    fn rebuild(&mut self, stream: &WatchStream, now: ObservedAt) {
+        let mut previous = std::mem::take(&mut self.rows);
         let mut rows = BTreeMap::new();
-        let mut withheld = Vec::new();
+        let mut overflow: Vec<&Object> = Vec::new();
+        self.rebuilt = 0;
         for object in stream.objects() {
+            if rows.len() >= self.capacity {
+                overflow.push(object);
+                continue;
+            }
             let key = key_of(object);
-            if rows.len() < self.capacity {
-                rows.insert(key.clone(), self.project(&key, object, now));
-            } else {
-                withheld.push(object.identity());
+            let held = previous.remove(&key);
+            match held {
+                Some(row) if unchanged(&row, object) => {
+                    rows.insert(key, row);
+                }
+                held => {
+                    self.rebuilt += 1;
+                    rows.insert(key, project(held.as_ref(), object, now));
+                }
             }
         }
         self.rows = rows;
-        self.withheld = withheld;
+
+        // The other half of the bound's own cost: the withheld list is proportional to the
+        // collection, and an [`Identity`] is five strings. It is compared against the objects
+        // that did not fit before it is rebuilt from them, because comparing borrows nothing and
+        // rebuilding allocates one identity per object the view had no room for — on every event.
+        let same = self.withheld.len() == overflow.len()
+            && std::iter::zip(&self.withheld, &overflow)
+                .all(|(held, object)| names_the_same_object(held, object));
+        if !same {
+            self.withheld = overflow.iter().map(|object| object.identity()).collect();
+        }
     }
 
     /// The REST collection this view projects (§13.1).
@@ -451,25 +507,54 @@ impl LiveView {
         }
     }
 
-    /// One row, keeping the observation time of a row that did not change.
+    /// How many rows the last refresh had to build, rather than keep.
     ///
-    /// A recreate is an arrival rather than a modification: same namespace and name, different
-    /// UID, is a different lifetime (§4 invariants 4 and 5), and reporting it as a change would
-    /// present a Pod that was deleted and remade as one that carried on.
-    fn project(&self, key: &RowKey, object: &Object, now: ObservedAt) -> Row {
-        let (observed_at, change) = match self.rows.get(key) {
-            Some(existing) if existing.object.uid() != object.uid() => (now, ChangeClass::Added),
-            Some(existing) if existing.object.resource_version() == object.resource_version() => {
-                (existing.observed_at, existing.change)
-            }
-            Some(_) => (now, ChangeClass::Modified),
-            None => (now, ChangeClass::Added),
-        };
-        Row {
-            object: object.clone(),
-            observed_at,
-            change,
-        }
+    /// The observable half of the bound the generic contract's §30.5 asks for: a view that
+    /// rebuilt every row of a ten-thousand-object collection on every watch event would be doing
+    /// the work §50.1 says must not freeze a shell, and this is the number that says whether it
+    /// is. Zero after a refresh that found nothing changed.
+    #[must_use]
+    pub fn rebuilt_rows(&self) -> usize {
+        self.rebuilt
+    }
+}
+
+/// Whether a withheld identity is the identity of the object now standing in its place.
+///
+/// Field by field rather than `Identity::eq`, because building the identity to compare it is the
+/// allocation this exists to avoid. §16.1's identity is the provider instance, the kind, the UID,
+/// the namespace and the name; the provider instance is the only one not compared here, and it
+/// cannot differ — every object of one view came out of one stream, which came out of one client.
+fn names_the_same_object(held: &Identity, object: &Object) -> bool {
+    held.uid() == object.uid()
+        && held.name() == object.name()
+        && held.namespace() == object.namespace()
+        && held.gvk() == object.gvk()
+}
+
+/// Whether a held row and the object the stream now holds are the same observation.
+///
+/// The same lifetime at the same `resourceVersion` (§14.3, §4 invariants 4 to 6). A version that
+/// did not move is the server saying nothing about this object has changed, which is precisely
+/// the claim a re-read of it would cost a clone to re-establish.
+fn unchanged(row: &Row, object: &Object) -> bool {
+    row.object.uid() == object.uid() && row.object.resource_version() == object.resource_version()
+}
+
+/// One row, keeping nothing from a row that is not the same observation.
+///
+/// A recreate is an arrival rather than a modification: same namespace and name, different UID,
+/// is a different lifetime (§4 invariants 4 and 5), and reporting it as a change would present a
+/// Pod that was deleted and remade as one that carried on.
+fn project(held: Option<&Row>, object: &Object, now: ObservedAt) -> Row {
+    let change = match held {
+        Some(row) if row.object.uid() == object.uid() => ChangeClass::Modified,
+        _ => ChangeClass::Added,
+    };
+    Row {
+        object: object.clone(),
+        observed_at: now,
+        change,
     }
 }
 

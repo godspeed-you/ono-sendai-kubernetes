@@ -25,8 +25,9 @@ use ono_provider_kubernetes::transport::{
     FixtureStream, HttpConnection, ListOptions, watch_request,
 };
 use ono_provider_kubernetes::watch::{
-    Backoff, ChangeClass, FrameError, GapReason, Reception, Reconciliation, ReconciliationStage,
-    ResourceVersion, ResumeError, SyncState, WatchDecoder, WatchEvent, WatchFailure, WatchStream,
+    Backoff, CHANGE_LOG_CAPACITY, ChangeClass, FrameError, GapReason, Reception, Reconciliation,
+    ReconciliationStage, ResourceVersion, ResumeError, SyncState, WatchDecoder, WatchEvent,
+    WatchFailure, WatchStream,
 };
 
 const INSTANCE: &str = "kubernetes:prod-eu";
@@ -356,6 +357,68 @@ fn should_expose_the_gap_in_words_an_operator_can_act_on() {
     assert!(described.contains("watch_expired_410"), "{described}");
     assert!(described.contains("18010"), "{described}");
     assert!(described.contains("18700"), "{described}");
+}
+
+#[test]
+fn should_bound_the_change_log_and_report_a_trimmed_history_as_a_gap() {
+    // §18.5 and §50.1: a watch is open for as long as an operator watches it, so a structure that
+    // grows with the *event count* rather than with the collection has no bound at all. The cache
+    // is bounded by the collection — ten thousand modifications of one Pod are one Pod — and the
+    // change log needs a bound of its own.
+    //
+    // What matters more than the number is what a trimmed log *says*. §19.4 exists to stop a
+    // history being handed over as whole when it is not, and a log that silently forgot its
+    // oldest entries would be exactly that: an ordered list of changes that begins in the middle
+    // of the period it claims to describe. So the trim is reported the way every other
+    // discontinuity is — as a gap, with the version the period began at and the version the
+    // retained record now begins at.
+    let mut stream = live_pods();
+    let events = CHANGE_LOG_CAPACITY + 500;
+    for index in 0..events {
+        let version = 20_000 + index;
+        stream.observe(WatchEvent::Modified(pod(
+            "checkout-1",
+            "uid-1",
+            &version.to_string(),
+        )));
+    }
+
+    assert_eq!(stream.discarded_events(), 0, "every event was applied");
+    assert_eq!(stream.object_count(), 1, "and the cache holds one Pod");
+    assert!(
+        stream.continuous_changes().len() <= CHANGE_LOG_CAPACITY,
+        "the log holds its bound and not one entry more: {}",
+        stream.continuous_changes().len()
+    );
+    assert_eq!(
+        stream.trimmed_changes() + stream.continuous_changes().len(),
+        events,
+        "and what it no longer holds is counted rather than forgotten"
+    );
+
+    let trim = stream
+        .gaps()
+        .iter()
+        .find(|gap| gap.reason() == GapReason::ChangeLogTrimmed)
+        .expect("a trimmed record is a gap in that record");
+    assert_eq!(trim.after().map(ResourceVersion::as_str), Some("18010"));
+    assert!(trim.is_closed(), "the record continues after the hole");
+    assert!(
+        !stream.is_gap_free(),
+        "and nothing may call this one whole history"
+    );
+    assert!(
+        stream.describe_continuity().contains("change_log_trimmed"),
+        "{}",
+        stream.describe_continuity()
+    );
+
+    // A second period starts its own log and its own account of what it dropped, because a
+    // segment is the largest span this provider may present as an ordered history (§19.4).
+    stream.observe(WatchEvent::Error(WatchFailure::Expired));
+    stream.listed(Vec::new(), ResourceVersion::new("30000"));
+    assert_eq!(stream.trimmed_changes(), 0);
+    assert!(stream.continuous_changes().is_empty());
 }
 
 #[test]

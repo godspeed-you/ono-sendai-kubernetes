@@ -207,8 +207,17 @@ fn nebula_gvk() -> Gvk {
 /// invalidation test needs several collections and several scopes in one session, because the
 /// whole question is which of them a write reaches.
 fn one_object_listing(gvr: &Gvr, scope: &Scope, namespace: &str) -> Listing {
+    // `<Kind>List`, not the generic `List` this fixture used to send. A collection endpoint
+    // names the kind its items are of, and since ADR-0046 this provider requires it to: the kind
+    // is what §22's protection is keyed on, so an envelope that names none is one the items'
+    // redaction cannot be decided from (`transport::identify`).
+    let kind = match gvr.resource() {
+        "pods" => "Pod",
+        "configmaps" => "ConfigMap",
+        other => panic!("this fixture does not know the kind of `{other}`"),
+    };
     let body = format!(
-        r#"{{"apiVersion":"v1","kind":"List","metadata":{{"resourceVersion":"18010"}},
+        r#"{{"apiVersion":"v1","kind":"{kind}List","metadata":{{"resourceVersion":"18010"}},
             "items":[{{"metadata":{{"name":"one","namespace":"{namespace}","uid":"uid-one",
             "resourceVersion":"18005"}}}}]}}"#
     );

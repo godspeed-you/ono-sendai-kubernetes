@@ -43,6 +43,7 @@ use crate::coverage::Outcome;
 use crate::discovery::Gvr;
 use crate::object::Object;
 use crate::plan::{FieldChange, Plan, Propagation, VerificationRule};
+use crate::redaction::guarded_document;
 use crate::transport::{
     ApiError, ErrorKind, Method, ObservedAt, Operation, Request, Response, Status, object_path,
 };
@@ -956,9 +957,14 @@ impl MutationOutcome {
 /// verbatim, which is the one way a mutation could disclose what a read may not (Gate I).
 #[must_use]
 pub fn admission_differences_of(requested: &Json, returned: &Object) -> Vec<FieldChange> {
+    // Both halves go through the same door. The returned half is guarded by the caller — that is
+    // what this function exists for — and the submitted half is guarded here, because §22.3's
+    // rule is about the bytes rather than about which way they were travelling: an applied
+    // Secret's payload in a mutation record is that payload in command history (§42.2).
+    let requested = guarded_document(returned.identity().provider_instance(), requested);
     let mut differences = Vec::new();
     let mut paths = Vec::new();
-    leaves(requested, String::new(), &mut paths);
+    leaves(&requested, String::new(), &mut paths);
     for (path, sent) in paths {
         if SERVER_OWNED_METADATA.contains(&path.as_str()) {
             continue;
