@@ -134,6 +134,17 @@ targets:
     summary: "What one object is related to, with the evidence class and the fields that decided each edge (specification sections 23 to 32)."
     identity_doc: "Two observations are the same edge when the object they start at, the relationship word, the far end's address and the field that decided all match. An edge has no `metadata.uid` of its own."
 
+  # What changed in a collection while this provider was watching it, and — the point of the
+  # exercise — every period it could not observe. §19.1's list-then-watch is one sequence, so this
+  # noun acquires the collection itself rather than reading one somebody else listed. Options:
+  # `kind`/`group`/`version`/`resource` name the collection exactly as `k8s-resource` does,
+  # `max_changes` bounds one invocation, and `reacquire` (default true) decides whether a broken
+  # stream is re-listed on the other side of its gap. The gap record is emitted either way.
+  - name: k8s-change
+    schema: io.github.godspeed-you.kubernetes.change/1
+    summary: "What changed in a collection while this provider was watching it, and every period it could not observe (specification section 19)."
+    identity_doc: "Two observations are the same change when the collection, the observation period, the word, the object's UID and its resourceVersion all match. A change has no `metadata.uid` of its own; the UID on the record is the object's."
+
   # The provider instance itself rather than anything in the cluster: which cluster this is,
   # whether it answers, and who you are to it (§8.5, §8.6, §10, §34.3). It is the one target here
   # that is useful when the cluster is *not* reachable, which is why an unreachable API server

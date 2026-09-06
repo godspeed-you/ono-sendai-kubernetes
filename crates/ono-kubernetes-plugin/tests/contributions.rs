@@ -135,11 +135,15 @@ fn should_declare_every_field_as_exactly_one_of_required_and_nullable() {
 #[test]
 fn should_identify_every_kubernetes_object_by_uid_rather_than_by_name() {
     for target in TARGETS {
-        // A relationship is the one thing this package answers for that is not an object: it has
-        // no `metadata.uid`, so it is keyed on the four things that make two edges the same edge.
-        // The exception is named here rather than written as `!= relation`, so that a *second*
-        // schema drifting off `uid` fails this test instead of joining a category.
-        if matches!(target.reads, Reads::Relations) {
+        // Two of the things this package answers for are not objects, and both are named here
+        // rather than written as `!= relation`, so that a *third* schema drifting off `uid`
+        // fails this test instead of joining a category.
+        //
+        // A relationship has no `metadata.uid`, so it is keyed on the four things that make two
+        // edges the same edge. An observed change has none either — the UID on a change record is
+        // the *object's*, and one object changing three times is three observations — so it is
+        // keyed on the collection, the observation period, the word, that UID and the version.
+        if matches!(target.reads, Reads::Relations | Reads::Changes) {
             continue;
         }
         let schema = target.schema_contribution().to_schema().unwrap();
@@ -155,6 +159,41 @@ fn should_identify_every_kubernetes_object_by_uid_rather_than_by_name() {
             target.fields.iter().any(|field| field.name == "name"),
             "`{}` still carries the name as a locator (§16.2)",
             target.schema
+        );
+    }
+}
+
+#[test]
+fn should_key_an_observed_change_on_the_period_it_belongs_to() {
+    // §19.4 and §39.3. The segment is in the key because pre-gap and post-gap observation are two
+    // histories: a key without it would let an object re-listed after a `410` collapse onto the
+    // observation of it made before the break, which is the stitching §4 invariant 14 forbids,
+    // arrived at through the identity model rather than through the record stream.
+    let changes = target("k8s-change").expect("the package answers for `k8s-change`");
+    let schema = changes.schema_contribution().to_schema().unwrap();
+    let identity: Vec<&str> = schema.identity().iter().map(|field| &**field).collect();
+    assert_eq!(
+        identity,
+        vec!["resource", "segment", "change", "uid", "resource_version"]
+    );
+    for component in &identity {
+        assert!(
+            changes.fields.iter().any(|field| field.name == *component),
+            "`{component}` is part of the identity and must be a field of the schema"
+        );
+    }
+    // A gap is about a period rather than about an object, so every object field it would fill
+    // has to be able to be null — including `terminating`, which every object schema declares
+    // required.
+    for name in ["uid", "name", "kind", "terminating", "resource_version"] {
+        let field = changes
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap_or_else(|| panic!("`k8s-change` carries `{name}`"));
+        assert!(
+            !field.required,
+            "`{name}` must be nullable on a change record: a gap is an observation of a period              with no object in it"
         );
     }
 }

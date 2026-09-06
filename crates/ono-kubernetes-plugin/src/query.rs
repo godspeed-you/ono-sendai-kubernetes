@@ -50,6 +50,7 @@ use ono_provider_kubernetes::discovery::{self, Discovery, Resource, Verb};
 use ono_provider_kubernetes::kubeconfig::{Credential, Kubeconfig, Secret, Trust};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
+use ono_provider_kubernetes::session::{Lookup, Session};
 use ono_provider_kubernetes::tls::{Anchors, ClientIdentity, TlsError, TlsSettings, TlsStream};
 use ono_provider_kubernetes::transport::{
     ApiError, ByteStream, Client, Freshness, ListOptions, Listing, Operation, Request,
@@ -61,6 +62,7 @@ use crate::broker::{BrokeredStream, decode_hex};
 use crate::contributions::{Reads, Target};
 use crate::dynamic::{self, Selector, Typing, Unresolved};
 use crate::records::{dynamic_record, record};
+use crate::sessions::{Key, Sessions};
 
 /// `provider.unavailable`, as core's `docs/contracts/errors.yaml` publishes it.
 ///
@@ -112,7 +114,7 @@ const MAX_KUBECONFIG: usize = 4 * 1024 * 1024;
 /// Never returns [`Outcome::Completed`] for an answer it knows to be partial; see the module
 /// documentation for why the values still cross first.
 #[must_use]
-pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
+pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -> Outcome {
     let schema = match target.schema_contribution().to_schema() {
         Ok(schema) => Arc::new(schema),
         Err(error) => return Outcome::Failed(error.into()),
@@ -134,14 +136,24 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
         return Outcome::Cancelled;
     }
 
-    let answer = converse(
-        ctx,
-        &endpoint,
-        Listed {
-            target,
-            endpoint: &endpoint,
-            selector: &selector,
-            lookup: lookup.as_deref(),
+    // The session is entered around the whole conversation rather than consulted before it: what
+    // discovery costs and what it produced are the same question, and asking them at two moments
+    // is how a snapshot comes to be fetched twice for one query.
+    let answer = sessions.with(
+        &endpoint.session_key(),
+        || endpoint.start_session(),
+        |session| {
+            converse(
+                ctx,
+                &endpoint,
+                Listed {
+                    target,
+                    endpoint: &endpoint,
+                    selector: &selector,
+                    lookup: lookup.as_deref(),
+                    session,
+                },
+            )
         },
     );
     let (answer, shape) = match answer {
@@ -157,6 +169,7 @@ struct Listed<'a> {
     endpoint: &'a Endpoint,
     selector: &'a Selector,
     lookup: Option<&'a str>,
+    session: &'a mut Session,
 }
 
 impl Conversation for Listed<'_> {
@@ -164,6 +177,7 @@ impl Conversation for Listed<'_> {
 
     fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
         read(
+            self.session,
             client,
             self.target,
             self.endpoint,
@@ -386,14 +400,15 @@ fn emit(
 
 /// Discovers what serves the target's kind, then reads it — one object, or the collection.
 fn read<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     target: &'static Target,
     endpoint: &Endpoint,
     selector: &Selector,
     lookup: Option<&str>,
 ) -> Result<(Answer, Shape), WireError> {
-    let core = document(client, endpoint, "/api")?;
-    let groups = document(client, endpoint, "/apis")?;
+    let core = document(session, client, endpoint, "/api")?;
+    let groups = document(session, client, endpoint, "/apis")?;
     // Two passes over the same two documents rather than two round trips: the preferred version
     // has to be known before the resource list can be asked for, and `Builder` answers only once
     // it is built.
@@ -412,7 +427,7 @@ fn read<S: ByteStream>(
 
     let (resource, shape) = match target.reads {
         Reads::Kind { group, kind } => {
-            let resource = curated(client, endpoint, &served, group, kind)?;
+            let resource = curated(session, client, endpoint, &served, group, kind)?;
             (resource, Shape::Curated)
         }
         // The instance diagnostic is not a listing of anything, so it never reaches this
@@ -427,6 +442,20 @@ fn read<S: ByteStream>(
                 "This target reports on the session rather than on anything in the cluster.",
             ));
         }
+        // Nor is an observed change: `changes::answer` acquires the collection itself, because
+        // §19.1's list-then-watch is one sequence and splitting it across two routes would let a
+        // watch open from a version no listing here produced.
+        Reads::Changes => {
+            return Err(failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                "a change is observed rather than listed, so there is no collection of changes \
+                 to read"
+                    .to_owned(),
+                "Ask what changed with `get k8s-change --kind ...`, which lists the collection \
+                 and then watches it from the version that listing returned.",
+            ));
+        }
         // Nor is a relationship: it has no collection of its own, and `relations::answer` routes
         // it long before a collection is chosen.
         Reads::Relations => {
@@ -439,8 +468,8 @@ fn read<S: ByteStream>(
             ));
         }
         Reads::Discovered => {
-            let resource = discovered(client, endpoint, &served, selector)?;
-            let typing = typing_of(client, endpoint, &resource)?;
+            let resource = discovered(session, client, endpoint, &served, selector)?;
+            let typing = typing_of(session, client, endpoint, &resource)?;
             (
                 resource.clone(),
                 Shape::Discovered {
@@ -459,6 +488,20 @@ fn read<S: ByteStream>(
     };
 
     if let Some(name) = lookup {
+        // §20.2's other origin. A session that is watching this collection has already been told
+        // what is in it, and answering from that cache is the only way a record's provenance
+        // ever says anything but `direct-read`. `Lookup` is four answers rather than an
+        // `Option` for exactly this call site: a cache that is still synchronising, or one whose
+        // continuity broke, must fall through to the wire rather than report an absence it is
+        // not entitled to (§20.3, §4 invariant 13).
+        match session.lookup(resource.gvr(), &scope, scope.namespace(), name) {
+            Lookup::Cached(read) => {
+                let (object, freshness) = read.into_parts();
+                return Ok((Answer::Fetched(Box::new((object, freshness))), shape));
+            }
+            Lookup::ConfirmedAbsent => return Ok((Answer::Absent, shape)),
+            Lookup::NotWatched | Lookup::NotSynced(_) => {}
+        }
         return Ok((fetch(client, &resource, &scope, name)?, shape));
     }
 
@@ -537,6 +580,7 @@ pub(crate) fn fetch<S: ByteStream>(
 
 /// The resource serving a kind this package named at build time (§15.2).
 fn curated<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
     served: &Discovery,
@@ -555,7 +599,7 @@ fn curated<S: ByteStream>(
         )
     })?;
     let group_version = group_version_of(group, version);
-    let discovery = resource_list(client, endpoint, &group_version)?;
+    let discovery = resource_list(session, client, endpoint, &group_version)?;
     discovery
         .by_kind(&group_version, kind)
         .cloned()
@@ -576,15 +620,38 @@ fn curated<S: ByteStream>(
 /// narrowed it — which is what makes a kind nobody compiled in reachable by name alone, and what
 /// makes §35.8's ambiguity a real possibility rather than a theoretical one.
 fn discovered<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
     served: &Discovery,
     selector: &Selector,
 ) -> Result<Resource, WireError> {
+    resolve_in(session, client, endpoint, served, selector, Verb::List)
+}
+
+/// As [`discovered`], for a question that needs a verb other than `list`.
+///
+/// §11.5's third state is a resource the server serves and does not let a caller enumerate, and
+/// `watch` is a fourth permission on the same collection. Resolving for the verb the question
+/// actually needs is what keeps a refusal saying which grant is missing rather than which grant
+/// this code happened to ask about first (§60.5, ADR-0012).
+pub(crate) fn resolve_in<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    served: &Discovery,
+    selector: &Selector,
+    verb: Verb,
+) -> Result<Resource, WireError> {
     let group_versions = search_space(served, selector)?;
     let mut builder = Discovery::builder();
     for group_version in &group_versions {
-        let list = document(client, endpoint, &resource_list_path(group_version))?;
+        let list = document(
+            session,
+            client,
+            endpoint,
+            &resource_list_path(group_version),
+        )?;
         builder = builder.resources(&list).map_err(|error| {
             failure(
                 UNAVAILABLE_CODE,
@@ -596,7 +663,7 @@ fn discovered<S: ByteStream>(
     }
     let discovery = builder.build();
 
-    dynamic::resolve(selector, &discovery)
+    dynamic::resolve_for(selector, &discovery, verb)
         .cloned()
         .map_err(|unresolved| unresolved_failure(&unresolved, selector, &discovery))
 }
@@ -680,10 +747,18 @@ fn search_space(served: &Discovery, selector: &Selector) -> Result<Vec<String>, 
 /// `customresourcedefinitions` to understand a custom resource. A server that does not publish
 /// one leaves the typing absent, and every field still projects (§12.5, Gate B).
 fn typing_of<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
     resource: &Resource,
 ) -> Result<Typing, WireError> {
+    // §12.4's cache, and the first thing in this package that reads it. The key is the GVK
+    // rather than the document's path, because that is what a schema describes and what §12.4's
+    // invalidation rules are written in terms of: a CRD whose structural schema changed, a group
+    // version withdrawn, a cluster replaced.
+    if let Some(cached) = session.schema(resource.gvk()) {
+        return Ok(Typing::from_schema(cached.clone()));
+    }
     let path = if resource.group().is_empty() {
         format!("/openapi/v3/api/{}", resource.version())
     } else {
@@ -694,21 +769,32 @@ fn typing_of<S: ByteStream>(
         )
     };
     let document = optional_document(client, endpoint, &path)?;
-    Ok(Typing::of(
+    let typing = Typing::of(
         document.as_deref(),
         resource.group(),
         resource.version(),
         resource.kind(),
-    ))
+    );
+    // Cached even when the server published nothing: an absent schema is an answer about this
+    // cluster (§12.3), and re-asking a server that has already said no is §50.2's cost paid for
+    // a document that will not be there next time either.
+    session.cache_schema(resource.gvk().clone(), typing.schema().clone());
+    Ok(typing)
 }
 
 /// One group-version's resource list, as a snapshot of its own.
 pub(crate) fn resource_list<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
     group_version: &str,
 ) -> Result<Discovery, WireError> {
-    let list = document(client, endpoint, &resource_list_path(group_version))?;
+    let list = document(
+        session,
+        client,
+        endpoint,
+        &resource_list_path(group_version),
+    )?;
     Ok(Discovery::builder()
         .resources(&list)
         .map_err(|error| {
@@ -812,10 +898,19 @@ pub(crate) fn unresolved_failure(
 /// has to be put on it here. A cluster that requires authentication for `/api` answers `401`
 /// otherwise, which reads as "not a Kubernetes API server" and is not what happened.
 pub(crate) fn document<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
     path: &str,
 ) -> Result<String, WireError> {
+    // §50.2, in one branch. `/api`, `/apis` and a resource list are the same three documents
+    // every invocation asked for, and the session is what makes the second query in a session
+    // free. The documents are held rather than the assembled snapshot because the snapshot a
+    // query resolves against must cover exactly the group-versions that query searched — see
+    // `Session::discovery_document`.
+    if let Some(held) = session.discovery_document(path) {
+        return Ok(held.to_owned());
+    }
     let request = endpoint.authorise(Request::get(path).header("Accept", "application/json"));
     let response = client
         .connection()
@@ -834,14 +929,16 @@ pub(crate) fn document<S: ByteStream>(
              cannot be read at all.",
         ));
     }
-    String::from_utf8(response.body().to_vec()).map_err(|error| {
+    let text = String::from_utf8(response.body().to_vec()).map_err(|error| {
         failure(
             UNAVAILABLE_CODE,
             UNAVAILABLE,
             format!("the API server's answer to `{path}` is not text: {error}"),
             "A discovery document is JSON.",
         )
-    })
+    })?;
+    session.cache_discovery_document(path, text.clone());
+    Ok(text)
 }
 
 /// One JSON document the query can do without.
@@ -885,6 +982,18 @@ pub(crate) struct Endpoint {
     /// else. A `https://` server always carries settings.
     pub(crate) tls: Option<TlsSettings>,
     pub(crate) authorization: Option<Secret>,
+    /// How this endpoint proves who it is — the kind, never the material (§8.1).
+    ///
+    /// Beside [`Self::authorization`] rather than derived from it: a client certificate proves an
+    /// identity and puts no header on a request, so an endpoint with no `Authorization` is not
+    /// the same thing as an anonymous one.
+    pub(crate) credential: Credential,
+    /// The namespace the context this endpoint came from starts navigation in (§7.5).
+    ///
+    /// Distinct from [`Self::scope`], which is what *this query* asked about. The session records
+    /// the first as a fact about the configuration and never the second, because a scope one
+    /// invocation chose has no business surviving into the next (§6.5).
+    pub(crate) default_namespace: Option<String>,
 }
 
 impl fmt::Debug for Endpoint {
@@ -969,6 +1078,10 @@ impl Endpoint {
             // taken here (§8.4).
             tls: None,
             authorization: None,
+            // §7.3's endpoint carries no credential at all, and saying so is not the same as
+            // saying nothing: the API server decides what an anonymous request means.
+            credential: Credential::Anonymous,
+            default_namespace: None,
         })
     }
 
@@ -1056,7 +1169,48 @@ impl Endpoint {
             max_pages: max_pages(options),
             tls,
             authorization,
+            credential: connection.credential(),
+            default_namespace: connection.namespace().map(str::to_owned),
         })
+    }
+
+    /// What makes this invocation the same session as the last one (§6.2, §6.5).
+    ///
+    /// Everything in the key is something the operator configured; nothing in it is something
+    /// the cluster said. §10.3 is the reason for the second half: two instances that reach one
+    /// cluster share a fingerprint and are still two instances, so a key that included what the
+    /// cluster answered would merge exactly the pair §10.3 forbids merging.
+    pub(crate) fn session_key(&self) -> Key {
+        Key {
+            instance: self.instance.clone(),
+            endpoint: self.server_url(),
+            transport: match &self.tls {
+                None => "plaintext",
+                Some(settings) if settings.verifies_certificates() => "tls-verified",
+                Some(_) => "tls-unverified",
+            },
+        }
+    }
+
+    /// A session for this endpoint, holding nothing yet (§6.3, §6.4).
+    ///
+    /// The credential's *kind* travels into the session and its material does not. §8.1 draws
+    /// that line, and holding it here is what makes a session safe to keep across invocations: a
+    /// rotated token takes effect on the next call rather than at the end of a process, and no
+    /// invocation can be answered with a credential another one resolved.
+    pub(crate) fn start_session(&self) -> Session {
+        Session::for_endpoint(
+            self.instance.clone(),
+            self.server_url(),
+            self.default_namespace.as_deref(),
+            self.credential,
+        )
+    }
+
+    /// The API server as a URL, which is how §6.3 records an endpoint.
+    fn server_url(&self) -> String {
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        format!("{scheme}://{}:{}", self.host, self.port)
     }
 
     /// A client over `stream`, carrying whatever credential the context resolved to.

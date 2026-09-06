@@ -200,12 +200,23 @@ struct Watched {
 
 /// The live state of one provider instance (§6.3).
 pub struct Session<C: Clock = SystemClock> {
-    connection: Connection,
+    /// The kubeconfig context this session was resolved from, where one was.
+    ///
+    /// Optional because §7.3 admits an endpoint named directly — a `kubectl proxy`, an
+    /// automation host, a test cluster — and such a session has no context, no trust anchors and
+    /// no credential to hand back. Modelling that as an absent connection rather than as an
+    /// invented one keeps [`Self::credential_material`] from ever answering with something the
+    /// operator did not configure.
+    connection: Option<Connection>,
     instance: String,
+    endpoint: String,
+    namespace: Option<String>,
+    credential: Credential,
     tls: Option<TlsSettings>,
     identity: Identity,
     fingerprint: Fingerprint,
     discovery: Option<Discovery>,
+    documents: BTreeMap<String, String>,
     schemas: SchemaCache,
     watches: BTreeMap<(Gvr, Scope), Watched>,
     capabilities: BTreeSet<Capability>,
@@ -223,6 +234,41 @@ impl Session<SystemClock> {
     pub fn new(connection: Connection) -> Self {
         Self::with_clock(connection, SystemClock)
     }
+
+    /// A session for an endpoint the caller named directly, with no kubeconfig behind it (§7.3).
+    ///
+    /// The counterpart of [`Self::new`] for the configuration §7.3 allows: an operator who names
+    /// an API server rather than a context still has a provider instance, and that instance still
+    /// pays §50.2's discovery cost once per session rather than once per call.
+    ///
+    /// It takes the *kind* of credential and never the material. §8.1 separates the two, and a
+    /// session assembled this way is where the separation becomes structural: the credential is
+    /// resolved from the operator's configuration on every invocation and never held here, so no
+    /// invocation can be answered with a credential another one resolved.
+    #[must_use]
+    pub fn for_endpoint(
+        instance: impl Into<String>,
+        endpoint: impl Into<String>,
+        namespace: Option<&str>,
+        credential: Credential,
+    ) -> Self {
+        Self {
+            connection: None,
+            instance: instance.into(),
+            endpoint: endpoint.into(),
+            namespace: namespace.map(str::to_owned),
+            credential,
+            tls: None,
+            identity: Identity::unknown(),
+            fingerprint: Fingerprint::unknown(),
+            discovery: None,
+            documents: BTreeMap::new(),
+            schemas: SchemaCache::new(""),
+            watches: BTreeMap::new(),
+            capabilities: BTreeSet::new(),
+            clock: SystemClock,
+        }
+    }
 }
 
 impl<C: Clock> Session<C> {
@@ -230,13 +276,20 @@ impl<C: Clock> Session<C> {
     #[must_use]
     pub fn with_clock(connection: Connection, clock: C) -> Self {
         let instance = connection.instance_id();
+        let endpoint = connection.server().to_owned();
+        let namespace = connection.namespace().map(str::to_owned);
+        let credential = connection.credential();
         Self {
-            connection,
+            connection: Some(connection),
             instance,
+            endpoint,
+            namespace,
+            credential,
             tls: None,
             identity: Identity::unknown(),
             fingerprint: Fingerprint::unknown(),
             discovery: None,
+            documents: BTreeMap::new(),
             schemas: SchemaCache::new(""),
             watches: BTreeMap::new(),
             capabilities: BTreeSet::new(),
@@ -265,7 +318,7 @@ impl<C: Clock> Session<C> {
     /// The resolved API server endpoint (§6.3).
     #[must_use]
     pub fn endpoint(&self) -> &str {
-        self.connection.server()
+        &self.endpoint
     }
 
     /// The default namespace this instance starts navigation in, where its context names one.
@@ -274,13 +327,13 @@ impl<C: Clock> Session<C> {
     /// session (§6.5).
     #[must_use]
     pub fn namespace(&self) -> Option<&str> {
-        self.connection.namespace()
+        self.namespace.as_deref()
     }
 
     /// How this session proves who it is — the kind, never the material (§8.1).
     #[must_use]
     pub fn credential(&self) -> Credential {
-        self.connection.credential()
+        self.credential
     }
 
     /// The active credential material, where the connection carries it inline.
@@ -290,13 +343,17 @@ impl<C: Clock> Session<C> {
     /// [`fmt::Debug`] and [`Self::diagnostic`] cannot reach it at all, which is §6.3's last line.
     #[must_use]
     pub fn credential_material(&self) -> Option<&Secret> {
-        self.connection.material()
+        self.connection.as_ref().and_then(Connection::material)
     }
 
-    /// The resolved connection, for a caller that has to open the byte stream.
+    /// The resolved kubeconfig context, for a caller that has to open the byte stream.
+    ///
+    /// Absent for a session built by [`Self::for_endpoint`], which has no context behind it
+    /// (§7.3). `None` here is "this session was configured without a kubeconfig" and never "the
+    /// context could not be resolved", which would have been a failure before a session existed.
     #[must_use]
-    pub fn connection(&self) -> &Connection {
-        &self.connection
+    pub fn connection(&self) -> Option<&Connection> {
+        self.connection.as_ref()
     }
 
     /// The TLS configuration, once a connection has been established (§6.3).
@@ -373,6 +430,7 @@ impl<C: Clock> Session<C> {
 
         if change.invalidated() {
             self.discovery = None;
+            self.documents.clear();
             self.watches.clear();
             self.identity = Identity::unknown();
             self.capabilities.clear();
@@ -411,6 +469,42 @@ impl<C: Clock> Session<C> {
         self.discovery.is_none()
     }
 
+    /// One discovery document this session has already read, by the path it came from.
+    ///
+    /// §50.2's cost is three round trips before the first object — `/api`, `/apis` and a resource
+    /// list — and they are the same three every invocation. Holding the *documents* rather than
+    /// only the assembled [`Discovery`] is what lets a caller that assembles a different subset
+    /// per question still pay for each document once: the snapshot a query resolves against must
+    /// be built from exactly the group-versions that query searched, because §35.8's ambiguity is
+    /// a property of the search space and an answer that depended on what an earlier query had
+    /// fetched would not be the same answer twice.
+    ///
+    /// The path is the key because the path is what identifies the document to the server. A
+    /// document cached under a group-version would need a second rule for `/api` and `/apis`,
+    /// which name no group-version at all.
+    #[must_use]
+    pub fn discovery_document(&self, path: &str) -> Option<&str> {
+        self.documents.get(path).map(String::as_str)
+    }
+
+    /// Remembers a discovery document, so the next invocation does not fetch it again (§50.2).
+    pub fn cache_discovery_document(
+        &mut self,
+        path: impl Into<String>,
+        document: impl Into<String>,
+    ) {
+        self.documents.insert(path.into(), document.into());
+    }
+
+    /// How many discovery documents this session holds.
+    ///
+    /// A count rather than an iterator: the question a caller has is whether §50.2's cost has
+    /// already been paid, and handing out the documents would invite a second assembler.
+    #[must_use]
+    pub fn discovery_documents(&self) -> usize {
+        self.documents.len()
+    }
+
     /// The schemas held for this cluster (§12.4).
     #[must_use]
     pub fn schemas(&self) -> &SchemaCache {
@@ -442,12 +536,18 @@ impl<C: Clock> Session<C> {
     pub fn group_version_changed(&mut self, group: &str, version: &str) {
         self.schemas.invalidate_group_version(group, version);
         self.discovery = None;
+        // Every document rather than that group-version's: `/apis` names which versions are
+        // served and which one is preferred, so a change to one of them makes the group list a
+        // claim about a cluster that has moved on. Keeping it and dropping only the resource list
+        // is how a kind comes to be addressed at a version the server stopped serving.
+        self.documents.clear();
     }
 
     /// Forgets a whole group, for a CRD deleted or an API group withdrawn (§12.4, §11.5).
     pub fn group_withdrawn(&mut self, group: &str) {
         self.schemas.invalidate_group(group);
         self.discovery = None;
+        self.documents.clear();
     }
 
     // --- §6.3: negotiated capabilities ----------------------------------------------------------
@@ -645,13 +745,14 @@ impl<C: Clock> fmt::Debug for Session<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Session")
             .field("instance", &self.instance)
-            .field("endpoint", &self.connection.server())
-            .field("namespace", &self.connection.namespace())
-            .field("credential", &self.connection.credential())
+            .field("endpoint", &self.endpoint)
+            .field("namespace", &self.namespace)
+            .field("credential", &self.credential)
             .field("tls", &self.tls_posture().as_str())
             .field("identity", &self.identity)
             .field("fingerprint", &self.fingerprint.obtained_signals())
             .field("discovery", &self.discovery.is_some())
+            .field("discovery_documents", &self.documents.len())
             .field("schemas", &self.schemas.len())
             .field("watches", &self.watches.len())
             .field("capabilities", &self.capabilities)

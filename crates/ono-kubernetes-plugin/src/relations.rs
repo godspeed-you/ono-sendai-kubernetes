@@ -38,6 +38,7 @@ use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::place::Place;
 use ono_provider_kubernetes::redaction::{self, Guarded};
 use ono_provider_kubernetes::relationship::{Edge, Graph, Relation};
+use ono_provider_kubernetes::session::Session;
 use ono_provider_kubernetes::transport::{ByteStream, Client, Freshness, ListOptions};
 use ono_provider_kubernetes::workload::Workload;
 use ono_value::Schema;
@@ -50,6 +51,7 @@ use crate::query::{
     UNSUPPORTED, UNSUPPORTED_CODE, failure,
 };
 use crate::records::edge_record;
+use crate::sessions::Sessions;
 
 /// How many objects one derivation's page asks the API server for.
 const PAGE_SIZE: u32 = 500;
@@ -74,7 +76,7 @@ const CHILDREN_OF: &[(&str, &str, &str, &str)] = &[
 
 /// Answers a `k8s-relation` query: one object in, its edges out.
 #[must_use]
-pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
+pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -> Outcome {
     let schema = match target.schema_contribution().to_schema() {
         Ok(schema) => Arc::new(schema),
         Err(error) => return Outcome::Failed(error.into()),
@@ -106,13 +108,20 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
         return Outcome::Cancelled;
     }
 
-    let derived = query::converse(
-        ctx,
-        &endpoint,
-        Related {
-            endpoint: &endpoint,
-            selector: &selector,
-            name: &name,
+    let derived = sessions.with(
+        &endpoint.session_key(),
+        || endpoint.start_session(),
+        |session| {
+            query::converse(
+                ctx,
+                &endpoint,
+                Related {
+                    endpoint: &endpoint,
+                    selector: &selector,
+                    name: &name,
+                    session,
+                },
+            )
         },
     );
     let derived = match derived {
@@ -127,13 +136,15 @@ struct Related<'a> {
     endpoint: &'a Endpoint,
     selector: &'a Selector,
     name: &'a str,
+    session: &'a mut Session,
 }
 
 impl Conversation for Related<'_> {
     type Answer = Option<Derived>;
 
     fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
-        let served = catalogue(client, self.endpoint, self.selector)?;
+        let session = self.session;
+        let served = catalogue(session, client, self.endpoint, self.selector)?;
         let resource = dynamic::resolve_for(self.selector, &served, Verb::Get)
             .cloned()
             .map_err(|unresolved| query::unresolved_failure(&unresolved, self.selector, &served))?;
@@ -173,7 +184,14 @@ impl Conversation for Related<'_> {
             freshness,
         };
         stated(&mut derived);
-        two_sided(client, self.endpoint, &served, &scope, &mut derived)?;
+        two_sided(
+            session,
+            client,
+            self.endpoint,
+            &served,
+            &scope,
+            &mut derived,
+        )?;
         Ok(Some(derived))
     }
 }
@@ -234,6 +252,7 @@ fn is(object: &Object, group: &str, kind: &str) -> bool {
 
 /// The edges that need a second object read, each recording its own gap where it could not.
 fn two_sided<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
     served: &Discovery,
@@ -242,12 +261,15 @@ fn two_sided<S: ByteStream>(
 ) -> Result<(), WireError> {
     if is(derived.source.object(), "", "Service") {
         // §26.1: the Service's selector against the labels of the Pods in its own namespace.
-        if let Some(pods) = collection(client, endpoint, served, scope, "", "Pod", derived)? {
+        if let Some(pods) =
+            collection(session, client, endpoint, served, scope, "", "Pod", derived)?
+        {
             let edges = Graph::selects(derived.source.object(), &pods);
             derived.edges.extend(edges);
         }
         // §26.2: the slices that carry the standard service-name label.
         if let Some(slices) = collection(
+            session,
             client,
             endpoint,
             served,
@@ -263,7 +285,9 @@ fn two_sided<S: ByteStream>(
     if let Some((.., group, child)) = CHILDREN_OF
         .iter()
         .find(|(owner_group, owner_kind, ..)| is(derived.source.object(), owner_group, owner_kind))
-        && let Some(children) = collection(client, endpoint, served, scope, group, child, derived)?
+        && let Some(children) = collection(
+            session, client, endpoint, served, scope, group, child, derived,
+        )?
     {
         let edges = Workload::owns(derived.source.object(), &children);
         derived.edges.extend(edges);
@@ -278,6 +302,7 @@ fn two_sided<S: ByteStream>(
 /// short. The rule that wanted the objects is then not evaluated at all, which is ADR-0007's
 /// position: an unevaluated selector says so rather than returning the subset it could evaluate.
 fn collection<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
     served: &Discovery,
@@ -286,7 +311,7 @@ fn collection<S: ByteStream>(
     kind: &str,
     derived: &mut Derived,
 ) -> Result<Option<Vec<Object>>, WireError> {
-    let Some(resource) = serving(client, endpoint, served, group, kind)? else {
+    let Some(resource) = serving(session, client, endpoint, served, group, kind)? else {
         derived
             .coverage
             .record(Gap::new(scope.clone(), CoverageOutcome::TypeNotServed));
@@ -341,6 +366,7 @@ fn collection<S: ByteStream>(
 /// object's relationships, and a cluster without EndpointSlices has no `represented-by` edges to
 /// report — what it must not do is report that as "none", which is why the caller records a gap.
 fn serving<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
     served: &Discovery,
@@ -351,7 +377,7 @@ fn serving<S: ByteStream>(
         return Ok(None);
     };
     let group_version = query::group_version_of(group, version);
-    let discovery = query::resource_list(client, endpoint, &group_version)?;
+    let discovery = query::resource_list(session, client, endpoint, &group_version)?;
     Ok(discovery.by_kind(&group_version, kind).cloned())
 }
 
@@ -361,6 +387,7 @@ fn serving<S: ByteStream>(
 /// a compile-time assumption about which one. Narrowed where the query narrowed it, which is what
 /// keeps §35.8's ambiguity answerable rather than resolved by an arbitrary type priority.
 fn catalogue<S: ByteStream>(
+    session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
     selector: &Selector,
@@ -369,12 +396,17 @@ fn catalogue<S: ByteStream>(
     // be asked for, and a builder answers only once it is built — so the same two documents are
     // parsed into a snapshot that decides the search space and again into the one the resources
     // join. `query::read` does the same for the same reason.
-    let core = query::document(client, endpoint, "/api")?;
-    let groups = query::document(client, endpoint, "/apis")?;
+    let core = query::document(session, client, endpoint, "/api")?;
+    let groups = query::document(session, client, endpoint, "/apis")?;
     let served = versions(&core, &groups)?.build();
     let mut builder = versions(&core, &groups)?;
     for group_version in search_space(&served, selector) {
-        let list = query::document(client, endpoint, &query::resource_list_path(&group_version))?;
+        let list = query::document(
+            session,
+            client,
+            endpoint,
+            &query::resource_list_path(&group_version),
+        )?;
         builder = builder.resources(&list).map_err(|error| {
             failure(
                 UNAVAILABLE_CODE,

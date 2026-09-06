@@ -954,3 +954,104 @@ async fn should_answer_a_context_the_same_way_whatever_ran_before_it() {
     plugin.shutdown(ShutdownReason::Unload).await;
     fixture.discard();
 }
+
+/// How many times `cluster` was asked for `path`.
+fn asked_for(cluster: &Cluster, path: &str) -> usize {
+    cluster
+        .heads()
+        .iter()
+        .filter(|head| {
+            head.split_whitespace()
+                .nth(1)
+                .is_some_and(|target| target.split('?').next() == Some(path))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn should_hold_one_session_per_context_and_nothing_between_two() {
+    // §6.5 with a session in the picture, which is the case this file was written to fail on.
+    // Until now nothing was shared between two queries, so nothing *could* cross over; the
+    // package now keeps discovery, the published schemas, the cluster fingerprint and the watch
+    // registry across invocations, and every one of those is a thing that crosses if it is keyed
+    // on the wrong noun.
+    //
+    // Three queries — alpha, beta, alpha — and the questions the servers were asked are the
+    // evidence. Alpha's second query costs it no discovery, so a session exists; beta's first
+    // query costs it a full discovery even though alpha had just paid for one, so the session is
+    // alpha's rather than the package's.
+    let fixture = Fixture::build();
+    let plugin = fixture.loaded().await;
+
+    for context in ["alpha", "beta", "alpha"] {
+        let (events, result) = plugin
+            .query("k8s-pod", fixture.context(context))
+            .await
+            .expect("the query starts")
+            .collect()
+            .await;
+        assert_eq!(
+            result.status,
+            InvokeStatus::Completed,
+            "`{context}`: {:?}",
+            result.error
+        );
+        assert_eq!(records(&events).len(), 1, "`{context}` holds one pod");
+    }
+
+    for (name, cluster, pods) in [("alpha", &fixture.alpha, 2), ("beta", &fixture.beta, 1)] {
+        assert_eq!(
+            asked_for(cluster, "/api"),
+            1,
+            "{name} was asked what it serves once, however many queries it answered — the \
+             session is keyed on the provider instance and survives the invocation (§6.3, §50.2)"
+        );
+        assert_eq!(
+            asked_for(cluster, "/api/v1"),
+            1,
+            "{name}'s resource list likewise"
+        );
+        assert_eq!(
+            asked_for(
+                cluster,
+                &format!("/api/v1/namespaces/{}/pods", cluster.namespace)
+            ),
+            pods,
+            "{name}'s objects are read every time it is asked, because a session caches what a \
+             cluster is and never what is in it"
+        );
+    }
+
+    // The discovery beta paid for is beta's: alpha's session did not answer it, and alpha's
+    // session was not filled by it. The strongest form of that here is that beta was asked at
+    // all — a shared, wrongly-keyed cache would have answered beta from alpha's snapshot, and
+    // beta's server would show no discovery request whatsoever.
+    assert!(
+        asked_for(&fixture.beta, "/api") == 1 && asked_for(&fixture.beta, "/apis") == 1,
+        "beta discovered its own cluster rather than inheriting alpha's snapshot (§6.5)"
+    );
+
+    // §8.1 and §6.5's credential prohibition, now that something *does* live across a call: the
+    // credential is not one of the things that does. Every request alpha's server saw carries
+    // alpha's own token, including the ones from the second query, which proves the credential
+    // was resolved again from the kubeconfig rather than taken from a session.
+    for (name, cluster, token, other) in [
+        ("alpha", &fixture.alpha, "alpha-token", "beta-token"),
+        ("beta", &fixture.beta, "beta-token", "alpha-token"),
+    ] {
+        for head in cluster.heads() {
+            assert!(
+                head.contains(&format!("Authorization: Bearer {token}")),
+                "{name} saw a request with no credential of its own on it, so something is \
+                 answering from state instead of from the operator's configuration: {head}"
+            );
+            assert!(
+                !head.contains(other),
+                "{name} saw the other context's credential: {head}"
+            );
+        }
+    }
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    fixture.discard();
+}

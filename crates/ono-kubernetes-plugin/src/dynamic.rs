@@ -287,6 +287,23 @@ impl Typing {
         }
     }
 
+    /// The typing a session already holds for this kind (§12.4).
+    ///
+    /// The cached counterpart of [`Self::of`]: the parse happened once, and what the session
+    /// remembers is the result rather than the document, so a second query on the same kind
+    /// re-reads neither. An absent schema round-trips through here unchanged, which is what
+    /// keeps §12.3's "the server publishes none" from being asked of the server twice.
+    #[must_use]
+    pub fn from_schema(schema: Schema) -> Self {
+        Self { schema }
+    }
+
+    /// The schema underneath, for a session that has to remember it (§12.4).
+    #[must_use]
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     /// Where the typing came from, as the record reports it.
     #[must_use]
     pub fn source(&self) -> SchemaSource {
@@ -360,12 +377,14 @@ pub struct Content {
 
 /// The object's content, typed as far as the projection types it.
 ///
-/// **Metadata is excluded from `precision` and `untyped` deliberately.** This package projects
-/// `metadata` itself, from §14's common projection, into the record's own named fields — so a
-/// schema that says nothing about `metadata` has left no gap in what is reported, and counting
-/// it as one would make every resource on every server read as undescribed. What the aggregate
-/// measures is what the aggregate is about: the fields whose meaning only the resource's own
-/// schema could supply.
+/// **Metadata is excluded from `precision`, `untyped` and `other` deliberately.** This package
+/// projects `metadata` itself, from §14's common projection, into the record's own named fields —
+/// all twelve of §14.1's, annotations, finalizers, owner references and field managers included —
+/// so a schema that says nothing about `metadata` has left no gap in what is reported, and
+/// counting it as one would make every resource on every server read as undescribed. Letting it
+/// through into `other` as well would report one fact twice, under two names and at two
+/// precisions. What the aggregate measures is what the aggregate is about: the fields whose
+/// meaning only the resource's own schema could supply.
 #[must_use]
 pub fn content(projection: &Projection, native: &Json) -> Content {
     let is_content = |intent: Intent| {

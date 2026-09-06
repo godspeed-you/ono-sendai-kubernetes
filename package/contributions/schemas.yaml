@@ -97,12 +97,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       phase:
         type: string
         nullable: true
@@ -143,10 +173,40 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole — this is where topology and instance type live.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: Whether deletion was accepted and has not completed.
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       ready:
         type: string
         nullable: true
@@ -214,12 +274,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole — what a Service selector matches on.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed. A pod held by a finalizer stays
           here indefinitely, and is not deleted (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       phase:
         type: string
         nullable: true
@@ -285,10 +375,40 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: Whether deletion was accepted and has not completed.
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       desired_replicas:
         type: int
         nullable: true
@@ -376,12 +496,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       desired_replicas:
         type: int
         nullable: true
@@ -467,12 +617,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       desired_replicas:
         type: int
         nullable: true
@@ -574,12 +754,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       desired_scheduled:
         type: int
         nullable: true
@@ -674,12 +884,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       service_type:
         type: string
         nullable: true
@@ -766,12 +1006,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       address_type:
         type: string
         nullable: true
@@ -859,12 +1129,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       ingress_class:
         type: string
         nullable: true
@@ -943,12 +1243,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       completions:
         type: int
         nullable: true
@@ -1065,12 +1395,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       schedule:
         type: string
         nullable: true
@@ -1151,12 +1511,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       keys:
         type: list<string>
         nullable: true
@@ -1218,10 +1608,40 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Labels are not payload.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: Whether deletion was accepted and has not completed.
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       secret_type:
         type: string
         nullable: true
@@ -1283,12 +1703,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       secrets:
         type: list<string>
         nullable: true
@@ -1354,12 +1804,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       phase:
         type: string
         nullable: true
@@ -1438,12 +1918,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       phase:
         type: string
         nullable: true
@@ -1526,12 +2036,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       provisioner:
         type: string
         nullable: true
@@ -1613,12 +2153,42 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: >-
           Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
           present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       pod_selector:
         type: map
         nullable: true
@@ -1691,10 +2261,40 @@ schemas:
         type: map
         nullable: true
         doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
       terminating:
         type: bool
         required: true
         doc: Whether deletion was accepted and has not completed (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
       api_group:
         type: string
         required: true
@@ -1918,6 +2518,126 @@ schemas:
           rather than null where there is none.
     default_view:
       columns: [name, relation, target_name, evidence_class, evidence, asserted]
+
+  # One observed change, and one period that was not observed (§19, §39.3, §41.4, Gate F).
+  #
+  # The hard requirement of §19 is not that changes are delivered; it is that a *gap* in the
+  # observation is impossible to miss. §4 invariant 14 forbids stitching pre-gap and post-gap
+  # events into one history, and a stream of changes with nothing in it to mark the break would be
+  # exactly that stitching. So `gap` is one of the five words `change` takes, and every record
+  # carries the observation period it belongs to.
+  - id: io.github.godspeed-you.kubernetes.change/1
+    name: KubernetesChange
+    summary: One observed change in a watched collection, or one period that was not observed at all.
+    identity: [resource, segment, change, uid, resource_version]
+    fields:
+      change:
+        type: enum
+        values: [listed, added, modified, deleted, gap]
+        required: true
+        doc: >-
+          What this record reports. `listed` is an object that was in the collection when
+          observation began — a starting state rather than a change (§19.1). `added`, `modified`
+          and `deleted` are §19.3's classes verbatim. `gap` is a period this provider could not
+          observe, which is a fact about time rather than about an object, and its object fields
+          are therefore all null.
+      resource:
+        type: string
+        required: true
+        doc: >-
+          The REST collection being observed, as `group/version/resource` — a GVR and never a
+          GVK (§13.1).
+      scope:
+        type: string
+        required: true
+        doc: 'What was asked about: one namespace, every namespace, or cluster scope (§9.4).'
+      segment:
+        type: int
+        required: true
+        doc: >-
+          Which unbroken period of observation this record belongs to, counting from one.
+          Everything before a `410 Gone` is segment 1 and everything after it is segment 2, so
+          two segments are two histories and the space between them is the gap (§19.4, §39.3).
+      continuous:
+        type: bool
+        required: true
+        doc: >-
+          Whether observation has been unbroken from the acquisition to this record. The one-bit
+          form of `segment`, for a reader who filters rather than groups. False from the first
+          gap onward, and never reset.
+      sync_state:
+        type: string
+        required: true
+        doc: >-
+          What a live view may honestly show right now (§41.4) — `syncing`, `live`,
+          `reconnecting`, `gap detected` or `denied`. `live` is the only one of the five that
+          entitles anybody to read an absence as an absence (§20.3).
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          The *object's* `metadata.uid`, which is what makes two observations about one lifetime
+          (§16.1). Null for a gap. A change has no identity of its own.
+      name:
+        type: string
+        nullable: true
+        doc: '`metadata.name` of the object the change is about.'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`, null for a cluster-scoped object and for a gap (§9.2).'
+      api_version:
+        type: string
+        nullable: true
+        doc: '`apiVersion` of the object.'
+      kind:
+        type: string
+        nullable: true
+        doc: '`kind` of the object.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion` of the object as this observation saw it, as the opaque
+          string the server sent (§14.3). Never sorted as a timeline, and never compared across
+          resources — it is what makes two observations of one object distinguishable and
+          nothing more.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp` of the object.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels` of the object, whole.'
+      terminating:
+        type: bool
+        nullable: true
+        doc: >-
+          Whether the object carries a deletion timestamp. Nullable here where every object
+          schema makes it required, because a change record may be about no object at all.
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what a `deleted` event does *not* mean while any of
+          them are still there.
+      gap_reason:
+        type: enum
+        values: [watch_expired_410, watch_denied, restarted_without_checkpoint]
+        nullable: true
+        doc: >-
+          Why continuity broke, in Appendix D.4's vocabulary. Null on every record but the one
+          that reports a break.
+      gap_detail:
+        type: string
+        nullable: true
+        doc: >-
+          The break with both of its edges — the last version observed before it and the version
+          observation resumed at, once it did. A closed gap is still a gap: closing it says
+          observation continues, never that the unobserved period was filled in (§19.4).
+    default_view:
+      columns: [change, segment, continuous, kind, name, resource_version, gap_reason]
 
   - id: io.github.godspeed-you.kubernetes.cluster/1
     name: KubernetesCluster

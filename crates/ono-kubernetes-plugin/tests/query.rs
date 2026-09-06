@@ -216,6 +216,11 @@ struct RecordedCluster {
     /// selector deliberately excludes. Layered over `tier_one` rather than replacing it, and off
     /// by default so that giving the Pod an owner cannot change what the projection tests prove.
     relations: bool,
+    /// Which watch script this server plays, where it serves a watch at all (§19).
+    watch: Watching,
+    /// How many times the Pod collection has been listed, so that a re-acquisition after a gap
+    /// answers with the state the cluster reached while nobody was observing it (§19.4 step 4).
+    lists: Arc<std::sync::atomic::AtomicUsize>,
     /// The TLS identity this server presents, where it speaks HTTPS at all. `None` is the plain
     /// HTTP/1.1 an API server behind `kubectl proxy` speaks.
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -234,7 +239,126 @@ impl std::fmt::Debug for RecordedCluster {
     }
 }
 
+/// Which watch script a recorded server plays.
+///
+/// Two scripts rather than one, because the case §19 is really about is not the one where events
+/// arrive. `Expiry` is Gate F: a `410` that arrives as an ERROR frame *inside* a `200 OK` stream,
+/// which is how a real expiry arrives and which an implementation that classifies HTTP codes
+/// never sees.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Watching {
+    /// The server offers no watch script; the collection is only ever listed.
+    #[default]
+    NotOffered,
+    /// One arrival and one change, and then the response ends.
+    Changes,
+    /// One change, and then `410 Gone` as an ERROR frame in a successful stream (§19.4).
+    Expiry,
+}
+
+/// One Pod as the watch fixtures use it: a name, a lifetime and a version, and nothing else.
+fn watched_pod(name: &str, uid: &str, resource_version: &str) -> Json {
+    json!({
+        "metadata": {
+            "name": name,
+            "namespace": "default",
+            "uid": uid,
+            "resourceVersion": resource_version,
+            "creationTimestamp": "2026-09-03T08:00:00Z",
+        },
+        "spec": {"containers": [{"name": "app"}]},
+        "status": {"phase": "Running"},
+    })
+}
+
+/// One object as a watch frame, with the newline that ends it.
+///
+/// The object carries its own `apiVersion` and `kind`, as a watch frame's does: a frame is not a
+/// list item, so there is no envelope above it to take them from.
+fn frame(class: &str, object: &Json) -> String {
+    format!(
+        "{}\n",
+        json!({"type": class, "object": standalone(object.clone(), "v1", "Pod")})
+    )
+}
+
+/// A chunked `200 OK`, framed the way a real watch response is.
+///
+/// Chunked on purpose: HTTP's framing and the newline framing of a watch body are unrelated, and
+/// a fixture that delivered one frame per chunk would never exercise the decoder that holds a
+/// frame split across two of them.
+fn chunked(frames: &[String]) -> Vec<u8> {
+    let mut wire = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+    );
+    for frame in frames {
+        wire.push_str(&format!("{:x}\r\n{frame}\r\n", frame.len()));
+    }
+    wire.push_str("0\r\n\r\n");
+    wire.into_bytes()
+}
+
+/// What the recorded server sends down an open watch.
+fn watch_body(cluster: &RecordedCluster) -> Vec<u8> {
+    let expired = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+        "message": "too old resource version: 9100 (9400)",
+        "reason": "Expired", "code": 410,
+    });
+    match cluster.watch {
+        Watching::NotOffered => not_found("a watch"),
+        Watching::Changes => chunked(&[
+            frame("ADDED", &watched_pod("two", "u-2", "4002")),
+            frame("MODIFIED", &watched_pod("one", "u-1", "4003")),
+        ]),
+        // The `410` arrives *inside* a stream the server opened with `200 OK`, which is the case
+        // §19.4 is about and the one a fixture answering `410 Gone` as a status code would miss.
+        // The ERROR frame's payload is a `Status` rather than an object, so it goes in as it
+        // stands rather than through `frame`, which dresses an object for a mutation frame.
+        Watching::Expiry => chunked(&[
+            frame("MODIFIED", &watched_pod("one", "u-1", "4003")),
+            format!("{}\n", json!({"type": "ERROR", "object": expired})),
+        ]),
+    }
+}
+
+/// The Pod collection as the watch fixtures list it, which is not the same set twice.
+///
+/// The second listing is what a re-acquisition after a gap sees: `one` has moved on and `three`
+/// has appeared, and nobody observed either happening. That is the whole point of §19.4 — the
+/// state after the break is *inferred from a snapshot* rather than reached by observed changes.
+fn watch_listing(cluster: &RecordedCluster) -> Json {
+    let seen = cluster
+        .lists
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if seen == 0 {
+        return json!({
+            "kind": "PodList", "apiVersion": "v1",
+            "metadata": {"resourceVersion": "9100"},
+            "items": [watched_pod("one", "u-1", "4001")],
+        });
+    }
+    json!({
+        "kind": "PodList", "apiVersion": "v1",
+        "metadata": {"resourceVersion": "9200"},
+        "items": [
+            watched_pod("one", "u-1", "4003"),
+            watched_pod("three", "u-3", "4004"),
+        ],
+    })
+}
+
 impl RecordedCluster {
+    /// A server that serves a watch on its Pod collection, playing `script`.
+    fn watching(script: Watching) -> Arc<Self> {
+        Arc::new(Self {
+            pods: 1,
+            apps: true,
+            watch: script,
+            ..Self::default()
+        })
+    }
+
     fn with_pods(pods: usize) -> Arc<Self> {
         Arc::new(Self {
             pods,
@@ -406,6 +530,31 @@ fn pod(index: usize) -> Json {
                 "resourceVersion": "4711",
                 "creationTimestamp": "2026-09-01T09:00:00Z",
                 "labels": {"app": "api"},
+                // The four §14.1 fields the boundary used to drop. They are here rather than in
+                // a fixture of their own because they are ordinary metadata: every object may
+                // carry them, and a projection that reads them only for a special case is the
+                // projection §14.1 forbids.
+                "annotations": {
+                    "kubectl.kubernetes.io/last-applied-configuration": "{}",
+                    "deployment.kubernetes.io/revision": "4",
+                },
+                "finalizers": ["example.com/drain-connections"],
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "api-7d9f",
+                    "uid": "a1a1a1a1-0000-0000-0000-000000000001",
+                    "controller": true, "blockOwnerDeletion": true,
+                }],
+                "managedFields": [
+                    {"manager": "kube-controller-manager", "operation": "Update",
+                     "apiVersion": "v1", "fieldsType": "FieldsV1",
+                     "fieldsV1": {"f:metadata": {"f:labels": {}}}},
+                    {"manager": "kubelet", "operation": "Update", "subresource": "status",
+                     "apiVersion": "v1", "fieldsType": "FieldsV1",
+                     "fieldsV1": {"f:status": {"f:phase": {}}}},
+                    {"manager": "kubelet", "operation": "Update",
+                     "apiVersion": "v1", "fieldsType": "FieldsV1",
+                     "fieldsV1": {"f:metadata": {}}},
+                ],
             },
             "spec": {
                 "nodeName": "node-a",
@@ -453,6 +602,19 @@ fn custom_object(index: usize) -> Json {
             "resourceVersion": "5100",
             "creationTimestamp": "2026-09-02T07:00:00Z",
             "labels": {"line": "north"},
+            // The same four fields on a kind nothing compiled in. §14's projection is common to
+            // every Kubernetes object, and a CRD is a normal resource (§33.1).
+            "annotations": {"menagerie.example/calibrated-by": "bench-3"},
+            "finalizers": ["menagerie.example/release-bench"],
+            "ownerReferences": [{
+                "apiVersion": "menagerie.example/v1", "kind": "Bench", "name": "bench-3",
+                "uid": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                "controller": false, "blockOwnerDeletion": false,
+            }],
+            "managedFields": [
+                {"manager": "menagerie-operator", "operation": "Apply", "apiVersion":
+                 "menagerie.example/v1", "fieldsType": "FieldsV1", "fieldsV1": {"f:spec": {}}},
+            ],
         },
         "spec": {
             "teeth": 24,
@@ -1153,7 +1315,15 @@ fn collection(kind: &str, api_version: &str, items: &[Json]) -> Json {
 
 fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let pods = cluster.pods;
+    // Read before the query string is dropped, because `watch=true` is the whole difference
+    // between reading a collection and observing it, and it lives nowhere else in the request.
+    if cluster.watch != Watching::NotOffered && path.contains("watch=true") {
+        return watch_body(cluster);
+    }
     let path = path.split('?').next().unwrap_or(path);
+    if cluster.watch != Watching::NotOffered && path == "/api/v1/namespaces/default/pods" {
+        return response(&watch_listing(cluster).to_string());
+    }
     // §60.5's refusal, before any of the layered fixtures answer for the same path: a derivation
     // that reads the Pod collection must be able to meet it too, and not only a Pod query.
     if cluster.deny_pod_list && path == "/api/v1/namespaces/default/pods" {
@@ -3778,5 +3948,607 @@ async fn should_read_ownership_downwards_and_say_the_reversal_is_a_derivation() 
             "the direction is this provider's derivation, and it says so: {supporting:?}"
         );
     }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- §14.1's last four fields, at the boundary --------------------------------------------------
+
+/// One entry of a `map` field, as text.
+fn map_entry(record: &RecordValue, field: &str, key: &str) -> Option<String> {
+    match record.get(field) {
+        Some(Value::Map(map)) => match map.get(key) {
+            Some(Value::String(text)) => Some(text.to_string()),
+            Some(Value::Null) | None => None,
+            other => panic!("`{field}.{key}` is text, and it is {other:?}"),
+        },
+        Some(Value::Null) | None => None,
+        other => panic!("`{field}` is a map or null, and it is {other:?}"),
+    }
+}
+
+/// The `owner_references` list, each reference as its own map.
+fn owner_references(record: &RecordValue) -> Vec<std::sync::Arc<ono_value::MapValue>> {
+    match record.get("owner_references") {
+        Some(Value::List(entries)) => entries
+            .iter()
+            .map(|entry| match entry {
+                Value::Map(map) => std::sync::Arc::clone(map),
+                other => panic!("an owner reference is a map, and it is {other:?}"),
+            })
+            .collect(),
+        other => panic!("`owner_references` is a list, and it is {other:?}"),
+    }
+}
+
+/// Asserts everything §14.5, §14.6 and §14.7 require of one record's metadata.
+///
+/// Written once and used for a curated kind and a discovered one, because that is the claim:
+/// §14's projection is common to every Kubernetes object, so a CRD nobody compiled in reaches its
+/// annotations by exactly the route a Pod does (§33.1, Gate A).
+fn assert_metadata_projection(
+    record: &RecordValue,
+    annotation: (&str, &str),
+    finalizer: &str,
+    owner: (&str, &str, bool),
+    managers: &[&str],
+) {
+    // §14.5: a structured map, not a rendered string. The assertion is on one key, because
+    // reading one key is what a map is for and what text would take away.
+    assert_eq!(
+        map_entry(record, "annotations", annotation.0).as_deref(),
+        Some(annotation.1),
+        "§14.5: annotations are a map with keys in it, not one flattened string"
+    );
+    // §14.6: what is holding the deletion open, beside the fact that one was accepted.
+    assert_eq!(
+        list_of(record, "finalizers").as_deref(),
+        Some([finalizer.to_owned()].as_slice()),
+        "§14.6: the finalizers are what decide whether a deletion completes (Gate H)"
+    );
+
+    let references = owner_references(record);
+    assert_eq!(references.len(), 1, "the object states one owner");
+    let reference = &references[0];
+    assert_eq!(
+        reference.get("kind"),
+        Some(&Value::String(owner.0.into())),
+        "an owner reference keeps its kind"
+    );
+    assert_eq!(
+        reference.get("name"),
+        Some(&Value::String(owner.1.into())),
+        "and its name"
+    );
+    assert_eq!(
+        reference.get("controller"),
+        Some(&Value::Bool(owner.2)),
+        "and the flag §24.3 turns into the difference between `owned-by` and `controlled-by` — \
+         a list of names would drop it"
+    );
+    assert!(
+        matches!(reference.get("block_owner_deletion"), Some(Value::Bool(_))),
+        "and the flag that decides whether the owner's deletion waits"
+    );
+
+    // §14.7: the managers, summarised. The same manager twice is one manager, and the order is
+    // this package's rather than the server's, so two reads of one object agree.
+    let managers_seen = list_of(record, "field_managers");
+    assert_eq!(
+        managers_seen.as_deref(),
+        Some(
+            managers
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+                .as_slice()
+        ),
+        "§14.7: `managedFields` is summarised as its distinct managers, sorted"
+    );
+}
+
+#[tokio::test]
+async fn should_carry_every_metadata_field_the_projection_names_for_a_curated_kind() {
+    // §14.1 names twelve fields and says a provider MUST NOT pretend the data is absent. Four of
+    // them — annotations, finalizers, ownerReferences, managedFields — were projected by the
+    // domain layer, declared by no schema, and therefore reached nobody. This is the boundary
+    // half of §14.5, §14.6 and §14.7, and it is the last requirement K1 waited on.
+    let plugin = loaded(2).await;
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let records = records(&events);
+    let held = &records[0];
+    held.validate()
+        .expect("the record conforms to the schema it carries");
+
+    assert_metadata_projection(
+        held,
+        ("deployment.kubernetes.io/revision", "4"),
+        "example.com/drain-connections",
+        ("ReplicaSet", "api-7d9f", true),
+        &["kube-controller-manager", "kubelet"],
+    );
+
+    // And the other side of every one of them: an object that states none of the four says so
+    // with null rather than with an empty list nobody wrote (§4, unknown is null).
+    let bare = &records[1];
+    assert_eq!(bare.get("annotations"), Some(&Value::Null));
+    assert_eq!(bare.get("finalizers"), Some(&Value::Null));
+    assert_eq!(bare.get("owner_references"), Some(&Value::Null));
+    assert_eq!(bare.get("field_managers"), Some(&Value::Null));
+    assert_eq!(
+        bare.get("terminating"),
+        Some(&Value::Bool(true)),
+        "a deletion accepted with no finalizer holding it is still terminating, and the two \
+         fields are what tell those cases apart (Gate H)"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_carry_every_metadata_field_the_projection_names_for_a_kind_nobody_compiled_in() {
+    // The same four fields on a kind whose group, name and fields exist only in this file. §14's
+    // projection is common to every object, so there is one route rather than two — which is the
+    // difference between §33.1's "CRDs are normal resources" and the typed-builtins-raw-JSON
+    // split it calls non-conformant.
+    let plugin = loaded_with_custom_resources().await;
+    let (events, result) = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[
+                ("kind", json!("Sprocket")),
+                ("group", json!("menagerie.example")),
+            ]),
+        )
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let records = records(&events);
+    let held = &records[0];
+    held.validate()
+        .expect("the record conforms to the schema it carries");
+
+    assert_metadata_projection(
+        held,
+        ("menagerie.example/calibrated-by", "bench-3"),
+        "menagerie.example/release-bench",
+        ("Bench", "bench-3", false),
+        &["menagerie-operator"],
+    );
+
+    // The dynamic record's `other` map is still content rather than metadata: §14's twelve
+    // fields are named fields of the schema, and repeating them inside the payload would report
+    // one fact twice under two names with two precisions.
+    assert!(
+        !matches!(held.get("other"), Some(Value::Map(map)) if map.get("metadata").is_some()),
+        "metadata is projected, never dropped into the untyped payload"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- §6.3's session, and §50.2's cost ------------------------------------------------------------
+
+/// How many times the recorded server was asked for `path`.
+///
+/// Counted off the request heads the server kept, so it is what travelled rather than what the
+/// package believes it sent. §50.2 is a claim about round trips, and the only honest way to check
+/// one is to count them at the far end.
+fn asked_for(cluster: &RecordedCluster, path: &str) -> usize {
+    cluster
+        .heads()
+        .iter()
+        .filter(|head| {
+            head.split_whitespace()
+                .nth(1)
+                .is_some_and(|target| target.split('?').next() == Some(path))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn should_not_run_discovery_again_for_a_second_query_in_one_session() {
+    // §50.2 and §6.3. Before the session was wired, every invocation re-resolved the endpoint,
+    // re-ran discovery over `/api` and `/apis` and re-read the resource list — three round trips
+    // before the first object, every time, against a cluster whose answer to all three had not
+    // changed since the previous query a second earlier.
+    //
+    // The assertion is on what the *server* saw, because that is what §50.2 is about. Two things
+    // have to hold at once and the second is the one that makes this a session rather than a
+    // cache of answers: discovery is paid for once, and the list is paid for every time — a query
+    // that stopped asking the cluster what is in a collection would be answering from a snapshot
+    // nobody is keeping true (§20.3).
+    let cluster = RecordedCluster::with_pods(2);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    let (_, first) = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the first query starts")
+        .collect()
+        .await;
+    assert_eq!(first.status, InvokeStatus::Completed, "{:?}", first.error);
+    let discovery_after_one = (
+        asked_for(&cluster, "/api"),
+        asked_for(&cluster, "/apis"),
+        asked_for(&cluster, "/api/v1"),
+    );
+    assert_eq!(
+        discovery_after_one,
+        (1, 1, 1),
+        "the first query pays for discovery, because nothing knew this cluster yet"
+    );
+
+    let (events, second) = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the second query starts in the same session")
+        .collect()
+        .await;
+    assert_eq!(second.status, InvokeStatus::Completed, "{:?}", second.error);
+    assert_eq!(
+        (
+            asked_for(&cluster, "/api"),
+            asked_for(&cluster, "/apis"),
+            asked_for(&cluster, "/api/v1"),
+        ),
+        discovery_after_one,
+        "the second query in one session asks the cluster nothing about its own API surface \
+         again — that is §6.3's session and §50.2's requirement"
+    );
+    assert_eq!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods"),
+        2,
+        "and the objects are read every time: a session caches what the cluster *is*, never \
+         what is in it, because nothing here is keeping that true (§20.3)"
+    );
+    assert_eq!(
+        records(&events).len(),
+        2,
+        "the second answer is a whole answer rather than a cheaper one"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_read_the_published_schema_once_for_two_queries_of_one_kind() {
+    // §12.4's cache, which had no reader at all: the OpenAPI v3 document for a group-version is
+    // the most expensive thing this provider fetches, and it was fetched per query. §50.3 asks
+    // for lazy schema loading; a schema loaded lazily and then thrown away is the same cost with
+    // a better name.
+    let cluster = RecordedCluster::with_custom_resources();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let options = at_cluster(&[
+        ("kind", json!("Sprocket")),
+        ("group", json!("menagerie.example")),
+    ]);
+
+    for attempt in 0..2 {
+        let (events, result) = plugin
+            .query("k8s-resource", options.clone())
+            .await
+            .expect("the query starts")
+            .collect()
+            .await;
+        assert_eq!(
+            result.status,
+            InvokeStatus::Completed,
+            "attempt {attempt}: {:?}",
+            result.error
+        );
+        let records = records(&events);
+        assert_eq!(
+            text_of(&records[0], "schema_source").as_deref(),
+            Some("openapi-v3"),
+            "attempt {attempt}: the typing is the cluster's own, cached or not — a cache that \
+             degraded the answer would be worse than no cache"
+        );
+        assert!(
+            matches!(
+                records[0].get("spec"),
+                Some(Value::Map(spec)) if matches!(spec.get("renewAt"), Some(Value::Timestamp(_))),
+            ),
+            "attempt {attempt}: and it still turns a described `date-time` into an instant"
+        );
+    }
+    assert_eq!(
+        asked_for(&cluster, "/openapi/v3/apis/menagerie.example/v1"),
+        1,
+        "the published schema is read once per session and remembered by GVK (§12.4)"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- §19's watch, and the gap it is really about ------------------------------------------------
+
+/// The `change`, `segment` and `continuous` of every record, in the order they were emitted.
+///
+/// The order matters here and nowhere else in this file: §19.4's prohibition is about a *history*,
+/// and a history is a sequence.
+fn observed(records: &[Arc<RecordValue>]) -> Vec<(String, i128, bool)> {
+    records
+        .iter()
+        .map(|record| {
+            let Some(Value::Int(segment)) = record.get("segment") else {
+                panic!("every change record states its observation period");
+            };
+            let Some(Value::Bool(continuous)) = record.get("continuous") else {
+                panic!("every change record says whether observation has been unbroken");
+            };
+            (
+                text_of(record, "change").expect("every change record states what it is"),
+                *segment,
+                *continuous,
+            )
+        })
+        .collect()
+}
+
+async fn watched(script: Watching) -> (Arc<RecordedCluster>, ono_kuang_supervisor::LoadedPlugin) {
+    let cluster = RecordedCluster::watching(script);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    (cluster, plugin)
+}
+
+#[tokio::test]
+async fn should_deliver_what_changed_while_it_was_watching() {
+    // §19.1 end to end, and the first time anything in this package opens a watch at all. The
+    // sequence is the requirement: the collection is listed, the watch opens from the version
+    // *that listing* returned, and the changes that follow are the ones since it. A watch opened
+    // without that version would start at the present moment and silently lose everything that
+    // already existed, which is why the acquisition is not an optimisation.
+    let (cluster, plugin) = watched(Watching::Changes).await;
+    let (events, result) = plugin
+        .query("k8s-change", at_cluster(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+
+    let records = records(&events);
+    for record in &records {
+        record
+            .validate()
+            .expect("the record conforms to the schema it carries");
+    }
+    assert_eq!(
+        observed(&records),
+        vec![
+            ("listed".to_owned(), 1, true),
+            ("added".to_owned(), 1, true),
+            ("modified".to_owned(), 1, true),
+        ],
+        "the state at acquisition, then the changes since it, all in one unbroken period"
+    );
+    assert_eq!(
+        text_of(&records[1], "name").as_deref(),
+        Some("two"),
+        "an arrival is the object that arrived"
+    );
+    assert_eq!(
+        text_of(&records[2], "resource_version").as_deref(),
+        Some("4003"),
+        "and a change carries the version it was observed at (§14.3), never a timestamp"
+    );
+    for record in &records {
+        assert_eq!(
+            text_of(record, "sync_state").as_deref(),
+            Some("live"),
+            "the stream listed and is watching, which is the one state that entitles anybody to \
+             read an absence as an absence (§20.3, §41.4)"
+        );
+        assert_eq!(
+            text_of(record, "resource").as_deref(),
+            Some("/v1/pods"),
+            "the record names the REST collection — a GVR, never a GVK (§13.1)"
+        );
+    }
+
+    // §20.2's third origin, which nothing could produce before a watch existed: an object that
+    // was listed was read, and an object that arrived on the stream was pushed.
+    let origin = |record: &RecordValue| record.provenance().source().unwrap_or_default().to_owned();
+    assert!(
+        origin(&records[0]).contains("origin=direct-read"),
+        "the acquisition is a read: {}",
+        origin(&records[0])
+    );
+    assert!(
+        origin(&records[1]).contains("origin=watch-event"),
+        "and what the server pushed says so, because a reader decides how much to trust a record \
+         by how it was come by: {}",
+        origin(&records[1])
+    );
+
+    assert_eq!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods"),
+        2,
+        "one listing and one watch, both on the collection endpoint — the watch is the same \
+         path with `watch=true` on it"
+    );
+    assert!(
+        cluster
+            .heads()
+            .iter()
+            .any(|head| head.contains("watch=true") && head.contains("resourceVersion=9100")),
+        "the watch opened from the version the listing returned, never from `now` (§19.1): {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_make_a_watch_gap_visible_rather_than_stitching_a_history_over_it() {
+    // Gate F (§62.6) and §4 invariant 14, end to end for the first time. A `410 Gone` arrives as
+    // an ERROR frame inside a stream the server opened with `200 OK` — which is how an expiry
+    // actually arrives, and what an implementation that classifies HTTP status codes never sees.
+    //
+    // What must reach a user is not that the watch failed. It is that a *period* was not
+    // observed: `one` moved from version 4003 and `three` appeared, and nobody saw either happen.
+    // The records on the far side of the gap are therefore a second history rather than the
+    // continuation of the first, and three fields say so — the word `gap`, the segment, and
+    // `continuous`.
+    let (cluster, plugin) = watched(Watching::Expiry).await;
+    let (events, result) = plugin
+        .query("k8s-change", at_cluster(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+
+    let records = records(&events);
+    let sequence = observed(&records);
+    assert_eq!(
+        sequence,
+        vec![
+            ("listed".to_owned(), 1, true),
+            ("modified".to_owned(), 1, true),
+            ("gap".to_owned(), 1, false),
+            ("listed".to_owned(), 2, false),
+            ("listed".to_owned(), 2, false),
+        ],
+        "the break is a record of its own, and everything after it is a second period: {sequence:?}"
+    );
+
+    let gap = &records[2];
+    assert_eq!(
+        text_of(gap, "gap_reason").as_deref(),
+        Some("watch_expired_410"),
+        "the reason is the one Appendix D.4 names, and it is not a generic failure"
+    );
+    assert!(
+        text_of(gap, "gap_detail").is_some_and(|detail| detail.contains("gap after 4003")),
+        "the gap names the last version observed before it — 4003, the change that was seen, and \
+         not 9100, the version the watch opened at — so a reader can place an observation on the \
+         correct side of the break: {:?}",
+        text_of(gap, "gap_detail")
+    );
+    assert_eq!(
+        gap.get("uid"),
+        Some(&Value::Null),
+        "a gap is an observation of a period, so there is no object in it and null says so"
+    );
+    assert_eq!(
+        text_of(gap, "sync_state").as_deref(),
+        Some("gap detected"),
+        "and while the gap stands, the cache may not answer absence at all (§20.3)"
+    );
+
+    // The prohibition itself: nothing before the break and nothing after it shares a period, so
+    // no consumer can concatenate them into an ordered history that reads as complete.
+    let before: Vec<_> = sequence
+        .iter()
+        .take(3)
+        .map(|(.., segment, _)| segment)
+        .collect();
+    let after: Vec<_> = sequence
+        .iter()
+        .skip(3)
+        .map(|(.., segment, _)| segment)
+        .collect();
+    assert!(
+        before.iter().all(|segment| **segment == 1) && after.iter().all(|segment| **segment == 2),
+        "pre-gap and post-gap observation are two histories (§4 invariant 14): {sequence:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .skip(3)
+            .all(|record| record.get("continuous") == Some(&Value::Bool(false))),
+        "and `continuous` never goes back to true: closing a gap says observation continues, \
+         never that the unobserved period was filled in (§19.4)"
+    );
+    // The state on the far side was inferred from a snapshot rather than reached by observed
+    // changes, and this is what that costs: `three` exists and nothing ever reported it arriving.
+    let names: Vec<_> = records
+        .iter()
+        .skip(3)
+        .filter_map(|record| text_of(record, "name"))
+        .collect();
+    assert_eq!(names, vec!["one".to_owned(), "three".to_owned()]);
+    assert!(
+        !records.iter().any(
+            |record| text_of(record, "change").as_deref() == Some("added")
+                && text_of(record, "name").as_deref() == Some("three")
+        ),
+        "`three` is never reported as having arrived, because nobody observed it arriving"
+    );
+
+    assert_eq!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods"),
+        3,
+        "one acquisition, one watch, and one re-acquisition on the far side of the gap (§19.4)"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_answer_a_watched_object_from_the_cache_and_say_that_is_where_it_came_from() {
+    // §20.2's `MUST`, which had only one origin to report until a watch existed. A read has to
+    // state whether it is a direct observation or something a cache remembered, and the whole
+    // point of stating it is that a reader decides how much to trust the record by it.
+    //
+    // Two queries in one session: the first opens a watch, which leaves the session with a cache
+    // a watch is keeping true; the second asks for one object by name and is answered from it.
+    // The proof is at the far end of the wire — the object endpoint is never asked at all.
+    let (cluster, plugin) = watched(Watching::Changes).await;
+    let (_, acquired) = plugin
+        .query("k8s-change", at_cluster(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the watch starts")
+        .collect()
+        .await;
+    assert_eq!(
+        acquired.status,
+        InvokeStatus::Completed,
+        "{:?}",
+        acquired.error
+    );
+
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[("name", json!("two"))]))
+        .await
+        .expect("the read starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let held = records(&events);
+    assert_eq!(held.len(), 1, "one object was asked for and one arrived");
+    assert_eq!(text_of(&held[0], "uid").as_deref(), Some("u-2"));
+
+    let source = held[0].provenance().source().unwrap_or_default().to_owned();
+    assert!(
+        source.contains("origin=cache"),
+        "a record a cache remembered says so, and never that it is a direct read (§20.2): \
+         {source}"
+    );
+    assert_eq!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods/two"),
+        0,
+        "the object endpoint was never asked, which is what makes this a cache rather than a \
+         faster way of spelling the same request (§50.2)"
+    );
+
+    // And the answer is only ever given while the watch entitles it to be: an object that is not
+    // in a live cache is read from the cluster rather than reported as absent (§20.3, §4
+    // invariant 13). `absent-one` is in neither, so this is the refusal rather than the hit.
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[("name", json!("nowhere"))]))
+        .await
+        .expect("the read starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert!(
+        records(&events).is_empty(),
+        "a synchronised cache that is being watched may report an absence as an absence, and \
+         this is the one state in which it may (§20.3)"
+    );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

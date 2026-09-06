@@ -43,6 +43,7 @@ use serde_json::json;
 use crate::broker::BrokeredStream;
 use crate::contributions::Target;
 use crate::query::{Endpoint, UNAVAILABLE, UNAVAILABLE_CODE, failure};
+use crate::sessions::Sessions;
 
 /// The group that serves `SelfSubjectReview` (§8.6).
 ///
@@ -56,7 +57,11 @@ const KUBE_SYSTEM: &str = "kube-system";
 
 /// Answers the cluster diagnostic for one provider instance.
 #[must_use]
-pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> InvocationOutcome {
+pub fn answer(
+    target: &'static Target,
+    sessions: &Sessions,
+    ctx: &mut Ctx<'_>,
+) -> InvocationOutcome {
     let schema = match target.schema_contribution().to_schema() {
         Ok(schema) => Arc::new(schema),
         Err(error) => return InvocationOutcome::Failed(error.into()),
@@ -73,6 +78,20 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> InvocationOutcome {
         Ok(diagnostic) => diagnostic,
         Err(error) => return InvocationOutcome::Failed(error),
     };
+    // §10.4's `MUST`, at the one moment this package has the evidence for it. A fingerprint is
+    // gathered here and nowhere else — a read of `kube-system` and of the server origin is a cost
+    // §50.2 will not pay on every list — so this is where a cluster replaced behind an unchanged
+    // configuration name is noticed, and where everything the session cached about the previous
+    // one is discarded. Doing it as the evidence arrives rather than as a cache is read is what
+    // makes §10.4's "before anything is presented as current" mean something.
+    sessions.with(
+        &endpoint.session_key(),
+        || endpoint.start_session(),
+        |session| {
+            session.observed_fingerprint(diagnostic.fingerprint().clone());
+            session.identified(diagnostic.identity().clone());
+        },
+    );
     let value = match record(target, &schema, &diagnostic) {
         Ok(value) => value,
         Err(error) => {

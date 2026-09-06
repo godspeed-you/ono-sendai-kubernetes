@@ -17,6 +17,7 @@
 //! translated into a boolean, because `True`, `False` and `Unknown` are three states and a
 //! boolean has two.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ono_provider_kubernetes::condition;
@@ -210,6 +211,79 @@ pub fn dynamic_record(
     Ok(Value::Record(Arc::new(builder.build())))
 }
 
+/// One observed change, as everything the record says about it (§19, §39.3, §41.4).
+///
+/// A struct rather than eight arguments because the fields are read together and their meanings
+/// only make sense together: the word without the segment is a change nobody can place in time,
+/// and the segment without `continuous` is a number nobody can act on.
+pub struct Change<'a> {
+    /// `listed`, `added`, `modified`, `deleted` or `gap`.
+    pub class: &'a str,
+    /// The REST collection being observed (§13.1), which is a GVR and never a GVK.
+    pub resource: &'a str,
+    /// What was asked about: one namespace, every namespace, or cluster scope (§9.4).
+    pub scope: &'a str,
+    /// Which unbroken period of observation this record belongs to, counting from one.
+    pub segment: usize,
+    /// Whether observation has been unbroken from the acquisition to this record (§19.4).
+    pub continuous: bool,
+    /// What a live view may honestly show right now (§41.4).
+    pub sync_state: &'a str,
+    /// Why continuity broke, for the record that reports a break.
+    pub gap_reason: Option<&'a str>,
+    /// The break with both of its edges, in the shape Appendix D.4 sketches.
+    pub gap_detail: Option<String>,
+    /// The object it happened to, absent for a gap — which is about a period, not an object.
+    pub object: Option<&'a Guarded>,
+}
+
+/// Builds one record of one observed change, or of one period that was not observed (Gate F).
+///
+/// The object half goes through the same projection every other schema's does, so `uid`,
+/// `name` and `resource_version` mean here what they mean everywhere (ADR-0013). What this adds
+/// is the continuity, and it is required on every record rather than attached to the ones that
+/// broke: a reader who has to look for a marker is a reader who will miss it, and §4 invariant 14
+/// is precisely about the history that reads as continuous while a piece of it was never seen.
+///
+/// # Errors
+///
+/// [`ErrorValue`] when a field name is not one the schema declares — a drift between this crate's
+/// table and the schema built from it, never something a cluster can cause.
+pub fn change_record(
+    target: &Target,
+    schema: &Arc<Schema>,
+    change: &Change<'_>,
+    freshness: &Freshness,
+) -> Result<Value, ErrorValue> {
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    for field in target.fields {
+        let value = match field.name {
+            // --- what happened, and where ---
+            "change" => Value::String(change.class.into()),
+            "resource" => Value::String(change.resource.into()),
+            "scope" => Value::String(change.scope.into()),
+
+            // --- which observation period, and what reaching it cost ---
+            "segment" => integer(i64::try_from(change.segment).unwrap_or(i64::MAX)),
+            "continuous" => Value::Bool(change.continuous),
+            "sync_state" => Value::String(change.sync_state.into()),
+
+            // --- what was not observed ---
+            "gap_reason" => text(change.gap_reason),
+            "gap_detail" => text(change.gap_detail.as_deref()),
+
+            // --- the object, where the observation was about one. Null everywhere for a gap,
+            // because a period nobody observed is exactly what is unknown about it. ---
+            name => match change.object {
+                Some(guarded) => field_value(name, guarded),
+                None => Value::Null,
+            },
+        };
+        builder = builder.set(field.name, value)?;
+    }
+    Ok(Value::Record(Arc::new(builder.build())))
+}
+
 /// The record's provenance, carrying what §17.1 requires a read to state about itself.
 ///
 /// §17.1 asks a read to carry six things. `resourceVersion` is a field of the record, because it
@@ -326,8 +400,22 @@ fn field_value(name: &str, guarded: &Guarded) -> Value {
         "kind" => Value::String(object.gvk().kind().into()),
         "resource_version" => text(object.resource_version()),
         "created" => timestamp(object.creation_timestamp()),
-        "labels" => labels(object),
+        "labels" => string_map(object.labels()),
+        // §14.5: a structured map beside `labels`, never one flattened string. The two carry
+        // different intents — a label selects, an annotation records — and both are read one key
+        // at a time, which text does not allow.
+        "annotations" => string_map(object.annotations()),
         "terminating" => Value::Bool(object.is_terminating()),
+        // §14.6, the other half of `terminating`. A deletion that was accepted completes when the
+        // last finalizer clears, so an object that is terminating and holds finalizers is being
+        // held by something namable rather than being slow (Gate H).
+        "finalizers" => string_list(object.finalizers()),
+        // §14.6's references, whole. The `controller` and `blockOwnerDeletion` flags are what
+        // make an owner reference more than a name, and a list of names would drop both.
+        "owner_references" => owner_references(object),
+        // §14.7's summary rather than `managedFields` itself: the distinct managers, sorted. The
+        // structure stays reachable through `k8s-resource`, which projects the whole object.
+        "field_managers" => string_list(object.field_managers()),
 
         // --- Namespace, and Pod ---
         "phase" => text(field_str(object, "/status/phase")),
@@ -516,16 +604,15 @@ fn timestamp(value: Option<&str>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// `metadata.labels`, or null where the object carries none.
+/// A `metadata` string map — `labels` or `annotations` — or null where the object carries none.
 ///
-/// Empty and absent are folded together here, and only here: the API server omits `labels`
+/// Empty and absent are folded together here, and only here: the API server omits the key
 /// entirely for an object with none, so there is no observation that distinguishes them.
-fn labels(object: &Object) -> Value {
-    if object.labels().is_empty() {
+fn string_map(entries: &BTreeMap<String, String>) -> Value {
+    if entries.is_empty() {
         return Value::Null;
     }
-    let map: MapValue = object
-        .labels()
+    let map: MapValue = entries
         .iter()
         .map(|(key, value)| {
             (
@@ -535,6 +622,58 @@ fn labels(object: &Object) -> Value {
         })
         .collect();
     Value::Map(Arc::new(map))
+}
+
+/// A list of strings the projection already holds, or null where it holds none.
+///
+/// Null for the same reason [`string_map`] is: the API server omits `finalizers` and
+/// `managedFields` entirely rather than sending them empty, so "none" and "not stated" are one
+/// observation and inventing an empty list would be the more precise of two readings.
+fn string_list(entries: &[String]) -> Value {
+    if entries.is_empty() {
+        return Value::Null;
+    }
+    Value::List(
+        entries
+            .iter()
+            .map(|entry| Value::String(entry.as_str().into()))
+            .collect(),
+    )
+}
+
+/// `metadata.ownerReferences`, each whole, or null where the object states none (§14.6).
+///
+/// A map per reference rather than a name per reference. `controller` is what §24.3 turns into
+/// the difference between `owned-by` and `controlled-by`, and `blockOwnerDeletion` is what
+/// decides whether the owner's deletion waits — neither survives a list of names. The keys are
+/// spelled as this package spells every other field, so `api_version` here means what
+/// `api_version` means on the record itself (ADR-0013).
+fn owner_references(object: &Object) -> Value {
+    let references = object.owner_references();
+    if references.is_empty() {
+        return Value::Null;
+    }
+    Value::List(
+        references
+            .iter()
+            .map(|owner| {
+                let mut map = MapValue::new();
+                map.insert(
+                    Arc::from("api_version"),
+                    Value::String(owner.api_version().into()),
+                );
+                map.insert(Arc::from("kind"), Value::String(owner.kind().into()));
+                map.insert(Arc::from("name"), Value::String(owner.name().into()));
+                map.insert(Arc::from("uid"), Value::String(owner.uid().into()));
+                map.insert(Arc::from("controller"), Value::Bool(owner.is_controller()));
+                map.insert(
+                    Arc::from("block_owner_deletion"),
+                    Value::Bool(owner.blocks_owner_deletion()),
+                );
+                Value::Map(Arc::new(map))
+            })
+            .collect(),
+    )
 }
 
 /// A string field by JSON pointer.

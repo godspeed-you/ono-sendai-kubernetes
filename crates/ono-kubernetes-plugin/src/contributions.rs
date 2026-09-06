@@ -92,6 +92,14 @@ pub enum Reads {
     /// one, which is what makes a CRD's owner references reachable without recompiling anything
     /// (§33.1). ADR-0014.
     Relations,
+    /// What changed in one collection while this provider was watching it (§19, Gate F).
+    ///
+    /// Not a collection either, and for a reason worth stating: a listing answers "what is
+    /// there", a watch answers "what happened", and the second question has an answer the first
+    /// cannot carry — the periods nobody observed. Which collection is watched is the *query's*
+    /// answer, resolved against discovery exactly as [`Self::Discovered`] resolves one, so a CRD
+    /// invented after this table was written is watchable without recompiling anything.
+    Changes,
 }
 
 impl Reads {
@@ -100,7 +108,7 @@ impl Reads {
     pub const fn group(self) -> Option<&'static str> {
         match self {
             Self::Kind { group, .. } => Some(group),
-            Self::Discovered | Self::Instance | Self::Relations => None,
+            Self::Discovered | Self::Instance | Self::Relations | Self::Changes => None,
         }
     }
 
@@ -109,7 +117,7 @@ impl Reads {
     pub const fn kind(self) -> Option<&'static str> {
         match self {
             Self::Kind { kind, .. } => Some(kind),
-            Self::Discovered | Self::Instance | Self::Relations => None,
+            Self::Discovered | Self::Instance | Self::Relations | Self::Changes => None,
         }
     }
 }
@@ -171,6 +179,7 @@ impl Target {
     pub const fn identity_fields(&self) -> &'static [&'static str] {
         match self.reads {
             Reads::Relations => EDGE_IDENTITY,
+            Reads::Changes => CHANGE_IDENTITY,
             Reads::Kind { .. } | Reads::Discovered | Reads::Instance => OBJECT_IDENTITY,
         }
     }
@@ -219,6 +228,26 @@ const EDGE_IDENTITY: &[&str] = &["uid", "relation", "target", "evidence_path"];
 /// Repeated per schema rather than shared through composition because `SchemaContribution` has no
 /// notion of a mixin: the wire shape is a flat field list, and a reader of one schema should see
 /// all of it in one place.
+///
+/// **All twelve of §14.1's fields, and the last four were the ones that reached nobody.**
+/// `object.rs` has projected `annotations`, `finalizers`, `ownerReferences` and `managedFields`
+/// since it was written; no schema declared them, so §14.1's "MUST NOT pretend the data is
+/// absent" was breached at the boundary rather than in the library. Four things decided their
+/// shape:
+///
+/// - `annotations` is a **map**, beside `labels`, because §14.5 requires both to stay structured.
+///   Flattening either into text loses the one thing an operator does with them, which is to read
+///   one key;
+/// - `finalizers` is a list beside `terminating`, because §14.6 is one question asked twice: a
+///   deletion was accepted, and something is holding it. Gate H's premise is that a user can see
+///   the second half, and until now only the first half was reachable;
+/// - `owner_references` is a `list<map>` rather than a list of names, because §14.6 keeps the
+///   `controller` and `blockOwnerDeletion` flags meaningful and a name on its own answers
+///   neither. It is *also* reachable as `k8s-relation` edges — the same fact as a relationship
+///   with its evidence, where this is the same fact as metadata of the object (ADR-0013);
+/// - `field_managers` is §14.7's **summary** rather than `managedFields` itself. The full record
+///   is large, is rarely what anyone wants, and the specification asks for a summary by default;
+///   the structure stays reachable through `k8s-resource`'s projection of the whole object.
 const fn common(namespaced: bool) -> &'static [Field] {
     if namespaced {
         NAMESPACED_METADATA
@@ -235,7 +264,11 @@ const CLUSTER_METADATA: &[Field] = &[
     Field::nullable("resource_version", "string"),
     Field::nullable("created", "timestamp"),
     Field::nullable("labels", "map"),
+    Field::nullable("annotations", "map"),
     Field::required("terminating", "bool"),
+    Field::nullable("finalizers", "list<string>"),
+    Field::nullable("owner_references", "list<map>"),
+    Field::nullable("field_managers", "list<string>"),
 ];
 
 const NAMESPACED_METADATA: &[Field] = &[
@@ -247,7 +280,11 @@ const NAMESPACED_METADATA: &[Field] = &[
     Field::nullable("resource_version", "string"),
     Field::nullable("created", "timestamp"),
     Field::nullable("labels", "map"),
+    Field::nullable("annotations", "map"),
     Field::required("terminating", "bool"),
+    Field::nullable("finalizers", "list<string>"),
+    Field::nullable("owner_references", "list<map>"),
+    Field::nullable("field_managers", "list<string>"),
 ];
 
 /// Concatenates the shared metadata with a kind's own fields, at compile time.
@@ -271,9 +308,9 @@ const fn with_metadata<const N: usize>(namespaced: bool, own: &'static [Field]) 
     fields
 }
 
-const NAMESPACE_FIELDS: [Field; 9] = with_metadata(false, &[Field::nullable("phase", "string")]);
+const NAMESPACE_FIELDS: [Field; 13] = with_metadata(false, &[Field::nullable("phase", "string")]);
 
-const NODE_FIELDS: [Field; 12] = with_metadata(
+const NODE_FIELDS: [Field; 16] = with_metadata(
     false,
     &[
         Field::nullable("ready", "string"),
@@ -283,7 +320,7 @@ const NODE_FIELDS: [Field; 12] = with_metadata(
     ],
 );
 
-const POD_FIELDS: [Field; 14] = with_metadata(
+const POD_FIELDS: [Field; 18] = with_metadata(
     true,
     &[
         Field::nullable("phase", "string"),
@@ -294,7 +331,7 @@ const POD_FIELDS: [Field; 14] = with_metadata(
     ],
 );
 
-const DEPLOYMENT_FIELDS: [Field; 16] = with_metadata(
+const DEPLOYMENT_FIELDS: [Field; 20] = with_metadata(
     true,
     &[
         Field::nullable("desired_replicas", "int"),
@@ -320,7 +357,7 @@ const DEPLOYMENT_FIELDS: [Field; 16] = with_metadata(
 /// statement rather than a gap.
 const RECONCILIATION: Field = Field::required("reconciliation", "map");
 
-const REPLICASET_FIELDS: [Field; 17] = with_metadata(
+const REPLICASET_FIELDS: [Field; 21] = with_metadata(
     true,
     &[
         Field::nullable("desired_replicas", "int"),
@@ -334,7 +371,7 @@ const REPLICASET_FIELDS: [Field; 17] = with_metadata(
     ],
 );
 
-const STATEFULSET_FIELDS: [Field; 19] = with_metadata(
+const STATEFULSET_FIELDS: [Field; 23] = with_metadata(
     true,
     &[
         Field::nullable("desired_replicas", "int"),
@@ -350,7 +387,7 @@ const STATEFULSET_FIELDS: [Field; 19] = with_metadata(
     ],
 );
 
-const DAEMONSET_FIELDS: [Field; 18] = with_metadata(
+const DAEMONSET_FIELDS: [Field; 22] = with_metadata(
     true,
     &[
         Field::nullable("desired_scheduled", "int"),
@@ -365,7 +402,7 @@ const DAEMONSET_FIELDS: [Field; 18] = with_metadata(
     ],
 );
 
-const SERVICE_FIELDS: [Field; 16] = with_metadata(
+const SERVICE_FIELDS: [Field; 20] = with_metadata(
     true,
     &[
         Field::nullable("service_type", "string"),
@@ -378,7 +415,7 @@ const SERVICE_FIELDS: [Field; 16] = with_metadata(
     ],
 );
 
-const ENDPOINTSLICE_FIELDS: [Field; 16] = with_metadata(
+const ENDPOINTSLICE_FIELDS: [Field; 20] = with_metadata(
     true,
     &[
         Field::nullable("address_type", "string"),
@@ -391,7 +428,7 @@ const ENDPOINTSLICE_FIELDS: [Field; 16] = with_metadata(
     ],
 );
 
-const INGRESS_FIELDS: [Field; 14] = with_metadata(
+const INGRESS_FIELDS: [Field; 18] = with_metadata(
     true,
     &[
         Field::nullable("ingress_class", "string"),
@@ -402,7 +439,7 @@ const INGRESS_FIELDS: [Field; 14] = with_metadata(
     ],
 );
 
-const JOB_FIELDS: [Field; 21] = with_metadata(
+const JOB_FIELDS: [Field; 25] = with_metadata(
     true,
     &[
         Field::nullable("completions", "int"),
@@ -420,7 +457,7 @@ const JOB_FIELDS: [Field; 21] = with_metadata(
     ],
 );
 
-const CRONJOB_FIELDS: [Field; 15] = with_metadata(
+const CRONJOB_FIELDS: [Field; 19] = with_metadata(
     true,
     &[
         Field::nullable("schedule", "string"),
@@ -432,7 +469,7 @@ const CRONJOB_FIELDS: [Field; 15] = with_metadata(
     ],
 );
 
-const CONFIGMAP_FIELDS: [Field; 12] = with_metadata(
+const CONFIGMAP_FIELDS: [Field; 16] = with_metadata(
     true,
     &[
         Field::nullable("keys", "list<string>"),
@@ -441,7 +478,7 @@ const CONFIGMAP_FIELDS: [Field; 12] = with_metadata(
     ],
 );
 
-const SECRET_FIELDS: [Field; 11] = with_metadata(
+const SECRET_FIELDS: [Field; 15] = with_metadata(
     true,
     &[
         Field::nullable("secret_type", "string"),
@@ -449,7 +486,7 @@ const SECRET_FIELDS: [Field; 11] = with_metadata(
     ],
 );
 
-const SERVICEACCOUNT_FIELDS: [Field; 12] = with_metadata(
+const SERVICEACCOUNT_FIELDS: [Field; 16] = with_metadata(
     true,
     &[
         Field::nullable("secrets", "list<string>"),
@@ -458,7 +495,7 @@ const SERVICEACCOUNT_FIELDS: [Field; 12] = with_metadata(
     ],
 );
 
-const PERSISTENTVOLUMECLAIM_FIELDS: [Field; 16] = with_metadata(
+const PERSISTENTVOLUMECLAIM_FIELDS: [Field; 20] = with_metadata(
     true,
     &[
         Field::nullable("phase", "string"),
@@ -471,7 +508,7 @@ const PERSISTENTVOLUMECLAIM_FIELDS: [Field; 16] = with_metadata(
     ],
 );
 
-const PERSISTENTVOLUME_FIELDS: [Field; 16] = with_metadata(
+const PERSISTENTVOLUME_FIELDS: [Field; 20] = with_metadata(
     false,
     &[
         Field::nullable("phase", "string"),
@@ -485,7 +522,7 @@ const PERSISTENTVOLUME_FIELDS: [Field; 16] = with_metadata(
     ],
 );
 
-const STORAGECLASS_FIELDS: [Field; 14] = with_metadata(
+const STORAGECLASS_FIELDS: [Field; 18] = with_metadata(
     false,
     &[
         Field::nullable("provisioner", "string"),
@@ -497,7 +534,7 @@ const STORAGECLASS_FIELDS: [Field; 14] = with_metadata(
     ],
 );
 
-const NETWORKPOLICY_FIELDS: [Field; 12] = with_metadata(
+const NETWORKPOLICY_FIELDS: [Field; 16] = with_metadata(
     true,
     &[
         Field::nullable("pod_selector", "map"),
@@ -527,7 +564,7 @@ const NETWORKPOLICY_FIELDS: [Field; 12] = with_metadata(
 ///   state are different claims (§4 invariant 8, §33.6), plus `untyped`, the pointers of the
 ///   fields no schema described. Those fields are *in* `spec`, `status` and `other` all the
 ///   same: §12.5 preserves them, and `untyped` says which they are rather than hiding them.
-const RESOURCE_FIELDS: [Field; 18] = with_metadata(
+const RESOURCE_FIELDS: [Field; 22] = with_metadata(
     true,
     &[
         Field::required("api_group", "string"),
@@ -594,6 +631,83 @@ const RELATION_FIELDS: &[Field] = &[
     Field::nullable("evidence_path", "string"),
     Field::required("asserted", "bool"),
     Field::required("supporting", "list<string>"),
+];
+
+/// What makes two observations the same observed change (§19.3, §39.3).
+///
+/// A change has no `metadata.uid` of its own — the UID on the record is the *object's*, and one
+/// object changing three times is three observations. Five components, and each is there because
+/// dropping it merges observations that are not the same one:
+///
+/// - `resource` — two collections may both hold an object of one UID at one version only if one
+///   of them is an aggregated view of the other, and this provider watches neither on the other's
+///   behalf;
+/// - `segment` — the unbroken period this observation belongs to. §19.4 forbids stitching pre-gap
+///   and post-gap observation into one history, and a key without the segment would let a
+///   re-listed object collapse onto the one observed before the break;
+/// - `change` — an object listed at acquisition and the same object modified a moment later are
+///   two facts, and the word is what separates them;
+/// - `uid` — which object. Null for a gap, which is about a period rather than about an object;
+/// - `resource_version` — which version of it. Null for a gap, and for a `DELETED` whose final
+///   object the server sent without one.
+const CHANGE_IDENTITY: &[&str] = &["resource", "segment", "change", "uid", "resource_version"];
+
+/// One observed change, and the continuity it belongs to (§19, §39.3, §41.4, Gate F).
+///
+/// **A record per observation, and a record for the periods with no observations in them.** The
+/// hard requirement of §19 is not that changes are delivered; it is that a *gap* in the
+/// observation is impossible to miss. §4 invariant 14 and §19.4 say pre-gap and post-gap events
+/// are never stitched into a continuous history, and a stream of change records with nothing to
+/// mark the break would be exactly that stitching — the reader would see an ordered sequence and
+/// have no way to know that a period of it was never observed.
+///
+/// So three fields carry the continuity, and they are required rather than optional because a
+/// record that could omit them would let a consumer forget to ask:
+///
+/// - `segment` counts the unbroken periods. Everything before a `410` is segment 1 and everything
+///   after it is segment 2, so `group by segment` is the honest reading and `sort by time` is not
+///   available as an accident;
+/// - `continuous` is false from the first gap onward — the one-bit form of the same fact, for the
+///   reader who filters rather than groups;
+/// - `sync_state` is §41.4's word for what a live view may honestly show right now: syncing,
+///   live, reconnecting, gap detected, denied. `live` is the only one of the five that entitles
+///   anybody to read an absence as an absence (§20.3).
+///
+/// `change` has five members and `gap` is one of them. A gap could have been a second schema; it
+/// is not, because a consumer that has to join two streams to notice a break is a consumer that
+/// will forget to, and because a gap *is* an observation — of a period, rather than of an object.
+/// Its object fields are null for the same reason: null is unknown, and what happened in that
+/// period is precisely what is unknown.
+///
+/// The object fields are §14's, spelled as every other schema here spells them (ADR-0013). They
+/// are all nullable, which the object schemas' are not: this record may be about no object at
+/// all.
+const CHANGE_FIELDS: &[Field] = &[
+    // --- what happened, and to what ---
+    Field::required("change", "enum<listed|added|modified|deleted|gap>"),
+    Field::required("resource", "string"),
+    Field::required("scope", "string"),
+    // --- which observation period, and whether anything was missed reaching it ---
+    Field::required("segment", "int"),
+    Field::required("continuous", "bool"),
+    Field::required("sync_state", "string"),
+    // --- the object it happened to, where there was one ---
+    Field::nullable("uid", "string"),
+    Field::nullable("name", "string"),
+    Field::nullable("namespace", "string"),
+    Field::nullable("api_version", "string"),
+    Field::nullable("kind", "string"),
+    Field::nullable("resource_version", "string"),
+    Field::nullable("created", "timestamp"),
+    Field::nullable("labels", "map"),
+    Field::nullable("terminating", "bool"),
+    Field::nullable("finalizers", "list<string>"),
+    // --- what was not observed, for the one class that is about a period ---
+    Field::nullable(
+        "gap_reason",
+        "enum<watch_expired_410|watch_denied|restarted_without_checkpoint>",
+    ),
+    Field::nullable("gap_detail", "string"),
 ];
 
 /// What `k8s-cluster` answers: which cluster this is, whether it answers, and who the provider is
@@ -951,6 +1065,21 @@ pub static TARGETS: &[Target] = &[
                        match. An edge has no `metadata.uid` of its own.",
         reads: Reads::Relations,
         fields: RELATION_FIELDS,
+    },
+    Target {
+        name: "k8s-change",
+        schema: "io.github.godspeed-you.kubernetes.change/1",
+        schema_name: "KubernetesChange",
+        schema_summary: "One observed change in a watched collection, or one period that was \
+                         not observed at all.",
+        summary: "What changed in a collection while this provider was watching it, and every \
+                  period it could not observe (specification section 19).",
+        identity_doc: "Two observations are the same change when the collection, the observation \
+                       period, the word, the object's UID and its resourceVersion all match. A \
+                       change has no `metadata.uid` of its own; the UID on the record is the \
+                       object's.",
+        reads: Reads::Changes,
+        fields: CHANGE_FIELDS,
     },
     Target {
         name: "k8s-cluster",
