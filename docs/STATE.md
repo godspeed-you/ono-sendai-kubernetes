@@ -345,64 +345,32 @@ plain HTTP. What it establishes is that the route exists and the contracts hold 
 
 ## In progress
 
-Everything this section carried on the morning of 2026-09-06 is done and committed: Gate J's
-concurrency, the spatial half, the log `follow`, the `SelfSubjectAccessReview` preflight, K5's two
-requirements, the three K2 relationship gaps, and the ephemeral-cluster harness.
+Nothing. The audit of 2026-09-06 and the coverage re-derivation of 2026-09-07 both closed
+completely: all five unmet `MUST`s that audit found are met, and every gap that map named as
+closable is closed. **All fourteen acceptance gates of §62 are met**, with the live half run
+against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`.
 
-**One thing is written and not committed**: `scripts/cluster.sh`, `tests/live_cluster.rs`,
-`docs/contracts/expected_test_skips.yaml`, the `skips` step in `scripts/gate.sh`, the Kubernetes
-matrix in `.github/workflows/ci.yml` and `ADR-0034`. The gate was green over exactly that tree
-(726 tests, `skips: 17 declared, 17 announced`) and both cluster legs ran — `kindest/node:v1.35.8`
-and `v1.37.0`, 11 live tests each, with `kubectl` absent from the machine. It is uncommitted only
-because the session's shell became unusable before the commit (see *Deferred / blocked*).
+### What is left, and why each is left
 
-### What the audit of 2026-09-06 found still open
+Four things, none of them a `MUST` that is unmet, and each with a reason rather than a backlog
+position. They are the gap list in [`coverage.md`](coverage.md), in the same order.
 
-A requirement-by-requirement audit of the whole specification and of the inherited generic
-contract, taken against the tree rather than against this board. **Five unmet `MUST`s**, in the
-order their absence bites:
-
-1. **§34.2 — an unavailable aggregated API group fails the whole provider.** `query::document`
-   returns `provider.unavailable` for any non-200 on a discovery path, and `resolve_in` and
-   `relations::catalogue` propagate it with `?` while looping over every preferred group-version.
-   One `APIService` answering 503 breaks `get k8s-resource` without `--group`, `get k8s-relation`
-   and every catalogue query. This is §4 invariant 16 and generic §3.5 as well, and §34.2's second
-   sentence — coverage reports the failed group-version separately — falls out of the same change:
-   record a `Gap` on the query's `Coverage` and continue.
-2. **§57.1 — manifest-declared capability is not distinguished from session-effective capability.**
-   `Session::negotiate`/`negotiated` have no production caller and `CLUSTER_FIELDS` carries no
-   capability. Generic §26.1 says the same thing in the generic vocabulary.
-3. **§41.1 — the inherited live-view contract is not used.** `live.rs` still has no importer, so
-   `stale` is the one of §41.4's six states that reaches nobody. `ADR-0588 (core)` removed the
-   reason it could not be wired: a contributed target now declares whether its answer ends, and an
-   unbounded one becomes the stream the shell's live view is fed by. Bumping the pin and declaring
-   `k8s-change` unbounded is the first half; a view state that reaches a record is the second.
-4. **Generic §16.5 — a successful mutation invalidates nothing.** `mutations.rs` touches the
-   session only for discovery, so a watch-seeded cache keeps serving the pre-change object with
-   `origin=cache` after `set k8s-resource` succeeds. The `MUST NOT` half holds; the `MUST` half
-   needs `Session::forget_object` on the mutation path.
-5. **§11.4 — discovery refresh has no caller.** `crd_updated`, `group_version_changed` and
-   `group_withdrawn` are written and tested and nothing invokes them; only a cluster *replacement*
-   clears discovery. §33.2's five CRD-lifecycle detections are the same gap.
-
-**The `SHOULD`s worth taking, roughly in order of operational bite:** server-side label and field
-selectors are never pushed (§17.3–§17.5 — `ListOptions::label_selector` has no caller outside its
-own tests); `Coverage::may_have_more` reaches no record, so `--max_pages 1` on a ten-page
-collection looks complete (§18.4); `Client::list` buffers every page before emitting (§18.5,
-generic §12.4); `budget.rs` is still unimported, so nothing estimates breadth (§17.6), throttles
-(§49.5) or honours `Retry-After` (§49.2) even though all three are written and tested; aggregated
-Discovery is never negotiated (§11.2); NetworkPolicy has no selector-derived edge (§31.1,
-Appendix A row 19); Pod/container runtime IDs and load-balancer addresses are not exported as
-evidence (§47.3, §47.4); no plan warns that an HPA may reconcile a replica change (§54.2, §54.1);
-a Namespace deletion gets no enhanced analysis (§55.2); the action surface is one JSON-pointer
-apply rather than §43.3's seven, and it is not labelled the low-level escape hatch §43.4 asks for;
-a `--set` at `/status/...` is neither routed to the subresource nor refused (§33.6); Tier 2's
-seventeen kinds are readable dynamically and none is curated (§15.3); `release_watch` has no
-caller (§19.7); eight of Appendix B's words have no producer.
-
-**Two documents to correct:** `README.md` still says no CI job runs against any Kubernetes version,
-which `.github/workflows/ci.yml` contradicts; and `docs/coverage.md` is a snapshot at `ad03456`,
-nine commits and nine ADRs stale.
+1. **Exec credential plugins (§8.2, §8.3).** The largest thing between this provider and most real
+   clusters: an EKS, GKE or AKS kubeconfig authenticates through an `ExecCredential` plugin and
+   this package runs none, so it refuses by name rather than connecting as somebody else. It needs
+   a process-execution capability this package does not declare and the three interaction modes
+   §8.3 names. §51.6's fourth audit record waits behind it. **This is the next task.**
+2. **No relationship index and no query plan (§50.4, §17.6).** Both are `SHOULD`s or `MAY`s whose
+   `MUST`s hold vacuously. Server-side selectors now exist but no *derivation* uses one, because a
+   rule's selector is not the caller's.
+3. **§60.3 has no test, and roles reach no object record.** A Service's selection changing under a
+   watch is the one canonical scenario untested, and it is where watch and relationships would have
+   to compose. `ROLE_OVERLAY` reaches a user only on an edge, so §53.3's `find place --role
+   workload` has nothing to match.
+4. **§15.4's Tier 3 ecosystems, behind the registry ADR-0053 declined to build.** Not built because
+   it governs curated CRD knowledge and this provider curates none; inventing an ecosystem's
+   semantics would be a claim about what somebody else's controller means by its fields. The
+   decision expires when a maintainer with that expertise contributes one.
 
 ## The transport decision, and what it costs
 
