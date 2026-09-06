@@ -58,7 +58,7 @@ use ono_provider_kubernetes::transport::{
 use ono_value::Schema;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
-use crate::broker::{BrokeredStream, decode_hex};
+use crate::broker::{BrokeredStream, Lease, ReadPolicy, decode_hex};
 use crate::contributions::{Reads, Target};
 use crate::dynamic::{self, Selector, Typing, Unresolved};
 use crate::records::{dynamic_record, record};
@@ -198,6 +198,14 @@ pub(crate) trait Conversation {
     /// What the exchange comes back with.
     type Answer;
 
+    /// How the connection reads while this exchange runs.
+    ///
+    /// A request and its response tolerate silence badly and a watch tolerates it as the normal
+    /// case, so the exchange says which it is rather than the connection guessing (§19, §62.12).
+    fn read_policy(&self) -> ReadPolicy {
+        ReadPolicy::request()
+    }
+
     /// Talks to the API server over `client`.
     ///
     /// # Errors
@@ -208,15 +216,30 @@ pub(crate) trait Conversation {
 
 /// Opens the brokered connection, runs one conversation over it, and closes it.
 ///
-/// The brokered connection borrows the context for as long as it lives, so the whole conversation
-/// happens inside the block below and only its result escapes.
+/// For a handler that has nothing to emit until the exchange is over, which is every handler but
+/// the watch. [`converse_on`] is the same thing against a lease the caller already holds.
 pub(crate) fn converse<C: Conversation>(
     ctx: &mut Ctx<'_>,
     endpoint: &Endpoint,
     conversation: C,
 ) -> Result<C::Answer, WireError> {
+    let lease = Lease::new(ctx);
+    converse_on(&lease, endpoint, conversation)
+}
+
+/// Opens the brokered connection, runs one conversation over it, and closes it.
+///
+/// The connection borrows the leased context for the length of each read rather than for its own
+/// lifetime, so a conversation that holds the same lease may emit between two reads with the
+/// response body still open — which is what makes a live watch reachable at all (ADR-0023).
+pub(crate) fn converse_on<C: Conversation>(
+    lease: &Lease<'_, '_>,
+    endpoint: &Endpoint,
+    conversation: C,
+) -> Result<C::Answer, WireError> {
+    let policy = conversation.read_policy();
     let (answer, handle, open) = {
-        let stream = BrokeredStream::connect(ctx, &endpoint.host, endpoint.port)?;
+        let stream = BrokeredStream::connect(lease, &endpoint.host, endpoint.port, policy)?;
         let handle = stream.handle();
         match &endpoint.tls {
             // Plain HTTP/1.1 over the brokered bytes: what an API server reached through
@@ -245,7 +268,10 @@ pub(crate) fn converse<C: Conversation>(
     if open {
         // Only while the host still holds it: `network.close` on a handle the host has already
         // retired is a protocol violation, and the host retires one the moment the peer closes.
-        let _ = ctx.host_call(method::NETWORK_CLOSE, json!({"connection": handle}));
+        // A watch abandoned mid-body — cancelled, or at its budget — comes through here too, so
+        // the connection is given back rather than left to the end of the invocation.
+        let _ =
+            lease.with(|ctx| ctx.host_call(method::NETWORK_CLOSE, json!({"connection": handle})));
     }
     answer
 }

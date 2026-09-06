@@ -7,8 +7,10 @@
 //!
 //! ```text
 //! contributions   what the package declares: targets, schemas, what each one reads
-//! broker          the host's brokered connection, seen as a byte stream
-//! changes         one watch: acquire, observe, and say which periods were not observed
+//! broker          the host's brokered connection, seen as a byte stream, and the context lease
+//!                 that lets a handler read and emit alternately over one open connection
+//! changes         one live watch: acquire, observe until the operator stops it, and say which
+//!                 periods were not observed
 //! sessions        what a provider instance keeps between two invocations, and keyed on what
 //! query           one `provider.query`: discovery, list, redact, emit
 //! cluster         the diagnostic: which cluster, reachable, as whom, and what is unknown

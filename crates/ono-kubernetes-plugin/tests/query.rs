@@ -221,6 +221,14 @@ struct RecordedCluster {
     /// How many times the Pod collection has been listed, so that a re-acquisition after a gap
     /// answers with the state the cluster reached while nobody was observing it (§19.4 step 4).
     lists: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many watches have been opened, so that the stream on the far side of a gap can be a
+    /// different one from the stream that broke (§19.4 step 4, §19.5).
+    watches: Arc<std::sync::atomic::AtomicUsize>,
+    /// The gate a `Paced` watch waits at before it sends each frame.
+    ///
+    /// The test holds it. A frame that is not on the wire cannot have been buffered by anything,
+    /// so a record built from it proves the package emitted while the body was still open.
+    release: Arc<tokio::sync::Notify>,
     /// The TLS identity this server presents, where it speaks HTTPS at all. `None` is the plain
     /// HTTP/1.1 an API server behind `kubectl proxy` speaks.
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -241,10 +249,12 @@ impl std::fmt::Debug for RecordedCluster {
 
 /// Which watch script a recorded server plays.
 ///
-/// Two scripts rather than one, because the case §19 is really about is not the one where events
-/// arrive. `Expiry` is Gate F: a `410` that arrives as an ERROR frame *inside* a `200 OK` stream,
-/// which is how a real expiry arrives and which an implementation that classifies HTTP codes
-/// never sees.
+/// More than one, because the cases §19 is really about are not the one where events arrive and
+/// the body then ends. `Expiry` is Gate F: a `410` that arrives as an ERROR frame *inside* a
+/// `200 OK` stream, which is how a real expiry arrives and which an implementation that
+/// classifies HTTP codes never sees. The three that follow it are what a *live* watch meets: a
+/// body that never ends, frames that arrive one at a time while it is open, and an expiry with a
+/// second stream on the far side of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Watching {
     /// The server offers no watch script; the collection is only ever listed.
@@ -254,6 +264,20 @@ enum Watching {
     Changes,
     /// One change, and then `410 Gone` as an ERROR frame in a successful stream (§19.4).
     Expiry,
+    /// One arrival, and then a body that never ends — a watch as a real server holds one open.
+    ///
+    /// The terminating chunk is deliberately never sent. An implementation that has to read a
+    /// response body to its end before it can emit anything cannot answer against this server at
+    /// all, which is exactly the property being asserted.
+    Held,
+    /// A body that never ends, delivering one frame each time the test releases one.
+    ///
+    /// The release is what makes "as each change arrives" checkable rather than plausible: the
+    /// second frame does not exist on the wire until the test has already taken the record the
+    /// first one produced.
+    Paced,
+    /// An expiry, then — after the re-acquisition — a second stream that stays open (§19.4).
+    ExpiryThenLive,
 }
 
 /// One Pod as the watch fixtures use it: a name, a lifetime and a version, and nothing else.
@@ -288,14 +312,29 @@ fn frame(class: &str, object: &Json) -> String {
 /// a fixture that delivered one frame per chunk would never exercise the decoder that holds a
 /// frame split across two of them.
 fn chunked(frames: &[String]) -> Vec<u8> {
+    let mut wire = held_open(frames);
+    wire.extend_from_slice(b"0\r\n\r\n");
+    wire
+}
+
+/// The same response with no terminating chunk: a body that has not ended and will not.
+///
+/// This is what a watch actually looks like from the client's side. `chunked` above is the
+/// special case where the server decided to close, and treating it as the general one is how an
+/// implementation ends up able to answer only after the observation is over.
+fn held_open(frames: &[String]) -> Vec<u8> {
     let mut wire = String::from(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
     );
     for frame in frames {
-        wire.push_str(&format!("{:x}\r\n{frame}\r\n", frame.len()));
+        wire.push_str(&chunk_of(frame));
     }
-    wire.push_str("0\r\n\r\n");
     wire.into_bytes()
+}
+
+/// One frame as one HTTP chunk.
+fn chunk_of(frame: &str) -> String {
+    format!("{:x}\r\n{frame}\r\n", frame.len())
 }
 
 /// What the recorded server sends down an open watch.
@@ -305,12 +344,29 @@ fn watch_body(cluster: &RecordedCluster) -> Vec<u8> {
         "message": "too old resource version: 9100 (9400)",
         "reason": "Expired", "code": 410,
     });
+    let opened = cluster
+        .watches
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match cluster.watch {
         Watching::NotOffered => not_found("a watch"),
         Watching::Changes => chunked(&[
             frame("ADDED", &watched_pod("two", "u-2", "4002")),
             frame("MODIFIED", &watched_pod("one", "u-1", "4003")),
         ]),
+        // A watch that stays open, which is every healthy watch. Nothing here ever ends the body.
+        Watching::Held => held_open(&[frame("ADDED", &watched_pod("two", "u-2", "4002"))]),
+        // The head only: the frames arrive later, one per release, from the connection task.
+        Watching::Paced => held_open(&[]),
+        // The stream that broke, and then the stream that replaced it. The second one stays
+        // open and carries a change of its own, so a reader can see that observation resumed
+        // rather than merely that it stopped.
+        Watching::ExpiryThenLive if opened == 0 => chunked(&[
+            frame("MODIFIED", &watched_pod("one", "u-1", "4003")),
+            format!("{}\n", json!({"type": "ERROR", "object": expired})),
+        ]),
+        Watching::ExpiryThenLive => {
+            held_open(&[frame("ADDED", &watched_pod("four", "u-4", "4005"))])
+        }
         // The `410` arrives *inside* a stream the server opened with `200 OK`, which is the case
         // §19.4 is about and the one a fixture answering `410 Gone` as a status code would miss.
         // The ERROR frame's payload is a `Status` rather than an object, so it goes in as it
@@ -320,6 +376,14 @@ fn watch_body(cluster: &RecordedCluster) -> Vec<u8> {
             format!("{}\n", json!({"type": "ERROR", "object": expired})),
         ]),
     }
+}
+
+/// The frames a `Paced` watch delivers, one per release.
+fn paced_frames() -> Vec<String> {
+    vec![
+        frame("ADDED", &watched_pod("two", "u-2", "4002")),
+        frame("MODIFIED", &watched_pod("one", "u-1", "4003")),
+    ]
 }
 
 /// The Pod collection as the watch fixtures list it, which is not the same set twice.
@@ -1541,6 +1605,23 @@ impl HostServices for RecordedCluster {
                         heads.push(head);
                     }
                     replies.push(document(&path, &cluster));
+                    // A paced watch answers with its head here and with its frames later, each
+                    // one when the test releases it. The sender is cloned rather than moved,
+                    // because the connection goes on carrying nothing until it is closed.
+                    if cluster.watch == Watching::Paced && path.contains("watch=true") {
+                        let sender = inbound.clone();
+                        let gate = Arc::clone(&cluster.release);
+                        tokio::spawn(async move {
+                            for frame in paced_frames() {
+                                gate.notified().await;
+                                let bytes = chunk_of(&frame).into_bytes();
+                                let chunk = json!({"bytes": {"$bytes": encode_hex(&bytes)}});
+                                if sender.send(Ok(chunk)).await.is_err() {
+                                    return;
+                                }
+                            }
+                        });
+                    }
                 }
                 let outbound = match &mut session {
                     None => replies.concat(),
@@ -4302,9 +4383,15 @@ async fn should_deliver_what_changed_while_it_was_watching() {
     // *that listing* returned, and the changes that follow are the ones since it. A watch opened
     // without that version would start at the present moment and silently lose everything that
     // already existed, which is why the acquisition is not an optimisation.
+    // `max_changes` is what keeps this a *bounded* observation: without it the watch runs until
+    // the operator stops it, which is what a watch is for and what the tests below assert. The
+    // bound is the option, not the default (ADR-0023).
     let (cluster, plugin) = watched(Watching::Changes).await;
     let (events, result) = plugin
-        .query("k8s-change", at_cluster(&[("kind", json!("Pod"))]))
+        .query(
+            "k8s-change",
+            at_cluster(&[("kind", json!("Pod")), ("max_changes", json!(3))]),
+        )
         .await
         .expect("the query starts")
         .collect()
@@ -4395,7 +4482,10 @@ async fn should_make_a_watch_gap_visible_rather_than_stitching_a_history_over_it
     // `continuous`.
     let (cluster, plugin) = watched(Watching::Expiry).await;
     let (events, result) = plugin
-        .query("k8s-change", at_cluster(&[("kind", json!("Pod"))]))
+        .query(
+            "k8s-change",
+            at_cluster(&[("kind", json!("Pod")), ("max_changes", json!(5))]),
+        )
         .await
         .expect("the query starts")
         .collect()
@@ -4499,7 +4589,10 @@ async fn should_answer_a_watched_object_from_the_cache_and_say_that_is_where_it_
     // The proof is at the far end of the wire — the object endpoint is never asked at all.
     let (cluster, plugin) = watched(Watching::Changes).await;
     let (_, acquired) = plugin
-        .query("k8s-change", at_cluster(&[("kind", json!("Pod"))]))
+        .query(
+            "k8s-change",
+            at_cluster(&[("kind", json!("Pod")), ("max_changes", json!(3))]),
+        )
         .await
         .expect("the watch starts")
         .collect()
@@ -4549,6 +4642,258 @@ async fn should_answer_a_watched_object_from_the_cache_and_say_that_is_where_it_
         records(&events).is_empty(),
         "a synchronised cache that is being watched may report an absence as an absence, and \
          this is the one state in which it may (§20.3)"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- §19 and §41 again, with the stream left open --------------------------------------------
+
+/// How long a test waits for one record before it calls the watch stuck.
+///
+/// Generous, because the gate runs under load. What it is really checking is the difference
+/// between "arrives while the body is open" and "arrives when the body ends" — and against these
+/// servers the body never ends, so a package that has to read to the end waits forever.
+const SOON: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The next record of a live watch, or a failure that says the watch is not live.
+async fn next_record(
+    invocation: &mut ono_kuang_supervisor::RunningInvocation,
+    what: &str,
+) -> Arc<RecordValue> {
+    let event = tokio::time::timeout(SOON, invocation.next())
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{what}: nothing arrived while the watch body was still open — a watch that can \
+                 only answer once the response ends is not a watch (§19, §41)"
+            )
+        })
+        .unwrap_or_else(|| panic!("{what}: the stream ended instead of answering"));
+    match event {
+        StreamEvent::Value(Value::Record(record)) => record,
+        StreamEvent::Value(other) => panic!("{what}: a provider answers records, not {other:?}"),
+        StreamEvent::Failed(error) => panic!("{what}: the invocation failed: {error:?}"),
+    }
+}
+
+/// The `change`, `segment` and `continuous` of one record.
+fn observation(record: &RecordValue) -> (String, i128, bool) {
+    let Some(Value::Int(segment)) = record.get("segment") else {
+        panic!("every change record states its observation period");
+    };
+    let Some(Value::Bool(continuous)) = record.get("continuous") else {
+        panic!("every change record says whether observation has been unbroken");
+    };
+    (
+        text_of(record, "change").expect("every change record states what it is"),
+        *segment,
+        *continuous,
+    )
+}
+
+#[tokio::test]
+async fn should_emit_a_record_as_each_change_arrives_rather_than_when_the_stream_ends() {
+    // §19 and §41's live view, end to end. The recorded server opens the watch and then sends
+    // nothing: each frame goes on the wire only when this test releases it, and the terminating
+    // chunk is never sent at all. So a record can only arrive here if the package emitted it
+    // while the response body was open — which is the thing ADR-0022 §5 said the protocol did
+    // not allow, because the brokered connection held the invocation context for its whole life.
+    //
+    // The old shape does not merely emit late against this server. It cannot answer at all.
+    let (cluster, plugin) = watched(Watching::Paced).await;
+    let mut invocation = plugin
+        .query("k8s-change", at_cluster(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the watch starts");
+
+    let acquired = next_record(&mut invocation, "the acquisition").await;
+    assert_eq!(observation(&acquired), ("listed".to_owned(), 1, true));
+    assert_eq!(text_of(&acquired, "name").as_deref(), Some("one"));
+
+    // Nothing has been sent down the watch yet. This is what puts the first frame on the wire.
+    cluster.release.notify_one();
+    let arrival = next_record(&mut invocation, "the arrival").await;
+    assert_eq!(observation(&arrival), ("added".to_owned(), 1, true));
+    assert_eq!(
+        text_of(&arrival, "name").as_deref(),
+        Some("two"),
+        "the record of the frame that had just arrived, and of no other"
+    );
+    assert_eq!(
+        text_of(&arrival, "sync_state").as_deref(),
+        Some("live"),
+        "and the stream says it is live while it still is (§41.4)"
+    );
+
+    // The second frame did not exist on the wire until now, so the record below cannot have been
+    // built from anything buffered while the first one was read.
+    cluster.release.notify_one();
+    let change = next_record(&mut invocation, "the change").await;
+    assert_eq!(observation(&change), ("modified".to_owned(), 1, true));
+    assert_eq!(
+        text_of(&change, "resource_version").as_deref(),
+        Some("4003")
+    );
+
+    invocation.cancel().await;
+    let result = tokio::time::timeout(SOON, invocation.finish())
+        .await
+        .expect("a cancelled watch answers rather than hanging");
+    assert_eq!(result.status, InvokeStatus::Cancelled);
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_go_on_watching_after_a_gap_rather_than_ending_at_the_break() {
+    // Gate F (§62.6) inside a watch that does not stop. A `410` arrives as an ERROR frame in a
+    // `200 OK` stream, the gap is a record, state is re-acquired by listing (§19.4 step 4) — and
+    // then observation *continues*, on a second stream, in a second period. The change that
+    // arrives after the break carries segment 2 and `continuous = false` forever after, so no
+    // consumer can concatenate the two halves into a history that reads as complete.
+    let (cluster, plugin) = watched(Watching::ExpiryThenLive).await;
+    let mut invocation = plugin
+        .query("k8s-change", at_cluster(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the watch starts");
+
+    let mut seen = Vec::new();
+    let mut names = Vec::new();
+    let mut gap_reason = None;
+    for what in [
+        "the acquisition",
+        "the change",
+        "the gap",
+        "the re-acquisition",
+        "the re-acquisition",
+        "the change after the break",
+    ] {
+        let record = next_record(&mut invocation, what).await;
+        record
+            .validate()
+            .expect("the record conforms to the schema it carries");
+        seen.push(observation(&record));
+        names.push(text_of(&record, "name"));
+        if text_of(&record, "change").as_deref() == Some("gap") {
+            gap_reason = text_of(&record, "gap_reason");
+        }
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            ("listed".to_owned(), 1, true),
+            ("modified".to_owned(), 1, true),
+            ("gap".to_owned(), 1, false),
+            ("listed".to_owned(), 2, false),
+            ("listed".to_owned(), 2, false),
+            ("added".to_owned(), 2, false),
+        ],
+        "the break is a record, and what follows it is a second period that goes on observing"
+    );
+    assert_eq!(gap_reason.as_deref(), Some("watch_expired_410"));
+    assert_eq!(
+        names.last().and_then(Option::as_deref),
+        Some("four"),
+        "the arrival on the far side of the gap was observed arriving, which is why it is an \
+         `added` rather than another `listed`"
+    );
+    assert_eq!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods"),
+        4,
+        "one acquisition, the watch that broke, the re-acquisition, and the watch that replaced \
+         it (§19.4 step 4, §19.5)"
+    );
+
+    invocation.cancel().await;
+    let result = tokio::time::timeout(SOON, invocation.finish())
+        .await
+        .expect("a cancelled watch answers rather than hanging");
+    assert_eq!(result.status, InvokeStatus::Cancelled);
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_stop_a_live_watch_promptly_when_the_host_cancels_it() {
+    // §62.12, Gate L. A watch runs until the operator stops it, so cancellation is the *only*
+    // way most watches end — and the two things that have to hold are that it is observed
+    // between chunks rather than at the end of a body that never comes, and that the instance
+    // is still there afterwards. The brokered connection is released on the way out: closing a
+    // handle the host has already retired would quarantine the package.
+    let (cluster, plugin) = watched(Watching::Held).await;
+    let mut invocation = plugin
+        .query("k8s-change", at_cluster(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the watch starts");
+    for what in ["the acquisition", "the arrival"] {
+        next_record(&mut invocation, what).await;
+    }
+
+    invocation.cancel().await;
+    let result = tokio::time::timeout(SOON, invocation.finish())
+        .await
+        .expect("a cancelled watch terminates promptly rather than at the read deadline");
+    assert_eq!(
+        result.status,
+        InvokeStatus::Cancelled,
+        "cancellation is observed and answered, never a stream that simply stops (§31.14)"
+    );
+
+    // The instance survived, which is what says the connection was given back rather than
+    // abandoned or closed twice.
+    let (events, later) = plugin
+        .query("k8s-namespace", at_cluster(&[]))
+        .await
+        .expect("a later query still works")
+        .collect()
+        .await;
+    assert_eq!(later.status, InvokeStatus::Completed, "{:?}", later.error);
+    assert_eq!(records(&events).len(), 1);
+    assert!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods") >= 2,
+        "the watch was opened, which is what there was to cancel: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_report_the_gap_even_where_the_query_refused_to_pay_for_a_re_acquisition() {
+    // `reacquire` is the one part of §19.4 step 4 a query may switch off, and the gap record is
+    // not the part it switches off. Re-listing costs a second read of the whole collection, and
+    // an operator who only wanted to know *that* continuity broke should not have to pay it —
+    // but a stream that lost a period and does not say so is §4 invariant 14 undone by an
+    // option, so the break is reported and the watch then ends, because the checkpoint that
+    // would have resumed it is void.
+    let (cluster, plugin) = watched(Watching::Expiry).await;
+    let (events, result) = plugin
+        .query(
+            "k8s-change",
+            at_cluster(&[("kind", json!("Pod")), ("reacquire", json!(false))]),
+        )
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+
+    let records = records(&events);
+    assert_eq!(
+        observed(&records),
+        vec![
+            ("listed".to_owned(), 1, true),
+            ("modified".to_owned(), 1, true),
+            ("gap".to_owned(), 1, false),
+        ],
+        "the break is still a record of its own, and the stream stops at it"
+    );
+    assert_eq!(
+        text_of(&records[2], "gap_reason").as_deref(),
+        Some("watch_expired_410")
+    );
+    assert_eq!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods"),
+        2,
+        "one acquisition and one watch: the second listing is exactly what was declined"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

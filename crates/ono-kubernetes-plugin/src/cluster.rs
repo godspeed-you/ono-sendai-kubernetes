@@ -40,7 +40,7 @@ use ono_provider_kubernetes::transport::{
 use ono_value::{ErrorValue, MapValue, Provenance, RecordValue, Schema, Value};
 use serde_json::json;
 
-use crate::broker::BrokeredStream;
+use crate::broker::{BrokeredStream, Lease, ReadPolicy};
 use crate::contributions::Target;
 use crate::query::{Endpoint, UNAVAILABLE, UNAVAILABLE_CODE, failure};
 use crate::sessions::Sessions;
@@ -126,8 +126,16 @@ pub fn answer(
 /// the answer this target exists to give.
 fn observe(ctx: &mut Ctx<'_>, endpoint: &Endpoint) -> Result<ClusterDiagnostic, WireError> {
     let posture = posture(endpoint);
+    // The diagnostic emits nothing until the interrogation is over, so the lease is opened and
+    // closed here rather than being handed down from the caller.
+    let lease = Lease::new(ctx);
     let (health, fingerprint, identity, handle, open) = {
-        let stream = match BrokeredStream::connect(ctx, &endpoint.host, endpoint.port) {
+        let stream = match BrokeredStream::connect(
+            &lease,
+            &endpoint.host,
+            endpoint.port,
+            ReadPolicy::request(),
+        ) {
             Ok(stream) => stream,
             Err(error) if error.name == "capability.denied" => return Err(error),
             Err(error) => {
@@ -169,7 +177,8 @@ fn observe(ctx: &mut Ctx<'_>, endpoint: &Endpoint) -> Result<ClusterDiagnostic, 
         }
     };
     if open {
-        let _ = ctx.host_call(method::NETWORK_CLOSE, json!({"connection": handle}));
+        let _ =
+            lease.with(|ctx| ctx.host_call(method::NETWORK_CLOSE, json!({"connection": handle})));
     }
     Ok(
         ClusterDiagnostic::for_instance(endpoint.instance.clone(), posture)

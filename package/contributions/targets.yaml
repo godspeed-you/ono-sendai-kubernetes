@@ -136,10 +136,13 @@ targets:
 
   # What changed in a collection while this provider was watching it, and — the point of the
   # exercise — every period it could not observe. §19.1's list-then-watch is one sequence, so this
-  # noun acquires the collection itself rather than reading one somebody else listed. Options:
-  # `kind`/`group`/`version`/`resource` name the collection exactly as `k8s-resource` does,
-  # `max_changes` bounds one invocation, and `reacquire` (default true) decides whether a broken
-  # stream is re-listed on the other side of its gap. The gap record is emitted either way.
+  # noun acquires the collection itself rather than reading one somebody else listed. It is a
+  # *live* watch: a record is emitted as each change arrives and the invocation runs until it is
+  # cancelled (§41, ADR-0023). Options: `kind`/`group`/`version`/`resource` name the collection
+  # exactly as `k8s-resource` does, `max_changes` bounds the answer to that many records for a
+  # caller that wants a prefix rather than a stream, and `reacquire` (default true) decides
+  # whether a broken stream is re-listed on the other side of its gap. The gap record is emitted
+  # either way.
   - name: k8s-change
     schema: io.github.godspeed-you.kubernetes.change/1
     summary: "What changed in a collection while this provider was watching it, and every period it could not observe (specification section 19)."
