@@ -588,6 +588,40 @@ fn should_declare_the_same_arguments_in_the_document_and_across_the_handshake() 
 }
 
 #[test]
+fn should_declare_the_same_boundedness_in_the_document_and_across_the_handshake() {
+    // `ADR-0588 (core)`. The host decides whether to collect a contributed answer *before* it
+    // reads the first record, from this declaration — so a document that disagreed with the
+    // handshake would have the shell collecting a watch, which never returns to the prompt.
+    //
+    // Exactly two words do not end: the watch, and the log, which is bounded until `follow` is
+    // written and declares the worst case because boundedness belongs to the target rather than
+    // to the invocation (ADR-0035). Naming them here rather than counting them means adding a
+    // third is a decision somebody takes on purpose.
+    let parsed = TargetDocument::parse(TARGETS_DOCUMENT).expect("the targets document reads");
+    for target in TARGETS {
+        let declared = parsed
+            .targets
+            .iter()
+            .find(|entry| entry.name == target.name)
+            .expect("the document declares it");
+        assert_eq!(
+            declared.answer,
+            target.target_contribution().answer,
+            "`{}` declares a different boundedness on disk and across the handshake",
+            target.name
+        );
+        let unbounded = matches!(target.name, "k8s-change" | "k8s-log");
+        assert_eq!(
+            !declared.answer.is_bounded(),
+            unbounded,
+            "`{}` is {} the pair of words whose answer does not end",
+            target.name,
+            if unbounded { "one of" } else { "not one of" }
+        );
+    }
+}
+
+#[test]
 fn should_declare_only_arguments_a_handler_actually_reads() {
     // A declared argument that nothing consumes is the same failure as an undeclared one that
     // something does: the shell offers a word, the user writes it, and it changes nothing. The

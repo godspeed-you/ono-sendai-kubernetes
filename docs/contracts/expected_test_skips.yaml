@@ -81,6 +81,9 @@ declared:
   # recorded documents (§59.1). What they need is the **shell**, and `ono` is built from core.
   # Setting `ONO_BINARY`, or putting a built core checkout beside this one, is the whole of the
   # prerequisite — and CI's `gate` job supplies neither today, which is why these rows exist.
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_hand_a_watch_to_the_shell_as_a_stream_rather_than_a_table"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
   - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_reach_the_registry_with_every_argument_this_package_declares"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"

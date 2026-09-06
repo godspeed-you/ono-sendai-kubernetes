@@ -427,6 +427,68 @@ fn standing_on_the_pod(cluster: &RecordedCluster, grants: &[&str], then: &str) -
 // --- the tests -----------------------------------------------------------------------------------
 
 #[test]
+fn should_hand_a_watch_to_the_shell_as_a_stream_rather_than_a_table() {
+    // §41.1 and `ADR-0588 (core)`. A watch has no end, and until a target could say so the host
+    // had one behaviour for every contributed answer — read it to the end — so `get k8s-change`
+    // never returned to a prompt at all.
+    //
+    // The proof is the *refusal*, and it is a better proof than a table would be: the shell shows
+    // a live stream in place at a terminal and refuses to render one where nobody is watching
+    // (shell specification §18.3). This run's output is captured, so the refusal is what an
+    // unbounded declaration produces and a bounded one could never produce — a bounded answer
+    // here would have been tabulated. It arrives before any watch is drained, because
+    // boundedness is known when the stream is built rather than when it ends.
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_hand_a_watch_to_the_shell_as_a_stream_rather_than_a_table",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let cluster = RecordedCluster::start();
+    let home = plugin_home("watch-stream");
+    let run = shell(
+        &binary,
+        &home,
+        &format!(
+            "{}; get k8s-change --host 127.0.0.1 --port {} --namespace shop --kind Pod",
+            load(&["network.connect", "clock.read"]),
+            cluster.port
+        ),
+    );
+
+    assert!(
+        run.stderr.contains("a live stream needs a representation"),
+        "an answer this package declares does not end is a stream the shell will not tabulate: \
+         {}{}",
+        run.stdout,
+        run.stderr
+    );
+    // And the bounded neighbour still is one, so the declaration is discriminating rather than
+    // blanket: every other word this package contributes still answers with a table.
+    let bounded = shell(
+        &binary,
+        &home,
+        &format!(
+            "{}; get k8s-pod --host 127.0.0.1 --port {} --namespace shop | count | to json",
+            load(&["network.connect", "clock.read"]),
+            cluster.port
+        ),
+    );
+    assert!(
+        !bounded
+            .stderr
+            .contains("a live stream needs a representation"),
+        "a bounded answer is collected as it always was: {}{}",
+        bounded.stdout,
+        bounded.stderr
+    );
+}
+
+#[test]
 fn should_reach_the_registry_with_every_argument_this_package_declares() {
     // The one thing every other test in this file assumes and none of them checked: that the
     // *host* reads this package's declarations and accepts them. The package's own tests drive

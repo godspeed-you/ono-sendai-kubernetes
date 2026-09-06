@@ -20,8 +20,8 @@
 //! question instead of the answer — ADR-0010.
 
 use ono_kuang_sdk::protocol::{
-    CommandContribution, ParameterContribution, SchemaContribution, SchemaFieldContribution,
-    TargetContribution,
+    Answer, CommandContribution, ParameterContribution, SchemaContribution,
+    SchemaFieldContribution, TargetContribution,
 };
 
 /// One argument a contribution declares, in the vocabulary a core command declares its own
@@ -451,6 +451,40 @@ impl Target {
             summary: self.summary.to_owned(),
             identity_doc: self.identity_doc.to_owned(),
             options: self.options().iter().map(Parameter::contribution).collect(),
+            answer: self.answer(),
+        }
+    }
+
+    /// Whether this target's answer ends by itself (`ADR-0588 (core)`).
+    ///
+    /// **Two words do not**, and the host has to know before it reads the first record: a package
+    /// that has not emitted yet and one that never will look the same from outside, and what is
+    /// being decided is whether to collect the answer at all. A collected watch never returns to
+    /// the prompt.
+    ///
+    /// - `k8s-change` is a watch. §41 gives it no natural end — the operator ends it — and there
+    ///   is no bounded reading of it to fall back on.
+    /// - `k8s-log` is bounded *unless* `follow` is written, and the declaration is a property of
+    ///   the target rather than of the invocation, so it declares the worst case. That is the
+    ///   right direction to be wrong in: an unbounded answer that ends is a stream that ended,
+    ///   while a bounded declaration over a followed log is a shell that does not come back. What
+    ///   it costs is that a bare `get k8s-log` whose output goes somewhere that is not a terminal
+    ///   and not a serializer is refused rather than tabulated — the shell's own rule for a live
+    ///   stream, with a message naming the two ways out. ADR-0035.
+    #[must_use]
+    pub const fn answer(&self) -> Answer {
+        match self.reads {
+            Reads::Changes | Reads::Logs => Answer::Unbounded,
+            Reads::Instance
+            | Reads::Kind { .. }
+            | Reads::Discovered
+            | Reads::Relations
+            | Reads::Events
+            | Reads::Evidence
+            | Reads::Timeline
+            | Reads::Why
+            | Reads::Conditions
+            | Reads::Plan => Answer::Bounded,
         }
     }
 

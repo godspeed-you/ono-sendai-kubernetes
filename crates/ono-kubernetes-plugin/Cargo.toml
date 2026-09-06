@@ -22,8 +22,8 @@ serde_json = { workspace = true }
 # The deterministic test host of spec §31.73, and the supervisor types its host services are
 # written against. Both come from the same git reference as the SDK, so a plugin is tested
 # against exactly the host revision it is built against.
-ono-kuang-testhost = { git = "https://github.com/godspeed-you/ono-sendai", rev = "e1a44fd7246e0beb99d7edbd95a9a09991963c41" }
-ono-kuang-supervisor = { git = "https://github.com/godspeed-you/ono-sendai", rev = "e1a44fd7246e0beb99d7edbd95a9a09991963c41" }
+ono-kuang-testhost = { git = "https://github.com/godspeed-you/ono-sendai", rev = "29edac758293c564816b7514765236a8ee360740" }
+ono-kuang-supervisor = { git = "https://github.com/godspeed-you/ono-sendai", rev = "29edac758293c564816b7514765236a8ee360740" }
 async-trait = "0.1"
 # The recorded cluster speaks TLS in one test, so the package's own `rustls` session has a real
 # server on the other end of it rather than a fixture that replays a handshake.

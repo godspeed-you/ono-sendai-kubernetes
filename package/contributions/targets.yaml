@@ -277,6 +277,7 @@ targets:
     schema: io.github.godspeed-you.kubernetes.change/1
     summary: "What changed in a collection while this provider was watching it, and every period it could not observe (specification section 19)."
     identity_doc: "Two observations are the same change when the collection, the observation period, the word, the object's UID and its resourceVersion all match. A change has no `metadata.uid` of its own; the UID on the record is the object's."
+    answer: unbounded
 
     options:
       - name: context
@@ -386,6 +387,7 @@ targets:
       Two observations are the same line when the Pod's `metadata.uid`, the container, the run and
       the ordinal within the read all match. A line has no identity of its own; a process that
       printed one message twice printed it twice.
+    answer: unbounded
 
     options:
       - name: context
