@@ -615,11 +615,12 @@ targets:
         type: string
         doc: "`apply` for a bounded field change or `delete` for the object. Default `apply` (specification section 43.3)."
       - name: set
-        type: map
+        type: record
         doc: "A mapping from a JSON pointer to the value the field should hold, e.g. `{\"/spec/replicas\": 2}`."
       - name: unset
-        type: string
-        doc: "A pointer, or a list of them, whose fields the apply gives up rather than sets (specification section 44.1)."
+        type: list<string>
+        doc: "A pointer whose field the apply gives up rather than sets. Write it more than once for more than one (specification section 44.1)."
+        repeatable: true
       - name: propagation
         type: string
         doc: "`Foreground`, `Background` or `Orphan` for a deletion's dependents (specification section 45.2)."

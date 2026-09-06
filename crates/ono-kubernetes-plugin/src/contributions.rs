@@ -51,6 +51,8 @@ pub struct Parameter {
     /// vocabulary coerces. `None` means the argument simply does not arrive, which is a
     /// different thing from arriving as zero, empty or false.
     pub default: Option<&'static str>,
+    /// Whether the argument may be written more than once, accumulating.
+    pub repeatable: bool,
 }
 
 impl Parameter {
@@ -61,6 +63,22 @@ impl Parameter {
             declared_type,
             doc,
             default: None,
+            repeatable: false,
+        }
+    }
+
+    /// A declared argument that may be written more than once, accumulating into a list.
+    const fn repeatable(
+        name: &'static str,
+        declared_type: &'static str,
+        doc: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            declared_type,
+            doc,
+            default: None,
+            repeatable: true,
         }
     }
 
@@ -76,6 +94,7 @@ impl Parameter {
             declared_type,
             doc,
             default: Some(default),
+            repeatable: false,
         }
     }
 
@@ -86,10 +105,9 @@ impl Parameter {
             name: self.name.to_owned(),
             declared_type: self.declared_type.to_owned(),
             doc: self.doc.to_owned(),
-            // Nothing here is written twice, and nothing is written without its value: an
-            // endpoint, a name and a page budget are each one word, and a flag that may stand
-            // alone would make `--dry_run` mean the opposite of `--dry_run false` by omission.
-            repeatable: false,
+            repeatable: self.repeatable,
+            // Nothing here is written without its value: a flag that may stand alone would make
+            // `--dry_run` mean the opposite of `--dry_run false` by omission.
             optional_value: false,
             default: self
                 .default
@@ -593,15 +611,15 @@ const PLAN_OPTIONS: &[Parameter] = &[
     ),
     Parameter::new(
         "set",
-        "map",
+        "record",
         "A mapping from a JSON pointer to the value the field should hold, e.g. \
          `{\"/spec/replicas\": 2}`.",
     ),
-    Parameter::new(
+    Parameter::repeatable(
         "unset",
-        "string",
-        "A pointer, or a list of them, whose fields the apply gives up rather than sets \
-         (specification section 44.1).",
+        "list<string>",
+        "A pointer whose field the apply gives up rather than sets. Write it more than once for \
+         more than one (specification section 44.1).",
     ),
     Parameter::new(
         "propagation",
@@ -2233,15 +2251,15 @@ impl Command {
 const APPLY_OPTIONS: &[Parameter] = &[
     Parameter::new(
         "set",
-        "map",
+        "record",
         "A mapping from a JSON pointer to the value the field should hold, e.g. \
          `{\"/spec/replicas\": 2}`.",
     ),
-    Parameter::new(
+    Parameter::repeatable(
         "unset",
-        "string",
-        "A pointer, or a list of them, whose fields this apply gives up rather than sets \
-         (specification section 44.1).",
+        "list<string>",
+        "A pointer whose field this apply gives up rather than sets. Write it more than once for \
+         more than one (specification section 44.1).",
     ),
     Parameter::defaulting(
         "field_manager",

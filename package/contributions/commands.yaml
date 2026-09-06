@@ -75,7 +75,7 @@ commands:
     risk: mutate
     examples:
       - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/replicas\": 2}'"
-      - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/replicas\": 2}' --dry-run false"
+      - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/replicas\": 2}' --dry_run false"
 
     options:
       - name: context
@@ -113,11 +113,12 @@ commands:
         doc: "Ask the API server what it would do without doing it. Default true: the shortest sentence a user can write predicts (specification section 44.5)."
         default: "true"
       - name: set
-        type: map
+        type: record
         doc: "A mapping from a JSON pointer to the value the field should hold, e.g. `{\"/spec/replicas\": 2}`."
       - name: unset
-        type: string
-        doc: "A pointer, or a list of them, whose fields this apply gives up rather than sets (specification section 44.1)."
+        type: list<string>
+        doc: "A pointer whose field this apply gives up rather than sets. Write it more than once for more than one (specification section 44.1)."
+        repeatable: true
       - name: field_manager
         type: string
         doc: "The name field ownership is recorded under (specification section 44.2)."
@@ -140,7 +141,7 @@ commands:
     risk: destructive
     examples:
       - "remove k8s-resource --context prod --kind ConfigMap --name stale"
-      - "remove k8s-resource --context prod --kind ConfigMap --name stale --dry-run false"
+      - "remove k8s-resource --context prod --kind ConfigMap --name stale --dry_run false"
 
     options:
       - name: context
