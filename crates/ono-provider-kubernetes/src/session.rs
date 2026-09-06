@@ -598,6 +598,23 @@ impl<C: Clock> Session<C> {
             .map(|watched| &watched.stream)
     }
 
+    /// When this session last observed the collection one watch covers, on its own clock.
+    ///
+    /// The only provider-clock fact a stream has. `watch.rs` records which change arrived and in
+    /// what order and keeps no arrival instant, so this is the moment of the most recent
+    /// observation of the collection — the listing that seeded the cache, or the last event
+    /// applied to it (§20.2).
+    ///
+    /// It is what a temporal answer widens its window back to: a timeline assembled now, over a
+    /// collection this session has been watching, covers a period that began before the read
+    /// (§39.3). Never a substitute for a per-event time, which does not exist.
+    #[must_use]
+    pub fn watch_observed_at(&self, gvr: &Gvr, scope: &Scope) -> Option<ObservedAt> {
+        self.watches
+            .get(&(gvr.clone(), scope.clone()))
+            .map(|watched| watched.observed_at)
+    }
+
     /// Every collection this session is watching.
     #[must_use]
     pub fn watched(&self) -> Vec<(&Gvr, &Scope)> {

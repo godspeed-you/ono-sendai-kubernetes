@@ -500,3 +500,379 @@ fn should_not_let_a_resource_version_stand_in_for_a_time() {
         closed.describe()
     );
 }
+
+// --- the watch half and the temporal half, composed (§39.3, §41.4, §61.6) --------------------------
+
+/// A Pod of the same collection that this timeline is not about.
+const OTHER_POD: &str = r#"{
+  "apiVersion":"v1","kind":"Pod",
+  "metadata":{"name":"basket-1a2b","namespace":"shop","uid":"pod-2","resourceVersion":"9001"}
+}"#;
+
+/// The same name as `POD`, a different `metadata.uid`: a second lifetime (§4 invariants 4–5).
+const RECREATED_POD: &str = r#"{
+  "apiVersion":"v1","kind":"Pod",
+  "metadata":{"name":"checkout-7f9d","namespace":"shop","uid":"pod-9","resourceVersion":"9700"}
+}"#;
+
+fn parsed(document: &str) -> Object {
+    Object::parse(INSTANCE, document).expect("the fixture is a well-formed object")
+}
+
+/// The same Pod carrying a later `resourceVersion`, as a watch event delivers it.
+fn pod_at(version: &str) -> Object {
+    parsed(&POD.replace(
+        "\"resourceVersion\":\"9000\"",
+        &format!("\"resourceVersion\":\"{version}\""),
+    ))
+}
+
+fn pods() -> Gvr {
+    Gvr::new("", "v1", "pods")
+}
+
+#[test]
+fn should_include_what_the_sessions_watch_witnessed_of_the_objects_collection() {
+    // §39.3 and §61.6. The two halves of §39 did not compose: `k8s-change` observed the changes
+    // and `k8s-timeline` could not retrieve them, so §39.3's history was observable and not
+    // retrievable. A timeline that can include the watch's own record is what closes that, and it
+    // includes only what happened to *this* object — the collection's other Pods are somebody
+    // else's history.
+    let mut stream = WatchStream::new(pods(), Scope::in_namespace("shop"));
+    stream.listed(vec![pod()], ResourceVersion::new("9000"));
+    stream.observe(WatchEvent::Modified(pod_at("9005")));
+    stream.observe(WatchEvent::Modified(parsed(OTHER_POD)));
+    stream.observe(WatchEvent::Deleted(pod_at("9010")));
+
+    let mut timeline = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(50_000),
+    );
+    let included = timeline.include_watch(
+        &pod().identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+
+    assert_eq!(included.periods(), 1);
+    assert_eq!(
+        included.witnessed(),
+        2,
+        "two of the three changes happened to this Pod; the third is another object's"
+    );
+    let observed = timeline.observed();
+    assert_eq!(observed.len(), 2);
+    assert!(
+        observed
+            .iter()
+            .all(|observation| observation.source().as_str() == "watch-event"),
+        "a change this provider saw happen is a watch event and nothing else (§39.1)"
+    );
+    assert!(
+        observed[0].detail().contains("modified") && observed[1].detail().contains("deleted"),
+        "arrival order is the order the stream recorded: {:?}",
+        observed
+            .iter()
+            .map(|observation| observation.detail())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn should_never_present_two_observation_periods_as_one_history() {
+    // §4 invariant 14 and §19.4. After a `410 Gone` the changes either side of the break are two
+    // histories; concatenating them produces an ordered list that reads as complete while missing
+    // everything that happened during the break. There is deliberately no call that returns one
+    // sequence: a period has to be named, exactly as a clock has to be named to get an order.
+    let mut stream = WatchStream::new(pods(), Scope::in_namespace("shop"));
+    stream.listed(vec![pod()], ResourceVersion::new("9000"));
+    stream.observe(WatchEvent::Modified(pod_at("9005")));
+    stream.observe(WatchEvent::Error(WatchFailure::Expired));
+    stream.listed(vec![pod()], ResourceVersion::new("9600"));
+    stream.observe(WatchEvent::Modified(pod_at("9605")));
+
+    let mut timeline = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(50_000),
+    );
+    timeline.include_watch(
+        &pod().identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+
+    assert_eq!(timeline.periods().len(), 2, "an expiry ends a period");
+    assert!(!timeline.is_continuous());
+    assert_eq!(timeline.gaps().len(), 1);
+    assert_eq!(timeline.gaps()[0].reason().as_str(), "watch_expired_410");
+
+    let first = &timeline.periods()[0];
+    let second = &timeline.periods()[1];
+    assert_eq!(first.from().as_str(), "9000");
+    assert_eq!(second.from().as_str(), "9600");
+    assert!(!first.is_open(), "the period the expiry closed is closed");
+    assert!(second.is_open());
+    assert_eq!(timeline.witnessed(first).len(), 1);
+    assert_eq!(timeline.witnessed(second).len(), 1);
+    assert!(
+        timeline.witnessed(first)[0].detail() != timeline.witnessed(second)[0].detail(),
+        "each change names the period it belongs to, so two periods cannot be read as one run"
+    );
+    assert!(
+        timeline.describe().contains("watch_expired_410"),
+        "a timeline that spans a gap says so: {}",
+        timeline.describe()
+    );
+}
+
+#[test]
+fn should_witness_nothing_from_a_collection_that_was_only_listed() {
+    // §39.2 held absolutely. The cache holds the Pod because a list put it there, and a list is
+    // one look at current state. Turning the objects of a synchronized cache into observed history
+    // is exactly the retroactive history the section forbids — nothing observed only once is
+    // history.
+    let mut stream = WatchStream::new(pods(), Scope::in_namespace("shop"));
+    stream.listed(vec![pod()], ResourceVersion::new("9000"));
+
+    let mut timeline = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(50_000),
+    );
+    let included = timeline.include_watch(
+        &pod().identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+
+    assert_eq!(stream.object_count(), 1, "the cache holds it");
+    assert_eq!(included.witnessed(), 0);
+    assert!(
+        timeline.observed().is_empty(),
+        "the object was read once and never seen to change"
+    );
+    assert_eq!(
+        included.periods(),
+        1,
+        "the period is real; it is simply empty"
+    );
+}
+
+#[test]
+fn should_leave_a_reported_stamp_reported_when_a_watch_is_included() {
+    // §39.2's other half. Composing the two does not upgrade anything: a `creationTimestamp` read
+    // off current state stays `reported` however much watch history sits beside it, because the
+    // watch did not witness the creation and no amount of neighbouring evidence makes it so.
+    let mut stream = WatchStream::new(pods(), Scope::in_namespace("shop"));
+    stream.listed(vec![pod()], ResourceVersion::new("9000"));
+    stream.observe(WatchEvent::Modified(pod_at("9005")));
+
+    let mut timeline = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(50_000),
+    );
+    timeline.record(Observation::of_creation(&pod()).expect("the fixture has a creationTimestamp"));
+    timeline.include_watch(
+        &pod().identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+
+    assert_eq!(timeline.reported().len(), 1);
+    assert_eq!(timeline.reported()[0].basis(), Basis::Reported);
+    assert_eq!(timeline.reported()[0].source().as_str(), "object-metadata");
+    assert_eq!(timeline.observed().len(), 1);
+}
+
+#[test]
+fn should_attach_no_clock_reading_to_a_change_no_clock_measured() {
+    // What the stream kept and what it did not. `watch.rs` records which change arrived in which
+    // order and never when each one arrived, so a witnessed change carries a position and no
+    // instant. Stamping them all with the moment the timeline was assembled would invent
+    // acquisition times that look exactly like measured ones, and they would then sort against
+    // this provider's real readings.
+    let mut stream = WatchStream::new(pods(), Scope::in_namespace("shop"));
+    stream.listed(vec![pod()], ResourceVersion::new("9000"));
+    stream.observe(WatchEvent::Modified(pod_at("9005")));
+
+    let mut timeline = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(50_000),
+    );
+    timeline.record(Observation::reported(
+        pod().identity(),
+        ReportedSource::ResourceSnapshot,
+        Stamp::observed(ObservedAt::from_unix_millis(50_000)),
+        "read",
+    ));
+    timeline.include_watch(
+        &pod().identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+
+    let witnessed = timeline.observed();
+    assert_eq!(witnessed.len(), 1);
+    assert_eq!(witnessed[0].stamp().source(), &ClockSource::Unclocked);
+    assert!(
+        !witnessed[0].stamp().is_placeable(),
+        "there is no instant to place, and inventing one is the mistake"
+    );
+    assert!(
+        witnessed[0].detail().contains("9005"),
+        "the position it was seen at, which is a position and never a time (§14.3): {}",
+        witnessed[0].detail()
+    );
+
+    // And it cannot be sorted against the read that did happen on this machine's clock.
+    let ours = timeline.ordered_on(&ClockSource::Provider);
+    assert_eq!(
+        ours.sequence().len(),
+        1,
+        "only the read is on this provider's clock"
+    );
+    let unclocked = timeline.ordered_on(&ClockSource::Unclocked);
+    assert!(unclocked.sequence().is_empty());
+    assert_eq!(unclocked.unplaceable().len(), 1);
+    assert_eq!(
+        Stamp::unclocked().relate(&Stamp::observed(ObservedAt::from_unix_millis(1))),
+        Order::Unordered(Undecidable::Unplaceable),
+        "no clock read it, so there is no instant to place it against one that was read"
+    );
+}
+
+#[test]
+fn should_not_carry_a_previous_lifetimes_changes_into_this_objects_timeline() {
+    // §4 invariants 4 and 5. The watch saw a Pod deleted and one of the same name created, and
+    // they are two lifetimes. A timeline keyed on the name would present the old Pod's changes as
+    // this one's history, which is the lifecycle discontinuity §16.3 exists to make visible.
+    let mut stream = WatchStream::new(pods(), Scope::in_namespace("shop"));
+    stream.listed(vec![pod()], ResourceVersion::new("9000"));
+    stream.observe(WatchEvent::Deleted(pod_at("9500")));
+    stream.observe(WatchEvent::Added(parsed(RECREATED_POD)));
+
+    let mut timeline = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(50_000),
+    );
+    let included = timeline.include_watch(
+        &parsed(RECREATED_POD).identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+
+    assert_eq!(
+        included.witnessed(),
+        1,
+        "the new lifetime was added; the old one's deletion is not its history"
+    );
+    assert!(timeline.observed()[0].detail().contains("added"));
+}
+
+#[test]
+fn should_say_a_watch_that_never_synchronised_observed_nothing() {
+    // §20.3 and §4 invariant 13. A stream that has not completed its initial list has observed
+    // nothing, and an empty history from it must not read as a quiet object. The scope goes into
+    // the coverage as a hole, because that is the vocabulary that already distinguishes "there is
+    // nothing" from "nobody could see".
+    let stream = WatchStream::new(pods(), Scope::in_namespace("shop"));
+
+    let mut timeline = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(50_000),
+    );
+    let included = timeline.include_watch(
+        &pod().identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+
+    assert_eq!(included.state().as_str(), "syncing");
+    assert_eq!(included.periods(), 0);
+    assert!(!timeline.coverage().is_complete());
+    assert!(
+        timeline.describe().contains("not queried"),
+        "an unsynchronised watch is not a period in which nothing happened: {}",
+        timeline.describe()
+    );
+}
+
+#[test]
+fn should_say_a_refused_watch_left_the_period_unobserved() {
+    // §21.4 and §4 invariant 13 again, one state along. Authorization refused the stream, so the
+    // period after the refusal is unobserved rather than uneventful — and what was observed before
+    // it is still real and still carried.
+    let mut stream = WatchStream::new(pods(), Scope::in_namespace("shop"));
+    stream.listed(vec![pod()], ResourceVersion::new("9000"));
+    stream.observe(WatchEvent::Modified(pod_at("9005")));
+    stream.observe(WatchEvent::Error(WatchFailure::Denied));
+
+    let mut timeline = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(50_000),
+    );
+    let included = timeline.include_watch(
+        &pod().identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+
+    assert_eq!(included.state().as_str(), "denied");
+    assert_eq!(
+        included.witnessed(),
+        1,
+        "what was seen before the refusal was seen"
+    );
+    assert!(!timeline.is_continuous());
+    assert_eq!(timeline.gaps()[0].reason().as_str(), "watch_denied");
+    assert!(
+        !timeline.coverage().is_complete(),
+        "a refused stream is a scope that could not be read"
+    );
+}
+
+#[test]
+fn should_widen_the_window_back_to_the_moment_the_watch_was_observing() {
+    // §39.3's coverage window, carried rather than described. The timeline opens when the read is
+    // made; the watch was observing the collection before that, and the window has to say so or
+    // the answer reads as "observed for an instant" while carrying changes from earlier. It widens
+    // to the moment the session is known to have been observing and never further, because that
+    // is the earliest instant this provider can produce evidence for.
+    let mut stream = WatchStream::new(pods(), Scope::in_namespace("shop"));
+    stream.listed(vec![pod()], ResourceVersion::new("9000"));
+    stream.observe(WatchEvent::Modified(pod_at("9005")));
+
+    let mut timeline = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(50_000),
+    );
+    timeline.include_watch(
+        &pod().identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+
+    assert_eq!(timeline.window().opened_at().unix_millis(), 20_000);
+    assert_eq!(timeline.window().latest_at().unix_millis(), 50_000);
+
+    // A watch observed *after* the timeline opened does not shorten it: the read still happened.
+    let mut later = Timeline::opened(
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        &FixedClock::at_unix_millis(10_000),
+    );
+    later.include_watch(
+        &pod().identity(),
+        &stream,
+        ObservedAt::from_unix_millis(20_000),
+    );
+    assert_eq!(later.window().opened_at().unix_millis(), 10_000);
+}

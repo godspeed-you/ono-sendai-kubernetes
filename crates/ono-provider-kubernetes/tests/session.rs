@@ -761,3 +761,36 @@ fn should_hold_the_tls_configuration_the_connection_was_established_with() {
         "what protects the session is part of what the session says about itself"
     );
 }
+
+#[test]
+fn should_say_when_it_last_observed_a_watched_collection() {
+    // §20.2 and §39.3. A watch's segments say *which* changes were seen and in what order; they
+    // carry no instant, because `watch.rs` records arrival order and never arrival time. The one
+    // provider-clock fact about a stream lives here — the moment this session last observed the
+    // collection — and it is what lets a timeline widen its window back to a period this provider
+    // was demonstrably watching, instead of reporting a window one read wide beside changes that
+    // happened earlier.
+    let mut session = session("dev");
+    assert_eq!(
+        session.watch_observed_at(&pods(), &shop()),
+        None,
+        "a collection nobody watched has no moment of observation"
+    );
+
+    session
+        .synchronise(&pods(), &shop(), one_pod_listing())
+        .expect("a complete listing seeds the cache");
+
+    assert_eq!(
+        session
+            .watch_observed_at(&pods(), &shop())
+            .map(ono_provider_kubernetes::transport::ObservedAt::unix_millis),
+        Some(OBSERVED),
+        "the moment the read that filled the cache was made, never the moment it is asked about"
+    );
+    assert_eq!(
+        session.watch_observed_at(&pods(), &Scope::in_namespace("payments")),
+        None,
+        "another scope is another stream (§6.5)"
+    );
+}

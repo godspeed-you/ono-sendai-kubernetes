@@ -34,17 +34,30 @@
 //! noticed and observation resumed. A duration comes from the second pair or from nowhere: the
 //! tokens are opaque, they are not comparable, and §14.3 and §4 invariant 6 say so.
 //!
+//! **A history is per unbroken period.** [`Timeline::include_watch`] takes what a watch on the
+//! subject's collection actually witnessed of the subject into the answer, which is what joins
+//! §39.3's watch half to this temporal half: without it the changes lived in the session and no
+//! answer retrieved them. What comes across is filed under the [`ObservedPeriod`] it arrived in,
+//! and [`Timeline::witnessed`] needs a period named — so the concatenation of two periods, which
+//! reads as a complete run while missing everything that happened during the break between them,
+//! has no entry point (§4 invariant 14). A witnessed change carries a *position* and
+//! [`Stamp::unclocked`]: `watch.rs` records arrival order and not arrival time, so there is no
+//! instant to attach and inventing one would produce something that sorts convincingly against
+//! this machine's real readings.
+//!
 //! Nothing here does I/O. Time enters through [`crate::transport::Clock`], so a fixture fixes it
 //! and every assertion below is deterministic (§59.1).
 
 use std::fmt;
 
 use crate::condition::Condition;
-use crate::coverage::{Coverage, Scope};
+use crate::coverage::{Coverage, Gap, Outcome, Scope};
 use crate::events::Event;
 use crate::object::{Identity, Object};
 use crate::transport::{Clock, ObservedAt};
-use crate::watch::{GapReason, ObservedChange, ResourceVersion, WatchGap, WatchStream};
+use crate::watch::{
+    GapReason, ObservedChange, ResourceVersion, Segment, SyncState, WatchGap, WatchStream,
+};
 
 // --- clocks ---------------------------------------------------------------------------------------
 
@@ -71,6 +84,14 @@ pub enum ClockSource {
     /// status does not record which. Deliberately not comparable even with itself — two
     /// unattributed stamps may be from two machines, and "same field" is not "same clock".
     Unattributed,
+    /// No clock read anything. The fact is known and its moment is not.
+    ///
+    /// A change a watch witnessed is the case this exists for: `watch.rs` records which change
+    /// arrived and in which order, and never when each one arrived. Attributing such a change to
+    /// this provider's clock would be an invented acquisition time that sorts convincingly
+    /// against real readings, so it is attributed to no clock at all and carries a position
+    /// instead (§39.3, §14.3).
+    Unclocked,
 }
 
 impl ClockSource {
@@ -81,7 +102,7 @@ impl ClockSource {
     /// sequence that has never existed anywhere.
     #[must_use]
     pub fn is_comparable_with(&self, other: &Self) -> bool {
-        self == other && !matches!(self, Self::Unattributed)
+        self == other && !matches!(self, Self::Unattributed | Self::Unclocked)
     }
 }
 
@@ -93,6 +114,7 @@ impl fmt::Display for ClockSource {
             Self::Reporter(name) => write!(f, "reported-by/{name}"),
             Self::Node(name) => write!(f, "node/{name}"),
             Self::Unattributed => f.write_str("unattributed"),
+            Self::Unclocked => f.write_str("unclocked"),
         }
     }
 }
@@ -104,7 +126,7 @@ pub enum Undecidable {
     DifferentClocks,
     /// Neither stamp names its writer, so they may be from the same clock or from two.
     ClockUnattributed,
-    /// At least one of them could not be read as an instant at all.
+    /// At least one of them names no instant: unreadable text, or no clock reading at all.
     Unplaceable,
 }
 
@@ -209,6 +231,20 @@ impl Stamp {
         Self::rfc3339(ClockSource::Unattributed, raw)
     }
 
+    /// A fact whose moment nothing measured (§39.3).
+    ///
+    /// Empty text rather than a substitute, because there is no text: a position, a description
+    /// or the moment of assembly in this field would all be read as a timestamp by anything that
+    /// sorts on it. [`Self::is_placeable`] answers false and [`Self::relate`] refuses.
+    #[must_use]
+    pub fn unclocked() -> Self {
+        Self {
+            source: ClockSource::Unclocked,
+            raw: String::new(),
+            unix_millis: None,
+        }
+    }
+
     /// An RFC 3339 timestamp from a named clock.
     #[must_use]
     pub fn rfc3339(source: ClockSource, raw: impl Into<String>) -> Self {
@@ -249,6 +285,15 @@ impl Stamp {
     /// and the comparison means nothing.
     #[must_use]
     pub fn relate(&self, other: &Self) -> Order {
+        // A stamp nothing measured has no instant to compare, whichever clock the other one is
+        // on. Answered before the clock check so that two unclocked stamps do not come back as
+        // "the clock is unattributed", which would suggest there was a reading and nobody signed
+        // it.
+        if matches!(self.source, ClockSource::Unclocked)
+            || matches!(other.source, ClockSource::Unclocked)
+        {
+            return Order::Unordered(Undecidable::Unplaceable);
+        }
         if !self.source.is_comparable_with(&other.source) {
             return if self.source == other.source {
                 Order::Unordered(Undecidable::ClockUnattributed)
@@ -436,6 +481,35 @@ impl Observation {
     #[must_use]
     pub fn from_change(change: &ObservedChange, at: ObservedAt) -> Self {
         Self::watched(change.identity().clone(), at, change.class().as_str())
+    }
+
+    /// A change a watch witnessed, retrieved from the stream afterwards (§39.3).
+    ///
+    /// The counterpart of [`Self::watched`], for the case where the moment has already gone.
+    /// `watch.rs` keeps which change arrived and in which order; it keeps no arrival instant, so
+    /// there is none to attach and the stamp is [`Stamp::unclocked`]. What the change does carry
+    /// is a *position* — the continuity token the object held when it was seen — and the
+    /// observation period it belongs to, because a change in one period and a change in another
+    /// are two histories with a hole between them (§4 invariant 14).
+    ///
+    /// [`Basis::Observed`] all the same: this provider saw it happen, which is exactly what §39.2
+    /// separates from a timestamp read off state. Seeing something happen and knowing when are two
+    /// claims, and only the second is missing.
+    #[must_use]
+    pub fn witnessed(change: &ObservedChange, period: usize) -> Self {
+        let position = change.resource_version().map_or_else(
+            || "an unstated position".to_owned(),
+            |version| format!("position {version}"),
+        );
+        Self {
+            subject: change.identity().clone(),
+            source: Source::WatchEvent,
+            stamp: Stamp::unclocked(),
+            detail: format!(
+                "{} at {position}, in observation period {period}",
+                change.class().as_str()
+            ),
+        }
     }
 
     /// A timestamp read off state, with the clock that wrote it.
@@ -722,6 +796,107 @@ impl TemporalGap {
     }
 }
 
+/// One unbroken period a watch observed, as an object's timeline carries it (§39.3).
+///
+/// The largest span this provider may present as an ordered history. It begins at a
+/// `resourceVersion` the server handed out and ends where continuity broke, and the changes inside
+/// it arrived in the order they are held in. Two periods are two histories: the space between them
+/// is a [`TemporalGap`], and there is deliberately no call on [`Timeline`] that returns the
+/// witnessed changes of all periods as one sequence. A period has to be named, exactly as a clock
+/// has to be named to get an order out of [`Timeline::ordered_on`].
+///
+/// The two ends are continuity tokens rather than instants, and they stay that way (§14.3, §4
+/// invariant 6). Their difference is not a duration, and the timeline's [`Window`] is where time
+/// is measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedPeriod {
+    ordinal: usize,
+    from: ResourceVersion,
+    to: Option<ResourceVersion>,
+    first: usize,
+    count: usize,
+}
+
+impl ObservedPeriod {
+    /// Which period this is, counting from one in the order they were observed.
+    #[must_use]
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    /// The position observation began at — a position, never a time.
+    #[must_use]
+    pub fn from(&self) -> &ResourceVersion {
+        &self.from
+    }
+
+    /// The last position observed before continuity broke, for a period that ended.
+    #[must_use]
+    pub fn to(&self) -> Option<&ResourceVersion> {
+        self.to.as_ref()
+    }
+
+    /// Whether this period was still being observed when the timeline read the stream.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.to.is_none()
+    }
+
+    /// How many of the subject's changes were witnessed in it.
+    ///
+    /// Zero is an ordinary answer and not an empty period: a watch that listed a collection and
+    /// saw nothing change observed a real stretch of time in which this object stood still.
+    #[must_use]
+    pub fn witnessed_count(&self) -> usize {
+        self.count
+    }
+
+    /// The period in words: where it began, where it ended, and how much was seen in it.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let ended = self
+            .to
+            .as_ref()
+            .map_or_else(|| "still open".to_owned(), |to| format!("closed at {to}"));
+        format!(
+            "observation period {} from {} ({ended}): {} change(s) witnessed",
+            self.ordinal, self.from, self.count
+        )
+    }
+}
+
+/// What taking a watch into a timeline contributed, and in what state the watch was.
+///
+/// Returned rather than left to be re-derived, because the three numbers answer three different
+/// questions a caller has: whether the stream was in a state that observes at all, how many
+/// separate histories came back, and how much of it was about this subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Included {
+    state: SyncState,
+    periods: usize,
+    witnessed: usize,
+}
+
+impl Included {
+    /// What the stream could honestly show at the moment it was read (§41.4).
+    #[must_use]
+    pub fn state(self) -> SyncState {
+        self.state
+    }
+
+    /// How many unbroken observation periods came back.
+    #[must_use]
+    pub fn periods(self) -> usize {
+        self.periods
+    }
+
+    /// How many of the subject's own changes the watch witnessed, across all of them.
+    #[must_use]
+    pub fn witnessed(self) -> usize {
+        self.witnessed
+    }
+}
+
 /// The observations on one clock, in order, and the ones that could not be placed on it.
 ///
 /// Two lists rather than one sorted list with the awkward entries dropped: an unplaceable stamp is
@@ -777,6 +952,7 @@ pub struct Timeline {
     coverage: Coverage,
     observations: Vec<Observation>,
     gaps: Vec<TemporalGap>,
+    periods: Vec<ObservedPeriod>,
 }
 
 impl Timeline {
@@ -797,6 +973,7 @@ impl Timeline {
             coverage: Coverage::complete(scope),
             observations: Vec::new(),
             gaps: Vec::new(),
+            periods: Vec::new(),
         }
     }
 
@@ -846,6 +1023,118 @@ impl Timeline {
         for gap in stream.gaps() {
             self.gaps.push(TemporalGap::from_watch(gap, at));
         }
+    }
+
+    /// Takes what a watch on the subject's collection actually observed of *the subject* into
+    /// this timeline (§39.3, §61.6).
+    ///
+    /// The composition the two halves of §39 were missing. `k8s-change` observes changes and
+    /// `k8s-timeline` reads timestamps off state, and until a timeline could hold the watch's own
+    /// record, §39.3's history was observable and not retrievable: the changes existed in the
+    /// session and no answer joined them to the object they happened to.
+    ///
+    /// Four rules decide what comes across, and each of them is a refusal:
+    ///
+    /// **Only this subject's changes.** The stream watches a collection; the timeline is about one
+    /// object. Matching is on the full [`Identity`], so a Pod rebuilt under the same name does not
+    /// inherit the deleted one's history (§4 invariants 4 and 5).
+    ///
+    /// **Only what was witnessed.** The cache the stream holds is a list result, and a list is one
+    /// look at current state. Nothing in it becomes history; only the changes a segment recorded
+    /// do (§39.2).
+    ///
+    /// **One period at a time.** Every witnessed change is filed under the unbroken period it
+    /// arrived in, and the breaks between periods arrive as [`TemporalGap`]s. There is no call
+    /// that concatenates them (§4 invariant 14, §19.4).
+    ///
+    /// **No invented instants.** `watch.rs` keeps no arrival time per event, so each witnessed
+    /// change carries a position and [`Stamp::unclocked`]. What *is* measured is `observed_at` —
+    /// the moment the session is known to have been observing this collection — and it widens the
+    /// window rather than being stamped on anything.
+    pub fn include_watch(
+        &mut self,
+        subject: &Identity,
+        stream: &WatchStream,
+        observed_at: ObservedAt,
+    ) -> Included {
+        let scope = stream.scope().clone();
+        self.coverage.observed(scope.clone());
+
+        // The window widens back to the moment this provider is known to have had an eye on the
+        // collection, and never further. When the watch was acquired is not recorded anywhere this
+        // can read, so the earliest defensible instant is the latest one the session measured.
+        if observed_at.unix_millis() < self.window.opened_at.unix_millis() {
+            self.window.opened_at = observed_at;
+        }
+        if observed_at.unix_millis() > self.window.latest_at.unix_millis() {
+            self.window.latest_at = observed_at;
+        }
+
+        for gap in stream.gaps() {
+            self.gaps.push(TemporalGap::from_watch(gap, observed_at));
+        }
+
+        // §4 invariant 13 in the two states where an empty history is not an uneventful one. What
+        // was observed before a refusal is still carried below; the scope gap says the rest of the
+        // period was unreadable rather than quiet.
+        match stream.state() {
+            SyncState::Syncing => self.coverage.record(Gap::new(scope, Outcome::NotQueried)),
+            SyncState::Denied => self.coverage.record(Gap::new(scope, Outcome::ListDenied)),
+            SyncState::Live | SyncState::Reconnecting | SyncState::GapDetected => {}
+        }
+
+        let mut witnessed = 0;
+        for segment in stream.segments() {
+            let ordinal = self.periods.len() + 1;
+            let first = self.observations.len();
+            let count = self.absorb_segment(subject, segment, ordinal);
+            witnessed += count;
+            self.periods.push(ObservedPeriod {
+                ordinal,
+                from: segment.started_at().clone(),
+                to: segment.closed_at().cloned(),
+                first,
+                count,
+            });
+        }
+
+        Included {
+            state: stream.state(),
+            periods: stream.segments().len(),
+            witnessed,
+        }
+    }
+
+    /// Records one segment's changes to the subject, and says how many there were.
+    fn absorb_segment(&mut self, subject: &Identity, segment: &Segment, ordinal: usize) -> usize {
+        let mut count = 0;
+        for change in segment.changes() {
+            if change.identity() != subject {
+                continue;
+            }
+            self.observations
+                .push(Observation::witnessed(change, ordinal));
+            count += 1;
+        }
+        count
+    }
+
+    /// The unbroken observation periods a watch contributed, oldest first (§39.3).
+    #[must_use]
+    pub fn periods(&self) -> &[ObservedPeriod] {
+        &self.periods
+    }
+
+    /// The subject's changes witnessed in one period, in the order they arrived.
+    ///
+    /// The only ordered history this module offers over watch events, and it is per period. The
+    /// concatenation of two periods reads as a complete run while missing everything that happened
+    /// during the break between them, so it has no entry point rather than a warning against it
+    /// (§4 invariant 14).
+    #[must_use]
+    pub fn witnessed(&self, period: &ObservedPeriod) -> &[Observation] {
+        let end = period.first.saturating_add(period.count);
+        self.observations.get(period.first..end).unwrap_or_default()
     }
 
     /// What the query did and did not reach, in the provider's scope vocabulary (§21.4).
@@ -950,6 +1239,7 @@ impl Timeline {
     #[must_use]
     pub fn describe(&self) -> String {
         let mut parts = vec![self.window.describe()];
+        parts.extend(self.periods.iter().map(ObservedPeriod::describe));
         parts.extend(self.gaps.iter().map(TemporalGap::describe));
         let scope = self.coverage.describe();
         if !scope.is_empty() {
