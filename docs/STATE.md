@@ -542,7 +542,7 @@ both halves:
   its emptiness proves nothing", which is why `k8s-event` and `k8s-log` reuse
   `provider.unavailable` for their refusals (ADR-0025).
 - **A target's declared schema id is not checked against the package's contributed schemas at
-  load — and there are no longer any placeholders to be caught by it.** All 30 targets now declare
+  load — and there are no longer any placeholders to be caught by it.** Every target declares
   a schema the package contributes, and `tests/contributions.rs` holds the document, the handshake
   and the wiring table to each other. The core finding stands and is now only latent: the
   supervisor checks a contributed target's schema id for a package-or-core *prefix*, never against
