@@ -208,12 +208,106 @@ pub const SHAPES: &[Shape] = &[
     // What it needs to run (§29–§32).
     Shape::new(schema!("pod"), schema!("serviceaccount"), "runs-as"),
     Shape::new(schema!("pod"), schema!("configmap"), "references-config"),
-    Shape::new(schema!("pod"), schema!("secret"), "references-secret"),
+    Shape::new(
+        schema!("pod"),
+        schema!("secret"),
+        "references-secret, uses-image-pull-secret",
+    ),
     Shape::new(schema!("pod"), schema!("persistentvolumeclaim"), "mounts"),
     Shape::new(
         schema!("persistentvolumeclaim"),
         schema!("persistentvolume"),
         "bound-to",
+    ),
+    Shape::new(
+        schema!("persistentvolumeclaim"),
+        schema!("storageclass"),
+        "uses-storage-class",
+    ),
+    Shape::new(
+        schema!("persistentvolume"),
+        schema!("storageclass"),
+        "uses-storage-class",
+    ),
+    // What a workload controller's own pod template names (§25.1, §29, §30.1, ADR-0029). The
+    // controller states these, not the Pods it has not created yet, so a `near` on a Deployment
+    // whose Pods are all crash-looping still reaches the ConfigMap that is the reason. No kind
+    // below is new to this list, so none of it costs a listing the pass was not already making.
+    Shape::new(schema!("deployment"), schema!("serviceaccount"), "runs-as"),
+    Shape::new(
+        schema!("deployment"),
+        schema!("configmap"),
+        "references-config",
+    ),
+    Shape::new(
+        schema!("deployment"),
+        schema!("secret"),
+        "references-secret",
+    ),
+    Shape::new(
+        schema!("deployment"),
+        schema!("persistentvolumeclaim"),
+        "mounts",
+    ),
+    Shape::new(schema!("replicaset"), schema!("serviceaccount"), "runs-as"),
+    Shape::new(
+        schema!("replicaset"),
+        schema!("configmap"),
+        "references-config",
+    ),
+    Shape::new(
+        schema!("replicaset"),
+        schema!("secret"),
+        "references-secret",
+    ),
+    Shape::new(
+        schema!("replicaset"),
+        schema!("persistentvolumeclaim"),
+        "mounts",
+    ),
+    Shape::new(schema!("statefulset"), schema!("serviceaccount"), "runs-as"),
+    Shape::new(
+        schema!("statefulset"),
+        schema!("configmap"),
+        "references-config",
+    ),
+    Shape::new(
+        schema!("statefulset"),
+        schema!("secret"),
+        "references-secret",
+    ),
+    Shape::new(
+        schema!("statefulset"),
+        schema!("persistentvolumeclaim"),
+        "mounts",
+    ),
+    Shape::new(schema!("daemonset"), schema!("serviceaccount"), "runs-as"),
+    Shape::new(
+        schema!("daemonset"),
+        schema!("configmap"),
+        "references-config",
+    ),
+    Shape::new(schema!("daemonset"), schema!("secret"), "references-secret"),
+    Shape::new(
+        schema!("daemonset"),
+        schema!("persistentvolumeclaim"),
+        "mounts",
+    ),
+    Shape::new(schema!("job"), schema!("serviceaccount"), "runs-as"),
+    Shape::new(schema!("job"), schema!("configmap"), "references-config"),
+    Shape::new(schema!("job"), schema!("secret"), "references-secret"),
+    Shape::new(schema!("job"), schema!("persistentvolumeclaim"), "mounts"),
+    Shape::new(schema!("cronjob"), schema!("serviceaccount"), "runs-as"),
+    Shape::new(
+        schema!("cronjob"),
+        schema!("configmap"),
+        "references-config",
+    ),
+    Shape::new(schema!("cronjob"), schema!("secret"), "references-secret"),
+    Shape::new(
+        schema!("cronjob"),
+        schema!("persistentvolumeclaim"),
+        "mounts",
     ),
     Shape::new(schema!("statefulset"), schema!("service"), "uses-service"),
     Shape::new(schema!("ingress"), schema!("secret"), "uses-tls-secret"),

@@ -35,7 +35,22 @@ use std::collections::BTreeMap;
 use serde_json::Value as Json;
 
 use crate::object::{Identity, Object};
-use crate::relationship::{Edge, Evidence, Relation, Target};
+use crate::relationship::{Edge, Evidence, Relation, Target, pod_spec_edges};
+
+/// The kinds that carry a pod template, and the pointer their template's spec sits at (§25.1).
+///
+/// Group and kind, because a `Deployment` of somebody else's group is a different resource
+/// (§13.5). The pointer is per kind rather than assumed: a CronJob templates a Job that templates
+/// a Pod, and reading `/spec/template` there would find nothing and report a CronJob that depends
+/// on no configuration at all.
+const POD_TEMPLATES: &[(&str, &str, &str)] = &[
+    ("apps", "Deployment", "/spec/template/spec"),
+    ("apps", "ReplicaSet", "/spec/template/spec"),
+    ("apps", "StatefulSet", "/spec/template/spec"),
+    ("apps", "DaemonSet", "/spec/template/spec"),
+    ("batch", "Job", "/spec/template/spec"),
+    ("batch", "CronJob", "/spec/jobTemplate/spec/template/spec"),
+];
 
 /// The well-known label by which an EndpointSlice names the Service it belongs to (§26.2).
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
@@ -334,6 +349,37 @@ impl Workload {
             })
             .collect();
         SelectorMatch::Evaluated(edges)
+    }
+
+    /// The objects a controller's pod template says its Pods will need (§25.1).
+    ///
+    /// §25.1 asks for `Deployment -> uses-template -> PodTemplate semantics`, and §25.3 answers
+    /// the shape that request cannot take: a template is not an object, so there is no address
+    /// for an edge to point at and no lifetime for it to be bound to. What a template *does*
+    /// state is which ConfigMaps, Secrets, claims, pull Secrets and identity the workload
+    /// depends on — and every one of those is an addressable object. So the template's semantics
+    /// reach a user as the controller's own reference edges, each citing the pointer inside the
+    /// template that carried it (Gate D), in the vocabulary §29 to §32 already use.
+    ///
+    /// Placement is deliberately absent. A template's `spec.nodeName` asks where Pods should go;
+    /// `scheduled-on` says where a Pod *is* (§28.1), and a Deployment is nowhere.
+    ///
+    /// A kind that states no pod template yields nothing rather than a guess: the table below is
+    /// GVK identity on both halves, so a custom resource carrying a field called `template` is
+    /// not read as a Deployment (§13.5, §23.5).
+    #[must_use]
+    pub fn template_dependencies(controller: &Object) -> Vec<Edge> {
+        let gvk = controller.gvk();
+        let Some((.., base)) = POD_TEMPLATES
+            .iter()
+            .find(|(group, kind, _)| *group == gvk.group() && *kind == gvk.kind())
+        else {
+            return Vec::new();
+        };
+        let Some(spec) = controller.field(base) else {
+            return Vec::new();
+        };
+        pod_spec_edges(&controller.identity(), controller.namespace(), spec, base)
     }
 
     /// The Service a StatefulSet names as its governing Service (§25.3).

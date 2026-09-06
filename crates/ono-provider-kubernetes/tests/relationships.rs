@@ -17,6 +17,7 @@
 )]
 
 use ono_provider_kubernetes::object::Object;
+use ono_provider_kubernetes::redaction;
 use ono_provider_kubernetes::relationship::{Edge, Evidence, Graph, Relation, Target};
 
 const POD: &str = r#"{
@@ -169,6 +170,11 @@ fn should_spell_relationships_the_way_the_specification_does() {
         (Relation::RunsAs, "runs-as"),
         (Relation::Mounts, "mounts"),
         (Relation::BoundTo, "bound-to"),
+        // Appendix B's word rather than §30.1's `provisioned-by / storage-class`. The appendix
+        // says its names are candidates to be reconciled with the project's global registry, and
+        // `provisioned-by` would claim the provisioning happened where the field only names a
+        // class. ADR-0031.
+        (Relation::UsesStorageClass, "uses-storage-class"),
         (Relation::ReferencesConfig, "references-config"),
         (Relation::ReferencesSecret, "references-secret"),
         (Relation::UsesImagePullSecret, "uses-image-pull-secret"),
@@ -438,4 +444,345 @@ fn should_keep_a_derived_edge_distinguishable_from_a_declared_one() {
         .is_asserted_by_provider(),
         "a selector edge is derived by this provider from two facts, not asserted by the server"
     );
+}
+
+const BOUND_CLAIM: &str = r#"{
+  "apiVersion":"v1","kind":"PersistentVolumeClaim",
+  "metadata":{"name":"checkout-data","namespace":"shop","uid":"pvc-1","resourceVersion":"7"},
+  "spec":{"volumeName":"pvc-0e12-4a","storageClassName":"fast","accessModes":["ReadWriteOnce"]},
+  "status":{"phase":"Bound"}
+}"#;
+
+const PENDING_CLAIM: &str = r#"{
+  "apiVersion":"v1","kind":"PersistentVolumeClaim",
+  "metadata":{"name":"waiting","namespace":"shop","uid":"pvc-2"},
+  "spec":{"storageClassName":"fast","accessModes":["ReadWriteOnce"]},
+  "status":{"phase":"Pending"}
+}"#;
+
+const UNBOUND_CLAIM: &str = r#"{
+  "apiVersion":"v1","kind":"PersistentVolumeClaim",
+  "metadata":{"name":"released","namespace":"shop","uid":"pvc-3"},
+  "spec":{"volumeName":"","storageClassName":"fast"},
+  "status":{"phase":"Pending"}
+}"#;
+
+const LAYERED_POD: &str = r#"{
+  "apiVersion":"v1","kind":"Pod",
+  "metadata":{"name":"api-1","namespace":"shop","uid":"pod-9","resourceVersion":"3"},
+  "spec":{
+    "imagePullSecrets":[{"name":"registry-cred"}],
+    "volumes":[
+      {"name":"bundle","projected":{"sources":[
+        {"configMap":{"name":"trust-bundle"}},
+        {"secret":{"name":"client-cert","optional":true}},
+        {"serviceAccountToken":{"path":"token","audience":"api","expirationSeconds":3600}}
+      ]}}
+    ],
+    "initContainers":[
+      {"name":"migrate","image":"migrate:1",
+       "envFrom":[{"configMapRef":{"name":"migrate-env","optional":true}}]}
+    ],
+    "containers":[
+      {"name":"app","image":"api:1",
+       "env":[{"name":"KEY","valueFrom":{"secretKeyRef":{"name":"app-key","key":"k",
+                                                          "optional":false}}}]}
+    ],
+    "ephemeralContainers":[
+      {"name":"debug","image":"debug:1",
+       "envFrom":[{"secretRef":{"name":"debug-token"}}]}
+    ]
+  }
+}"#;
+
+const POD_SHAPED_CUSTOM_RESOURCE: &str = r#"{
+  "apiVersion":"acme.example.com/v1","kind":"Pod",
+  "metadata":{"name":"impostor","namespace":"shop","uid":"cr-1"},
+  "spec":{"nodeName":"ip-10-42-2-19","serviceAccountName":"checkout-sa"}
+}"#;
+
+#[test]
+fn should_bind_a_claim_to_the_volume_it_names() {
+    // §30.2: `spec.volumeName` is the claim's own statement that it is bound, so `bound-to` is a
+    // native-field edge rather than a second reading — and a PersistentVolume is cluster-scoped,
+    // so the claim's namespace must not travel onto it (§9.2, §24.2).
+    let claim = object(BOUND_CLAIM);
+    let bound = Graph::edges_of(&claim)
+        .into_iter()
+        .find(|edge| edge.relation() == Relation::BoundTo)
+        .expect("a bound claim names its volume");
+
+    assert_eq!(bound.target().kind(), "PersistentVolume");
+    assert_eq!(bound.target().name(), "pvc-0e12-4a");
+    assert_eq!(bound.target().api_version(), Some("v1"));
+    assert_eq!(
+        bound.target().namespace(),
+        None,
+        "a PersistentVolume is cluster-scoped, and a namespace on it would address nothing"
+    );
+    assert!(
+        !bound.target().is_resolved(),
+        "the volume was never read, and §24.1 keeps the edge without inventing its lifetime"
+    );
+    assert_eq!(
+        bound.evidence(),
+        &Evidence::NativeField {
+            path: "/spec/volumeName".to_owned(),
+            value: "pvc-0e12-4a".to_owned(),
+        }
+    );
+    assert_eq!(
+        bound.supporting(),
+        &[Evidence::NativeField {
+            path: "/status/phase".to_owned(),
+            value: "Bound".to_owned(),
+        }],
+        "§30.2's `relevant status fields` qualify the binding without deciding it"
+    );
+}
+
+#[test]
+fn should_not_treat_a_pending_claim_as_bound() {
+    // §30.2 MUST: a Pending claim with no `volumeName` is not bound to anything, and an empty
+    // string is not a volume name either — an edge to `` would address a volume nobody has.
+    for fixture in [PENDING_CLAIM, UNBOUND_CLAIM] {
+        let claim = object(fixture);
+        assert!(
+            !Graph::edges_of(&claim)
+                .iter()
+                .any(|edge| edge.relation() == Relation::BoundTo),
+            "an unbound claim states no binding, and absence is not a reason to guess one"
+        );
+    }
+}
+
+#[test]
+fn should_read_configuration_from_containers_that_are_not_the_main_ones() {
+    // §29.1: an init container and an ephemeral container reference ConfigMaps and Secrets the
+    // same way `spec.containers` does. Scanning only the main containers reports a Pod that
+    // cannot start for want of a ConfigMap as one that references none.
+    let pod = object(LAYERED_POD);
+    let edges = Graph::edges_of(&pod);
+    let paths: Vec<&str> = edges
+        .iter()
+        .filter_map(|edge| edge.evidence().path())
+        .collect();
+
+    assert!(
+        paths.contains(&"/spec/initContainers/0/envFrom/0/configMapRef/name"),
+        "an init container's reference cites its own pointer, got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/spec/ephemeralContainers/0/envFrom/0/secretRef/name"),
+        "an ephemeral container's reference cites its own pointer, got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/spec/containers/0/env/0/valueFrom/secretKeyRef/name"),
+        "the main containers are still scanned, got {paths:?}"
+    );
+    let migrate = edges
+        .iter()
+        .find(|edge| edge.target().name() == "migrate-env")
+        .expect("the init container's ConfigMap is a target");
+    assert_eq!(migrate.relation(), Relation::ReferencesConfig);
+    assert_eq!(migrate.target().namespace(), Some("shop"));
+}
+
+#[test]
+fn should_read_the_sources_a_projected_volume_composes() {
+    // §29.1 names the projected ConfigMap source explicitly. A projected volume is how a Pod
+    // reads several sources under one mount, and skipping it hides the dependency entirely.
+    let pod = object(LAYERED_POD);
+    let edges = Graph::edges_of(&pod);
+    let from_volume: Vec<&Edge> = edges
+        .iter()
+        .filter(|edge| {
+            edge.evidence()
+                .path()
+                .is_some_and(|path| path.starts_with("/spec/volumes/0"))
+        })
+        .collect();
+
+    let paths: Vec<&str> = from_volume
+        .iter()
+        .filter_map(|edge| edge.evidence().path())
+        .collect();
+    assert!(
+        paths.contains(&"/spec/volumes/0/projected/sources/0/configMap/name"),
+        "got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/spec/volumes/0/projected/sources/1/secret/name"),
+        "a projected Secret source names the Secret in `name`, got {paths:?}"
+    );
+    assert_eq!(
+        from_volume.len(),
+        2,
+        "a `serviceAccountToken` source references no object — the API server mints the token — \
+         so it contributes no edge rather than an edge to a name nobody can look up"
+    );
+}
+
+#[test]
+fn should_keep_an_optional_reference_marked_optional() {
+    // §29.3: a missing optional target is not an error, and an edge that dropped the flag would
+    // make an absent ConfigMap read as a broken Pod. The flag qualifies the edge rather than
+    // deciding it, so it rides as supporting evidence with the pointer that stated it.
+    let pod = object(LAYERED_POD);
+    let edges = Graph::edges_of(&pod);
+
+    let optional = edges
+        .iter()
+        .find(|edge| edge.target().name() == "migrate-env")
+        .expect("the init container references a ConfigMap");
+    assert_eq!(
+        optional.supporting(),
+        &[Evidence::NativeField {
+            path: "/spec/initContainers/0/envFrom/0/configMapRef/optional".to_owned(),
+            value: "true".to_owned(),
+        }]
+    );
+
+    let required = edges
+        .iter()
+        .find(|edge| edge.target().name() == "app-key")
+        .expect("the container reads a secret key");
+    assert_eq!(
+        required.supporting(),
+        &[Evidence::NativeField {
+            path: "/spec/containers/0/env/0/valueFrom/secretKeyRef/optional".to_owned(),
+            value: "false".to_owned(),
+        }],
+        "a reference that states `optional: false` said so, and the edge repeats what it read"
+    );
+
+    let unstated = edges
+        .iter()
+        .find(|edge| edge.target().name() == "debug-token")
+        .expect("the ephemeral container references a Secret");
+    assert!(
+        unstated.supporting().is_empty(),
+        "a reference that carries no `optional` field has none, and a fabricated `false` would \
+         report a field the object never held"
+    );
+}
+
+#[test]
+fn should_relate_a_pod_to_the_secrets_its_images_are_pulled_with() {
+    // §32.1 and §22.4: `spec.imagePullSecrets` is a Secret reference a Pod states about itself,
+    // and a Pod that cannot pull its image is the case an operator asks about. The word is the
+    // one a ServiceAccount's pull secrets already use, so there is one vocabulary for one fact.
+    let pod = object(LAYERED_POD);
+    let edges = Graph::edges_of(&pod);
+
+    let pull = edges
+        .iter()
+        .find(|edge| edge.relation() == Relation::UsesImagePullSecret)
+        .expect("the pod names an image pull secret");
+    assert_eq!(pull.target().kind(), "Secret");
+    assert_eq!(pull.target().name(), "registry-cred");
+    assert_eq!(
+        pull.target().namespace(),
+        Some("shop"),
+        "a pull Secret is namespace-local (§24.2, §32.1)"
+    );
+    assert_eq!(
+        pull.evidence(),
+        &Evidence::NativeField {
+            path: "/spec/imagePullSecrets/0/name".to_owned(),
+            value: "registry-cred".to_owned(),
+        }
+    );
+
+    // The plugin emits `Graph::edges_of` *and* `redaction::secret_references` filtered to the
+    // two `uses-*` words. A Pod pull-secret edge produced by both would reach a user twice.
+    assert!(
+        !redaction::secret_references(&pod)
+            .iter()
+            .any(|edge| edge.relation() == Relation::UsesImagePullSecret),
+        "`secret_references` adds the ServiceAccount's own entries and takes the Pod's edges \
+         from `edges_of`; producing this one twice would double every pull-secret edge"
+    );
+}
+
+#[test]
+fn should_not_read_a_custom_resource_as_a_pod_because_it_is_called_one() {
+    // §13.5: GVK identity is group *and* kind. A custom `Pod` in someone else's group carries
+    // whatever fields its author chose, and reading `spec.nodeName` there would assert a
+    // scheduling fact about an object that never claimed one.
+    let impostor = object(POD_SHAPED_CUSTOM_RESOURCE);
+    assert!(
+        Graph::edges_of(&impostor).is_empty(),
+        "only `v1 Pod` states a Pod's fields"
+    );
+}
+
+const VOLUME_WITH_CLASS: &str = r#"{
+  "apiVersion":"v1","kind":"PersistentVolume",
+  "metadata":{"name":"pvc-0e12-4a","uid":"pv-1"},
+  "spec":{"storageClassName":"fast","capacity":{"storage":"20Gi"}}
+}"#;
+
+const CLAIM_REFUSING_A_CLASS: &str = r#"{
+  "apiVersion":"v1","kind":"PersistentVolumeClaim",
+  "metadata":{"name":"static-data","namespace":"shop","uid":"pvc-2"},
+  "spec":{"storageClassName":"","volumeName":"pv-static"}
+}"#;
+
+const CLAIM_TAKING_THE_DEFAULT: &str = r#"{
+  "apiVersion":"v1","kind":"PersistentVolumeClaim",
+  "metadata":{"name":"default-data","namespace":"shop","uid":"pvc-3"},
+  "spec":{"accessModes":["ReadWriteOnce"]}
+}"#;
+
+#[test]
+fn should_relate_a_claim_and_a_volume_to_the_class_each_one_names() {
+    // §30.1 and §30.3: the class decides the provisioner, the reclaim policy and whether the
+    // volume can grow, which is why §30.3 wants it reachable before a change is planned. The
+    // field states it, so the edge is a native field on both ends — and a StorageClass is
+    // cluster-scoped, so neither namespace travels onto it (§9.2).
+    for (fixture, source) in [(BOUND_CLAIM, "a claim"), (VOLUME_WITH_CLASS, "a volume")] {
+        let edge = Graph::edges_of(&object(fixture))
+            .into_iter()
+            .find(|edge| edge.relation() == Relation::UsesStorageClass)
+            .unwrap_or_else(|| panic!("{source} that names a class relates to it"));
+
+        assert_eq!(edge.target().kind(), "StorageClass");
+        assert_eq!(edge.target().name(), "fast");
+        assert_eq!(edge.target().api_version(), Some("storage.k8s.io/v1"));
+        assert_eq!(edge.target().namespace(), None, "{source}");
+        assert_eq!(
+            edge.evidence(),
+            &Evidence::NativeField {
+                path: "/spec/storageClassName".to_owned(),
+                value: "fast".to_owned(),
+            },
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn should_relate_no_class_where_the_object_named_none() {
+    // The two ways of naming no class, and both are answers rather than gaps. `""` is
+    // Kubernetes' way of saying *no class, do not provision dynamically*, and an edge would
+    // address a StorageClass called the empty string. An absent field means the cluster's
+    // default applies, and which class that is, is a fact about the cluster — reading it from
+    // here would be an inference wearing a native field's clothes (§23.5, §4 invariant 20).
+    for (fixture, how) in [
+        (
+            CLAIM_REFUSING_A_CLASS,
+            "an empty class name refuses a class",
+        ),
+        (
+            CLAIM_TAKING_THE_DEFAULT,
+            "an absent one takes the cluster default",
+        ),
+    ] {
+        let classes: Vec<_> = Graph::edges_of(&object(fixture))
+            .into_iter()
+            .filter(|edge| edge.relation() == Relation::UsesStorageClass)
+            .collect();
+        assert!(classes.is_empty(), "{how}, got {classes:?}");
+    }
 }

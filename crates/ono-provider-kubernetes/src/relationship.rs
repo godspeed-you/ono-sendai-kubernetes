@@ -73,6 +73,14 @@ pub enum Relation {
     Mounts,
     /// The source claim is bound to the target volume (§30.2).
     BoundTo,
+    /// The source claim or volume names the target StorageClass (§30.1, §30.3).
+    ///
+    /// Appendix B's word rather than §30.1's `provisioned-by / storage-class`. ADR-0031 records
+    /// why: the appendix says its names are candidates to be reconciled with the project's global
+    /// relationship registry, `uses-*` is the shape every other "this object names that one" edge
+    /// here already has, and `provisioned-by` would claim the provisioning happened — which the
+    /// field does not say and a `Pending` claim disproves.
+    UsesStorageClass,
     /// The source reads configuration from the target (§29.1).
     ReferencesConfig,
     /// The source reads a secret from the target (§29.2).
@@ -106,6 +114,7 @@ impl Relation {
             Self::RunsAs => "runs-as",
             Self::Mounts => "mounts",
             Self::BoundTo => "bound-to",
+            Self::UsesStorageClass => "uses-storage-class",
             Self::ReferencesConfig => "references-config",
             Self::ReferencesSecret => "references-secret",
             Self::UsesSecret => "uses-secret",
@@ -484,8 +493,17 @@ impl Graph {
             }
         }
 
-        if object.gvk().kind() == "Pod" {
-            edges.extend(pod_edges(object, &source, namespace.as_deref()));
+        // Group *and* kind, because §13.5 makes GVK the identity: a custom `Pod` in someone
+        // else's group carries whatever fields its author chose, and reading `spec.nodeName`
+        // there would assert a scheduling fact about an object that never claimed one.
+        match (object.gvk().group(), object.gvk().kind()) {
+            ("", "Pod") => edges.extend(pod_edges(object, &source, namespace.as_deref())),
+            ("", "PersistentVolumeClaim") => edges.extend(claim_edges(object, &source)),
+            // A PersistentVolume names its class in the same field a claim does, and nothing
+            // else about a volume is a relationship this provider derives: what it is backed by
+            // is §47.5's cross-system evidence, exported rather than resolved.
+            ("", "PersistentVolume") => edges.extend(storage_class_edge(object, &source)),
+            _ => {}
         }
 
         edges
@@ -535,6 +553,10 @@ fn pod_edges(pod: &Object, source: &Identity, namespace: Option<&str>) -> Vec<Ed
     // A Node is cluster-scoped, so its edge carries no namespace; every other reference below is
     // namespace-local. Building the node edge on its own is what keeps that difference visible
     // rather than papering over it with the pod's namespace.
+    //
+    // It is also the one fact here that only a *Pod* states. `spec.nodeName` inside a controller's
+    // template is a request for where Pods should go, and reading it through [`pod_spec_edges`]
+    // would put a Deployment on a node (§28.1).
     if let Some(node) = pod.field("/spec/nodeName").and_then(Json::as_str) {
         edges.push(Edge::new(
             source.clone(),
@@ -546,116 +568,368 @@ fn pod_edges(pod: &Object, source: &Identity, namespace: Option<&str>) -> Vec<Ed
             },
         ));
     }
-    if let Some(account) = pod.field("/spec/serviceAccountName").and_then(Json::as_str) {
+    if let Some(spec) = pod.field("/spec") {
+        edges.extend(pod_spec_edges(source, namespace, spec, "/spec"));
+    }
+
+    edges
+}
+
+/// The edges any pod spec states, wherever that spec sits in its object (§29 to §32).
+///
+/// `base` is the JSON pointer the spec was read at, and every evidence path is built from it, so
+/// the same rules serve a Pod at `/spec` and a controller's template at `/spec/template/spec`
+/// while each edge still cites the field that decided it (Gate D). Duplicating the rules per
+/// location is how the three container lists came to be one for so long.
+pub(crate) fn pod_spec_edges(
+    source: &Identity,
+    namespace: Option<&str>,
+    spec: &Json,
+    base: &str,
+) -> Vec<Edge> {
+    let mut edges = Vec::new();
+
+    if let Some(account) = spec.pointer("/serviceAccountName").and_then(Json::as_str) {
         edges.push(reference_edge(
             source,
             Relation::RunsAs,
             "ServiceAccount",
             namespace,
             account,
-            "/spec/serviceAccountName",
+            &format!("{base}/serviceAccountName"),
         ));
     }
-
-    if let Some(volumes) = pod.field("/spec/volumes").and_then(Json::as_array) {
-        for (index, volume) in volumes.iter().enumerate() {
-            if let Some(claim) = volume
-                .pointer("/persistentVolumeClaim/claimName")
-                .and_then(Json::as_str)
-            {
+    // §22.4 and §32.1: the Secrets the kubelet pulls images with, in the same word a
+    // ServiceAccount's pull secrets already use. A Pod that cannot pull its image is exactly the
+    // object an operator asks about, and one vocabulary keeps the two ends of that answer joined.
+    if let Some(entries) = spec.pointer("/imagePullSecrets").and_then(Json::as_array) {
+        for (index, entry) in entries.iter().enumerate() {
+            if let Some(name) = entry.get("name").and_then(Json::as_str) {
                 edges.push(reference_edge(
                     source,
-                    Relation::Mounts,
-                    "PersistentVolumeClaim",
-                    namespace,
-                    claim,
-                    &format!("/spec/volumes/{index}/persistentVolumeClaim/claimName"),
-                ));
-            }
-            if let Some(name) = volume.pointer("/configMap/name").and_then(Json::as_str) {
-                edges.push(reference_edge(
-                    source,
-                    Relation::ReferencesConfig,
-                    "ConfigMap",
-                    namespace,
-                    name,
-                    &format!("/spec/volumes/{index}/configMap/name"),
-                ));
-            }
-            if let Some(name) = volume.pointer("/secret/secretName").and_then(Json::as_str) {
-                edges.push(reference_edge(
-                    source,
-                    Relation::ReferencesSecret,
+                    Relation::UsesImagePullSecret,
                     "Secret",
                     namespace,
                     name,
-                    &format!("/spec/volumes/{index}/secret/secretName"),
+                    &format!("{base}/imagePullSecrets/{index}/name"),
                 ));
             }
         }
     }
 
-    if let Some(containers) = pod.field("/spec/containers").and_then(Json::as_array) {
+    if let Some(volumes) = spec.pointer("/volumes").and_then(Json::as_array) {
+        for (index, volume) in volumes.iter().enumerate() {
+            edges.extend(volume_edges(
+                source,
+                namespace,
+                volume,
+                &format!("{base}/volumes/{index}"),
+            ));
+        }
+    }
+
+    // §29.1's references are stated by every container list, not by `spec.containers` alone. A
+    // Pod that cannot start because an init container's ConfigMap is missing would otherwise be
+    // reported as a Pod that references no configuration.
+    for list in ["containers", "initContainers", "ephemeralContainers"] {
+        let Some(containers) = spec.pointer(&format!("/{list}")).and_then(Json::as_array) else {
+            continue;
+        };
         for (index, container) in containers.iter().enumerate() {
-            let base = format!("/spec/containers/{index}");
-            if let Some(from) = container.get("envFrom").and_then(Json::as_array) {
-                for (position, entry) in from.iter().enumerate() {
-                    if let Some(name) = entry.pointer("/configMapRef/name").and_then(Json::as_str) {
-                        edges.push(reference_edge(
-                            source,
-                            Relation::ReferencesConfig,
-                            "ConfigMap",
-                            namespace,
-                            name,
-                            &format!("{base}/envFrom/{position}/configMapRef/name"),
-                        ));
-                    }
-                    if let Some(name) = entry.pointer("/secretRef/name").and_then(Json::as_str) {
-                        edges.push(reference_edge(
-                            source,
-                            Relation::ReferencesSecret,
-                            "Secret",
-                            namespace,
-                            name,
-                            &format!("{base}/envFrom/{position}/secretRef/name"),
-                        ));
-                    }
-                }
+            edges.extend(container_edges(
+                source,
+                namespace,
+                container,
+                &format!("{base}/{list}/{index}"),
+            ));
+        }
+    }
+
+    edges
+}
+
+/// The objects one volume names, by its typed source (§30.1).
+///
+/// Typed rather than flattened, which is §30.1's own rule: an `emptyDir` and a `configMap` are
+/// not one string with different contents. A source this provider has no rule for contributes
+/// nothing, and that includes `serviceAccountToken` — the API server mints that token, so there
+/// is no object for an edge to point at.
+fn volume_edges(
+    source: &Identity,
+    namespace: Option<&str>,
+    volume: &Json,
+    base: &str,
+) -> Vec<Edge> {
+    let mut edges = Vec::new();
+
+    if let Some(claim) = volume
+        .pointer("/persistentVolumeClaim/claimName")
+        .and_then(Json::as_str)
+    {
+        edges.push(reference_edge(
+            source,
+            Relation::Mounts,
+            "PersistentVolumeClaim",
+            namespace,
+            claim,
+            &format!("{base}/persistentVolumeClaim/claimName"),
+        ));
+    }
+    if let Some(name) = volume.pointer("/configMap/name").and_then(Json::as_str) {
+        edges.push(
+            reference_edge(
+                source,
+                Relation::ReferencesConfig,
+                "ConfigMap",
+                namespace,
+                name,
+                &format!("{base}/configMap/name"),
+            )
+            .with_supporting(optional_evidence(
+                volume.pointer("/configMap"),
+                &format!("{base}/configMap"),
+            )),
+        );
+    }
+    if let Some(name) = volume.pointer("/secret/secretName").and_then(Json::as_str) {
+        edges.push(
+            reference_edge(
+                source,
+                Relation::ReferencesSecret,
+                "Secret",
+                namespace,
+                name,
+                &format!("{base}/secret/secretName"),
+            )
+            .with_supporting(optional_evidence(
+                volume.pointer("/secret"),
+                &format!("{base}/secret"),
+            )),
+        );
+    }
+    // A projected volume composes several sources under one mount, and §29.1 names the projected
+    // ConfigMap source explicitly. A Secret projection carries `name` rather than `secretName`.
+    if let Some(sources) = volume
+        .pointer("/projected/sources")
+        .and_then(Json::as_array)
+    {
+        for (position, projected) in sources.iter().enumerate() {
+            let at = format!("{base}/projected/sources/{position}");
+            if let Some(name) = projected.pointer("/configMap/name").and_then(Json::as_str) {
+                edges.push(
+                    reference_edge(
+                        source,
+                        Relation::ReferencesConfig,
+                        "ConfigMap",
+                        namespace,
+                        name,
+                        &format!("{at}/configMap/name"),
+                    )
+                    .with_supporting(optional_evidence(
+                        projected.pointer("/configMap"),
+                        &format!("{at}/configMap"),
+                    )),
+                );
             }
-            if let Some(env) = container.get("env").and_then(Json::as_array) {
-                for (position, entry) in env.iter().enumerate() {
-                    if let Some(name) = entry
-                        .pointer("/valueFrom/configMapKeyRef/name")
-                        .and_then(Json::as_str)
-                    {
-                        edges.push(reference_edge(
-                            source,
-                            Relation::ReferencesConfig,
-                            "ConfigMap",
-                            namespace,
-                            name,
-                            &format!("{base}/env/{position}/valueFrom/configMapKeyRef/name"),
-                        ));
-                    }
-                    if let Some(name) = entry
-                        .pointer("/valueFrom/secretKeyRef/name")
-                        .and_then(Json::as_str)
-                    {
-                        edges.push(reference_edge(
-                            source,
-                            Relation::ReferencesSecret,
-                            "Secret",
-                            namespace,
-                            name,
-                            &format!("{base}/env/{position}/valueFrom/secretKeyRef/name"),
-                        ));
-                    }
-                }
+            if let Some(name) = projected.pointer("/secret/name").and_then(Json::as_str) {
+                edges.push(
+                    reference_edge(
+                        source,
+                        Relation::ReferencesSecret,
+                        "Secret",
+                        namespace,
+                        name,
+                        &format!("{at}/secret/name"),
+                    )
+                    .with_supporting(optional_evidence(
+                        projected.pointer("/secret"),
+                        &format!("{at}/secret"),
+                    )),
+                );
             }
         }
     }
 
     edges
+}
+
+/// The ConfigMaps and Secrets one container reads, and how it reads them (§29.1, §29.2).
+fn container_edges(
+    source: &Identity,
+    namespace: Option<&str>,
+    container: &Json,
+    base: &str,
+) -> Vec<Edge> {
+    let mut edges = Vec::new();
+
+    if let Some(from) = container.get("envFrom").and_then(Json::as_array) {
+        for (position, entry) in from.iter().enumerate() {
+            if let Some(name) = entry.pointer("/configMapRef/name").and_then(Json::as_str) {
+                let at = format!("{base}/envFrom/{position}/configMapRef");
+                edges.push(
+                    reference_edge(
+                        source,
+                        Relation::ReferencesConfig,
+                        "ConfigMap",
+                        namespace,
+                        name,
+                        &format!("{at}/name"),
+                    )
+                    .with_supporting(optional_evidence(entry.pointer("/configMapRef"), &at)),
+                );
+            }
+            if let Some(name) = entry.pointer("/secretRef/name").and_then(Json::as_str) {
+                let at = format!("{base}/envFrom/{position}/secretRef");
+                edges.push(
+                    reference_edge(
+                        source,
+                        Relation::ReferencesSecret,
+                        "Secret",
+                        namespace,
+                        name,
+                        &format!("{at}/name"),
+                    )
+                    .with_supporting(optional_evidence(entry.pointer("/secretRef"), &at)),
+                );
+            }
+        }
+    }
+    if let Some(env) = container.get("env").and_then(Json::as_array) {
+        for (position, entry) in env.iter().enumerate() {
+            if let Some(name) = entry
+                .pointer("/valueFrom/configMapKeyRef/name")
+                .and_then(Json::as_str)
+            {
+                let at = format!("{base}/env/{position}/valueFrom/configMapKeyRef");
+                edges.push(
+                    reference_edge(
+                        source,
+                        Relation::ReferencesConfig,
+                        "ConfigMap",
+                        namespace,
+                        name,
+                        &format!("{at}/name"),
+                    )
+                    .with_supporting(optional_evidence(
+                        entry.pointer("/valueFrom/configMapKeyRef"),
+                        &at,
+                    )),
+                );
+            }
+            if let Some(name) = entry
+                .pointer("/valueFrom/secretKeyRef/name")
+                .and_then(Json::as_str)
+            {
+                let at = format!("{base}/env/{position}/valueFrom/secretKeyRef");
+                edges.push(
+                    reference_edge(
+                        source,
+                        Relation::ReferencesSecret,
+                        "Secret",
+                        namespace,
+                        name,
+                        &format!("{at}/name"),
+                    )
+                    .with_supporting(optional_evidence(
+                        entry.pointer("/valueFrom/secretKeyRef"),
+                        &at,
+                    )),
+                );
+            }
+        }
+    }
+
+    edges
+}
+
+/// The `optional` flag beside a reference, as supporting evidence (§29.3).
+///
+/// Supporting rather than deciding: the flag does not make the reference exist, and it changes
+/// what a missing target means — §29.3 says an absent optional target is not an error, and an
+/// edge that dropped the flag would report a healthy Pod as a broken one. Absent when the object
+/// carried no such field, because the default is not something the API server said.
+fn optional_evidence(reference: Option<&Json>, base: &str) -> Vec<Evidence> {
+    reference
+        .and_then(|reference| reference.get("optional"))
+        .and_then(Json::as_bool)
+        .map(|optional| {
+            vec![Evidence::NativeField {
+                path: format!("{base}/optional"),
+                value: optional.to_string(),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+/// The volume a claim states it is bound to (§30.2).
+///
+/// `spec.volumeName` is the binding, and a claim that names none is not bound to anything: §30.2
+/// forbids treating a Pending claim as bound, so an absent or empty name produces no edge rather
+/// than an edge to a volume nobody has. A PersistentVolume is cluster-scoped, so the claim's
+/// namespace does not travel onto the target (§9.2, §24.2).
+fn claim_edges(claim: &Object, source: &Identity) -> Vec<Edge> {
+    let mut edges = storage_class_edge(claim, source);
+    let Some(volume) = claim
+        .field("/spec/volumeName")
+        .and_then(Json::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return edges;
+    };
+    // §30.2's "relevant status fields": the phase qualifies the binding without deciding it, so a
+    // claim whose spec names a volume the control plane has not confirmed still says so.
+    let phase = claim
+        .field("/status/phase")
+        .and_then(Json::as_str)
+        .map(|phase| {
+            vec![Evidence::NativeField {
+                path: "/status/phase".to_owned(),
+                value: phase.to_owned(),
+            }]
+        })
+        .unwrap_or_default();
+    edges.push(
+        Edge::new(
+            source.clone(),
+            Relation::BoundTo,
+            Target::new("PersistentVolume", volume).with_api_version(Some("v1")),
+            Evidence::NativeField {
+                path: "/spec/volumeName".to_owned(),
+                value: volume.to_owned(),
+            },
+        )
+        .with_supporting(phase),
+    );
+    edges
+}
+
+/// The class a claim or a volume names, where it names one (§30.1, §30.3).
+///
+/// Three states the field keeps apart, and only one of them is an edge. A name is the class.
+/// **The empty string is not**: `storageClassName: ""` is Kubernetes' way of saying *no class,
+/// do not provision dynamically*, and an edge there would point at a StorageClass whose name is
+/// the empty string. **Absent is not either**: it means the cluster's default class applies, and
+/// which class that is, is a fact about the cluster rather than about this object — reading it
+/// here would be an inference presented as a native field (§23.5, §4 invariant 20).
+///
+/// A StorageClass is cluster-scoped, so the target carries no namespace (§9.2).
+fn storage_class_edge(object: &Object, source: &Identity) -> Vec<Edge> {
+    let Some(class) = object
+        .field("/spec/storageClassName")
+        .and_then(Json::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return Vec::new();
+    };
+    vec![Edge::new(
+        source.clone(),
+        Relation::UsesStorageClass,
+        Target::new("StorageClass", class).with_api_version(Some("storage.k8s.io/v1")),
+        Evidence::NativeField {
+            path: "/spec/storageClassName".to_owned(),
+            value: class.to_owned(),
+        },
+    )]
 }
 
 fn reference_edge(

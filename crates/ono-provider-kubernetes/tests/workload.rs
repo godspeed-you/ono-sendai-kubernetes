@@ -796,3 +796,135 @@ fn should_carry_checkable_evidence_on_every_edge_it_produces() {
         }
     }
 }
+
+const TEMPLATED_DEPLOYMENT: &str = r#"{
+  "apiVersion":"apps/v1","kind":"Deployment",
+  "metadata":{"name":"api","namespace":"shop","uid":"dep-9","resourceVersion":"4"},
+  "spec":{
+    "selector":{"matchLabels":{"app":"api"}},
+    "template":{
+      "metadata":{"labels":{"app":"api"}},
+      "spec":{
+        "nodeName":"ip-10-42-2-19",
+        "serviceAccountName":"api-sa",
+        "imagePullSecrets":[{"name":"registry-cred"}],
+        "volumes":[
+          {"name":"conf","configMap":{"name":"api-config"}},
+          {"name":"data","persistentVolumeClaim":{"claimName":"api-data"}}
+        ],
+        "containers":[
+          {"name":"app","image":"api:1",
+           "envFrom":[{"secretRef":{"name":"api-token"}}]}
+        ]
+      }
+    }
+  }
+}"#;
+
+const TEMPLATED_CRONJOB: &str = r#"{
+  "apiVersion":"batch/v1","kind":"CronJob",
+  "metadata":{"name":"nightly","namespace":"shop","uid":"cj-9"},
+  "spec":{
+    "schedule":"0 2 * * *",
+    "jobTemplate":{"spec":{"template":{"spec":{
+      "containers":[{"name":"run","image":"run:1",
+                     "envFrom":[{"configMapRef":{"name":"nightly-env"}}]}]
+    }}}}
+  }
+}"#;
+
+#[test]
+fn should_read_a_controllers_dependencies_from_the_template_it_states() {
+    // §25.1 asks for `Deployment -> uses-template -> PodTemplate semantics`, and §25.3 says a
+    // template is not an object. What a template *states* is which ConfigMaps, Secrets, claims
+    // and identity the workload needs, and those targets are addressable — so the semantics
+    // reach a user as the controller's own reference edges, cited at the template's pointer.
+    let deployment = object(TEMPLATED_DEPLOYMENT);
+    let edges = Workload::template_dependencies(&deployment);
+    let paths: Vec<&str> = edges
+        .iter()
+        .filter_map(|edge| edge.evidence().path())
+        .collect();
+
+    assert!(
+        paths.contains(&"/spec/template/spec/volumes/0/configMap/name"),
+        "got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/spec/template/spec/containers/0/envFrom/0/secretRef/name"),
+        "got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/spec/template/spec/serviceAccountName"),
+        "got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/spec/template/spec/imagePullSecrets/0/name"),
+        "got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/spec/template/spec/volumes/1/persistentVolumeClaim/claimName"),
+        "got {paths:?}"
+    );
+
+    let config = edges
+        .iter()
+        .find(|edge| edge.relation() == Relation::ReferencesConfig)
+        .expect("the template names a ConfigMap");
+    assert_eq!(config.source().uid(), Some("dep-9"));
+    assert_eq!(
+        config.target().namespace(),
+        Some("shop"),
+        "the template's references live in the controller's namespace (§24.2)"
+    );
+    assert!(
+        edges
+            .iter()
+            .all(|edge| edge.evidence().is_asserted_by_provider()),
+        "every one of these is a field the Deployment itself carries (§23.1)"
+    );
+}
+
+#[test]
+fn should_not_read_a_placement_from_a_template() {
+    // §28.1: `scheduled-on` is where a Pod *is*, and a template's `spec.nodeName` is where the
+    // Pods it has not created yet are asked to go. A Deployment is scheduled nowhere, and an
+    // edge saying otherwise would put a controller on a node.
+    let deployment = object(TEMPLATED_DEPLOYMENT);
+    assert!(
+        Workload::template_dependencies(&deployment)
+            .iter()
+            .all(|edge| edge.relation() != Relation::ScheduledOn),
+        "a template states an intent about placement, never an observation of one"
+    );
+}
+
+#[test]
+fn should_reach_a_cronjobs_template_through_the_job_it_templates() {
+    // §25.5: a CronJob's pod template is two levels down, and reading `/spec/template` there
+    // would find nothing and report a CronJob that depends on no configuration.
+    let cronjob = object(TEMPLATED_CRONJOB);
+    let edges = Workload::template_dependencies(&cronjob);
+    let config = edges
+        .iter()
+        .find(|edge| edge.relation() == Relation::ReferencesConfig)
+        .expect("the job template names a ConfigMap");
+    assert_eq!(config.target().name(), "nightly-env");
+    assert_eq!(
+        config.evidence().path(),
+        Some("/spec/jobTemplate/spec/template/spec/containers/0/envFrom/0/configMapRef/name")
+    );
+}
+
+#[test]
+fn should_read_no_template_from_a_kind_that_states_none() {
+    // A Pod is not a controller of anything, and a custom resource that happens to carry a
+    // `spec.template` is not a Deployment (§13.5, §23.5). Scanning either would produce edges
+    // nobody stated in the shape of ones the API server did.
+    for fixture in [POD, SERVICE, INGRESS] {
+        assert!(
+            Workload::template_dependencies(&object(fixture)).is_empty(),
+            "only the kinds §25 names carry a pod template"
+        );
+    }
+}

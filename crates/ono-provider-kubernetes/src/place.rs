@@ -794,6 +794,8 @@ pub enum Waypoint {
     AttachesTo,
     /// A claim and what satisfies it (§30.2).
     BoundTo,
+    /// The class a claim or a volume names (§30.1, §30.3).
+    UsesStorageClass,
     /// The endpoint objects that carry this endpoint's addresses (§26.2).
     ///
     /// The navigation word for [`Relation::RepresentedBy`]: §35.5 names the EndpointSlices of a
@@ -844,6 +846,7 @@ impl Waypoint {
         Self::RoutesTo,
         Self::AttachesTo,
         Self::BoundTo,
+        Self::UsesStorageClass,
         Self::HasEndpoints,
         Self::EndpointFor,
         Self::UsesService,
@@ -874,6 +877,7 @@ impl Waypoint {
             Self::RoutesTo => "routes-to",
             Self::AttachesTo => "attaches-to",
             Self::BoundTo => "bound-to",
+            Self::UsesStorageClass => "uses-storage-class",
             Self::HasEndpoints => "has-endpoints",
             Self::EndpointFor => "endpoint-for",
             Self::UsesService => "uses-service",
@@ -917,6 +921,7 @@ impl Waypoint {
             Relation::RoutesTo => Self::RoutesTo,
             Relation::AttachesTo => Self::AttachesTo,
             Relation::BoundTo => Self::BoundTo,
+            Relation::UsesStorageClass => Self::UsesStorageClass,
             Relation::RepresentedBy => Self::HasEndpoints,
             Relation::EndpointFor => Self::EndpointFor,
             Relation::UsesService => Self::UsesService,
@@ -953,6 +958,7 @@ impl Waypoint {
             Self::RoutesTo => Some(Relation::RoutesTo),
             Self::AttachesTo => Some(Relation::AttachesTo),
             Self::BoundTo => Some(Relation::BoundTo),
+            Self::UsesStorageClass => Some(Relation::UsesStorageClass),
             Self::HasEndpoints => Some(Relation::RepresentedBy),
             Self::EndpointFor => Some(Relation::EndpointFor),
             Self::UsesService => Some(Relation::UsesService),
@@ -1029,6 +1035,7 @@ const PROXIMITY: &[(Waypoint, Proximity)] = &[
     (Waypoint::Controls, Proximity::Lineage),
     (Waypoint::Owns, Proximity::Lineage),
     (Waypoint::BoundTo, Proximity::Dependency),
+    (Waypoint::UsesStorageClass, Proximity::Dependency),
     (Waypoint::Mounts, Proximity::Dependency),
     (Waypoint::ReferencesConfig, Proximity::Dependency),
     (Waypoint::ReferencesSecret, Proximity::Dependency),

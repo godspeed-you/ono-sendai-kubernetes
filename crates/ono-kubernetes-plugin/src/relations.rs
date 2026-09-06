@@ -244,6 +244,12 @@ pub(crate) fn stated_edges(object: &Object) -> Vec<Edge> {
     if is(object, "apps", "StatefulSet") {
         edges.extend(Workload::governing_service(object));
     }
+    // §25.1's `uses-template`, answered as the dependencies the template states rather than as an
+    // edge to the template itself: a PodTemplate is not an addressable object (§25.3), so an edge
+    // pointing at one would name a place `Place::of_target` cannot build. The guard is the kind
+    // table inside the rule, because the pointer differs per kind — a CronJob's template is two
+    // levels down — and a second guard here would be a second place for the two to disagree.
+    edges.extend(Workload::template_dependencies(object));
     // §26.2 and §26.4: an endpoint with no target reference stays an endpoint fact rather than
     // being forced into a Pod relationship, which is why this reads the edge and not the address.
     if is(object, "discovery.k8s.io", "EndpointSlice") {
@@ -500,6 +506,7 @@ const RELATIONS: &[Relation] = &[
     Relation::RunsAs,
     Relation::Mounts,
     Relation::BoundTo,
+    Relation::UsesStorageClass,
     Relation::ReferencesConfig,
     Relation::ReferencesSecret,
     Relation::UsesSecret,
