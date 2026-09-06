@@ -359,7 +359,7 @@ fn should_rank_service_neighbours_by_operational_relevance() {
 
     let neighbourhood = Neighbourhood::around(Place::of_object(&service).expect("addressable"))
         .with(
-            Waypoint::ConstrainedBy,
+            Waypoint::ProtectedBy,
             place("kubernetes:prod", NETWORK_POLICY),
             Evidence::Selector {
                 selector: [("app".to_owned(), "checkout".to_owned())].into(),
@@ -506,6 +506,31 @@ fn should_name_every_extracted_relation_with_a_waypoint() {
         assert!(
             waypoint.relation().is_some(),
             "`{word}` is a relationship this provider extracts, not only one it accepts"
+        );
+    }
+}
+
+/// ADR-0031's rule, applied to the words Appendix B lists and this provider does not emit: a
+/// relation word a query may filter on and nothing ever answers is worse than one that is
+/// refused, because the empty answer reads as "this object has no such edges". `uses` is a
+/// generic where this provider has specific words and would blur §29's four evidence classes into
+/// one; `grants-to` would name subjects Kubernetes does not store (§32.3); `has-address` would
+/// point an edge at a load-balancer address, which is not an object with a place — it leaves this
+/// provider as identity evidence instead (§47.4, ADR-0016). ADR-0040 records all three.
+#[test]
+fn should_offer_no_word_for_a_relationship_nothing_answers() {
+    for word in ["uses", "grants-to", "has-address"] {
+        assert_eq!(
+            Waypoint::parse(word),
+            None,
+            "`{word}` is offerable as a filter and nothing ever answers it"
+        );
+    }
+    for word in ["protected-by", "selected-by", "routed-from", "binds"] {
+        let waypoint = Waypoint::parse(word).expect("Appendix B's word, with a producer behind it");
+        assert!(
+            waypoint.relation().is_some(),
+            "`{word}` reaches a relationship"
         );
     }
 }

@@ -42,7 +42,7 @@ use std::sync::Arc;
 use ono_kubernetes_plugin::contributions::{Target, target};
 use ono_kubernetes_plugin::records::{Exported, evidence_record};
 use ono_provider_kubernetes::coverage::Scope;
-use ono_provider_kubernetes::evidence::NodeEvidence;
+use ono_provider_kubernetes::evidence::SubjectEvidence;
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::place::Place;
 use ono_provider_kubernetes::redaction::Guarded;
@@ -83,6 +83,18 @@ const UNRECOGNISED: &str = r#"{
   "status":{"addresses":[{"type":"InternalIP","address":"10.42.0.18"}],"nodeInfo":{}}
 }"#;
 
+/// A running Pod, whose containers a future container-runtime provider would resolve (§47.3).
+const RUNNING_POD: &str = r#"{
+  "apiVersion":"v1","kind":"Pod",
+  "metadata":{"name":"checkout-7f9d","namespace":"shop","uid":"pod-1","resourceVersion":"4103"},
+  "spec":{"nodeName":"worker-03"},
+  "status":{"containerStatuses":[
+    {"name":"app","image":"registry.example/checkout:1.25",
+     "imageID":"pullable://registry.example/checkout@sha256:0a1b",
+     "containerID":"quantum-runtime://ab12cd34"}
+  ]}
+}"#;
+
 /// A Node in a cluster running no cloud controller at all (§4 invariant 13).
 const BARE_METAL: &str = r#"{
   "apiVersion":"v1","kind":"Node",
@@ -106,9 +118,9 @@ fn exported(document: &str) -> Vec<Arc<RecordValue>> {
             .to_schema()
             .expect("the contributed schema is well formed"),
     );
-    let node = Object::parse(INSTANCE, document).expect("the fixture is a well-formed Node");
-    let evidence = NodeEvidence::of(&node).expect("the fixture is a Node");
-    let here = Place::of_object(&node).expect("a Node has an address");
+    let node = Object::parse(INSTANCE, document).expect("the fixture is a well-formed object");
+    let evidence = SubjectEvidence::of(&node).expect("the fixture is a kind §47 gives a rule");
+    let here = Place::of_object(&node).expect("the subject has an address");
     let freshness = Freshness::direct_read(
         ObservedAt::from_unix_millis(1_000),
         node.resource_version().map(str::to_owned),
@@ -124,10 +136,8 @@ fn exported(document: &str) -> Vec<Arc<RecordValue>> {
         .map(Exported::Observed)
         .chain(evidence.unobserved().iter().map(Exported::Unobserved))
         .map(|item| {
-            match evidence_record(
-                target, &schema, &here, &guarded, &evidence, &item, &freshness,
-            )
-            .expect("every field the table names is one the schema declares")
+            match evidence_record(target, &schema, &here, &guarded, &item, &freshness)
+                .expect("every field the table names is one the schema declares")
             {
                 Value::Record(record) => record,
                 other => panic!("the record builder answered {other:?}"),
@@ -558,4 +568,52 @@ fn should_read_every_input_field_from_the_declared_evidence_schema() {
              a resolver coupled to an implementation detail rather than to a contract"
         );
     }
+}
+
+#[test]
+fn should_put_a_container_identifier_on_the_wire_with_its_runtime_scheme_and_its_rank() {
+    // §47.3 and §47.6 through the same record builder the route runs: a resolver for a container
+    // runtime reads exactly the fields the cloud resolver above reads, and the two claims about
+    // one container arrive ranked. `quantum-runtime` is not a runtime anybody has installed, and
+    // the package cannot tell — which is §47.1 one level below the Node.
+    let records = exported(RUNNING_POD);
+    let string = |record: &Arc<RecordValue>, field: &str| match record.get(field) {
+        Some(Value::String(value)) => Some(value.to_string()),
+        _ => None,
+    };
+    let field = |key: &str, field: &str| -> Option<String> {
+        records
+            .iter()
+            .find(|record| string(record, "key").as_deref() == Some(key))
+            .and_then(|record| string(record, field))
+    };
+
+    assert_eq!(
+        field("kubernetes.pod.container-id", "value").as_deref(),
+        Some("quantum-runtime://ab12cd34")
+    );
+    assert_eq!(
+        field("kubernetes.pod.container-id", "uri_scheme").as_deref(),
+        Some("quantum-runtime"),
+        "the scheme is preserved rather than stripped into an ambiguous opaque string (§47.3)"
+    );
+    assert_eq!(
+        field("kubernetes.pod.container-id", "qualifier").as_deref(),
+        Some("app"),
+        "which container of the Pod this is about"
+    );
+    assert_eq!(
+        field("kubernetes.pod.image-id", "strength").as_deref(),
+        Some("distinguishing")
+    );
+    assert_eq!(
+        field("kubernetes.pod.image", "strength").as_deref(),
+        Some("correlating"),
+        "§47.6: a tag is a name somebody may move, and tag equality is not digest identity"
+    );
+    assert_eq!(
+        field("kubernetes.pod.image", "uri_scheme"),
+        None,
+        "an image reference is not a URI, and a scheme parsed out of one would be invented"
+    );
 }

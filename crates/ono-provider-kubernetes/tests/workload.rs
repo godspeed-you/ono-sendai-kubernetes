@@ -154,6 +154,13 @@ const SERVICE: &str = r#"{
           "ports":[{"name":"http","port":80,"targetPort":8080}]}
 }"#;
 
+/// A Service of the same namespace that no rule names.
+const OTHER_SERVICE: &str = r#"{
+  "apiVersion":"v1","kind":"Service",
+  "metadata":{"name":"catalogue","namespace":"shop","uid":"svc-2"},
+  "spec":{"type":"ClusterIP","selector":{"app":"catalogue"}}
+}"#;
+
 const SLICE_ONE: &str = r#"{
   "apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice",
   "metadata":{"name":"checkout-abc","namespace":"shop","uid":"eps-1",
@@ -927,4 +934,56 @@ fn should_read_no_template_from_a_kind_that_states_none() {
             "only the kinds §25 names carry a pod template"
         );
     }
+}
+
+#[test]
+fn should_read_an_ingress_from_the_service_s_end_as_routed_from() {
+    // Appendix B's `routed-from`: §27.1's `routes-to` read from the backend's end, which is where
+    // an operator stands when a Service has endpoints and a URL still answers 503. The path, host
+    // and port evidence §27.1 requires survives the reversal — an edge that dropped it would say
+    // *that* something routes here without saying which rule does.
+    let service = object(SERVICE);
+    let edges = Workload::routed_from(&service, &[object(INGRESS), object(HTTPROUTE)]);
+
+    let routers: Vec<(&str, &str)> = edges
+        .iter()
+        .map(|edge| (edge.relation().as_str(), edge.target().name()))
+        .collect();
+    assert_eq!(
+        routers,
+        vec![("routed-from", "shop"), ("routed-from", "shop")],
+        "the Ingress and the HTTPRoute both name this Service as a backend (§27.1, §27.3)"
+    );
+    let ingress_edge = &edges[0];
+    assert_eq!(
+        ingress_edge.evidence(),
+        &Evidence::NativeField {
+            path: "/spec/rules/0/http/paths/0/backend/service/name".to_owned(),
+            value: "checkout".to_owned(),
+        },
+        "the field of the *router* that decided, cited where it can be resolved"
+    );
+    assert!(
+        ingress_edge
+            .supporting()
+            .iter()
+            .any(|evidence| evidence.describe().contains("shop.example.com")),
+        "the host stays attached to the routing edge: {:?}",
+        ingress_edge.supporting()
+    );
+    assert_eq!(ingress_edge.source().name(), "checkout");
+    assert_eq!(ingress_edge.target().kind(), "Ingress");
+}
+
+#[test]
+fn should_not_report_a_router_that_names_another_service_as_routing_here() {
+    // §23.5: a router in the same namespace is not a router to this Service. Matching on anything
+    // looser than the backend the rule names — the namespace, a similar name — is the inference
+    // §23.5 forbids arriving in the shape of a native field.
+    let other = object(OTHER_SERVICE);
+
+    assert!(
+        Workload::routed_from(&other, &[object(INGRESS)]).is_empty(),
+        "the Ingress names `checkout`, and this Service is not it"
+    );
 }

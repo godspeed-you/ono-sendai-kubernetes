@@ -635,6 +635,60 @@ impl Workload {
         edges
     }
 
+    /// The routers that name one Service as a backend — §27.1 read from the backend's end
+    /// (Appendix B).
+    ///
+    /// The end an operator stands at when a Service has healthy endpoints and the URL in front of
+    /// it still answers 503. The routers are re-read through [`Self::ingress_edges`] and
+    /// [`Self::gateway_edges`] rather than through a second rule of their own, so `routes-to` and
+    /// `routed-from` are one decision seen from two sides — and §27.1's host, path and port
+    /// evidence survives the reversal, because an edge that said only *that* something routes
+    /// here would not say which rule does.
+    ///
+    /// Matched on the backend the rule names, never on the namespace or on a similar name: §23.5
+    /// forbids that correlation from arriving in the shape of a native field.
+    #[must_use]
+    pub fn routed_from(service: &Object, routers: &[Object]) -> Vec<Edge> {
+        let source = service.identity();
+        let mut edges = Vec::new();
+        for router in routers {
+            let mut stated = Vec::new();
+            if router.gvk().group() == "networking.k8s.io" && router.gvk().kind() == "Ingress" {
+                stated.extend(Self::ingress_edges(router));
+            }
+            stated.extend(Self::gateway_edges(router));
+            for edge in stated {
+                if edge.relation() != Relation::RoutesTo
+                    || edge.target().kind() != "Service"
+                    || edge.target().name() != service.name()
+                    || edge.target().namespace() != service.namespace()
+                {
+                    continue;
+                }
+                let mut supporting = edge.supporting().to_vec();
+                // The rule lives on the router; this edge reads it the other way round, and says
+                // so rather than letting the direction pass as something the Service states.
+                supporting.push(Evidence::Derived {
+                    rule: format!(
+                        "routing reversal: {}/{} names this Service as a backend",
+                        router.gvk().kind(),
+                        router.name()
+                    ),
+                });
+                edges.push(
+                    Edge::new(
+                        source.clone(),
+                        Relation::RoutedFrom,
+                        Target::of_object(router),
+                        edge.evidence().clone(),
+                    )
+                    .with_supporting(supporting),
+                );
+            }
+        }
+        edges
+    }
+
     /// The Gateway API relationships an object states, when it is a Gateway API object at all
     /// (§27.3).
     ///

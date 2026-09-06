@@ -1,9 +1,17 @@
-//! What a Node states about the machine underneath it, routed so that somebody can read it.
+//! What an object states about the systems around Kubernetes, routed so that somebody can read it.
 //!
 //! Specification §28.3 to §28.5, §47 and Appendix C.3. `evidence.rs` in the domain layer exports
-//! a Node's cross-system identity evidence and refuses to resolve any of it; §47.7 then requires
-//! that evidence to be **inspectable**, and until this module existed it was inspectable only by
-//! a Rust test. An export nobody can read is not an export.
+//! cross-system identity evidence and refuses to resolve any of it; §47.7 then requires that
+//! evidence to be **inspectable**, and until this module existed it was inspectable only by a
+//! Rust test. An export nobody can read is not an export.
+//!
+//! **Which object is the query's answer, and only from a table.** Four kinds state such evidence
+//! and each states a different one — §47.2's machine under a Node, §47.3's containers of a Pod,
+//! §47.4's load-balancer addresses of a Service or an Ingress — so the `kind` option says which,
+//! defaulting to `Node`. It is deliberately not the resolution `k8s-resource` does over every
+//! group the cluster serves: there is no generic evidence rule, every rule is a set of pointers
+//! into one kind's own fields, and a kind resolved through discovery would be fetched and then
+//! refused. Refusing by name, before a cluster is reached, is the same answer without the read.
 //!
 //! Three things decide the shape of the answer, and all three are the domain module's rules
 //! surviving into a record.
@@ -36,8 +44,7 @@ use std::sync::Arc;
 
 use ono_kuang_sdk::protocol::WireError;
 use ono_kuang_sdk::{Ctx, Outcome};
-use ono_provider_kubernetes::coverage::Scope;
-use ono_provider_kubernetes::evidence::NodeEvidence;
+use ono_provider_kubernetes::evidence::SubjectEvidence;
 use ono_provider_kubernetes::place::Place;
 use ono_provider_kubernetes::session::Session;
 use ono_provider_kubernetes::transport::{ByteStream, Client, Freshness};
@@ -52,7 +59,7 @@ use crate::query::{
 use crate::records::{Exported, evidence_record};
 use crate::sessions::Sessions;
 
-/// Answers a `k8s-evidence` query: one Node in, what it states about its machine out.
+/// Answers a `k8s-evidence` query: one object in, what it states about a foreign system out.
 #[must_use]
 pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -> Outcome {
     let schema = match target.schema_contribution().to_schema() {
@@ -65,17 +72,20 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
             "--name node-a",
         ));
     };
-    // The kind is this table's rather than the query's, and it is the one read below `Kind` that
-    // still names one: the pointers and the published keys are a Node's, and reading a Pod
-    // through them would answer an empty evidence set that renders as a machine with nothing to
-    // say rather than as the wrong question (§47.1).
     let Reads::Evidence = target.reads else {
         return Outcome::Failed(failure(
             UNSUPPORTED_CODE,
             UNSUPPORTED,
-            "this target does not read Node evidence".to_owned(),
+            "this target does not read identity evidence".to_owned(),
             "This is a defect in the Kubernetes provider's contribution table.",
         ));
+    };
+    // Which kind, from the query, against the table of kinds that have a rule. A kind with none
+    // is refused here rather than fetched and then refused: the answer is the same and the
+    // cluster is not asked a question this package cannot use (§47.1).
+    let wanted = match subject_kind(ctx) {
+        Ok(wanted) => wanted,
+        Err(error) => return Outcome::Failed(error),
     };
     let endpoint = match Endpoint::resolve(ctx) {
         Ok(endpoint) => endpoint,
@@ -94,6 +104,7 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
                 &endpoint,
                 Machine {
                     endpoint: &endpoint,
+                    wanted,
                     name: &name,
                     session,
                 },
@@ -106,9 +117,49 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
     }
 }
 
-/// Resolve the Node collection through discovery, and read one Node by name.
+/// The kinds §47 gives an evidence rule, and the API group each is served in.
+///
+/// A table rather than discovery's whole surface, because a rule is pointers into one kind's own
+/// fields and no rule generalises. GVK identity on both halves: a custom resource called `Pod` in
+/// somebody else's group is not this Pod (§13.5).
+const SUBJECTS: &[(&str, &str)] = &[
+    ("", "Node"),
+    ("", "Pod"),
+    ("", "Service"),
+    ("networking.k8s.io", "Ingress"),
+];
+
+/// Which kind the query asked about, or a refusal naming the ones that have a rule.
+fn subject_kind(ctx: &Ctx<'_>) -> Result<&'static (&'static str, &'static str), WireError> {
+    let asked = ctx
+        .arguments()
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or("Node");
+    SUBJECTS
+        .iter()
+        .find(|(_, kind)| kind.eq_ignore_ascii_case(asked))
+        .ok_or_else(|| {
+            let known: Vec<&str> = SUBJECTS.iter().map(|(_, kind)| *kind).collect();
+            failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                format!("`{asked}` states no cross-system identity evidence this provider exports"),
+                &format!(
+                    "Answering nothing would say the object has nothing to say about the systems \
+                     around it, which is a different claim. The kinds are: {}. Section 47 gives \
+                     each of them a rule of its own; there is no generic one.",
+                    known.join(", ")
+                ),
+            )
+        })
+}
+
+/// Resolve the subject's collection through discovery, and read one object by name.
 struct Machine<'a> {
     endpoint: &'a Endpoint,
+    wanted: &'static (&'static str, &'static str),
     name: &'a str,
     session: &'a mut Session,
 }
@@ -119,10 +170,13 @@ impl Conversation for Machine<'_> {
     fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
         let session = self.session;
         let served = query::served(session, client, self.endpoint)?;
-        // Which collection serves a Node, and at which version, is discovery's answer even for a
-        // kind this table names: §4 invariants 1–2 do not make an exception for a kind that has
+        // Which collection serves the kind, and at which version, is discovery's answer even for
+        // a kind this table names: §4 invariants 1–2 do not make an exception for a kind that has
         // been in the core group since v1.
-        let resource = query::curated(session, client, self.endpoint, &served, "", "Node")?;
+        let (group, kind) = *self.wanted;
+        let resource = query::curated(session, client, self.endpoint, &served, group, kind)?;
+        // A Node is cluster-scoped and a Pod is not, and which one this is, is the resource's
+        // answer rather than this table's (§9.2, §9.5).
         let scope = query::scope_for(self.endpoint, &resource);
         let (object, freshness) = match query::fetch(client, &resource, &scope, self.name)? {
             Answer::Absent => return Ok(None),
@@ -138,7 +192,7 @@ impl Conversation for Machine<'_> {
         };
         Ok(Some(Subject {
             resource,
-            scope: Scope::cluster(),
+            scope,
             guarded: query::hold(object)?,
             freshness,
         }))
@@ -147,7 +201,7 @@ impl Conversation for Machine<'_> {
 
 /// Streams one record per exported fact, then one per key that could not be read.
 ///
-/// The gaps go last and they go out: a rendering that dropped them would read as "this Node has
+/// The gaps go last and they go out: a rendering that dropped them would read as "this object has
 /// no cross-system identity" when it means "nobody asked" (§4 invariant 13, §47.7).
 fn emit(
     ctx: &mut Ctx<'_>,
@@ -155,30 +209,31 @@ fn emit(
     schema: &Arc<Schema>,
     subject: Option<&Subject>,
 ) -> Outcome {
-    // A Node that is not there states nothing about a machine, and that is an answer rather than
-    // a refusal (§21.4 `absent`).
+    // An object that is not there states nothing about a foreign system, and that is an answer
+    // rather than a refusal (§21.4 `absent`).
     let Some(subject) = subject else {
         return Outcome::Completed;
     };
-    let node = subject.guarded.object();
-    let evidence = match NodeEvidence::of(node) {
+    let object = subject.guarded.object();
+    let evidence = match SubjectEvidence::of(object) {
         Ok(evidence) => evidence,
         Err(error) => {
             return Outcome::Failed(failure(
                 UNSUPPORTED_CODE,
                 UNSUPPORTED,
                 format!("{error}"),
-                "This target reads the machine evidence of a Node (specification section 47).",
+                "This target reads what an object states about the systems around Kubernetes \
+                 (specification section 47).",
             ));
         }
     };
-    let here = match Place::of_object(node) {
+    let here = match Place::of_object(object) {
         Ok(here) => here,
         Err(error) => {
             return Outcome::Failed(failure(
                 UNAVAILABLE_CODE,
                 UNAVAILABLE,
-                format!("the Node this is evidence about has no address: {error}"),
+                format!("the object this is evidence about has no address: {error}"),
                 "A place needs a name, and §35.4 binds it to the object's lifetime identity.",
             ));
         }
@@ -198,7 +253,6 @@ fn emit(
             schema,
             &here,
             subject,
-            &evidence,
             &item,
             &subject.freshness,
         ) {
@@ -219,21 +273,12 @@ fn one(
     schema: &Arc<Schema>,
     here: &Place,
     subject: &Subject,
-    evidence: &NodeEvidence,
     exported: &Exported<'_>,
     freshness: &Freshness,
 ) -> Result<(), Outcome> {
     let value = query::built(
         target,
-        evidence_record(
-            target,
-            schema,
-            here,
-            &subject.guarded,
-            evidence,
-            exported,
-            freshness,
-        ),
+        evidence_record(target, schema, here, &subject.guarded, exported, freshness),
     )?;
     query::deliver(ctx, &value)
 }

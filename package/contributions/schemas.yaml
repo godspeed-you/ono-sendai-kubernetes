@@ -2896,38 +2896,39 @@ schemas:
   - id: io.github.godspeed-you.kubernetes.evidence/1
     name: KubernetesIdentityEvidence
     summary: >-
-      One value a Node states about the machine underneath it, with where it was read and how far
-      it goes — never a link to another system.
+      One value an object states about a system outside Kubernetes, with where it was read and how
+      far it goes — never a link to that system.
     identity: [uid, key, source]
     fields:
       uid:
         type: string
         nullable: true
         doc: >-
-          `metadata.uid` of the Node this is evidence about (§16.1). The evidence attaches to a
-          *lifetime*: a Node rebuilt under the same name is a different machine, and evidence that
-          outlived the rebuild would point a resolver at hardware that is gone (§4 invariants
-          4–5).
+          `metadata.uid` of the object this is evidence about (§16.1). The evidence attaches to a
+          *lifetime*: a Node rebuilt under the same name is a different machine, a Pod restarted
+          under the same name runs different containers, and evidence that outlived either would
+          point a resolver at something that is gone (§4 invariants 4–5).
       name:
         type: string
         required: true
         doc: >-
-          `metadata.name` of the Node. A locator, never an identity (§16.2).
+          `metadata.name` of the object. A locator, never an identity (§16.2).
       api_version:
         type: string
         required: true
         doc: >-
-          `apiVersion` of the Node.
+          `apiVersion` of the object.
       kind:
         type: string
         required: true
         doc: >-
-          `kind` of the Node, as the server spells it.
+          `kind` of the object, as the server spells it — one of Node, Pod, Service or Ingress,
+          each of which states a different kind of cross-system fact (§47.2 to §47.4).
       subject:
         type: string
         required: true
         doc: >-
-          The Node as a place address, in the grammar every other address in this document uses
+          The object as a place address, in the grammar every other address in this document uses
           (§35.4, ADR-0008).
       key:
         type: string
@@ -2935,16 +2936,18 @@ schemas:
         doc: >-
           What kind of fact this is, under the key Appendix C.3 fixes — `kubernetes.node.provider-
           id`, `kubernetes.node.address`, `kubernetes.node.system-uuid`, `kubernetes.node.machine-
-          id`, and the placement keys of §28.3. A spelling a resolver written against the document
-          can look for.
+          id` and the placement keys of §28.3 for a Node; `kubernetes.pod.container-id`,
+          `kubernetes.pod.image-id` and `kubernetes.pod.image` for a Pod (§47.3, §47.6); and
+          `kubernetes.load-balancer.address` for a Service or an Ingress (§47.4). A spelling a
+          resolver written against the document can look for.
       qualifier:
         type: string
         nullable: true
         doc: >-
-          What narrows the key: the address type for an address (§28.5). Carried beside the value
-          rather than folded into it, because a resolver matching an internal address against a
-          public inventory is precisely the mistake the type information prevents. Null where the
-          key already says everything.
+          What narrows the key: the address type for an address (§28.5), the container name for a
+          container or image fact (§47.3). Carried beside the value rather than folded into it,
+          because a resolver matching an internal address against a public inventory is precisely
+          the mistake the type information prevents. Null where the key already says everything.
       value:
         type: string
         nullable: true
@@ -2955,7 +2958,7 @@ schemas:
         type: string
         nullable: true
         doc: >-
-          The JSON pointer this was read from, resolvable against the Node it came from — a
+          The JSON pointer this was read from, resolvable against the object it came from — a
           citation a reader can check rather than a field name they have to trust (§47.7). Null
           for a key that was not read.
       strength:
@@ -2967,8 +2970,11 @@ schemas:
           field whose purpose is to name one thing in the system that assigned it; `correlating`
           is a value equal across unrelated things, reassigned while the thing lives, or copied
           when a machine is cloned; `placement` is a property of where the subject sits rather
-          than of which thing it is, and a thousand machines share a zone (§28.3, §28.5). Null for
-          a key that was not read: strength is how far a *value* goes, and there is no value.
+          than of which thing it is, and a thousand machines share a zone (§28.3, §28.5). It is
+          also §47.6's ranking: a resolved `imageID` names content and is `distinguishing`, while
+          the `image` a container asked for is a tag somebody may move tonight and is
+          `correlating`. Null for a key that was not read: strength is how far a *value* goes, and
+          there is no value.
       evidence_class:
         type: enum
         values: [native-field, owner-reference, selector, convention, adapter-derivation, inference]
@@ -3006,7 +3012,9 @@ schemas:
         type: string
         nullable: true
         doc: >-
-          The scheme of a URI-shaped identifier, where the identifier is one. This and `uri_path`
+          The scheme of a URI-shaped identifier, where the identifier is one — a provider
+          identifier, a container id, a resolved image id. §47.3 requires the runtime scheme to
+          survive rather than be stripped into an ambiguous opaque string. This and `uri_path`
           are the whole decomposition §28.4 permits: this provider knows that `://` separates a
           scheme from a path and that `/` separates path segments, and it labels no segment. A
           resolver that has read the other system knows what the segments mean, and that is where
@@ -3021,9 +3029,9 @@ schemas:
         type: bool
         required: true
         doc: >-
-          Whether this record is a value the Node stated or a key that could not be read. False
+          Whether this record is a value the object stated or a key that could not be read. False
           makes `value`, `source`, `strength` and the rest null and fills `outcome` — because a
-          rendering that dropped the unread keys would read as "this Node has no cross-system
+          rendering that dropped the unread keys would read as "this object has no cross-system
           identity" when it means "nobody asked" (§4 invariant 13, §47.7).
       outcome:
         type: string
@@ -3649,6 +3657,21 @@ schemas:
         type: map
         required: true
         doc: 'How long each request above took, in milliseconds (§34.3).'
+      capabilities:
+        type: map
+        required: true
+        doc: >-
+          What the provider supports beside what this session found, one entry per capability
+          (§57.1). Each value is two halves separated by a comma — `supported by provider` or
+          `not supported by provider`, then one of `available on resource`,
+          `granted by local KUANG policy`, `blocked by local KUANG policy`,
+          `denied for current user`, `not served by cluster`, `not determined: <reason>` or
+          `unavailable in any session`. The second half is earned from evidence: a resource list
+          the cluster answered with, the host's answer about a grant, or nothing, in which case
+          it says `not determined` in §21.4's words rather than guessing either way.
+          **`available on resource` is a statement about the resource, never about the identity**
+          — it means a served resource offers the verb, and whether the current user may use it
+          on a given object is `k8s-plan`'s preflight answer (§21.2, §21.6).
     default_view:
       columns: [name, server, reachable, server_version, effective_identity, tls]
 

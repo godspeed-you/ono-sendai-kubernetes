@@ -24,7 +24,7 @@ use ono_provider_kubernetes::causal::{Finding, Support, Why};
 use ono_provider_kubernetes::condition::{self, Condition};
 use ono_provider_kubernetes::discovery::Resource;
 use ono_provider_kubernetes::events::Event;
-use ono_provider_kubernetes::evidence::{IdentityEvidence, NodeEvidence, Unobserved, key};
+use ono_provider_kubernetes::evidence::{IdentityEvidence, Unobserved, UriShape};
 use ono_provider_kubernetes::logs::{LineText, LogLine, Retrieved};
 use ono_provider_kubernetes::object::{Object, OwnerReference};
 use ono_provider_kubernetes::place::Place;
@@ -397,9 +397,9 @@ fn event_clock(event: &Event) -> ClockSource {
         })
 }
 
-/// One row of a Node's exported evidence: a value that was read, or a key that was not (§47).
+/// One row of an object's exported evidence: a value that was read, or a key that was not (§47).
 pub enum Exported<'a> {
-    /// A value the Node states, with where it was read and how far it goes.
+    /// A value the object states, with where it was read and how far it goes.
     Observed(&'a IdentityEvidence),
     /// A key that could not be read, and whether that is about the cluster or about the read.
     Unobserved(&'a Unobserved),
@@ -421,8 +421,7 @@ pub fn evidence_record(
     target: &Target,
     schema: &Arc<Schema>,
     here: &Place,
-    node: &Guarded,
-    evidence: &NodeEvidence,
+    subject: &Guarded,
     exported: &Exported<'_>,
     freshness: &Freshness,
 ) -> Result<Value, ErrorValue> {
@@ -430,12 +429,10 @@ pub fn evidence_record(
         Exported::Observed(item) => Some(*item),
         Exported::Unobserved(_) => None,
     };
-    // §28.4's decomposition belongs to the one key that is a URI-shaped identifier, and to no
-    // other. An address decomposed as a URI would be a shape nobody stated.
-    let shape = item
-        .filter(|item| item.key() == key::PROVIDER_ID)
-        .and_then(|_| evidence.provider_id())
-        .and_then(ono_provider_kubernetes::evidence::ProviderId::shape);
+    // §28.4's decomposition belongs to the keys whose value is an identifier another system
+    // minted — a provider identifier, a container id, a resolved image id — and to no other. The
+    // item carries its own shape, so an address is never decomposed into a URI nobody stated.
+    let shape = item.and_then(IdentityEvidence::shape);
     let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
     for field in target.fields {
         let value = match field.name {
@@ -469,8 +466,8 @@ pub fn evidence_record(
             "lookup_key" => item.map_or(Value::Null, |item| Value::Bool(item.is_lookup_key())),
 
             // --- §28.4, as far as it goes and no further ---
-            "uri_scheme" => text(shape.map(ono_provider_kubernetes::evidence::UriShape::scheme)),
-            "uri_path" => text(shape.map(ono_provider_kubernetes::evidence::UriShape::path)),
+            "uri_scheme" => text(shape.map(UriShape::scheme)),
+            "uri_path" => text(shape.map(UriShape::path)),
 
             // --- or a key nobody read, which is not a machine with nothing to say (§4 inv. 13) ---
             "observed" => Value::Bool(item.is_some()),
@@ -479,7 +476,7 @@ pub fn evidence_record(
                 Exported::Unobserved(gap) => Value::String(gap.outcome().as_str().into()),
             },
 
-            name => field_value(name, node),
+            name => field_value(name, subject),
         };
         builder = builder.set(field.name, value)?;
     }

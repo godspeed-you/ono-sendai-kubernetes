@@ -54,7 +54,7 @@ use ono_provider_kubernetes::place::{Neighbourhood, Place};
 use ono_provider_kubernetes::relationship::{Edge, Graph};
 use ono_provider_kubernetes::session::Session;
 use ono_provider_kubernetes::transport::{ByteStream, Client, ListOptions};
-use ono_provider_kubernetes::workload::Workload;
+use ono_provider_kubernetes::workload::{SelectorMatch, Workload};
 use ono_value::{RecordValue, SchemaId, Value, builtin_schemas};
 
 use crate::contributions::{Reads, TARGETS};
@@ -176,6 +176,12 @@ pub const SHAPES: &[Shape] = &[
     ),
     Shape::new(schema!("endpointslice"), schema!("pod"), "endpoint-for"),
     Shape::new(schema!("ingress"), schema!("service"), "routes-to"),
+    // §35.5's fourth class for a place: what constrains traffic to it (§31.1). Registered from
+    // the policy's end only — the host renders one registered edge from both of its ends, so a
+    // `pod -> networkpolicy` shape beside this one would put the same policy in a Pod's `near`
+    // twice, once under each word. `protected-by`, the Pod's end of it, is answered on request by
+    // `get k8s-relation`. ADR-0040.
+    Shape::new(schema!("networkpolicy"), schema!("pod"), "selects"),
     // Where it runs (§28.1).
     Shape::new(schema!("pod"), schema!("node"), "scheduled-on"),
     // Lineage, read from the child that states its own owner (§24.1, §24.3).
@@ -702,6 +708,16 @@ fn in_namespace(
 /// Every edge one object states or this provider derives from what the pass already read.
 fn derived(object: &Object, inventory: &Inventory) -> Vec<Edge> {
     let mut edges = crate::relations::stated_edges(object);
+    // §31.1: the Pods a policy is written for, evaluated against the objects this pass already
+    // read. A selector this provider does not evaluate contributes no edges rather than the
+    // subset it could evaluate (ADR-0007) — in a `near` that means one fewer exit, never an exit
+    // to a Pod the policy does not govern.
+    if crate::relations::is(object, "networking.k8s.io", "NetworkPolicy")
+        && let SelectorMatch::Evaluated(policed) =
+            Graph::policy_selects(object, inventory.of("", "Pod"))
+    {
+        edges.extend(policed);
+    }
     if crate::relations::is(object, "", "Service") {
         // §26.1 and §26.2: the two edges a Service has that need a second object, evaluated
         // against the objects this pass already read rather than against a second listing.

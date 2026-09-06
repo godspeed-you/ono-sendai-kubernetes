@@ -786,10 +786,15 @@ pub enum Waypoint {
     ScheduledOn,
     /// A selector of this object matches the neighbour's labels (§26.1).
     Selects,
+    /// A Service selects this Pod — `selects` walked from the Pod's end (§26.1).
+    SelectedBy,
     /// A workload controller's selector fits the neighbour without owning it (§23.3).
     SelectorMatches,
     /// The neighbour routes traffic here — Ingress, Gateway, HTTPRoute (§27).
     RoutesTo,
+    /// Traffic reaches this Service from the neighbouring router — `routes-to` walked from the
+    /// backend's end (§27.1, §27.3).
+    RoutedFrom,
     /// A route attaches to a Gateway (§27.3).
     AttachesTo,
     /// A claim and what satisfies it (§30.2).
@@ -824,8 +829,14 @@ pub enum Waypoint {
     UsesSecret,
     /// A Secret images are pulled with (§22.4, §32.1).
     UsesImagePullSecret,
-    /// A policy that applies here (§31.1).
-    ConstrainedBy,
+    /// The Role or ClusterRole a binding names (§32.2).
+    Binds,
+    /// A NetworkPolicy written for this Pod (§31.1).
+    ///
+    /// Appendix B's word, and it names *intent*: the policy object exists, and whether the
+    /// installed networking implementation enforces it is not something this provider observed
+    /// (§31.3). The evidence on the edge says so; the word alone would not.
+    ProtectedBy,
     /// Nothing more than living in the same namespace.
     ///
     /// Not a relationship, and named so that it cannot be mistaken for one: §35.5 exists precisely
@@ -842,8 +853,10 @@ impl Waypoint {
         Self::Controls,
         Self::ScheduledOn,
         Self::Selects,
+        Self::SelectedBy,
         Self::SelectorMatches,
         Self::RoutesTo,
+        Self::RoutedFrom,
         Self::AttachesTo,
         Self::BoundTo,
         Self::UsesStorageClass,
@@ -859,7 +872,8 @@ impl Waypoint {
         Self::ReferencesSecret,
         Self::UsesSecret,
         Self::UsesImagePullSecret,
-        Self::ConstrainedBy,
+        Self::Binds,
+        Self::ProtectedBy,
         Self::SharesNamespace,
     ];
 
@@ -873,8 +887,10 @@ impl Waypoint {
             Self::Controls => "controls",
             Self::ScheduledOn => "scheduled-on",
             Self::Selects => "selects",
+            Self::SelectedBy => "selected-by",
             Self::SelectorMatches => "selector-matches",
             Self::RoutesTo => "routes-to",
+            Self::RoutedFrom => "routed-from",
             Self::AttachesTo => "attaches-to",
             Self::BoundTo => "bound-to",
             Self::UsesStorageClass => "uses-storage-class",
@@ -890,7 +906,8 @@ impl Waypoint {
             Self::ReferencesSecret => "references-secret",
             Self::UsesSecret => "uses-secret",
             Self::UsesImagePullSecret => "uses-image-pull-secret",
-            Self::ConstrainedBy => "constrained-by",
+            Self::Binds => "binds",
+            Self::ProtectedBy => "protected-by",
             Self::SharesNamespace => "shares-namespace",
         }
     }
@@ -917,8 +934,10 @@ impl Waypoint {
             Relation::Controls => Self::Controls,
             Relation::ScheduledOn => Self::ScheduledOn,
             Relation::Selects => Self::Selects,
+            Relation::SelectedBy => Self::SelectedBy,
             Relation::SelectorMatches => Self::SelectorMatches,
             Relation::RoutesTo => Self::RoutesTo,
+            Relation::RoutedFrom => Self::RoutedFrom,
             Relation::AttachesTo => Self::AttachesTo,
             Relation::BoundTo => Self::BoundTo,
             Relation::UsesStorageClass => Self::UsesStorageClass,
@@ -934,17 +953,14 @@ impl Waypoint {
             Relation::ReferencesSecret => Self::ReferencesSecret,
             Relation::UsesSecret => Self::UsesSecret,
             Relation::UsesImagePullSecret => Self::UsesImagePullSecret,
+            Relation::Binds => Self::Binds,
+            Relation::ProtectedBy => Self::ProtectedBy,
         }
     }
 
     /// The extracted relationship this waypoint corresponds to, where there is one.
     ///
-    /// [`None`] for `constrained-by`: §35.5 names policies as something a user navigates to, and
-    /// the relationship model derives a NetworkPolicy's reach as `selects` (§31.1) rather than as
-    /// a word of its own. A caller that has read the policy supplies such a neighbour explicitly
-    /// with [`Neighbourhood::with`] and its evidence, so the gap is visible rather than silently
-    /// rendered as "no neighbours". [`None`] for `shares-namespace` because co-location is not a
-    /// relationship at all.
+    /// [`None`] only for `shares-namespace`, because co-location is not a relationship at all.
     #[must_use]
     pub fn relation(self) -> Option<Relation> {
         match self {
@@ -954,8 +970,10 @@ impl Waypoint {
             Self::Controls => Some(Relation::Controls),
             Self::ScheduledOn => Some(Relation::ScheduledOn),
             Self::Selects => Some(Relation::Selects),
+            Self::SelectedBy => Some(Relation::SelectedBy),
             Self::SelectorMatches => Some(Relation::SelectorMatches),
             Self::RoutesTo => Some(Relation::RoutesTo),
+            Self::RoutedFrom => Some(Relation::RoutedFrom),
             Self::AttachesTo => Some(Relation::AttachesTo),
             Self::BoundTo => Some(Relation::BoundTo),
             Self::UsesStorageClass => Some(Relation::UsesStorageClass),
@@ -971,7 +989,9 @@ impl Waypoint {
             Self::ReferencesSecret => Some(Relation::ReferencesSecret),
             Self::UsesSecret => Some(Relation::UsesSecret),
             Self::UsesImagePullSecret => Some(Relation::UsesImagePullSecret),
-            Self::ConstrainedBy | Self::SharesNamespace => None,
+            Self::Binds => Some(Relation::Binds),
+            Self::ProtectedBy => Some(Relation::ProtectedBy),
+            Self::SharesNamespace => None,
         }
     }
 
@@ -1023,12 +1043,14 @@ pub enum Proximity {
 /// end of `near` instead of displacing something the specification named.
 const PROXIMITY: &[(Waypoint, Proximity)] = &[
     (Waypoint::Selects, Proximity::Selected),
+    (Waypoint::SelectedBy, Proximity::Selected),
     (Waypoint::SelectorMatches, Proximity::Selected),
     (Waypoint::EndpointFor, Proximity::Selected),
     (Waypoint::HasEndpoints, Proximity::Endpoint),
     (Waypoint::RoutesTo, Proximity::Route),
+    (Waypoint::RoutedFrom, Proximity::Route),
     (Waypoint::AttachesTo, Proximity::Route),
-    (Waypoint::ConstrainedBy, Proximity::Policy),
+    (Waypoint::ProtectedBy, Proximity::Policy),
     (Waypoint::ScheduledOn, Proximity::Placement),
     (Waypoint::ControlledBy, Proximity::Lineage),
     (Waypoint::OwnedBy, Proximity::Lineage),
@@ -1048,6 +1070,9 @@ const PROXIMITY: &[(Waypoint, Proximity)] = &[
     // things the object needs to work rather than with the traffic arriving at it.
     (Waypoint::UsesIngressClass, Proximity::Dependency),
     (Waypoint::UsesGatewayClass, Proximity::Dependency),
+    // What a binding grants is what the bound Role holds, which is something the binding needs in
+    // order to mean anything rather than something arriving at it.
+    (Waypoint::Binds, Proximity::Dependency),
     (Waypoint::SharesNamespace, Proximity::Ambient),
 ];
 
@@ -1167,7 +1192,7 @@ impl Neighbourhood {
     /// Adds a neighbour the caller established, with the evidence for it.
     ///
     /// The way in for a relationship this provider does not extract from an object — a
-    /// NetworkPolicy's `constrained-by` (§31.1), a correlation a cross-system resolver drew — and
+    /// a correlation a cross-system resolver drew — and
     /// for a neighbour whose edge the caller does not have in hand. The evidence is required, so
     /// an added neighbour is as checkable as an extracted one (Gate D). Use
     /// [`Self::with_inbound`] where the relationship points at the focus.

@@ -342,20 +342,26 @@ targets:
       occurrences it counts.
 
     options: *named-in-a-discovered-collection
-  # What a Node states about the machine underneath it, exported for someone else to resolve (§28.3
-  # to §28.5, §47). The kind is fixed — the pointers and the published keys are a Node's — so the
-  # only option beyond the endpoint ones is `name`. Nothing here presents a match: each record
-  # carries the value, the pointer it was read at, its evidence class and its strength, and there is
-  # no field for a foreign resource. A key that could not be read is a record too, with `observed`
-  # false and an outcome from §21.4's vocabulary. ADR-0016.
+  # What an object states about the systems around Kubernetes, exported for someone else to resolve
+  # (§28.3 to §28.5, §47). Four kinds state such a thing and each states a different one — the
+  # machine under a Node (§47.2), the containers and images of a Pod (§47.3, §47.6), the
+  # load-balancer addresses of a Service or an Ingress (§47.4) — so `kind` says which, defaulting to
+  # `Node`. It is not resolved through discovery like `k8s-resource`: every rule is a set of
+  # pointers into one kind's own fields, so a kind with no rule is refused by name rather than
+  # fetched and then refused. Nothing here presents a match: each record carries the value, the
+  # pointer it was read at, its evidence class and its strength, and there is no field for a foreign
+  # resource. A key that could not be read is a record too, with `observed` false and an outcome
+  # from §21.4's vocabulary. ADR-0016, ADR-0040.
   - name: k8s-evidence
     schema: io.github.godspeed-you.kubernetes.evidence/1
     summary: >-
-      What a Node states about the machine underneath it, as inspectable evidence for a resolver
-      that has read the other system (specification section 47).
+      What a Node, a Pod, a Service or an Ingress states about the machine, the container runtime
+      or the load balancer behind it, as inspectable evidence for a resolver that has read the
+      other system (specification section 47).
     identity_doc: >-
-      Two observations are the same evidence when the Node's `metadata.uid`, the published key and
-      the field pointer all match. A Node rebuilt under the same name is a different machine.
+      Two observations are the same evidence when the object's `metadata.uid`, the published key
+      and the field pointer all match. A Node rebuilt under the same name is a different machine,
+      and a Pod restarted under the same name runs different containers.
 
     options:
       - name: context
@@ -370,9 +376,16 @@ targets:
       - name: port
         type: int
         doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
       - name: name
         type: string
         doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: kind
+        type: string
+        doc: "Whose evidence: `Node`, `Pod`, `Service` or `Ingress`. Each states a different kind of cross-system fact, and a kind with no rule is refused by name rather than answered empty (specification section 47)."
+        default: "Node"
   # One container's log, as lines (§42.1). Options: `name` is the Pod, `container` names one where
   # the Pod has several, `previous` reads the one prior run the kubelet retains, `timestamps` asks
   # the server to prefix each line, and `tail_lines`, `since_seconds` and `limit_bytes` bound the

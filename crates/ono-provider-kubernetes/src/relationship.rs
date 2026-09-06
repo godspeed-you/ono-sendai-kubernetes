@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use serde_json::Value as Json;
 
 use crate::object::{Identity, Object};
+use crate::workload::SelectorMatch;
 
 /// A named relationship between two objects.
 ///
@@ -49,6 +50,9 @@ pub enum Relation {
     ScheduledOn,
     /// The source Service selects the target by labels (§26.1).
     Selects,
+    /// The source Pod is selected by the target Service — [`Self::Selects`] from the Pod's end
+    /// (§26.1, Appendix B).
+    SelectedBy,
     /// The source's selector matches the target's labels, which is weaker than owning it (§23.3).
     SelectorMatches,
     /// The source StatefulSet is governed by the target Service (§25.3).
@@ -59,6 +63,9 @@ pub enum Relation {
     EndpointFor,
     /// The source routes traffic to the target Service (§27.1, §27.3).
     RoutesTo,
+    /// Traffic reaches the source Service from the target router — [`Self::RoutesTo`] from the
+    /// backend's end (§27.1, §27.3, Appendix B).
+    RoutedFrom,
     /// The source terminates TLS with the target Secret (§27.1).
     UsesTlsSecret,
     /// The source Ingress is handled by the target IngressClass (§27.2).
@@ -89,6 +96,21 @@ pub enum Relation {
     UsesSecret,
     /// The source pulls images with the target Secret (§22.4, §32.1).
     UsesImagePullSecret,
+    /// The source binding grants the rules of the target Role or ClusterRole (§32.2).
+    ///
+    /// The binding's `roleRef`, and nothing about who receives it: §32.3's subjects include Users
+    /// and Groups, which Kubernetes does not store, and ADR-0040 records why Appendix B's
+    /// `grants-to` is not emitted at all rather than emitted for the one subject kind that is an
+    /// object.
+    Binds,
+    /// The source Pod is governed by the target NetworkPolicy (§31.1).
+    ///
+    /// Appendix B's word for the Pod's end of §31.1's `NetworkPolicy -> selects -> Pod`, and
+    /// deliberately not [`Self::SelectedBy`]: a policy is not a Service, and one word for both
+    /// ends of both would put a firewall rule in the routing vocabulary. What it does **not**
+    /// claim is enforcement — §31.3 makes a policy object intent, and every edge carries that
+    /// as supporting evidence rather than leaving the word to imply observed traffic.
+    ProtectedBy,
 }
 
 impl Relation {
@@ -102,11 +124,13 @@ impl Relation {
             Self::Controls => "controls",
             Self::ScheduledOn => "scheduled-on",
             Self::Selects => "selects",
+            Self::SelectedBy => "selected-by",
             Self::SelectorMatches => "selector-matches",
             Self::UsesService => "uses-service",
             Self::RepresentedBy => "represented-by",
             Self::EndpointFor => "endpoint-for",
             Self::RoutesTo => "routes-to",
+            Self::RoutedFrom => "routed-from",
             Self::UsesTlsSecret => "uses-tls-secret",
             Self::UsesIngressClass => "uses-ingress-class",
             Self::AttachesTo => "attaches-to",
@@ -119,6 +143,8 @@ impl Relation {
             Self::ReferencesSecret => "references-secret",
             Self::UsesSecret => "uses-secret",
             Self::UsesImagePullSecret => "uses-image-pull-secret",
+            Self::Binds => "binds",
+            Self::ProtectedBy => "protected-by",
         }
     }
 }
@@ -503,6 +529,11 @@ impl Graph {
             // else about a volume is a relationship this provider derives: what it is backed by
             // is §47.5's cross-system evidence, exported rather than resolved.
             ("", "PersistentVolume") => edges.extend(storage_class_edge(object, &source)),
+            // §32.2's `binds`. Both bindings state their role in the same `roleRef`, and what
+            // differs is where the role is looked up (§9.5).
+            ("rbac.authorization.k8s.io", "RoleBinding" | "ClusterRoleBinding") => {
+                edges.extend(binding_edges(object, &source, namespace.as_deref()));
+            }
             _ => {}
         }
 
@@ -544,6 +575,290 @@ impl Graph {
             })
             .collect()
     }
+
+    /// The Services that select one Pod — §26.1 read from the Pod's end (Appendix B).
+    ///
+    /// The end an operator starts at when one Pod is missing from a Service's endpoints, and the
+    /// same evaluation as [`Self::selects`] so that the two directions cannot disagree. The
+    /// reversal is stated as supporting evidence, because the selector lives on the Service and
+    /// this edge reads it backwards.
+    #[must_use]
+    pub fn selected_by(pod: &Object, services: &[Object]) -> Vec<Edge> {
+        let source = pod.identity();
+        services
+            .iter()
+            .filter(|service| service.gvk().group().is_empty())
+            .filter(|service| service.gvk().kind() == "Service")
+            .filter_map(|service| {
+                let selector = string_map(service.field("/spec/selector"));
+                if selector.is_empty() {
+                    return None;
+                }
+                let matched = selected_labels(&selector, pod, service.namespace())?;
+                Some(
+                    Edge::new(
+                        source.clone(),
+                        Relation::SelectedBy,
+                        Target::of_object(service),
+                        Evidence::Selector {
+                            selector,
+                            matched_labels: matched,
+                        },
+                    )
+                    .with_supporting(vec![Evidence::Derived {
+                        rule: format!(
+                            "selector reversal: Service/{} states `spec.selector` and this Pod's \
+                             labels satisfy it",
+                            service.name()
+                        ),
+                    }]),
+                )
+            })
+            .collect()
+    }
+
+    /// The Pods a NetworkPolicy is written for, derived from `spec.podSelector` (§31.1).
+    ///
+    /// Namespace-local, because a NetworkPolicy governs its own namespace and nothing else. Both
+    /// halves of §31.1's `MUST` ride on every edge: the selector and the labels that satisfied it
+    /// as the deciding [`Evidence::Selector`], and the policy's namespace as supporting evidence
+    /// citing the field that states it.
+    ///
+    /// **An empty `spec.podSelector` is not an empty selector.** For a Service, empty means
+    /// *nothing is selected* (§26.1); for a NetworkPolicy, the API defines it as *every Pod in
+    /// this namespace*, which is what a default-deny policy is written as. Reading the two the
+    /// same way would report the strictest policy in a cluster as governing nothing.
+    ///
+    /// **Nothing here says who may reach those Pods.** §31.2 requires a policy's peers to keep
+    /// their native structure, so ingress and egress peers produce no edges at all: an edge to a
+    /// CIDR block would be the misleading boolean of §31.2 in a different shape.
+    #[must_use]
+    pub fn policy_selects(policy: &Object, candidates: &[Object]) -> SelectorMatch {
+        let selector = match policy_selector(policy) {
+            Ok(selector) => selector,
+            Err(reason) => return SelectorMatch::NotEvaluated { reason },
+        };
+        let source = policy.identity();
+        let edges = candidates
+            .iter()
+            .filter(|candidate| is_pod(candidate))
+            .filter_map(|pod| {
+                let matched = selected_labels(&selector, pod, policy.namespace())?;
+                Some(
+                    Edge::new(
+                        source.clone(),
+                        Relation::Selects,
+                        Target::of_object(pod),
+                        Evidence::Selector {
+                            selector: selector.clone(),
+                            matched_labels: matched,
+                        },
+                    )
+                    .with_supporting(policy_evidence(policy, &selector)),
+                )
+            })
+            .collect();
+        SelectorMatch::Evaluated(edges)
+    }
+
+    /// The NetworkPolicies that govern one Pod — §31.1 read from the Pod's end (Appendix B).
+    ///
+    /// The direction an operator asks in during an outage: what governs *this* Pod, rather than
+    /// what one policy covers. The evidence is the same evidence, because it is the same
+    /// derivation; only the end it is read from differs.
+    ///
+    /// One unevaluated selector makes the whole answer [`SelectorMatch::NotEvaluated`], and that
+    /// is stricter than [`Self::policy_selects`] on purpose: "which policies govern this Pod" is
+    /// one question, and answering it with the policies that happened to be evaluable is the
+    /// claim that no other policy applies (ADR-0007, §21.4).
+    #[must_use]
+    pub fn protected_by(pod: &Object, policies: &[Object]) -> SelectorMatch {
+        if !is_pod(pod) {
+            return SelectorMatch::NotEvaluated {
+                reason: format!(
+                    "`{}` is not a Pod, and `spec.podSelector` is evaluated against a Pod's labels",
+                    pod.gvk()
+                ),
+            };
+        }
+        let source = pod.identity();
+        let mut edges = Vec::new();
+        for policy in policies.iter().filter(|object| is_policy(object)) {
+            let selector = match policy_selector(policy) {
+                Ok(selector) => selector,
+                Err(reason) => {
+                    return SelectorMatch::NotEvaluated {
+                        reason: format!("`{}`: {reason}", policy.name()),
+                    };
+                }
+            };
+            let Some(matched) = selected_labels(&selector, pod, policy.namespace()) else {
+                continue;
+            };
+            edges.push(
+                Edge::new(
+                    source.clone(),
+                    Relation::ProtectedBy,
+                    Target::of_object(policy),
+                    Evidence::Selector {
+                        selector: selector.clone(),
+                        matched_labels: matched,
+                    },
+                )
+                .with_supporting(policy_evidence(policy, &selector)),
+            );
+        }
+        SelectorMatch::Evaluated(edges)
+    }
+}
+
+/// The Role or ClusterRole a binding names in `roleRef` (§32.2).
+///
+/// `roleRef.kind` decides where the role is looked up: a `Role` is namespace-local and a
+/// `ClusterRole` is cluster-scoped, so only the first carries the binding's namespace onto the
+/// target (§9.5, §24.2). A binding whose `roleRef` names neither yields nothing rather than an
+/// edge to a kind this provider guessed at.
+///
+/// The version is the group's `v1`, which is what the reference states in every cluster inside
+/// the support window; `roleRef` carries an `apiGroup` and no version, and a target has to name
+/// one to be addressable (§13.4).
+fn binding_edges(binding: &Object, source: &Identity, namespace: Option<&str>) -> Vec<Edge> {
+    let Some(reference) = binding.field("/roleRef") else {
+        return Vec::new();
+    };
+    let (Some(kind), Some(name)) = (
+        reference.get("kind").and_then(Json::as_str),
+        reference.get("name").and_then(Json::as_str),
+    ) else {
+        return Vec::new();
+    };
+    if !matches!(kind, "Role" | "ClusterRole") {
+        return Vec::new();
+    }
+    let group = reference
+        .get("apiGroup")
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    let api_version = if group.is_empty() {
+        "v1".to_owned()
+    } else {
+        format!("{group}/v1")
+    };
+    let scope = if kind == "Role" { namespace } else { None };
+    vec![
+        Edge::new(
+            source.clone(),
+            Relation::Binds,
+            Target::new(kind, name)
+                .with_api_version(Some(&api_version))
+                .in_namespace(scope),
+            Evidence::NativeField {
+                path: "/roleRef/name".to_owned(),
+                value: name.to_owned(),
+            },
+        )
+        .with_supporting(vec![Evidence::NativeField {
+            path: "/roleRef/kind".to_owned(),
+            value: kind.to_owned(),
+        }]),
+    ]
+}
+
+/// Whether the object is a core-group Pod — GVK identity, so somebody else's `Pod` is not one.
+fn is_pod(object: &Object) -> bool {
+    object.gvk().group().is_empty() && object.gvk().kind() == "Pod"
+}
+
+/// Whether the object is a `networking.k8s.io` NetworkPolicy (§13.5).
+fn is_policy(object: &Object) -> bool {
+    object.gvk().group() == "networking.k8s.io" && object.gvk().kind() == "NetworkPolicy"
+}
+
+/// A policy's `spec.podSelector` as label equalities, or why it was not evaluated (ADR-0007).
+///
+/// Three refusals, and each is a different thing the answer would otherwise get wrong: an object
+/// that is not a NetworkPolicy has no `podSelector` to read, a policy whose namespace nobody
+/// projected cannot carry §31.1's namespace evidence, and `matchExpressions` is not evaluated
+/// here — its `matchLabels` alone match *more* than the selector does, so a Pod an expression
+/// excludes would arrive looking governed.
+fn policy_selector(policy: &Object) -> Result<BTreeMap<String, String>, String> {
+    if !is_policy(policy) {
+        return Err(format!(
+            "`{}` is not a NetworkPolicy, and reading `spec.podSelector` from it would assert a \
+             policy nobody wrote",
+            policy.gvk()
+        ));
+    }
+    if policy.namespace().is_none() {
+        return Err(
+            "the policy states no `metadata.namespace`, and section 31.1 requires the namespace \
+             as evidence on every policy edge"
+                .to_owned(),
+        );
+    }
+    let Some(selector) = policy.field("/spec/podSelector") else {
+        return Err("the object states no `spec.podSelector`".to_owned());
+    };
+    if selector
+        .get("matchExpressions")
+        .and_then(Json::as_array)
+        .is_some_and(|expressions| !expressions.is_empty())
+    {
+        return Err(
+            "`spec.podSelector.matchExpressions` is not evaluated here, and its `matchLabels` \
+             alone would match more than the selector does"
+                .to_owned(),
+        );
+    }
+    Ok(string_map(selector.get("matchLabels")))
+}
+
+/// The labels of `pod` that satisfy the selector, or [`None`] where the policy does not reach it.
+///
+/// An empty selector matches every Pod of the policy's namespace and contributes no matched
+/// labels, because none decided.
+fn selected_labels(
+    selector: &BTreeMap<String, String>,
+    pod: &Object,
+    namespace: Option<&str>,
+) -> Option<BTreeMap<String, String>> {
+    if pod.namespace() != namespace {
+        return None;
+    }
+    let mut matched = BTreeMap::new();
+    for (key, wanted) in selector {
+        if pod.label(key) != Some(wanted.as_str()) {
+            return None;
+        }
+        matched.insert(key.clone(), wanted.clone());
+    }
+    Some(matched)
+}
+
+/// What rides beside a policy edge's selector: the namespace, the intent, and the empty selector.
+///
+/// The namespace is §31.1's other `MUST`, cited at the field that states it. The intent note is
+/// §31.3: a NetworkPolicy object proves that somebody wrote a rule, never that the installed
+/// networking implementation enforces it, and an edge read as observed traffic would report a
+/// cluster running no policy controller as protected.
+fn policy_evidence(policy: &Object, selector: &BTreeMap<String, String>) -> Vec<Evidence> {
+    let mut supporting = vec![Evidence::NativeField {
+        path: "/metadata/namespace".to_owned(),
+        value: policy.namespace().unwrap_or_default().to_owned(),
+    }];
+    if selector.is_empty() {
+        supporting.push(Evidence::Derived {
+            rule: "an empty `spec.podSelector`, which the API defines as every Pod in the \
+                   namespace"
+                .to_owned(),
+        });
+    }
+    supporting.push(Evidence::Derived {
+        rule: "policy intent: the API server states this policy, and whether the installed \
+               networking implementation enforces it is not observed"
+            .to_owned(),
+    });
+    supporting
 }
 
 /// The edges a Pod's own spec states.

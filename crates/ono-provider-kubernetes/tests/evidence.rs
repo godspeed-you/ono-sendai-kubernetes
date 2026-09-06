@@ -18,7 +18,7 @@
 )]
 
 use ono_provider_kubernetes::coverage::Outcome;
-use ono_provider_kubernetes::evidence::{NodeEvidence, ProviderId, Strength, key};
+use ono_provider_kubernetes::evidence::{ProviderId, Strength, SubjectEvidence, key};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::relationship::Evidence;
 
@@ -77,12 +77,12 @@ fn node() -> Object {
     Object::parse("kubernetes:prod-eu", NODE).expect("the fixture is a Node")
 }
 
-fn evidence_of(json: &str) -> NodeEvidence {
+fn evidence_of(json: &str) -> SubjectEvidence {
     let object = Object::parse("kubernetes:prod-eu", json).expect("the fixture is a Node");
-    NodeEvidence::of(&object).expect("a Node exports evidence")
+    SubjectEvidence::of_node(&object).expect("a Node exports evidence")
 }
 
-fn one(evidence: &NodeEvidence, wanted: &str) -> String {
+fn one(evidence: &SubjectEvidence, wanted: &str) -> String {
     let found = evidence.by_key(wanted);
     assert_eq!(found.len(), 1, "expected exactly one `{wanted}`: {found:?}");
     found[0].value().to_owned()
@@ -369,7 +369,7 @@ fn should_carry_the_node_identity_as_the_subject_of_every_item() {
     }
 
     let elsewhere = Object::parse("kubernetes:dev", NODE).expect("the fixture is a Node");
-    let elsewhere = NodeEvidence::of(&elsewhere).expect("a Node exports evidence");
+    let elsewhere = SubjectEvidence::of_node(&elsewhere).expect("a Node exports evidence");
     assert_ne!(elsewhere.subject(), evidence.subject());
 }
 
@@ -414,7 +414,7 @@ fn should_cite_a_pointer_that_resolves_in_the_object_it_came_from() {
     // key contains `/`, which is the pointer's own separator, so an unescaped citation resolves
     // to nothing while still looking checkable.
     let node = node();
-    let evidence = NodeEvidence::of(&node).expect("a Node exports evidence");
+    let evidence = SubjectEvidence::of_node(&node).expect("a Node exports evidence");
 
     for item in evidence.items() {
         let at = node
@@ -429,7 +429,7 @@ fn should_refuse_an_object_that_is_not_a_node() {
     // The keys are `kubernetes.node.*` and the pointers are Node pointers. Reading a Pod through
     // them would export an empty evidence set that looks like a Node with nothing to say.
     let pod = Object::parse("kubernetes:prod-eu", POD).expect("the fixture is a Pod");
-    let refused = NodeEvidence::of(&pod).expect_err("a Pod is not a Node");
+    let refused = SubjectEvidence::of_node(&pod).expect_err("a Pod is not a Node");
     assert!(refused.to_string().contains("Pod"));
 }
 
@@ -495,4 +495,295 @@ fn mentions(haystack: &str, word: &str) -> bool {
         let boundary = |char: Option<char>| char.is_none_or(|char| !char.is_ascii_alphanumeric());
         boundary(before) && boundary(after)
     })
+}
+
+/// A running Pod as the kubelet reports it: three container lists, two runtimes, one image
+/// resolved to a digest and one that never was.
+const RUNNING_POD: &str = r#"{
+  "apiVersion":"v1","kind":"Pod",
+  "metadata":{"name":"checkout-7f9d","namespace":"shop","uid":"pod-9","resourceVersion":"77"},
+  "spec":{"nodeName":"worker-03"},
+  "status":{
+    "phase":"Running",
+    "initContainerStatuses":[
+      {"name":"migrate","image":"registry.example/migrate:3",
+       "imageID":"registry.example/migrate@sha256:9f2c",
+       "containerID":"cri-o://7b1e0d"}
+    ],
+    "containerStatuses":[
+      {"name":"app","image":"registry.example/checkout:1.25",
+       "imageID":"pullable://registry.example/checkout@sha256:0a1b",
+       "containerID":"containerd://ab12cd34"},
+      {"name":"sidecar","image":"registry.example/proxy:latest",
+       "imageID":"",
+       "containerID":"futurert://f00d"}
+    ],
+    "ephemeralContainerStatuses":[
+      {"name":"debug","image":"registry.example/tools:1",
+       "imageID":"registry.example/tools@sha256:5e5e",
+       "containerID":"containerd://beef01"}
+    ]
+  }
+}"#;
+
+/// A Pod the scheduler has not placed: `status` came back and carries no container at all.
+const UNSTARTED_POD: &str = r#"{
+  "apiVersion":"v1","kind":"Pod",
+  "metadata":{"name":"pending-1","namespace":"shop","uid":"pod-10"},
+  "spec":{},
+  "status":{"phase":"Pending"}
+}"#;
+
+/// The same Pod as a metadata-only projection: nobody asked for `status`.
+const POD_METADATA_ONLY: &str = r#"{
+  "apiVersion":"v1","kind":"Pod",
+  "metadata":{"name":"pending-1","namespace":"shop","uid":"pod-10"}
+}"#;
+
+const LOAD_BALANCED_SERVICE: &str = r#"{
+  "apiVersion":"v1","kind":"Service",
+  "metadata":{"name":"checkout","namespace":"shop","uid":"svc-9"},
+  "spec":{"type":"LoadBalancer","selector":{"app":"checkout"}},
+  "status":{"loadBalancer":{"ingress":[
+    {"ip":"198.51.100.7"},
+    {"hostname":"a1b2c3.lb.example"}
+  ]}}
+}"#;
+
+const ROUTED_INGRESS: &str = r#"{
+  "apiVersion":"networking.k8s.io/v1","kind":"Ingress",
+  "metadata":{"name":"shop","namespace":"shop","uid":"ing-9"},
+  "spec":{},
+  "status":{"loadBalancer":{"ingress":[{"hostname":"edge.example"}]}}
+}"#;
+
+/// A Service that is not load-balanced: `status` answered, and there is no address.
+const CLUSTER_IP_SERVICE: &str = r#"{
+  "apiVersion":"v1","kind":"Service",
+  "metadata":{"name":"internal","namespace":"shop","uid":"svc-10"},
+  "spec":{"type":"ClusterIP"},
+  "status":{"loadBalancer":{}}
+}"#;
+
+const CONFIG_MAP: &str = r#"{
+  "apiVersion":"v1","kind":"ConfigMap",
+  "metadata":{"name":"settings","namespace":"shop","uid":"cm-1"}
+}"#;
+
+fn evidence_for(json: &str) -> SubjectEvidence {
+    let object = Object::parse("kubernetes:prod-eu", json).expect("the fixture reads");
+    SubjectEvidence::of(&object).expect("the object has an evidence rule")
+}
+
+fn qualified(evidence: &SubjectEvidence, wanted: &str) -> Vec<(String, String)> {
+    evidence
+        .by_key(wanted)
+        .iter()
+        .map(|item| {
+            (
+                item.qualifier().unwrap_or_default().to_owned(),
+                item.value().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn should_export_a_container_runtime_id_with_the_scheme_the_kubelet_wrote() {
+    // §47.3's `MUST`: the runtime scheme is preserved rather than stripped into an ambiguous
+    // opaque string. `ab12cd34` alone is a hexadecimal string that means nothing to anybody; the
+    // scheme is what tells a future container-runtime provider which runtime to ask.
+    let evidence = evidence_for(RUNNING_POD);
+    let app = evidence
+        .by_key(key::CONTAINER_ID)
+        .into_iter()
+        .find(|item| item.qualifier() == Some("app"))
+        .expect("the Pod reports a running container");
+
+    assert_eq!(app.value(), "containerd://ab12cd34");
+    assert_eq!(
+        app.shape().map(|shape| shape.scheme().to_owned()),
+        Some("containerd".to_owned())
+    );
+    assert_eq!(
+        app.shape().map(|shape| shape.path().to_owned()),
+        Some("ab12cd34".to_owned()),
+        "decomposed exactly as far as `<scheme>://<path>` goes, and no further (§28.4)"
+    );
+    assert_eq!(app.strength(), Strength::Distinguishing);
+    assert_eq!(app.source(), "/status/containerStatuses/0/containerID");
+}
+
+#[test]
+fn should_export_an_unrecognised_runtime_scheme_exactly_as_it_exports_a_recognised_one() {
+    // §47.1 and Gate K, one level below the Node: the decomposition knows that `://` separates a
+    // scheme from a path and nothing else. A match arm per runtime — "just to show the container
+    // id nicely" — is the foreign-domain knowledge §47.1 keeps out, arriving through a runtime
+    // instead of through a cloud.
+    let evidence = evidence_for(RUNNING_POD);
+    let schemes: Vec<String> = evidence
+        .by_key(key::CONTAINER_ID)
+        .iter()
+        .filter_map(|item| item.shape().map(|shape| shape.scheme().to_owned()))
+        .collect();
+
+    assert_eq!(
+        schemes,
+        vec![
+            "containerd".to_owned(),
+            "futurert".to_owned(),
+            "cri-o".to_owned(),
+            "containerd".to_owned(),
+        ],
+        "a runtime nobody has heard of is exported exactly as a familiar one is"
+    );
+}
+
+#[test]
+fn should_rank_an_image_tag_below_the_digest_the_runtime_resolved() {
+    // §47.6's `MUST`: tag equality is not digest identity. `checkout:1.25` is a name somebody may
+    // move to different content tonight, and the digest names the content itself. Exporting the
+    // two at one strength would let a resolver key an image lookup on a tag and match a machine
+    // running something else entirely.
+    let evidence = evidence_for(RUNNING_POD);
+    let tag = evidence
+        .by_key(key::IMAGE)
+        .into_iter()
+        .find(|item| item.qualifier() == Some("app"))
+        .expect("the container states the image it was asked for");
+    let digest = evidence
+        .by_key(key::IMAGE_ID)
+        .into_iter()
+        .find(|item| item.qualifier() == Some("app"))
+        .expect("the runtime resolved it");
+
+    assert_eq!(tag.value(), "registry.example/checkout:1.25");
+    assert_eq!(tag.strength(), Strength::Correlating);
+    assert!(
+        !tag.is_lookup_key(),
+        "a tag is a mutable name, and a resolver keying on it would match the wrong content"
+    );
+    assert_eq!(
+        digest.value(),
+        "pullable://registry.example/checkout@sha256:0a1b"
+    );
+    assert_eq!(digest.strength(), Strength::Distinguishing);
+    assert!(digest.is_lookup_key());
+}
+
+#[test]
+fn should_export_the_containers_of_every_list_a_pod_reports() {
+    // §47.3 reads `status`, and a Pod's containers are in three lists. An init container that
+    // failed and an ephemeral debug container are exactly the ones an operator is chasing across
+    // a runtime boundary, and reading only `containerStatuses` would report them as absent.
+    let evidence = evidence_for(RUNNING_POD);
+
+    assert_eq!(
+        qualified(&evidence, key::CONTAINER_ID),
+        vec![
+            ("app".to_owned(), "containerd://ab12cd34".to_owned()),
+            ("sidecar".to_owned(), "futurert://f00d".to_owned()),
+            ("migrate".to_owned(), "cri-o://7b1e0d".to_owned()),
+            ("debug".to_owned(), "containerd://beef01".to_owned()),
+        ],
+        "every container the Pod reports, named by the container it belongs to"
+    );
+    assert!(
+        evidence
+            .by_key(key::IMAGE_ID)
+            .iter()
+            .all(|item| item.qualifier() != Some("sidecar")),
+        "an empty `imageID` is a container whose image the runtime has not resolved, and an \
+         empty string is not evidence"
+    );
+}
+
+#[test]
+fn should_tell_a_pod_that_runs_nothing_from_one_whose_status_nobody_projected() {
+    // §4 invariant 13 again, at the Pod: a Pod whose status came back and lists no container is
+    // running nothing, and a metadata-only projection says nothing at all about what it runs.
+    assert_eq!(
+        evidence_for(UNSTARTED_POD).outcome_for(key::CONTAINER_ID),
+        Some(Outcome::Absent)
+    );
+    assert_eq!(
+        evidence_for(POD_METADATA_ONLY).outcome_for(key::CONTAINER_ID),
+        Some(Outcome::NotQueried)
+    );
+}
+
+#[test]
+fn should_export_the_load_balancer_addresses_a_service_reports() {
+    // §47.4: `status.loadBalancer.ingress[]` is exportable for later resolution to a cloud
+    // load-balancer resource. With type information, for §28.5's reason at another object: an
+    // address and a hostname resolve against different foreign systems.
+    let evidence = evidence_for(LOAD_BALANCED_SERVICE);
+
+    assert_eq!(
+        qualified(&evidence, key::LOAD_BALANCER_ADDRESS),
+        vec![
+            ("IP".to_owned(), "198.51.100.7".to_owned()),
+            ("Hostname".to_owned(), "a1b2c3.lb.example".to_owned()),
+        ]
+    );
+    assert!(
+        evidence
+            .by_key(key::LOAD_BALANCER_ADDRESS)
+            .iter()
+            .all(|item| item.strength() == Strength::Correlating && !item.is_lookup_key()),
+        "§47.4: an IP or hostname match alone remains resolver evidence, never a \
+         Kubernetes-verified foreign relationship"
+    );
+    assert_eq!(
+        evidence.by_key(key::LOAD_BALANCER_ADDRESS)[0].source(),
+        "/status/loadBalancer/ingress/0/ip"
+    );
+}
+
+#[test]
+fn should_export_the_load_balancer_address_an_ingress_reports() {
+    // §47.4 names Service *and* Ingress, and an Ingress is where an operator starts from a URL.
+    let evidence = evidence_for(ROUTED_INGRESS);
+
+    assert_eq!(
+        qualified(&evidence, key::LOAD_BALANCER_ADDRESS),
+        vec![("Hostname".to_owned(), "edge.example".to_owned())]
+    );
+}
+
+#[test]
+fn should_tell_a_service_with_no_load_balancer_from_one_nobody_asked_about() {
+    // A ClusterIP Service has no load-balancer address, and that is a fact about the Service.
+    assert_eq!(
+        evidence_for(CLUSTER_IP_SERVICE).outcome_for(key::LOAD_BALANCER_ADDRESS),
+        Some(Outcome::Absent)
+    );
+}
+
+#[test]
+fn should_refuse_an_object_no_evidence_rule_covers() {
+    // The pointers and the published keys belong to the kinds that have them. A ConfigMap read
+    // through a Pod's pointers would export an empty evidence set, which renders as an object
+    // with nothing to say rather than as the wrong question.
+    let object = Object::parse("kubernetes:prod-eu", CONFIG_MAP).expect("the fixture reads");
+    let refused =
+        SubjectEvidence::of(&object).expect_err("a ConfigMap states no cross-system fact");
+    assert!(refused.to_string().contains("ConfigMap"), "{refused}");
+}
+
+#[test]
+fn should_render_a_container_fact_under_the_field_and_the_container_it_came_from() {
+    // §47.7: the evidence is inspectable before any foreign provider is connected, and a line
+    // that said only `app: containerd://ab12cd34` would leave a reader guessing whether they are
+    // looking at a container id, an image or an image id.
+    let rendered = evidence_for(RUNNING_POD).describe();
+
+    assert!(
+        rendered.contains("containerID (app): containerd://ab12cd34"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("image (app): registry.example/checkout:1.25"),
+        "{rendered}"
+    );
 }

@@ -123,6 +123,12 @@ contributions:
     - "io.github.godspeed-you.kubernetes.service/1->io.github.godspeed-you.kubernetes.endpointslice/1"   # has-endpoints
     - "io.github.godspeed-you.kubernetes.endpointslice/1->io.github.godspeed-you.kubernetes.pod/1"   # endpoint-for
     - "io.github.godspeed-you.kubernetes.ingress/1->io.github.godspeed-you.kubernetes.service/1"   # routes-to
+    # What constrains traffic to a place (§31.1, §35.5). Registered from the policy's end only:
+    # the host renders one registered edge from both of its ends, so a `pod -> networkpolicy`
+    # shape beside this one would put the same policy in a Pod's `near` twice. `protected-by` —
+    # the Pod's end of this edge, and Appendix B's word for it — is answered on request by
+    # `get k8s-relation --kind Pod --relation protected-by` (ADR-0040).
+    - "io.github.godspeed-you.kubernetes.networkpolicy/1->io.github.godspeed-you.kubernetes.pod/1"   # selects
     # Where it runs (§28.1).
     - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.node/1"   # scheduled-on
     # Lineage, read from the child that states its own owner reference (§24.1, §24.3).

@@ -198,6 +198,20 @@ const NAMED: Parameter = Parameter::new(
      different request with different permissions (specification section 17.1).",
 );
 
+/// Which of §47's four subjects a query means, for `k8s-evidence`.
+///
+/// Declared with a default rather than left absent, because the answer differs per kind and a
+/// silent choice would be this package deciding which object an operator meant. `Node` is the
+/// default because §47.2's evidence is the oldest and the one §60.8's scenario names.
+const EVIDENCE_KIND: Parameter = Parameter::defaulting(
+    "kind",
+    "string",
+    "Whose evidence: `Node`, `Pod`, `Service` or `Ingress`. Each states a different kind of \
+     cross-system fact, and a kind with no rule is refused by name rather than answered empty \
+     (specification section 47).",
+    "Node",
+);
+
 /// A page budget for a listing (§18.4).
 const MAX_PAGES: Parameter = Parameter::new(
     "max_pages",
@@ -293,13 +307,19 @@ pub enum Reads {
     /// as [`Self::Discovered`] resolves one, so a custom resource's Events are reachable without
     /// recompiling anything.
     Events,
-    /// What one Node states about the machine underneath it, as evidence (§28.3–§28.5, §47).
+    /// What one object states about the systems around Kubernetes, as evidence (§47).
     ///
-    /// A Node and nothing else: the pointers and the published keys of `evidence.rs` are a
-    /// Node's, and reading a Pod through them would answer an empty evidence set that renders as
-    /// a machine with nothing to say rather than as the wrong question. The kind is therefore
-    /// named here — this *is* a curated read — and it is a separate variant from
-    /// [`Self::Kind`] because the records are not the Node.
+    /// Four kinds state such a thing and each states a different one: a Node names the machine
+    /// underneath it (§47.2), a Pod names the containers and images a runtime holds for it
+    /// (§47.3), and a Service or an Ingress names the load-balancer addresses something outside
+    /// answers on (§47.4). Which of them a query means is the *query's* answer, through a `kind`
+    /// option that defaults to `Node`.
+    ///
+    /// It is deliberately not [`Self::Discovered`]'s resolution over every group. There is no
+    /// generic evidence rule: every rule is a set of pointers into one kind's own fields, so a
+    /// kind resolved through discovery would be read and then refused — a promise the answer
+    /// cannot keep. The four are named here, and a fifth is refused by name before a cluster is
+    /// reached. It stays a variant of its own because the records are not the object.
     Evidence,
     /// One container's log, as lines (§42.1).
     ///
@@ -334,12 +354,12 @@ impl Reads {
     pub const fn group(self) -> Option<&'static str> {
         match self {
             Self::Kind { group, .. } => Some(group),
-            Self::Evidence => Some(""),
             Self::Discovered
             | Self::Instance
             | Self::Relations
             | Self::Changes
             | Self::Events
+            | Self::Evidence
             | Self::Logs
             | Self::Timeline
             | Self::Why
@@ -353,10 +373,10 @@ impl Reads {
     pub const fn kind(self) -> Option<&'static str> {
         match self {
             Self::Kind { kind, .. } => Some(kind),
-            // The one read below `Kind` that still names a kind: a Node, whose evidence is not
-            // the Node (§47.1).
-            Self::Evidence => Some("Node"),
-            Self::Discovered
+            // Not `Evidence`: four kinds state cross-system evidence and the query says which
+            // (§47.2 to §47.4), so this table names none of them.
+            Self::Evidence
+            | Self::Discovered
             | Self::Instance
             | Self::Relations
             | Self::Changes
@@ -561,8 +581,14 @@ impl Target {
                 options.push(NAMED);
                 options.push(MAX_PAGES);
             }
-            // A Node is cluster-scoped, so there is no namespace to name (§47.2).
-            Reads::Evidence => options.push(NAMED),
+            // §47.2's Node is cluster-scoped; §47.3's Pod and §47.4's Service and Ingress are
+            // not, so a namespace is nameable — and `all_namespaces` is not, because this is a
+            // question about one object (§17.1).
+            Reads::Evidence => {
+                options.push(SCOPE[0]);
+                options.push(NAMED);
+                options.push(EVIDENCE_KIND);
+            }
             Reads::Logs => {
                 options.push(SCOPE[0]);
                 options.push(NAMED);
@@ -1545,7 +1571,12 @@ const CHANGE_FIELDS: &[Field] = &[
 ///   fields rather than one, because §8.5 requires them to be impossible to confuse the day
 ///   impersonation exists. `impersonating` says whether they can differ;
 /// - **what it could not determine** — `unknowns`, each entry naming a subject and one of §21.4's
-///   eight outcomes, so a field the cluster refused reads differently from one it does not have.
+///   eight outcomes, so a field the cluster refused reads differently from one it does not have;
+/// - **what it can do here** — `capabilities`, one entry per capability, each a two-part
+///   statement of what the provider supports and what *this* session found (§57.1). The two
+///   halves are never derived from one another: a capability this build refuses reads
+///   differently from one the cluster does not serve, from one the operator did not grant, and
+///   from one nobody has asked about.
 const CLUSTER_FIELDS: &[Field] = &[
     Field::required("uid", "string"),
     Field::required("name", "string"),
@@ -1566,6 +1597,7 @@ const CLUSTER_FIELDS: &[Field] = &[
     Field::required("unknowns", "list<string>"),
     Field::required("probes", "map"),
     Field::required("latency_ms", "map"),
+    Field::required("capabilities", "map"),
 ];
 
 /// The targets this package answers for.
@@ -1912,13 +1944,15 @@ pub static TARGETS: &[Target] = &[
         name: "k8s-evidence",
         schema: "io.github.godspeed-you.kubernetes.evidence/1",
         schema_name: "KubernetesIdentityEvidence",
-        schema_summary: "One value a Node states about the machine underneath it, with where it \
-                         was read and how far it goes — never a link to another system.",
-        summary: "What a Node states about the machine underneath it, as inspectable evidence \
-                  for a resolver that has read the other system (specification section 47).",
-        identity_doc: "Two observations are the same evidence when the Node's `metadata.uid`, \
+        schema_summary: "One value an object states about a system outside Kubernetes, with \
+                         where it was read and how far it goes — never a link to that system.",
+        summary: "What a Node, a Pod, a Service or an Ingress states about the machine, the \
+                  container runtime or the load balancer behind it, as inspectable evidence for \
+                  a resolver that has read the other system (specification section 47).",
+        identity_doc: "Two observations are the same evidence when the object's `metadata.uid`, \
                        the published key and the field pointer all match. A Node rebuilt under \
-                       the same name is a different machine.",
+                       the same name is a different machine, and a Pod restarted under the same \
+                       name runs different containers.",
         reads: Reads::Evidence,
         fields: EVIDENCE_FIELDS,
     },

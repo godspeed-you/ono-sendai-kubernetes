@@ -40,7 +40,7 @@ use ono_provider_kubernetes::redaction::{self, Guarded};
 use ono_provider_kubernetes::relationship::{Edge, Graph, Relation};
 use ono_provider_kubernetes::session::Session;
 use ono_provider_kubernetes::transport::{ByteStream, Client, Freshness, ListOptions};
-use ono_provider_kubernetes::workload::Workload;
+use ono_provider_kubernetes::workload::{SelectorMatch, Workload};
 use ono_value::Schema;
 use serde_json::Value as Json;
 
@@ -188,6 +188,7 @@ impl Conversation for Related<'_> {
         })?;
         let mut derived = Derived {
             edges: Vec::new(),
+            unevaluated: Vec::new(),
             coverage: ono_provider_kubernetes::coverage::Coverage::complete(scope.clone()),
             source: guarded,
             freshness,
@@ -213,6 +214,12 @@ impl Conversation for Related<'_> {
 /// What one object's relationships came to, and what the derivation could not see.
 struct Derived {
     edges: Vec<Edge>,
+    /// The selectors a rule declined to evaluate, in the words of the field that stopped it.
+    ///
+    /// Beside the coverage rather than inside it, because [`Gap`] says which *scope* did not
+    /// answer and this is a scope that answered in full and a selector this provider does not
+    /// evaluate (ADR-0007). Both end the invocation; only one of them is about the cluster.
+    unevaluated: Vec<String>,
     coverage: ono_provider_kubernetes::coverage::Coverage,
     source: Guarded,
     freshness: Freshness,
@@ -313,6 +320,60 @@ fn two_sided<S: ByteStream>(
             derived.edges.extend(edges);
         }
     }
+    // §31.1, from the policy's end: the Pods of its own namespace, evaluated against
+    // `spec.podSelector`. The policy is the object an operator names during an outage, and until
+    // this derivation existed a NetworkPolicy had no relationship at all.
+    if is(
+        derived.source.object(),
+        "networking.k8s.io",
+        "NetworkPolicy",
+    ) && let Some(pods) =
+        collection(session, client, endpoint, served, scope, "", "Pod", derived)?
+    {
+        let reached = Graph::policy_selects(derived.source.object(), &pods);
+        evaluated(derived, reached);
+    }
+    if is(derived.source.object(), "", "Pod") {
+        // Appendix B's `selected-by`: §26.1 read from the Pod's end, which is where an operator
+        // stands when one Pod is missing from a Service's endpoints.
+        if let Some(services) = collection(
+            session, client, endpoint, served, scope, "", "Service", derived,
+        )? {
+            let edges = Graph::selected_by(derived.source.object(), &services);
+            derived.edges.extend(edges);
+        }
+        // Appendix B's `protected-by`: §31.1 read from the Pod's end.
+        if let Some(policies) = collection(
+            session,
+            client,
+            endpoint,
+            served,
+            scope,
+            "networking.k8s.io",
+            "NetworkPolicy",
+            derived,
+        )? {
+            let reached = Graph::protected_by(derived.source.object(), &policies);
+            evaluated(derived, reached);
+        }
+    }
+    // Appendix B's `routed-from`: §27.1 read from the backend's end, where an operator stands
+    // when a Service has healthy endpoints and the URL in front of it does not answer.
+    if is(derived.source.object(), "", "Service")
+        && let Some(routers) = collection(
+            session,
+            client,
+            endpoint,
+            served,
+            scope,
+            "networking.k8s.io",
+            "Ingress",
+            derived,
+        )?
+    {
+        let edges = Workload::routed_from(derived.source.object(), &routers);
+        derived.edges.extend(edges);
+    }
     if let Some((.., group, child)) = CHILDREN_OF
         .iter()
         .find(|(owner_group, owner_kind, ..)| is(derived.source.object(), owner_group, owner_kind))
@@ -324,6 +385,19 @@ fn two_sided<S: ByteStream>(
         derived.edges.extend(edges);
     }
     Ok(())
+}
+
+/// Takes the edges of an evaluated selector, or records why one was not evaluated (ADR-0007).
+///
+/// A selector this provider does not evaluate in full yields no edges at all rather than the
+/// subset it could evaluate: that subset is *wider* than the selector, so an object the selector
+/// excludes would arrive looking related. The reason ends the invocation beside the coverage
+/// gaps, because "no such edges" and "this selector was not evaluated" are different answers.
+fn evaluated(derived: &mut Derived, reached: SelectorMatch) {
+    match reached {
+        SelectorMatch::Evaluated(edges) => derived.edges.extend(edges),
+        SelectorMatch::NotEvaluated { reason } => derived.unevaluated.push(reason),
+    }
 }
 
 /// One collection a derivation needs, or [`None`] with a gap recorded against the answer.
@@ -522,11 +596,13 @@ const RELATIONS: &[Relation] = &[
     Relation::Controls,
     Relation::ScheduledOn,
     Relation::Selects,
+    Relation::SelectedBy,
     Relation::SelectorMatches,
     Relation::UsesService,
     Relation::RepresentedBy,
     Relation::EndpointFor,
     Relation::RoutesTo,
+    Relation::RoutedFrom,
     Relation::UsesTlsSecret,
     Relation::UsesIngressClass,
     Relation::AttachesTo,
@@ -539,6 +615,8 @@ const RELATIONS: &[Relation] = &[
     Relation::ReferencesSecret,
     Relation::UsesSecret,
     Relation::UsesImagePullSecret,
+    Relation::Binds,
+    Relation::ProtectedBy,
 ];
 
 /// Streams the edges, then reports whatever the derivation could not see.
@@ -623,6 +701,21 @@ fn emit(
                 ));
             }
         }
+    }
+    if !derived.unevaluated.is_empty() {
+        return Outcome::Failed(failure(
+            UNAVAILABLE_CODE,
+            UNAVAILABLE,
+            format!(
+                "a selector this provider does not evaluate leaves part of this object's \
+                 neighbourhood undetermined: {}",
+                derived.unevaluated.join("; ")
+            ),
+            "The edges that did arrive are true. An unevaluated selector is not a selector that \
+             matched nothing: its `matchLabels` alone match more than the selector does, so the \
+             objects it would have excluded cannot be reported either way (ADR-0007, \
+             specification section 23.3).",
+        ));
     }
     if derived.coverage.is_complete() {
         return Outcome::Completed;

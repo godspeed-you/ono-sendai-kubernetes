@@ -1,6 +1,10 @@
-//! What a Node says about the machine underneath it, exported for someone else to resolve.
+//! What an object says about the systems around Kubernetes, exported for someone else to resolve.
 //!
-//! Specification §28.3 to §28.5, §47 and Appendix C.3. One rule shapes the whole module, and it
+//! Specification §28.3 to §28.5, §47 and Appendix C.3. Three subjects state such a thing, and
+//! each states a different one: a **Node** names the machine underneath it (§47.2), a **Pod**
+//! names the containers and images a runtime holds for it (§47.3, §47.6), and a **Service** or an
+//! **Ingress** names the load-balancer addresses something outside the cluster answers on
+//! (§47.4). One rule shapes the whole module, and it
 //! is §47.1: **this provider exports identity evidence and never resolves a foreign domain.** It
 //! has read Kubernetes and nothing else, so the honest strongest claim it can make about a
 //! machine in another system is "here is what the API server stated, and here is how strongly
@@ -12,7 +16,9 @@
 //! decomposed as far as `<scheme>://<path>` goes and no further, because the moment one scheme
 //! gets a match arm — "just to show the instance nicely" — the vendor policy §28.4 forbids has
 //! arrived, and the second arm follows within a week. `tests/evidence.rs` reads this source and
-//! fails if a vendor is named in it, including in an example.
+//! fails if a vendor is named in it, including in an example. §47.3 asks for exactly the same
+//! restraint one level down: a container identifier keeps the scheme the kubelet wrote, and no
+//! rule here knows what any particular runtime's scheme means.
 //!
 //! Three strengths, because §47.2 ranks them and a flat list would throw the ranking away:
 //!
@@ -21,6 +27,11 @@
 //! correlating      equal across unrelated things, or reassigned: an address, a copied host id
 //! placement        where the subject sits rather than which thing it is: zone, region, arch
 //! ```
+//!
+//! §47.6 is where that ranking earns its keep: an image *tag* and an image *digest* are two
+//! different claims about one container, the tag names something a person may move tonight, and
+//! the section says in as many words that tag equality MUST NOT be confused with digest identity.
+//! So they are exported as separate keys at separate strengths rather than as one "image".
 //!
 //! What is deliberately absent: any way to turn evidence into a relationship. There is no
 //! constructor here that produces one, because §28.5 forbids address equality from establishing a
@@ -60,6 +71,25 @@ pub mod key {
     /// other is what the kubelet reported into status. They usually agree, and when they disagree
     /// that is worth seeing rather than resolving.
     pub const HOSTNAME: &str = "kubernetes.node.hostname";
+
+    /// One container's `containerID`, with the runtime scheme the kubelet wrote (§47.3).
+    ///
+    /// Qualified by the container's name, because a Pod holds several and an identifier with no
+    /// container against it is a fact about a Pod rather than about a container.
+    pub const CONTAINER_ID: &str = "kubernetes.pod.container-id";
+    /// One container's `imageID`: the image the runtime actually resolved and pulled (§47.6).
+    pub const IMAGE_ID: &str = "kubernetes.pod.image-id";
+    /// One container's `image`: the reference the object *asked* for (§47.6).
+    ///
+    /// A different claim from [`IMAGE_ID`] and deliberately a separate key. A tag is a name
+    /// somebody may point at different content tonight; a digest names the content.
+    pub const IMAGE: &str = "kubernetes.pod.image";
+    /// One entry of `status.loadBalancer.ingress`, qualified by what kind of address it is
+    /// (§47.4).
+    ///
+    /// One key for a Service and for an Ingress: the field is the same field, and a resolver
+    /// matching an address against an inventory does not care which kind published it.
+    pub const LOAD_BALANCER_ADDRESS: &str = "kubernetes.load-balancer.address";
 }
 
 /// Why no evidence could be read.
@@ -67,6 +97,22 @@ pub mod key {
 pub enum EvidenceError {
     /// The object is not a Node, so the Node pointers below would read nothing from it.
     NotANode {
+        /// What the object turned out to be.
+        gvk: String,
+    },
+    /// The object is not of the kind the requested rule reads.
+    WrongKind {
+        /// What the rule reads.
+        expected: &'static str,
+        /// What the object turned out to be.
+        gvk: String,
+    },
+    /// No rule here reads this kind, so there is no evidence to export rather than none present.
+    ///
+    /// Every rule in this module is a set of pointers into one kind's own fields. A kind without
+    /// one would answer an empty evidence set, which renders as an object with nothing to say
+    /// about the systems around it — and that is the wrong question answered confidently.
+    NoRule {
         /// What the object turned out to be.
         gvk: String,
     },
@@ -79,6 +125,16 @@ impl std::fmt::Display for EvidenceError {
                 f,
                 "`{gvk}` is not a Node, and Node evidence read from it would be empty rather \
                  than absent"
+            ),
+            Self::WrongKind { expected, gvk } => write!(
+                f,
+                "`{gvk}` is not {expected}, and evidence read from it through {expected}'s \
+                 pointers would be empty rather than absent"
+            ),
+            Self::NoRule { gvk } => write!(
+                f,
+                "`{gvk}` states no cross-system identity evidence this provider exports; the \
+                 kinds that do are Node, Pod, Service and Ingress (specification section 47)"
             ),
         }
     }
@@ -160,14 +216,22 @@ impl UriShape {
     }
 }
 
-/// `spec.providerID`, kept whole and read only as far as its shape allows (§28.4).
+/// An identifier written by another system, kept whole and read only as far as its shape allows.
+///
+/// One parser for §28.4's `spec.providerID` and §47.3's container and image identifiers, because
+/// they are the same problem: a value some other system minted, conventionally written as
+/// `<scheme>://<path>`, whose scheme this provider MUST preserve and MUST NOT interpret. A second
+/// parser would be a second place for one of them to acquire a match arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderId {
+pub struct SchemedId {
     raw: String,
     shape: Option<UriShape>,
 }
 
-impl ProviderId {
+/// What §28.4 and Appendix C.3 call this when the subject is a Node.
+pub type ProviderId = SchemedId;
+
+impl SchemedId {
     /// Reads an identifier without interpreting it.
     ///
     /// A value with no `://` is not malformed and is not rejected: the field is documented as
@@ -216,7 +280,48 @@ pub struct IdentityEvidence {
     source: String,
     strength: Strength,
     evidence: Evidence,
+    shape: Option<UriShape>,
 }
+
+impl IdentityEvidence {
+    /// One value a field of the subject stated, at the pointer it was read from.
+    ///
+    /// The decomposition is attached here rather than recomputed by a consumer, and only for the
+    /// keys that carry an identifier some other system minted: an address is not a URI, and a
+    /// scheme parsed out of one would be a shape nobody stated.
+    fn stated(
+        subject: &Identity,
+        key: &str,
+        qualifier: Option<&str>,
+        value: &str,
+        source: String,
+        strength: Strength,
+    ) -> Self {
+        Self {
+            subject: subject.clone(),
+            key: key.to_owned(),
+            qualifier: qualifier.map(str::to_owned),
+            value: value.to_owned(),
+            source: source.clone(),
+            strength,
+            evidence: Evidence::NativeField {
+                path: source,
+                value: value.to_owned(),
+            },
+            shape: SCHEMED
+                .contains(&key)
+                .then(|| SchemedId::parse(value).shape)
+                .flatten(),
+        }
+    }
+}
+
+/// The keys whose value is an identifier another system minted, written `<scheme>://<path>`.
+///
+/// A list rather than a guess at the value's shape: `10.42.0.17` will never contain `://`, and a
+/// rule that decomposed whatever happened to look like a URI would eventually decompose something
+/// that only looked like one.
+const SCHEMED: &[&str] = &[key::PROVIDER_ID, key::CONTAINER_ID, key::IMAGE_ID];
 
 impl IdentityEvidence {
     /// The object this is evidence about (Appendix C.3's `subject`).
@@ -292,16 +397,20 @@ impl IdentityEvidence {
         self.strength.is_distinguishing()
     }
 
+    /// The scheme and path, where this key's value came as a URI (§28.4, §47.3).
+    #[must_use]
+    pub fn shape(&self) -> Option<&UriShape> {
+        self.shape.as_ref()
+    }
+
     /// One line, in the field's own spelling (§47.7).
     #[must_use]
     pub fn describe(&self) -> String {
-        format!("{}: {}", self.label(), self.value)
-    }
-
-    fn label(&self) -> &str {
-        self.qualifier
-            .as_deref()
-            .unwrap_or_else(|| label_of(&self.key))
+        format!(
+            "{}: {}",
+            labelled(&self.key, self.qualifier.as_deref()),
+            self.value
+        )
     }
 }
 
@@ -336,16 +445,43 @@ impl Unobserved {
     }
 }
 
-/// Everything one Node exports for a cross-system resolver, and everything it could not.
+/// Everything one object exports for a cross-system resolver, and everything it could not.
+///
+/// One type for three subjects, because a resolver consumes items rather than kinds: what differs
+/// between a Node, a Pod and a load-balanced Service is which pointers were read, and that
+/// travels on each item as its `source`. What must not differ is the shape of the answer, or a
+/// consumer would need a rule per kind — and rules per kind are how foreign-domain knowledge
+/// arrives (§47.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeEvidence {
+pub struct SubjectEvidence {
     subject: Identity,
     provider_id: Option<ProviderId>,
     items: Vec<IdentityEvidence>,
     unobserved: Vec<Unobserved>,
 }
 
-impl NodeEvidence {
+impl SubjectEvidence {
+    /// Reads whatever cross-system evidence the object's own kind states (§47.2 to §47.4).
+    ///
+    /// The dispatch is on GVK, so a custom resource that happens to be called `Pod` is not read
+    /// through a Pod's pointers (§13.5).
+    ///
+    /// # Errors
+    ///
+    /// [`EvidenceError::NoRule`] for a kind no rule here reads. Answering an empty evidence set
+    /// would render as an object that states nothing about the systems around it, which is a
+    /// confident answer to a question nobody can ask of a ConfigMap.
+    pub fn of(object: &Object) -> Result<Self, EvidenceError> {
+        match (object.gvk().group(), object.gvk().kind()) {
+            ("", "Node") => Self::of_node(object),
+            ("", "Pod") => Self::of_pod(object),
+            ("", "Service") | ("networking.k8s.io", "Ingress") => Self::of_load_balancer(object),
+            _ => Err(EvidenceError::NoRule {
+                gvk: object.gvk().to_string(),
+            }),
+        }
+    }
+
     /// Reads a Node's cross-system evidence.
     ///
     /// # Errors
@@ -353,7 +489,7 @@ impl NodeEvidence {
     /// [`EvidenceError::NotANode`] for any other object. The keys and pointers below are a Node's,
     /// and reading a Pod through them would produce an empty evidence set that renders as a Node
     /// with nothing to say rather than as the wrong question.
-    pub fn of(node: &Object) -> Result<Self, EvidenceError> {
+    pub fn of_node(node: &Object) -> Result<Self, EvidenceError> {
         if !(node.gvk().group().is_empty() && node.gvk().kind() == "Node") {
             return Err(EvidenceError::NotANode {
                 gvk: node.gvk().to_string(),
@@ -369,18 +505,14 @@ impl NodeEvidence {
             .and_then(serde_json::Value::as_str)
             .map(ProviderId::parse);
         match &provider_id {
-            Some(identifier) => items.push(IdentityEvidence {
-                subject: subject.clone(),
-                key: key::PROVIDER_ID.to_owned(),
-                qualifier: None,
-                value: identifier.raw().to_owned(),
-                source: "/spec/providerID".to_owned(),
-                strength: Strength::Distinguishing,
-                evidence: Evidence::NativeField {
-                    path: "/spec/providerID".to_owned(),
-                    value: identifier.raw().to_owned(),
-                },
-            }),
+            Some(identifier) => items.push(IdentityEvidence::stated(
+                &subject,
+                key::PROVIDER_ID,
+                None,
+                identifier.raw(),
+                "/spec/providerID".to_owned(),
+                Strength::Distinguishing,
+            )),
             None => unobserved.push(Unobserved {
                 key: key::PROVIDER_ID.to_owned(),
                 // The spec stanza came back and did not carry the field, so the Node has no
@@ -402,19 +534,14 @@ impl NodeEvidence {
             ) else {
                 continue;
             };
-            let source = format!("/status/addresses/{at}/address");
-            items.push(IdentityEvidence {
-                subject: subject.clone(),
-                key: key::ADDRESS.to_owned(),
-                qualifier: Some(address_type.to_owned()),
-                value: address.to_owned(),
-                source: source.clone(),
-                strength: Strength::Correlating,
-                evidence: Evidence::NativeField {
-                    path: source,
-                    value: address.to_owned(),
-                },
-            });
+            items.push(IdentityEvidence::stated(
+                &subject,
+                key::ADDRESS,
+                Some(address_type),
+                address,
+                format!("/status/addresses/{at}/address"),
+                Strength::Correlating,
+            ));
             address_count += 1;
         }
         if address_count == 0 {
@@ -462,6 +589,7 @@ impl NodeEvidence {
                 qualifier: None,
                 value: value.to_owned(),
                 source: label_pointer(label),
+                shape: None,
                 strength: *strength,
                 // A well-known label is a convention rather than API structure (§23.4): a
                 // controller writes it and anyone with write access can change it, which is
@@ -481,7 +609,155 @@ impl NodeEvidence {
         })
     }
 
-    /// The Node this is evidence about.
+    /// Reads a Pod's container and image evidence (§47.3, §47.6).
+    ///
+    /// Every container list the status carries, in the order `containerStatuses`,
+    /// `initContainerStatuses`, `ephemeralContainerStatuses`: an init container that failed and a
+    /// debug container somebody attached are exactly the ones an operator is chasing across a
+    /// runtime boundary, and reading the first list alone would report them as absent.
+    ///
+    /// Three keys per container, and they are three claims rather than one. The `containerID` and
+    /// the `imageID` name one thing each — a container the runtime holds, content a registry
+    /// stores — while the `image` is the reference the object *asked* for, which somebody may
+    /// point at different content tonight. §47.6 forbids confusing the last with the first two,
+    /// and the strengths here are that sentence.
+    ///
+    /// The scheme in front of an identifier is kept exactly as the kubelet wrote it, including
+    /// one no rule here has ever seen (§47.3, §47.1).
+    ///
+    /// # Errors
+    ///
+    /// [`EvidenceError::WrongKind`] for anything that is not a core-group Pod.
+    pub fn of_pod(pod: &Object) -> Result<Self, EvidenceError> {
+        if !(pod.gvk().group().is_empty() && pod.gvk().kind() == "Pod") {
+            return Err(EvidenceError::WrongKind {
+                expected: "a Pod",
+                gvk: pod.gvk().to_string(),
+            });
+        }
+        let subject = pod.identity();
+        let mut items = Vec::new();
+
+        for list in CONTAINER_LISTS {
+            let pointer = format!("/status/{list}");
+            let Some(statuses) = pod.field(&pointer).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for (at, status) in statuses.iter().enumerate() {
+                let Some(container) = status.get("name").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                for (field, published, strength) in CONTAINER_FIELDS {
+                    // An empty string is a field the kubelet has not filled in yet — a container
+                    // whose image the runtime has not resolved — and exporting it would hand a
+                    // resolver a key that matches everything unresolved everywhere.
+                    let Some(value) = status
+                        .get(field)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+                    items.push(IdentityEvidence::stated(
+                        &subject,
+                        published,
+                        Some(container),
+                        value,
+                        format!("{pointer}/{at}/{field}"),
+                        *strength,
+                    ));
+                }
+            }
+        }
+
+        // §4 invariant 13 at the Pod: a status that came back and lists no container is a Pod
+        // running nothing, and a metadata-only projection says nothing about what it runs.
+        let unobserved = CONTAINER_FIELDS
+            .iter()
+            .filter(|(_, published, _)| !items.iter().any(|item| item.key == *published))
+            .map(|(_, published, _)| Unobserved {
+                key: (*published).to_owned(),
+                outcome: read_outcome(pod, "/status"),
+            })
+            .collect();
+
+        Ok(Self {
+            subject,
+            provider_id: None,
+            items,
+            unobserved,
+        })
+    }
+
+    /// Reads the load-balancer addresses a Service or an Ingress reports (§47.4).
+    ///
+    /// `status.loadBalancer.ingress[]` on both kinds, because it is the same field stating the
+    /// same thing: an address something outside this cluster answers on. Each entry may carry an
+    /// address, a hostname or both, and each is exported separately with the kind of address it
+    /// is — §28.5's reason at another object, because an address and a hostname resolve against
+    /// different foreign systems.
+    ///
+    /// Every one of them is `correlating` and no lookup key however exact it looks. §47.4 says
+    /// why: an IP or hostname match alone remains a resolver's evidence, never a
+    /// Kubernetes-verified foreign relationship — the address of a load balancer that was deleted
+    /// this morning is answered by whatever took it over this afternoon.
+    ///
+    /// # Errors
+    ///
+    /// [`EvidenceError::WrongKind`] for a kind that has no such status stanza.
+    pub fn of_load_balancer(object: &Object) -> Result<Self, EvidenceError> {
+        let gvk = object.gvk();
+        if !matches!(
+            (gvk.group(), gvk.kind()),
+            ("", "Service") | ("networking.k8s.io", "Ingress")
+        ) {
+            return Err(EvidenceError::WrongKind {
+                expected: "a Service or an Ingress",
+                gvk: gvk.to_string(),
+            });
+        }
+        let subject = object.identity();
+        let mut items = Vec::new();
+        let entries = object
+            .field("/status/loadBalancer/ingress")
+            .and_then(serde_json::Value::as_array);
+        for (at, entry) in entries.into_iter().flatten().enumerate() {
+            for (field, address_type) in LOAD_BALANCER_FIELDS {
+                let Some(value) = entry
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                items.push(IdentityEvidence::stated(
+                    &subject,
+                    key::LOAD_BALANCER_ADDRESS,
+                    Some(address_type),
+                    value,
+                    format!("/status/loadBalancer/ingress/{at}/{field}"),
+                    Strength::Correlating,
+                ));
+            }
+        }
+        let unobserved = if items.is_empty() {
+            vec![Unobserved {
+                key: key::LOAD_BALANCER_ADDRESS.to_owned(),
+                outcome: read_outcome(object, "/status"),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            subject,
+            provider_id: None,
+            items,
+            unobserved,
+        })
+    }
+
+    /// The object this is evidence about.
     #[must_use]
     pub fn subject(&self) -> &Identity {
         &self.subject
@@ -542,6 +818,27 @@ impl NodeEvidence {
             .join("\n")
     }
 }
+
+/// Every list a Pod's status reports containers in (§47.3).
+const CONTAINER_LISTS: &[&str] = &[
+    "containerStatuses",
+    "initContainerStatuses",
+    "ephemeralContainerStatuses",
+];
+
+/// What one container status states, under which key, and how far each value goes (§47.3, §47.6).
+const CONTAINER_FIELDS: &[(&str, &str, Strength)] = &[
+    // A runtime container identifier names one container in the runtime that minted it.
+    ("containerID", key::CONTAINER_ID, Strength::Distinguishing),
+    // A resolved image identifier names content: what was actually pulled.
+    ("imageID", key::IMAGE_ID, Strength::Distinguishing),
+    // The reference the object asked for. A tag is a name, and a name moves — §47.6 forbids
+    // treating equality here as identity there.
+    ("image", key::IMAGE, Strength::Correlating),
+];
+
+/// The two forms one load-balancer status entry may take, and the type each is published under.
+const LOAD_BALANCER_FIELDS: &[(&str, &str)] = &[("ip", "IP"), ("hostname", "Hostname")];
 
 /// The well-known labels §28.3 names, current spelling first.
 ///
@@ -605,18 +902,9 @@ fn push_node_info(
 ) {
     let pointer = format!("/status/nodeInfo/{field}");
     match node.field(&pointer).and_then(serde_json::Value::as_str) {
-        Some(value) => items.push(IdentityEvidence {
-            subject: subject.clone(),
-            key: published.to_owned(),
-            qualifier: None,
-            value: value.to_owned(),
-            source: pointer.clone(),
-            strength,
-            evidence: Evidence::NativeField {
-                path: pointer,
-                value: value.to_owned(),
-            },
-        }),
+        Some(value) => items.push(IdentityEvidence::stated(
+            subject, published, None, value, pointer, strength,
+        )),
         None => unobserved.push(Unobserved {
             key: published.to_owned(),
             outcome: read_outcome(node, "/status"),
@@ -646,6 +934,24 @@ fn label_pointer(label: &str) -> String {
     )
 }
 
+/// One item's label: the field it came from, and what narrows it (§47.7).
+///
+/// Two kinds of qualifier, and they read differently on purpose. A qualifier that says *what kind
+/// of value this is* — an address type — replaces the field name, because `InternalIP` says more
+/// than `address` does. A qualifier that says *which part of the subject this is about* — a
+/// container — qualifies the field name instead, because `app: containerd://ab12` would leave a
+/// reader guessing whether they are looking at a container id, an image or an image id.
+fn labelled(published: &str, qualifier: Option<&str>) -> String {
+    match qualifier {
+        None => label_of(published).to_owned(),
+        Some(qualifier) if TYPED_BY_QUALIFIER.contains(&published) => qualifier.to_owned(),
+        Some(qualifier) => format!("{} ({qualifier})", label_of(published)),
+    }
+}
+
+/// The keys whose qualifier names the kind of the value rather than a part of the subject.
+const TYPED_BY_QUALIFIER: &[&str] = &[key::ADDRESS, key::LOAD_BALANCER_ADDRESS];
+
 /// The field's own spelling, for a rendering that matches the object it came from (§47.7).
 fn label_of(published: &str) -> &str {
     match published {
@@ -659,6 +965,10 @@ fn label_of(published: &str) -> &str {
         key::ARCHITECTURE => "architecture",
         key::OPERATING_SYSTEM => "operatingSystem",
         key::HOSTNAME => "hostname",
+        key::CONTAINER_ID => "containerID",
+        key::IMAGE_ID => "imageID",
+        key::IMAGE => "image",
+        key::LOAD_BALANCER_ADDRESS => "address",
         other => other,
     }
 }
