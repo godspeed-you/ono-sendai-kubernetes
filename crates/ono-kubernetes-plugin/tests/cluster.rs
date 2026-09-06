@@ -894,3 +894,70 @@ async fn should_claim_no_capability_of_a_cluster_it_could_not_reach() {
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }
+
+// --- §51.6: what this provider records about itself ---------------------------------------------
+
+#[tokio::test]
+async fn should_record_what_the_broker_cannot_see_in_the_audit_trail() {
+    // §51.6 asks for non-secret audit metadata covering connection, permission failures and
+    // mutations, "according to Ono's inherited audit contract". The broker audits what it
+    // *checked* — a `network.connect` to a host and a port — and cannot see what the bytes on
+    // that connection were for, because it is a byte broker and this package carries its own
+    // protocol over it. So the facts worth auditing are exactly the ones only this package knows.
+    //
+    // `audit.event` was unobservable until `ADR-0589 (core)`: the host pushed a package's records
+    // onto a vector nothing read, which is why nothing here emitted any.
+    let cluster = RecordedCluster::new("kube-system-uid", Review::Answers);
+    let plugin = loaded(Arc::clone(&cluster)).await;
+    let (_, result) = plugin
+        .query("k8s-cluster", at("cluster.test", "recorded"))
+        .await
+        .expect("the diagnostic answers")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+
+    let trail = plugin.audit();
+    let ours: Vec<_> = trail
+        .iter()
+        .filter(|event| event.capability == "audit.event")
+        .collect();
+    assert!(
+        !ours.is_empty(),
+        "the connection this provider opened is in the trail: {trail:?}"
+    );
+    let connected = ours
+        .iter()
+        .find(|event| event.action.ends_with("connect"))
+        .expect("a connection is recorded");
+    assert_eq!(
+        connected.plugin, "io.github.godspeed-you.kubernetes",
+        "attributed by the host, not by this package"
+    );
+    let target = connected
+        .target
+        .as_ref()
+        .expect("what the package said travels whole");
+    assert_eq!(
+        target.get("endpoint").and_then(Json::as_str),
+        Some("cluster.test:8001"),
+        "and it names the endpoint, which is what makes a later record attributable to a \
+         cluster rather than to Kubernetes: {target}"
+    );
+
+    // §51.6's "non-secret", checked as a property of the whole trail rather than of one field:
+    // the trail is shown, exported and kept, so a payload put here is a payload published.
+    let everything = format!("{trail:?}");
+    for forbidden in [
+        "Bearer",
+        "token",
+        "certificate-authority-data",
+        "client-key",
+    ] {
+        assert!(
+            !everything.contains(forbidden),
+            "no credential material reaches the trail (`{forbidden}`): {everything}"
+        );
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}

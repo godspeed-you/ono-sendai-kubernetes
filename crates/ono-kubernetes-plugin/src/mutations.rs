@@ -128,6 +128,35 @@ pub fn answer(
         Ok(made) => made,
         Err(error) => return InvocationOutcome::Failed(error),
     };
+    // §51.6, before the record is built and whatever becomes of it. A change is the event an
+    // audit trail exists for, and the broker cannot see one: everything this command did to the
+    // cluster travelled as bytes on a connection it authorised by host and port. The *fields*
+    // are named; their values are not, because a value written to a Secret is a payload and the
+    // trail is kept.
+    let acceptance = match made.outcome.acceptance() {
+        Acceptance::Persisted => "persisted".to_owned(),
+        Acceptance::DryRun => "dry run".to_owned(),
+        Acceptance::Conflict(_) => "conflict".to_owned(),
+        Acceptance::PreconditionFailed(_) => "precondition failed".to_owned(),
+        // The classified reason and not the server's sentence: a `Status` message is the API
+        // server's prose about somebody's object, and prose is where a payload hides.
+        Acceptance::Refused(kind) => format!("refused: {}", kind.as_str()),
+    };
+    crate::audit::mutated(
+        ctx,
+        made.plan.target().provider_instance(),
+        &made.plan.target().gvk().to_string(),
+        made.plan.target().namespace().unwrap_or("cluster"),
+        made.plan.target().name(),
+        made.dry_run,
+        &acceptance,
+        &made
+            .plan
+            .field_changes()
+            .iter()
+            .map(|change| change.path().to_owned())
+            .collect::<Vec<_>>(),
+    );
     let value = match record(declared, &schema, &made) {
         Ok(value) => value,
         Err(error) => {

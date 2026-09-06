@@ -6,6 +6,7 @@
 //! testable without a host and this crate testable without a cluster.
 //!
 //! ```text
+//! audit           what this provider records about itself, for what the broker cannot see
 //! contributions   what the package declares: targets, schemas, what each one reads
 //! broker          the host's brokered connection, seen as a byte stream, and the context lease
 //!                 that lets a handler read and emit alternately over one open connection
@@ -31,6 +32,7 @@
 //! **`main.rs` is four lines on purpose.** Everything above lives in the library so that the
 //! conformance test can drive the real binary while the unit tests reach the same code directly.
 
+pub mod audit;
 pub mod broker;
 pub mod changes;
 pub mod cluster;

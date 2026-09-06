@@ -221,6 +221,11 @@ impl<'lease, 'ctx, 'io> BrokeredStream<'lease, 'ctx, 'io> {
         port: u16,
         policy: ReadPolicy,
     ) -> Result<Self, WireError> {
+        // §51.6, recorded before the handshake rather than after it: what an operator reading a
+        // trail wants to know is which cluster this package *reached for*, and a connection that
+        // failed is the more interesting of the two.
+        let _ =
+            lease.with(|ctx| crate::audit::connected(ctx, &format!("{host}:{port}"), host, port));
         let answer = lease.with(|ctx| {
             ctx.host_call(
                 method::NETWORK_CONNECT,

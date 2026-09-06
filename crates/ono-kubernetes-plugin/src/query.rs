@@ -449,6 +449,10 @@ pub(crate) enum Answer {
 /// the bound rather than saying "partial".
 struct Streamed<'a, 'ctx, 'io> {
     lease: &'a Lease<'ctx, 'io>,
+    /// Which provider instance this listing belongs to, for the audit trail (§51.6).
+    instance: String,
+    /// The collection being read, as a GVR, for the same reason.
+    collection: String,
     target: &'static Target,
     schema: &'a Arc<Schema>,
     shape: &'a Shape,
@@ -526,6 +530,20 @@ impl Streamed<'_, '_, '_> {
 
     /// What became of the whole listing, once the walk is over (§18.3, §34.2, §48.6).
     fn finish(self, listing: &Listing, unread: &[Gap]) -> Outcome {
+        // §51.6, before anything is decided about the outcome. A refusal reaches one person once;
+        // a trail of refusals is how somebody finds out days later that a token lost a grant, and
+        // the broker cannot see it because the denial arrives inside bytes it only forwarded.
+        for gap in listing.coverage().gaps() {
+            if matches!(gap.outcome(), Coverage::ReadDenied | Coverage::ListDenied) {
+                crate::audit::refused(
+                    self.lease,
+                    &self.instance,
+                    &self.collection,
+                    &gap.scope().to_string(),
+                    gap.outcome().as_str(),
+                );
+            }
+        }
         if let Some(outcome) = self.stopped {
             return outcome;
         }
@@ -822,6 +840,8 @@ fn read<S: ByteStream>(
 
     let mut streamed = Streamed {
         lease,
+        instance: client.provider_instance().to_owned(),
+        collection: resource.gvr().to_string(),
         target,
         schema,
         shape: &shape,
