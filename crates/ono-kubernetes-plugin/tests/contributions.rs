@@ -1373,11 +1373,36 @@ fn should_test_the_support_matrix_the_specification_declares_and_the_readme_clai
     // Three things have to agree, and they are three because each is what a different reader
     // believes: the specification says which minors are supported, the workflow says which are
     // exercised, and the README is what an operator reads instead of either.
-    let declared: BTreeSet<&str> = SPECIFICATION
+    // Derived from §5.1's sentence rather than hard-coded beside it. The first draft matched the
+    // sentence and then returned a literal list, which meant the specification was a sentinel and
+    // the window was three strings in this file — so a specification declaring a different window
+    // would have left the test green. It is parsed now: the two ends of "v1.35 through v1.37", and
+    // every minor between them.
+    let window = SPECIFICATION
         .lines()
-        .find(|line| line.contains("that means v1.35 through v1.37"))
-        .map(|_| ["v1.35", "v1.36", "v1.37"].into_iter().collect())
-        .expect("§5.1 declares the support window");
+        .find_map(|line| line.split_once("that means ")?.1.split_once(" through "))
+        .map(|(first, rest)| (first.to_owned(), rest.trim_end_matches('.').to_owned()))
+        .expect("§5.1 declares the support window as `that means vX.Y through vX.Z`");
+    let minor = |version: &str| -> u32 {
+        version
+            .split('.')
+            .nth(1)
+            .and_then(|minor| minor.parse().ok())
+            .unwrap_or_else(|| panic!("`{version}` is a `vMAJOR.MINOR`"))
+    };
+    let major = window
+        .0
+        .split('.')
+        .next()
+        .expect("the window's ends carry a major")
+        .to_owned();
+    let declared: BTreeSet<String> = (minor(&window.0)..=minor(&window.1))
+        .map(|each| format!("{major}.{each}"))
+        .collect();
+    assert!(
+        declared.len() >= 2,
+        "a window with an oldest and a newest is what Gate N is about, got {declared:?}"
+    );
 
     // What CI actually creates a cluster at, reduced to minors.
     let exercised: BTreeSet<String> = CI
@@ -1390,18 +1415,41 @@ fn should_test_the_support_matrix_the_specification_declares_and_the_readme_clai
         "the workflow names the versions it creates clusters at"
     );
 
-    let exercised_refs: BTreeSet<&str> = exercised.iter().map(String::as_str).collect();
     assert_eq!(
-        exercised_refs, declared,
+        exercised, declared,
         "§62.14: CI exercises exactly the minors §5.1 declares — the oldest and the newest are \
          the two Gate N names, and a leg that is not in the window is a leg nobody promised"
     );
 
-    // And the README, because it is what an operator reads instead of the specification.
-    for minor in &declared {
+    // And the README, because it is what an operator reads instead of the specification. The row
+    // rather than the file: `README.contains("v1.35")` is satisfied by a README saying v1.35 is
+    // *un*supported, which is the opposite claim in the same characters.
+    let claimed = README
+        .lines()
+        .find(|line| line.starts_with("| Kubernetes versions |"))
+        .expect("the README states which Kubernetes versions it claims");
+    for end in [&window.0, &window.1] {
         assert!(
-            README.contains(minor),
-            "the README's compatibility row names {minor}, which §5.1 declares and CI exercises"
+            claimed.contains(end.as_str()),
+            "the README's compatibility row names {end}, which is an end of §5.1's window: \
+             {claimed}"
+        );
+    }
+
+    // And the row that names the patch versions, which is the one an operator checks a leg
+    // against. This is where a `contains` is the right test rather than a lazy one: the row is a
+    // list, not a range, so every version CI creates a cluster at has to appear in it by name.
+    let exercised_row = README
+        .lines()
+        .find(|line| line.starts_with("| Kubernetes versions actually exercised |"))
+        .expect("the README states which versions were actually exercised");
+    for version in CI
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- version: "))
+    {
+        assert!(
+            exercised_row.contains(version),
+            "the README names {version}, which CI creates a cluster at: {exercised_row}"
         );
     }
 
@@ -1412,7 +1460,7 @@ fn should_test_the_support_matrix_the_specification_declares_and_the_readme_clai
         CLUSTER_SCRIPT
             .lines()
             .find_map(|line| line.trim().strip_prefix("DEFAULT_VERSION="))
-            .is_some_and(|default| default.trim_matches('"').starts_with(newest)),
-        "`scripts/cluster.sh` defaults to the newest declared minor"
+            .is_some_and(|default| default.trim_matches('"').starts_with(newest.as_str())),
+        "`scripts/cluster.sh` defaults to the newest declared minor, {newest}"
     );
 }

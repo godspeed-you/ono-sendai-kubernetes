@@ -11,8 +11,12 @@ started, and it is the only place the untouched sections are counted.
 Read as a **snapshot taken on 2026-09-07**, against `implementation` at `0cf2bfb`, re-derived from
 the tree. The previous reading was taken at `ee181b2`, and every gap it named as closable has been
 closed; the two things it could not have found were found by *running* the provider rather than by
-testing it, and both were real. Every row below was checked by opening the code the citation leads
-to. A coverage map that does not date itself is the second way to be dishonest about state.
+testing it, and both were real. Every verdict below was checked against the code; **the line
+numbers in the citations were not re-derived**, so read a `file.rs:NNN` as "near here" and the
+symbol name beside it as the thing that matters — a review found several of them drifted by a line
+or two and one pointing at unrelated code, which is what a stale line number does within an hour of
+being written. A coverage map that does not date itself is the second way to be dishonest about
+state; one that implies a precision it does not have is the third.
 
 ---
 
