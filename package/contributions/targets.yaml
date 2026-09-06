@@ -493,7 +493,7 @@ targets:
         doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
       - name: kind
         type: string
-        doc: "Whose evidence: `Node`, `Pod`, `Service` or `Ingress`. Each states a different kind of cross-system fact, and a kind with no rule is refused by name rather than answered empty (specification section 47)."
+        doc: "Whose evidence: `Node`, `Pod`, `Service`, `Ingress` or `PersistentVolume`. Each states a different kind of cross-system fact, and a kind with no rule is refused by name rather than answered empty (specification section 47)."
         default: "Node"
   # One container's log, as lines (§42.1). Options: `name` is the Pod, `container` names one where
   # the Pod has several, `previous` reads the one prior run the kubelet retains, `timestamps` asks

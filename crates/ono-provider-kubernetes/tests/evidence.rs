@@ -582,6 +582,31 @@ const CLUSTER_IP_SERVICE: &str = r#"{
   "status":{"loadBalancer":{}}
 }"#;
 
+/// A CSI-backed volume, as a real provisioner writes one.
+const CSI_VOLUME: &str = r#"{
+  "apiVersion":"v1","kind":"PersistentVolume",
+  "metadata":{"name":"pvc-9f3","uid":"pv-1"},
+  "spec":{
+    "capacity":{"storage":"20Gi"},
+    "storageClassName":"gp3",
+    "csi":{
+      "driver":"ebs.csi.aws.com",
+      "volumeHandle":"vol-0abc123def456789",
+      "fsType":"ext4"
+    }
+  }
+}"#;
+
+/// The same kind, provisioned through an in-tree source rather than through CSI.
+const IN_TREE_VOLUME: &str = r#"{
+  "apiVersion":"v1","kind":"PersistentVolume",
+  "metadata":{"name":"legacy","uid":"pv-2"},
+  "spec":{
+    "capacity":{"storage":"5Gi"},
+    "awsElasticBlockStore":{"volumeID":"aws://eu-central-1a/vol-0legacy","fsType":"ext4"}
+  }
+}"#;
+
 const CONFIG_MAP: &str = r#"{
   "apiVersion":"v1","kind":"ConfigMap",
   "metadata":{"name":"settings","namespace":"shop","uid":"cm-1"}
@@ -802,5 +827,94 @@ fn should_render_a_container_fact_under_the_field_and_the_container_it_came_from
     assert!(
         rendered.contains("image (app): registry.example/checkout:1.25"),
         "{rendered}"
+    );
+}
+
+// --- §47.5: storage evidence ---------------------------------------------------------------------
+
+#[test]
+fn should_export_a_csi_handle_and_the_driver_that_issued_it_as_two_facts() {
+    // §47.5: "CSI volume handles and driver identities MAY be exported for later resolution to
+    // cloud/block-storage resources." The handle is the strongest cross-system evidence this
+    // provider has after `providerID` — it is the string the backing system itself uses, so
+    // `vol-0abc123def456789` is an EBS volume id and a resolver needs no Kubernetes knowledge to
+    // match it.
+    let evidence = evidence_for(CSI_VOLUME);
+
+    assert_eq!(
+        evidence
+            .by_key(key::VOLUME_HANDLE)
+            .iter()
+            .map(|item| item.value().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["vol-0abc123def456789".to_owned()]
+    );
+    assert_eq!(
+        evidence.by_key(key::VOLUME_HANDLE)[0].strength(),
+        Strength::Distinguishing,
+        "a volume handle names one volume in the system that assigned it"
+    );
+    assert_eq!(
+        evidence.by_key(key::VOLUME_HANDLE)[0].source(),
+        "/spec/csi/volumeHandle"
+    );
+
+    // Two facts, not one. §47.1 forbids embedding cloud logic here, and joining them into
+    // `ebs.csi.aws.com/vol-0abc…` would be exactly that — a decision about whose namespace the
+    // handle lives in, made here, in a format the resolver would have to take apart again.
+    assert_eq!(
+        evidence
+            .by_key(key::VOLUME_DRIVER)
+            .iter()
+            .map(|item| item.value().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["ebs.csi.aws.com".to_owned()]
+    );
+    assert_eq!(
+        evidence.by_key(key::VOLUME_DRIVER)[0].strength(),
+        Strength::Correlating,
+        "every volume on a cluster may name the same driver: it is the namespace a handle is \
+         read in, not an identity"
+    );
+    assert_eq!(
+        evidence.by_key(key::VOLUME_FILESYSTEM)[0].strength(),
+        Strength::Placement,
+        "a filesystem type can reject a match and can never make one"
+    );
+
+    // §47.1 again, as the negative: nothing here resolved anything. There is no AWS in this
+    // answer, only the two strings the API server published and the pointers they came from.
+    assert!(
+        evidence
+            .items()
+            .iter()
+            .all(|item| item.source().starts_with("/spec/csi/")),
+        "every storage fact cites the field it was read from: {}",
+        evidence.describe()
+    );
+}
+
+#[test]
+fn should_report_a_volume_with_no_csi_source_as_having_none_rather_than_reading_the_in_tree_field()
+{
+    // The decision ADR-0051 records, asserted rather than described. An
+    // `awsElasticBlockStore.volumeID` is the same fact in an older spelling, and reading it under
+    // the same key would mean this file knowing which of a dozen in-tree source fields belongs to
+    // which cloud — the AWS/Azure/GCP logic §47.1 says MUST NOT live here.
+    //
+    // So the answer is §21.4's *absent*: this volume states no CSI handle. That is a fact about
+    // the volume, and it is a different answer from "nobody looked".
+    let evidence = evidence_for(IN_TREE_VOLUME);
+
+    assert!(evidence.by_key(key::VOLUME_HANDLE).is_empty());
+    assert_eq!(
+        evidence.outcome_for(key::VOLUME_HANDLE),
+        Some(Outcome::Absent),
+        "the volume was read and states no CSI source, which is not the same as not being read"
+    );
+    assert!(
+        !evidence.describe().contains("vol-0legacy"),
+        "the in-tree identifier is not republished under a CSI key: {}",
+        evidence.describe()
     );
 }

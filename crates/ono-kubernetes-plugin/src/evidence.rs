@@ -5,9 +5,10 @@
 //! evidence to be **inspectable**, and until this module existed it was inspectable only by a
 //! Rust test. An export nobody can read is not an export.
 //!
-//! **Which object is the query's answer, and only from a table.** Four kinds state such evidence
+//! **Which object is the query's answer, and only from a table.** Five kinds state such evidence
 //! and each states a different one — §47.2's machine under a Node, §47.3's containers of a Pod,
-//! §47.4's load-balancer addresses of a Service or an Ingress — so the `kind` option says which,
+//! §47.4's load-balancer addresses of a Service or an Ingress, §47.5's CSI handle and driver
+//! under a PersistentVolume — so the `kind` option says which,
 //! defaulting to `Node`. It is deliberately not the resolution `k8s-resource` does over every
 //! group the cluster serves: there is no generic evidence rule, every rule is a set of pointers
 //! into one kind's own fields, and a kind resolved through discovery would be fetched and then
@@ -127,6 +128,7 @@ const SUBJECTS: &[(&str, &str)] = &[
     ("", "Pod"),
     ("", "Service"),
     ("networking.k8s.io", "Ingress"),
+    ("", "PersistentVolume"),
 ];
 
 /// Which kind the query asked about, or a refusal naming the ones that have a rule.

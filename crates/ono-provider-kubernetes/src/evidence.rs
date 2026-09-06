@@ -90,6 +90,24 @@ pub mod key {
     /// One key for a Service and for an Ingress: the field is the same field, and a resolver
     /// matching an address against an inventory does not care which kind published it.
     pub const LOAD_BALANCER_ADDRESS: &str = "kubernetes.load-balancer.address";
+    /// `spec.csi.volumeHandle`: what the storage system calls the volume (§47.5).
+    ///
+    /// The strongest storage evidence there is, and the only one here that identifies: the handle
+    /// is the name the backing storage system itself gave the volume, whatever that system is, and
+    /// it arrives verbatim. It is meaningless without the driver that issued it, which is why the
+    /// two are exported together and never merged into one string.
+    pub const VOLUME_HANDLE: &str = "kubernetes.volume.handle";
+    /// `spec.csi.driver`: which CSI driver owns the handle (§47.5).
+    ///
+    /// Correlating rather than distinguishing on its own — every volume on a cluster may name the
+    /// same driver — and the namespace a [`VOLUME_HANDLE`] has to be read in. A resolver holding a
+    /// handle and no driver does not know which system's names it is holding.
+    pub const VOLUME_DRIVER: &str = "kubernetes.volume.driver";
+    /// `spec.csi.fsType`: the filesystem the driver was asked to present (§47.5).
+    ///
+    /// Placement rather than identity, and exported because a resolver matching a block device
+    /// can use it to reject a match it would otherwise make on a handle collision.
+    pub const VOLUME_FILESYSTEM: &str = "kubernetes.volume.filesystem";
 }
 
 /// Why no evidence could be read.
@@ -476,6 +494,7 @@ impl SubjectEvidence {
             ("", "Node") => Self::of_node(object),
             ("", "Pod") => Self::of_pod(object),
             ("", "Service") | ("networking.k8s.io", "Ingress") => Self::of_load_balancer(object),
+            ("", "PersistentVolume") => Self::of_storage(object),
             _ => Err(EvidenceError::NoRule {
                 gvk: object.gvk().to_string(),
             }),
@@ -757,6 +776,70 @@ impl SubjectEvidence {
         })
     }
 
+    /// Reads a PersistentVolume's storage evidence (§47.5).
+    ///
+    /// "CSI volume handles and driver identities MAY be exported for later resolution to
+    /// cloud/block-storage resources." The volume handle is the strongest cross-system evidence
+    /// this provider has after `providerID`: it is the string the backing storage system itself
+    /// uses, so it arrives unchanged and a resolver needs no Kubernetes knowledge to match it.
+    ///
+    /// The driver and the handle are two items rather than one composite key. §47.1 forbids
+    /// embedding foreign-domain logic here, and joining them into `<driver>/<handle>` would be
+    /// exactly that: a decision about which system's namespace the handle lives in, made by the
+    /// Kubernetes provider, in a format the resolver would have to take apart again.
+    ///
+    /// **In-tree volume sources are not read.** Each of the older per-vendor `spec` fields carries
+    /// the same fact in its own spelling, and reading them under this key would mean this file
+    /// holding a table of which vendor field belongs to which system — the foreign-domain
+    /// knowledge §47.1 says MUST NOT be here, and which the driver name makes unnecessary. A
+    /// volume with no `spec.csi` reports the absence rather than an empty set (§21.4).
+    ///
+    /// # Errors
+    ///
+    /// [`EvidenceError::WrongKind`] for anything that is not a core-group PersistentVolume.
+    pub fn of_storage(object: &Object) -> Result<Self, EvidenceError> {
+        let gvk = object.gvk();
+        if !(gvk.group().is_empty() && gvk.kind() == "PersistentVolume") {
+            return Err(EvidenceError::WrongKind {
+                expected: "a PersistentVolume",
+                gvk: gvk.to_string(),
+            });
+        }
+        let subject = object.identity();
+        let mut items = Vec::new();
+        let mut unobserved = Vec::new();
+        for (pointer, key, strength) in STORAGE_FIELDS {
+            match object
+                .field(pointer)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => items.push(IdentityEvidence::stated(
+                    &subject,
+                    key,
+                    None,
+                    value,
+                    (*pointer).to_owned(),
+                    *strength,
+                )),
+                // §21.4 at the one place a storage resolver would otherwise guess: a volume this
+                // cluster provisioned through an older in-tree source, or one whose `spec` was not
+                // read, has no CSI handle — which is not the same as having an empty one.
+                None => unobserved.push(Unobserved {
+                    key: (*key).to_owned(),
+                    outcome: read_outcome(object, "/spec"),
+                }),
+            }
+        }
+
+        Ok(Self {
+            subject,
+            provider_id: None,
+            items,
+            unobserved,
+        })
+    }
+
     /// The object this is evidence about.
     #[must_use]
     pub fn subject(&self) -> &Identity {
@@ -839,6 +922,30 @@ const CONTAINER_FIELDS: &[(&str, &str, Strength)] = &[
 
 /// The two forms one load-balancer status entry may take, and the type each is published under.
 const LOAD_BALANCER_FIELDS: &[(&str, &str)] = &[("ip", "IP"), ("hostname", "Hostname")];
+
+/// §47.5's three CSI fields, in the order a resolver needs them.
+///
+/// The handle first because it is the only one that identifies, the driver second because the
+/// handle is meaningless without it, and the filesystem last because it can only ever reject a
+/// match. None of them is interpreted here: §47.1 puts the foreign-domain logic in the resolver,
+/// and this file's whole job is to hand over the strings the API server published.
+const STORAGE_FIELDS: &[(&str, &str, Strength)] = &[
+    (
+        "/spec/csi/volumeHandle",
+        key::VOLUME_HANDLE,
+        Strength::Distinguishing,
+    ),
+    (
+        "/spec/csi/driver",
+        key::VOLUME_DRIVER,
+        Strength::Correlating,
+    ),
+    (
+        "/spec/csi/fsType",
+        key::VOLUME_FILESYSTEM,
+        Strength::Placement,
+    ),
+];
 
 /// The well-known labels §28.3 names, current spelling first.
 ///

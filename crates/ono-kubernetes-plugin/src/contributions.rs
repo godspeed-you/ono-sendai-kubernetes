@@ -206,13 +206,12 @@ const NAMED: Parameter = Parameter::new(
 const EVIDENCE_KIND: Parameter = Parameter::defaulting(
     "kind",
     "string",
-    "Whose evidence: `Node`, `Pod`, `Service` or `Ingress`. Each states a different kind of \
-     cross-system fact, and a kind with no rule is refused by name rather than answered empty \
-     (specification section 47).",
+    "Whose evidence: `Node`, `Pod`, `Service`, `Ingress` or `PersistentVolume`. Each states a \
+     different kind of cross-system fact, and a kind with no rule is refused by name rather than \
+     answered empty (specification section 47).",
     "Node",
 );
 
-/// A page budget for a listing (§18.4).
 /// Server-side filtering, pushed to the API server exactly as written (§17.3 to §17.5).
 ///
 /// Two parameters rather than one, because the API server treats them differently and so must a
@@ -240,6 +239,7 @@ const SELECTORS: &[Parameter] = &[
     ),
 ];
 
+/// A page budget for a listing (§18.4).
 const MAX_PAGES: Parameter = Parameter::new(
     "max_pages",
     "int",
