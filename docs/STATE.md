@@ -29,9 +29,9 @@ the last two that were not, reach a reader through `changes.rs` and `query.rs`.
 | Specification | `docs/architecture/kubernetes-provider.md` — canonical here, immutable, checksummed |
 | Domain layer | `crates/ono-provider-kubernetes`, twenty-four modules, no host and no cluster |
 | Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations, audit, spatial |
-| Contributions | 47 targets, 3 commands, 48 schemas, **zero verbs of this package's own** |
-| Tests | 931 across the workspace, all green; 21 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml` |
-| Live proof | 13 tests against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine |
+| Contributions | 47 targets, 2 commands, 48 schemas, 60 relation shapes, **zero verbs of this package's own** |
+| Tests | 933 across the workspace, all green; 22 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
+| Live proof | 14 tests in `live_cluster.rs` against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine. Thirteen of them announce a skip without one; the fourteenth is a static source scan that never does |
 | Transport | HTTP/1.1 over a `rustls` session over the host's brokered `network.connect` |
 | Conformance level reached | **none claimed.** §0.1 binds a claim to the gates; see `docs/coverage.md` for the requirement-by-requirement map |
 | Licence | Apache-2.0 (core is MIT) |
@@ -117,145 +117,22 @@ remove k8s-resource   risk: destructive   capabilities: [network.connect]
 Both verbs are core's own. `dry_run` defaults to **true**, so the shortest sentence a user can
 write asks the API server to run admission and persist nothing; writing costs one more argument.
 
-### Conformance, stated honestly
+### Conformance and the acceptance gates
 
-No level is claimed. §0.1 is the reason the assessment is done this way: "any implementation
-claiming conformance to a capability or maturity level in this document MUST satisfy the
-corresponding acceptance gates." So a level whose requirements are met is still not claimed while
-its gate is unproven, and each table below says which of the two is missing.
+**These live in [`coverage.md`](coverage.md), not here.** They were duplicated on this board for
+two sessions and drifted from the map both times, which is the argument for one owner: the board
+says what the last session did and what the next should do, and the map says where the whole
+surface stands. Requirement by requirement, gate by gate, with the evidence for each verdict, is
+that document.
 
-**Two levels are now met requirement by requirement and neither is claimed**, which is the shape
-§0.1 exists to produce: K0 waits on Gate J and K1 waits on Gate A, and both gates are about
-something this package could do and does not.
+The summary, as of 2026-09-07: **K0 6/6, K1 7/7, K2 7/7, K3 6/6, K4 7/7, K5 5/5, and all fourteen
+acceptance gates of §62 met** — the live half of the evidence run against `kind` at v1.35.8,
+v1.36.4 and v1.37.0 with no `kubectl` on the machine.
 
-**K0 — connection and discovery (§61.1): all six requirements met, not claimed.**
+**No level is claimed.** §0.1 binds a claim to the gates and the gates are met, so what remains is
+judgement rather than evidence: a level is a promise to a user about a provider nobody has yet run
+against a production cluster. Making that promise is not a decision this board takes on its own.
 
-| K0 requirement | State |
-|---|---|
-| kubeconfig / explicit connection | **yes.** A named `context` resolves through `~/.kube/config` — server, default namespace, trust anchors, bearer token, inline client certificate — read under the host's `filesystem.read` capability. An explicit `host` remains §7.3's explicit configuration, and naming neither is refused: no host is ever defaulted. `exec` credential plugins are refused rather than approximated (§8.2) |
-| secure TLS defaults | **yes.** `tls.rs` is a `rustls` session below the `ByteStream` trait; verification is on unless `insecure-skip-tls-verify` is set, a certificate authority that does not parse is fatal rather than a fall back to the platform store, and the insecure path is reachable only through a constructor that names it ([ADR-0009](adr/ADR-0009-an-insecure-tls-session-is-reachable-only-through-a-constructor-that-names-it.md)). TLS 1.2 is disabled by the crate's feature set |
-| provider instance isolation | **yes**, and the proof does more work than it did. `tests/isolation.rs` drives two kubeconfig contexts through one loaded instance and checks each of §6.5's five prohibitions against the decrypted wire transcript. Something is now shared between two queries — the session registry — so `should_hold_one_session_per_context_and_nothing_between_two` asserts that alpha discovers once across two queries, that beta discovers its own cluster rather than inheriting alpha's snapshot, and that *every* request each server saw carries its own context's credential, which is how the transcript proves the credential is resolved again rather than taken from state. The session key is the provider instance, the resolved endpoint and the transport posture, and a component may only ever split two invocations, never merge two ([ADR-0021](adr/ADR-0021-a-session-lives-in-the-process-and-is-keyed-on-what-the-operator-configured-never-on-what-the-cluster-said.md)) |
-| dynamic API discovery | **yes.** `/api`, `/apis` and the resource list come from the server, and are now read **once per session** rather than once per query — `should_not_run_discovery_again_for_a_second_query_in_one_session` counts the request heads the recorded server saw. A cluster serving no `apps` group gets `provider.unsupported` rather than a guessed path |
-| cluster / namespace scopes | **yes.** A namespace is a deliberate request, `all_namespaces` is explicit (§9.4), and a cluster-scoped kind gets no namespace segment (§9.2) |
-| provider health / identity diagnostics | **yes.** `get k8s-cluster` answers one record for the provider instance: the normalised API server origin, the `kube-system` namespace UID where readable, and the digest they compose, saying which signals it holds (§10.2); the server version and every request's source and latency (§34.3); the TLS posture (§8.4); the effective identity from `SelfSubjectReview` where the cluster serves it (§8.6); and `unknowns`, naming each thing it could not determine with one of §21.4's outcomes |
-
-**What holds K0 back is its gate, and the gate stopped being someone else's problem.** §62.10
-asks for two contexts queried *concurrently*. Until this morning that was unreachable: the SDK
-served one request at a time, and a second `provider.query` opened before the first was drained
-quarantined the instance with `runtime.protocol_violation`. **`ADR-0586` in core changed that** —
-a package may now have several invocations open at once, one worker each, under a ceiling declared
-in code by the author (`Plugin::concurrent_invocations`) and in the manifest by the operator
-(`runtime.max_concurrent_invocations`), with the smaller of the two winning and a refusal rather
-than a quarantine beyond it. That ADR names this provider's Gate J as one of the two pieces of work
-that found the bug.
-
-**This provider does not use it, for three independent and checkable reasons:**
-
-1. `Cargo.lock` pins the SDK at core `879d390`, which predates the change — `concurrent_invocations`
-   does not exist in the revision this workspace builds against;
-2. `sessions::Sessions` is an `Rc<RefCell<BTreeMap<Key, Session>>>`, and the new SDK's handler
-   bound is `Fn(&mut Ctx) -> Outcome + Send + Sync`. `Rc` and `RefCell` were chosen deliberately
-   because a lock would have suggested a concurrency the protocol did not have (ADR-0021 §1); that
-   reason has expired;
-3. neither `package/manifest.yaml` nor `plugin()` declares a ceiling, and `tests/isolation.rs`
-   still queries the two contexts sequentially — its header still says the SDK serves one request
-   at a time, which is true of the pinned revision and no longer true of core.
-
-So Gate J is not "not satisfiable as worded" any more. It is **work owed here**, and it is the one
-thing between K0's six met requirements and a claimed level.
-
-**K1 — dynamic read model (§61.2): all seven requirements met, not claimed.**
-
-| K1 requirement | State |
-|---|---|
-| arbitrary discovered readable resources | **yes.** `k8s-resource` resolves whatever the query names against the cluster's own discovery, over the preferred version of every group the server lists. A kind two groups both serve is refused with the candidates (§35.8, §13.5), and *not served*, *not listable*, *ambiguous* and *empty* are four different answers (§11.5, §21.4) |
-| dynamic schema / unstructured fallback | **yes.** The API server's OpenAPI v3 document for the resolved group-version types the resource; the component is found by what it declares in `x-kubernetes-group-version-kind` (§13.2). A server that publishes none leaves the typing absent, and every field still projects with its precision saying so (§12.3, §12.5) |
-| UID identity | **yes.** Every record's identity field is `metadata.uid`, for a custom resource exactly as for a Pod (§16.1). All 31 contributed schemas declare an identity and every one names `uid` as a component |
-| metadata projection | **yes**, and this is what changed. `annotations` is a map beside `labels` (§14.5); `finalizers` is a list beside `terminating`, which is §14.6 asked twice; `owner_references` is a `list<map>` carrying `controller` and `blockOwnerDeletion`, because a list of names drops the two flags that make a reference more than a name; `field_managers` is §14.7's summary. All four join the shared metadata block, so a discovered CRD reaches them by exactly the route a Pod does — pinned by `should_carry_every_metadata_field_the_projection_names_for_a_curated_kind` and `…_for_a_kind_nobody_compiled_in`. One field is summarised rather than carried: `deletionTimestamp` is the boolean `terminating` on an object record, and its instant reaches a user through `k8s-timeline` as a string beside the clock that wrote it |
-| get / list / pagination | **yes.** §17.1's direct lookup by name is wired and proven by four end-to-end tests that separate it from the listing: the canonical object endpoint, a `get` that succeeds where `list` is denied, a `404` that is absence rather than an unserved API, and a `403` that is a refused read ([ADR-0012](adr/ADR-0012-a-direct-lookup-by-name-is-its-own-request-and-its-absence-is-an-answer.md)). `list` carries pages and a budget |
-| partial coverage and RBAC truth | **yes**, as a failed invocation carrying what was missing ([ADR-0004](adr/ADR-0004-an-incomplete-read-fails-the-invocation-because-a-value-stream-cannot-carry-coverage.md)), and now with a `403` list denial pinned end to end rather than read |
-| CRD support | **yes.** A CRD invented after this package was built is discoverable, queryable and returns typed records without recompiling anything, no source file of the plugin crate names the kind the test uses, and its owner references are reachable through the same resolution |
-
-**K1's requirements are complete and the level is not claimed, because Gate A is not.** §62.1
-names five verbs — installed, discovered, queried, entered and watched — and *entered* is
-unreachable: nothing in Kubernetes is a place. The correction this board made this morning, that
-metadata projection rather than `get` was K1's open requirement, held for exactly one session and
-is now closed.
-
-**K2 — operational graph (§61.3): five of seven, not claimed.**
-
-| K2 requirement | State |
-|---|---|
-| owner references | **yes.** `owned-by`, `controlled-by` and the reversal `owns`/`controls`, the last with `supporting` saying the direction was reversed. An edge whose far end nobody read stays an edge and says so through `target_resolved` (§24.1) |
-| core curated workload relations | **yes** for Deployment → ReplicaSet → Pod, StatefulSet and DaemonSet → Pod, CronJob → Job → Pod, and StatefulSet's governing Service. §25.1's `uses-template` edge has no code |
-| Service / EndpointSlice relations | **yes.** `selects` derived from the selector against observed labels with the selector-less refusal, `represented-by` through the service-name label with the convention kept as evidence, `endpoint-for` where `targetRef` resolves, and an endpoint without one staying an endpoint fact |
-| scheduling relations | **yes.** `scheduled-on` from `spec.nodeName`, and no guess for an unscheduled Pod |
-| config / storage relations | partial. `references-config`, `references-secret`, `uses-secret`, `uses-image-pull-secret` and `mounts` are all routed. **§30.2's `PVC → bound-to → PV` has no producer**: `spec.volumeName` is read as a field and never as an edge, so `bound-to` is a word a query may filter on that nothing emits. §29.1's projected volume sources, `initContainers` and `ephemeralContainers` are never scanned |
-| spatial integration | **no, and the reason changed.** Both ends of every edge are a `place.rs` URI bound to the lifetime identity, which is §35.4 — and they are *strings on a record*, not places in Ono's graph. It used to be that core's spatial vocabulary was closed to a package. It is not any more: `ADR-0584` in core makes a contributed target a kind of place and `ADR-0585` runs a contributed relation between two contributed kinds. This package declares no contributed kinds of place, no `contributions.relations` and holds no `relation.write` grant, so `enter`, `near`, `up` and `map` still do not reach Kubernetes — and that is now work owed here |
-| relationship evidence inspection | **yes.** `evidence_class`, `evidence`, `evidence_path`, `asserted` and `supporting` on every edge record, and `should_never_present_an_inference_as_a_relationship` end to end |
-
-**K3 — live Kubernetes (§61.4): five of six, not claimed.**
-
-| K3 requirement | State |
-|---|---|
-| list/watch continuity | **yes.** `k8s-change` lists, feeds the listing to `Session::synchronise` — which refuses one that lost a page, because a cache seeded from it would afterwards read every refused object as absent — and opens the watch from the version *that listing* returned. Never from "now" (§19.1) |
-| reconnect | **yes.** The server's own watch timeout closes the stream, the checkpoint is still good, and the next request opens at it. A round that delivered nothing is paced by a bounded backoff (50 ms doubling to 1 s, reset by any round that delivered a record) |
-| 410 gap handling | **yes.** A `410` arriving as an error frame *inside* a successful `200 OK` stream is read as an expiry rather than a generic failure — which is how a real expiry arrives — and the break is a **record**: `gap`, with both edges, after which `segment` increments and `continuous` is false and never resets. `should_go_on_watching_after_a_gap_rather_than_ending_at_the_break` sees `listed(1) modified(1) gap(1) listed(2) listed(2) added(2)` |
-| live-view integration | **no, and it is the one that is unmet.** §41.1's `MUST` is to use the inherited Ono live-view contract. This package opens no host view; what it hands back is a value stream that happens to be live. `live.rs` — the module written for §41 — has no importer, and `stale`, the one of §41.4's six states that belongs to a view rather than to a stream, reaches nobody. The other five reach a user as `sync_state` on every record |
-| cache sync/freshness state | **yes.** A cache is refused a partial listing, refuses to read absence before sync, and stops answering when continuity broke; `should_answer_a_watched_object_from_the_cache_and_say_that_is_where_it_came_from` reads a named object out of the session cache with `origin=cache` on its provenance and the object endpoint never asked |
-| Events as supplemental observations | **yes.** `get k8s-event`: both representations, counts and series preserved, no ordering, no reason branching, and an unobserved search that *fails* rather than answering empty |
-
-**K3 stopped being a routing problem and became one requirement.** The gate it needs, Gate F, is
-now end to end.
-
-**K4 — bounded safe actions (§61.5): six of seven, not claimed.**
-
-| K4 requirement | State |
-|---|---|
-| authorization preflight support | **absent, and it is the one that is unmet.** `plan::Preflight` has a slot for a `SelfSubjectAccessReview` result and nothing anywhere builds or sends one. `should_not_report_permission_as_granted_when_no_preflight_ran` keeps the slot honest rather than filling it, and every plan a user sees carries `Caveat::PermissionNotVerified` — so the API server remains the only authority, which is §21.1, at the cost of the `AUTHORIZATION` line Appendix E spells |
-| prospective plan | **yes.** `get k8s-plan` is a read-only target: discovery, one `GET`, and this provider's rules. It does not dry-run — a dry-run `PATCH` runs admission webhooks, and a word a user may point at anything must not do that — and says `Caveat::AdmissionEffectsNotPreviewed` rather than leaving the omission to be inferred |
-| server dry-run where applicable | **yes**, and it is the default. `dry_run` is true unless the caller says otherwise, so the shortest sentence a user can write predicts; the record says `dry_run: true`, `acceptance: "dry run"`, `stage: null`, and carries the label the generic contract §21.4 requires — *provider-native dry run*, which predicts API acceptance and not what controllers do afterwards |
-| conflict / precondition handling | **yes.** `should_name_the_owning_manager_on_a_conflict_and_never_force` and `should_force_only_when_a_reason_was_given` run through the real binary. There is no `force` flag anywhere; `force_because` takes the sentence a reviewer will read |
-| asynchronous verification | **yes**, in the sense that matters: the verdict is made from a *later observation* rather than from the write's own response. One immediate look with a deadline of `Duration::ZERO`, and what is not decisive at that moment is `Inconclusive` — not `Pending`, because nothing is going to look again |
-| scoped recovery statement | **yes.** §46.5's two questions kept apart: `Recovery` states in two lists what reapplying would and would not restore, and recreation is never offered as recovery for a deletion |
-| deletion / finalizer semantics | **yes.** `remove k8s-resource` carries the propagation policy and the UID precondition on the request — asserted against the recorded server's body — and a deletion accepted with a finalizer reports `terminating; deletion is pending` with the finalizers beside it. The word "deleted" is not something `DeletionState` can produce |
-
-The deferral `ADR-0019` recorded — "nothing is wired to a user" — is discharged by
-[ADR-0024](adr/ADR-0024-a-mutation-is-a-command-with-a-declared-risk-and-a-granted-capability-and-its-easy-path-is-a-prediction.md).
-§43.1's ordering was kept: read usefulness reached a user across two sessions before any write did.
-
-**K5 — temporal / cross-system enrichment (§61.6): three of five met, one partial, one absent —
-not claimed.**
-
-| K5 requirement | State |
-|---|---|
-| explicit observation coverage | **yes.** `coverage.rs`'s eight outcomes, five of them pinned end to end; `gaps` and `not_observed` on every timeline record; `segment` and `continuous` on every change record |
-| resource snapshot / watch temporal integration | **partial.** The watch half reaches a user: `k8s-change` carries §39.3's segments and gaps. The temporal half reaches a user: `k8s-timeline` names the clock behind every stamp, and because it opens no watch, everything it produces is `Basis::Reported` — a Pod created at 08:00 and first read at 14:00 cannot be filed as six hours of history. **The two do not compose**: no route joins an object's timeline to the watch history of its collection, and there is no snapshot at all (§39.4 is an untaken `MAY`), so §39.3's history is observable and not retrievable |
-| causal evidence discipline | **yes.** `get k8s-why` answers one record per finding, each carrying `claim` — one of §40's five words verbatim — `claim_means`, which states where the word stops, and `strongest_claim` on *every* record so a reader who filters to one finding still sees the ceiling, and never a sum. Two clocks yield `CAUSALITY_NOT_PROVEN` with "different clocks wrote the two timestamps" rather than a number. §40.5's required answer is reachable and cheap. The declared schema carries no `cause`, `because`, `root_cause`, `explanation`, `impact` or `trigger`, and `tests/query.rs` reads the field names and fails if one appears. What it cannot yet produce is the `DEPENDENCY_PATH_EXISTS` rung, because a path needs `k8s-relation`'s traversal and doing it twice would be a second set of rules |
-| exported cross-system identity evidence | **yes**, and §47.7 with it. `get k8s-evidence --name <node>` renders `spec.providerID`, addresses by type, `systemUUID`, `machineID` and the topology labels before any foreign provider is connected — one record per key, each with its source pointer, its `evidence_class`, its ranked `strength` and a `lookup_key` that documents in as many words that it says nothing about whether anything matches. No constructor turns any of it into a relationship, no cloud vendor is named on the route, and the package links no cloud SDK ([ADR-0016](adr/ADR-0016-a-value-this-provider-cannot-verify-is-exported-as-evidence-never-as-a-link-or-a-history.md)) |
-| first verified external resolver path | **absent.** §60.8 step 3 — a synthetic resolver mapping the exported evidence — has no test and no code anywhere. The point of that test is that writing one should require no change here, and nothing has been written |
-
-### Acceptance gates (§62), one row each
-
-A gate is *claimed* only when it is provable end to end through the shell. The column says which
-state each is in, and never rounds one up. **Eight of the fourteen are end to end**, up from four.
-
-| Gate | State | Why |
-|---|---|---|
-| A — unknown CRD | **partial** | §62.1 names five verbs: installed, discovered, queried, entered and watched. Installed, discovered and queried are proven end to end against a recorded server offering an invented group, kind, plural, short name and field set, with a test asserting none of those words appears in any source file of the plugin crate. **Watched is now reachable and unpinned**: `k8s-change` resolves its collection for `Verb::Watch` through the same discovery route `k8s-resource` uses, so a CRD invented later is watchable by construction — and the watch tests use Pods, so nothing asserts it. **Entered is unreachable**, and that is the whole of what blocks K1 |
-| B — no raw-JSON collapse | **end to end** | Proven in both directions in one pair of tests: with a published schema `format: date-time` becomes an instant and `untyped` is empty; without one the same date stays text, every field survives, and each undescribed pointer is named |
-| C — UID lifetime | **partial** | Three end-to-end tests bite on a reused name from three directions: an Event is refused a later lifetime of the same name, ownership is matched by UID, and every delete carries a UID precondition that the recorded server's request body is asserted against (§56.3). Was *library only*; a delete can now be driven. **The gate's own sequence — delete, recreate under the same name, observe two lifetimes — is still not driven through the binary**, so this is three consequences proven and the premise assumed |
-| D — relationship evidence | **end to end** | Every `k8s-relation` record carries the evidence class, the description, the deciding field where there is one, and whether the API server states it or this provider derived it. All six of §62.4's classes are `Evidence` variants; the sixth, inference, has no producer and a test proves it never appears |
-| E — namespace truth | **end to end** | A `403` list denial fails the invocation naming `list denied`, and a `403` on one object is a refused read rather than an absence. A derived edge set that could not enumerate is a gap, not an empty answer. Two more shapes joined it: a denied Event scope is a `not_observed` entry on a timeline record, and a denied evidence key is answered as unread rather than omitted |
-| F — watch gap truth | **end to end** | `should_make_a_watch_gap_visible_rather_than_stitching_a_history_over_it`, and then the harder one: `should_go_on_watching_after_a_gap_rather_than_ending_at_the_break` sees `listed(1) modified(1) gap(1) listed(2) listed(2) added(2)` and four reads of the collection — the acquisition, the watch that broke, the re-acquisition, and the watch that replaced it. `should_report_the_gap_even_where_the_query_refused_to_pay_for_a_re_acquisition` proves what `reacquire: false` buys back is the second listing and never the gap |
-| G — desired/observed separation | **end to end** | The gate's own scenario is a Deployment *spec update*, and it is now driven through the real binary: `should_not_report_an_accepted_deployment_update_as_a_completed_rollout`. The follow-up read shows `generation` ahead of `observedGeneration`, so the record says `stage: API accepted desired-state change`, `verdict: inconclusive`, and a `reconciliation` map carrying the rule and the fields it read. The schema has no `succeeded`, no `rolled_out` and no `healthy`, and `tests/contributions.rs` fails if one is added |
-| H — finalizer truth | **end to end** | `should_report_a_deletion_with_a_finalizer_as_terminating_rather_than_deleted` drives `remove k8s-resource` against a server that accepts the deletion and answers with the object: `deletion_state` is `terminating; deletion is pending`, the finalizers are beside it, and the test asserts the word "deleted" appears nowhere in the statement |
-| I — secret safety | **end to end** | §62.9's three paths all take a `Guarded`, and so do the three emission paths added since — Events, logs and the mutation answer, whose admission diff is computed against a guarded object so an admission-rewritten Secret cannot be reported verbatim ([ADR-0003](adr/ADR-0003-secret-payload-is-destroyed-at-the-boundary-rather-than-filtered-on-the-way-out.md)). The routes that carry no object payload at all — evidence, timeline, why, condition — are safe by having nothing to leak, which is a weaker guarantee than the type and is recorded as one |
-| J — context isolation | **unproven, and now this repository's work** | The crossover half is proven end to end for credentials, namespaces, identities, fingerprints, record provenance and — since the session landed — for discovery not being inherited between two contexts. The gate says *concurrently*, and that is reachable in core since `ADR-0586`. It is not reached here: the SDK is pinned at `879d390`, `Sessions` is `Rc<RefCell<…>>` against a `Send + Sync` handler bound, no ceiling is declared, and `tests/isolation.rs` queries sequentially. This is the only gate whose reason moved *toward* this repository this session |
-| K — cross-system decoupling | **end to end** | Was *library only*. `get k8s-evidence` exports `spec.providerID` with its source pointer and its strength through the real binary (`should_export_a_node_s_machine_evidence_with_its_pointer_class_and_strength`); `should_name_no_cloud_vendor_on_the_route_that_exports_machine_evidence` reads the source of the whole route, and a second test reads the dependency graph for a cloud SDK |
-| L — cancellation | **partial** | Three of the four operations §62.12 names are end to end: a large list, a watch on an open body (`should_stop_a_live_watch_promptly_when_the_host_cancels_it`, which then answers the next query from the same instance — which is what says the brokered connection was given back), and a verification, which is one immediate observation and has nothing to cancel. **Log follow has no route at all**: `k8s-log` deliberately offers no `follow`, and `LogRequest::following()` is never called, so its cancellation is library only |
-| M — no `kubectl` dependency | unblocked, unproven | The package reaches an `https://` API server named by a kubeconfig context with no `kubectl` and no proxy in the path, and `grep Command::new` over `crates/` is empty. Claiming it wants a run against a real cluster, which nothing in this repository does yet |
-| N — current support matrix | untouched | `.github/workflows/ci.yml` has one `ubuntu-latest` job and no Kubernetes version axis. `README.md` now states §15.5's five support axes, which is a claim about shape; a matrix is a claim about versions, and only a CI run against two of them supports it |
 
 ## The next milestone
 
@@ -1044,7 +921,7 @@ claim. A sibling pins the core revision CI builds the shell from against *every*
 bump that touched only the workspace left two revisions of `ono-kuang-protocol` in one graph.
 
 Counts, so the next re-derivation has something to disagree with: 933 tests (662 domain, 271
-package), 47 targets, 3 commands, 48 schemas, 24 of 24 domain modules imported, 22 declared skips,
+package), 47 targets, 2 commands, 48 schemas, 24 of 24 domain modules imported, 22 declared skips,
 53 ADRs, 34 sections implemented and 32 partial, 22 of 22 invariants, **14 of 14 gates**.
 
 Next: exec credential plugins (§8.2, §8.3), which is what stands between this provider and most

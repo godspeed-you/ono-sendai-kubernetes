@@ -366,21 +366,81 @@ fn should_carry_the_source_identity_on_every_edge() {
 }
 
 #[test]
-fn should_never_produce_an_edge_without_evidence() {
-    // Gate D in one assertion: there is no way to construct an edge that cannot say where it
-    // came from, because `evidence()` is not optional.
+fn should_never_produce_an_edge_whose_evidence_names_nothing_checkable() {
+    // Gate D's floor, and it took a second writing to be one. The first asserted only that
+    // `describe()` returned a non-empty string — and `describe()` is a total match in which every
+    // arm emits at least a literal, so an edge built from an empty field path and an empty value
+    // rendered `" = "` and passed. A test with no failing input is not a floor; it is a comment
+    // that costs a test run.
+    //
+    // What it asserts now is that the evidence *names something a reader can go and check*: a
+    // pointer that starts at the document root for the classes that rest on one field, and both
+    // halves of the comparison for a selector. And it covers all five public producers rather
+    // than two, because the three it skipped — `selected_by`, `policy_selects` and
+    // `protected_by` — are exactly the ones added after it was written.
     let pod = object(POD);
     let service = object(SERVICE);
+    let policy = object(NETWORK_POLICY);
+    let pods = std::slice::from_ref(&pod);
+
     let mut all = Graph::edges_of(&pod);
-    all.extend(Graph::selects(&service, std::slice::from_ref(&pod)));
-    assert!(!all.is_empty());
+    all.extend(Graph::selects(&service, pods));
+    all.extend(Graph::selected_by(&pod, std::slice::from_ref(&service)));
+    if let SelectorMatch::Evaluated(edges) = Graph::policy_selects(&policy, pods) {
+        all.extend(edges);
+    }
+    if let SelectorMatch::Evaluated(edges) =
+        Graph::protected_by(&pod, std::slice::from_ref(&policy))
+    {
+        all.extend(edges);
+    }
+    assert!(
+        all.len() >= 5,
+        "all five producers answered, got {}",
+        all.len()
+    );
+
+    // Both branches below have to run, or the test is back to being a comment: a set of edges
+    // that all cite a pointer never exercises the selector rule, and a set that cites none never
+    // exercises the pointer rule.
+    let (mut cited, mut compared) = (0_usize, 0_usize);
     for edge in &all {
-        let described = edge.evidence().describe();
+        let evidence = edge.evidence();
+        let described = evidence.describe();
         assert!(
             !described.is_empty(),
             "every edge describes its own evidence, {edge:?} did not"
         );
+        match evidence.path() {
+            // A class that cites a field cites a JSON pointer into the object it read, so a
+            // reader can fetch that object and look. An empty path, or one that is not a
+            // pointer, names nothing.
+            Some(path) => {
+                cited += 1;
+                assert!(
+                    path.starts_with('/') && path.len() > 1,
+                    "`{}` cites `{path}`, which is not a pointer into anything: {edge:?}",
+                    evidence.class()
+                );
+            }
+            // A class that cites no single field has to name both sides of what it compared —
+            // §23.3's rule that a selector evaluation is not a field. The rendering is
+            // `selector {…} matched labels {…}`, and an empty pair on either side is a
+            // comparison of nothing with nothing.
+            None => {
+                compared += 1;
+                assert!(
+                    !described.contains("{}"),
+                    "`{}` describes a comparison with an empty side: {described}",
+                    evidence.class()
+                );
+            }
+        }
     }
+    assert!(
+        cited > 0 && compared > 0,
+        "both rules were exercised: {cited} edges cite a pointer, {compared} name a comparison"
+    );
 }
 
 #[test]

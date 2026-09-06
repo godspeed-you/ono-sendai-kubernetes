@@ -29,7 +29,7 @@ goes, and [`docs/STATE.md`](docs/STATE.md) says what is next.
 
 ## What you can type today
 
-The package contributes **47 targets, 3 commands and no verb of its own**: every operation is an
+The package contributes **47 targets, 2 commands and no verb of its own**: every operation is an
 Ono verb that already existed. Reading is `get`; the two words that write are core's own `set` and
 `remove`, aimed at the same noun `get` reads.
 
@@ -65,12 +65,15 @@ own. **`dry_run` defaults to `true`**, so the shortest sentence you can write as
 to run admission and persist nothing; `--dry_run false` is the one place you are asked to be
 explicit about which of the two you meant.
 
-Two honest limits on that grant. KUANG/11 has no capability family for changing state in the
+One honest limit on that grant. KUANG/11 has no capability family for changing state in the
 system a provider fronts, so both commands declare `network.connect` — which means **an operator
 who grants this package the ability to read a cluster has, in the same act, granted it the ability
-to write to one.** And a contributed target or command has nowhere to declare its options, so none
-of the flags above can be completed or helped by the shell; they are documented in
-[`package/contributions/`](package/contributions/) and in each summary.
+to write to one.** The `risk` descriptor and the dry-run default stand in that gap and are not a
+security boundary.
+
+Every flag above is declared and reaches the registry, so `help get k8s-pod` and
+`help set k8s-resource` list them with their types and defaults — including `--dry_run`, which is
+the argument that decides whether a cluster changes.
 
 **What you cannot type.** An `ExecCredential` plugin is not run, so a kubeconfig that authenticates
 through one — which is how EKS, GKE and AKS are usually configured — is refused by name rather than
@@ -129,7 +132,7 @@ Both are canonical in that repository and are deliberately not copied here.
 |---|---|
 | KUANG/11 package format | `kuang-package/1`, `kuang_api >=11.1 <12` |
 | Ono-Sendai core, to build | the revision `Cargo.toml` pins, which carries `ADR-0588 (core)` — a contributed target declares whether its answer ends, which is what lets a watch reach the shell as a live stream rather than as a table that never arrives |
-| Ono-Sendai core, to run | **at or after `ADR-0588 (core)`.** Earlier hosts answer everything else; `get k8s-change` and `get k8s-log --follow` are the two words that need it, because an earlier host collects an answer that has no end |
+| Ono-Sendai core, to run | **at or after `ADR-0590 (core)`**, which is the revision every manifest here pins and CI builds the shell from. `ADR-0588 (core)` is what makes `get k8s-change` and `get k8s-log --follow` stream rather than be collected; `ADR-0590 (core)` is what makes a refusal from either of them *reach you*, and a host between the two answers an empty table where this provider refused |
 | Kubernetes versions | **v1.35 – v1.37**, which is what upstream maintained on the specification's snapshot date (§0.5, §5.1). The claim is a tested matrix rather than a parser guard: nothing in the provider inspects `gitVersion`, and a cluster outside the window may work perfectly (§5.2) |
 | Kubernetes versions actually exercised | **v1.35.8, v1.36.4 and v1.37.0** — the declared oldest, the one between and the newest — on ephemeral `kind` clusters in CI and on demand through `scripts/cluster.sh` (§5.5, §59.3, Gate N) |
 | Releases of this provider | none |
@@ -175,7 +178,9 @@ whether or not it is curated. Section-by-section evidence is in
 
 "Mutation capable" means one bounded field change or one deletion, of one object named by the
 caller, with the preconditions taken from the object that was read — never a bulk operation and
-never a scale, restart or cordon action of its own (§43.3 is not fully served). "Watch capable"
+never a bulk operation. §43.3's seven curated actions are served as *arguments* of those two
+verbs — `--replicas`, `--restart_rollout`, `--schedulable` and the rest — rather than as words of
+this package's own, which is where the pressure toward a mini-shell was and where it was refused. "Watch capable"
 means `get k8s-change` resolves the collection through discovery, so a kind invented after this
 package was built is watchable — proven against a real cluster on a CRD created while the watch was
 open.
@@ -186,20 +191,19 @@ The specification defines six conformance levels (§61), and a provider may sit 
 levels for different resource families rather than claiming one flag:
 
 ```text
-K0  connection and discovery                            requirements met — not claimed
-K1  dynamic read model, including CRDs                   requirements met — not claimed
-K2  operational graph — relationships and navigation     five of seven
-K3  live Kubernetes — watch continuity, gaps, freshness  five of six
-K4  bounded safe actions                                 six of seven
-K5  temporal and cross-system enrichment                 three of five, one partial
+K0  connection and discovery                            6 of 6
+K1  dynamic read model, including CRDs                   7 of 7
+K2  operational graph — relationships and navigation     7 of 7
+K3  live Kubernetes — watch continuity, gaps, freshness  6 of 6
+K4  bounded safe actions                                 7 of 7
+K5  temporal and cross-system enrichment                 5 of 5
 ```
 
-**No level is claimed, including the two whose requirements are met.** §0.1 binds a conformance
-claim to the corresponding acceptance gates: K0 waits on Gate J, which asks for two kubeconfig
-contexts queried *concurrently*, and K1 waits on Gate A, which asks for an unknown CRD to be
-*entered* as well as discovered and queried. Both are things this package could do and does not,
-and both are the first two items on [`docs/STATE.md`](docs/STATE.md). Requirement by requirement,
-and gate by gate, is in that document.
+**No level is claimed, and the reason is no longer evidence.** §0.1 binds a conformance claim to
+the corresponding acceptance gates, and all fourteen are met — the live half of that evidence run
+against `kind` at v1.35.8, v1.36.4 and v1.37.0. What is left is judgement: a level is a promise to
+a user about a provider nobody has yet run against a production cluster, and the place to assemble
+the evidence for one is [`docs/coverage.md`](docs/coverage.md) rather than this table.
 
 Read-only usefulness comes first. Mutation support is never required to call the provider
 production-ready for its declared scope, and it landed here before a live *view* did — which is
@@ -216,12 +220,14 @@ Of the things it asks for, direct API interaction with no dependency on `kubectl
 identity, useful behaviour for kinds unknown at compile time, relationships with inspectable
 evidence, honest handling of RBAC denial and watch discontinuity, no Kubernetes-specific parser or
 core exception, and deterministic tests needing no live cluster are all built and tested here.
-**Navigation through the existing spatial model is not**, and it is the largest open item: a
-Kubernetes object carries an address and is not yet somewhere you can be.
+Navigation through the existing spatial model is built too: an object is a place, `near` answers
+in §35.5's order under a `relation.write` grant, and a CRD invented after the build is entered.
+What the gate asks for that is *not* here is a provider it has been run against in anger.
 
 The specification's §64 sets the implementation order: connection foundation, then the dynamic
-resource model, then the curated operational graph, then live observation. Phases 1, 2 and 4 are
-closed, phase 3 owes its spatial half, and parts of phases 5 through 8 arrived early.
+resource model, then the curated operational graph, then live observation. All four are closed,
+and parts of phases 5 through 8 arrived early — which cost one thing that is still true: a
+mutation is verified by an immediate read rather than against a watch.
 
 ## Ownership
 

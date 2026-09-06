@@ -662,6 +662,26 @@ fn should_enter_a_custom_kind_the_cluster_learned_after_this_package_was_built()
     };
     let home = plugin_home(&live, "enter-crd");
 
+    // The uid the cluster minted for this Widget, read before the place is entered so that the
+    // assertion below compares against a value from the API server rather than against whatever
+    // the place happens to carry. Asserting only that a `uid` field is non-empty would pass on an
+    // implementation that put the *name* there, which is §4 invariant 4's whole subject.
+    let typed = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-resource {} --kind Widget --group {GROUP} --namespace {ALPHA} --name gauge \
+             | select uid | to json",
+            as_admin(&home)
+        ),
+    )
+    .only();
+    let minted = typed["uid"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the cluster minted a uid for the Widget, got {typed}"))
+        .to_owned();
+    assert_ne!(minted, "gauge", "a uid is not the object's name");
+
     let run = shell(
         &live,
         &home,
@@ -682,9 +702,10 @@ fn should_enter_a_custom_kind_the_cluster_learned_after_this_package_was_built()
     let uid = place["identity"]["uid"]
         .as_str()
         .unwrap_or_else(|| panic!("the place is identified by uid, got {place}"));
-    assert!(
-        !uid.is_empty(),
-        "and the uid is the cluster's, not a name standing in for one: {place}"
+    assert_eq!(
+        uid, minted,
+        "the place is bound to the lifetime the *cluster* minted, not to a name standing in for \
+         one: {place}"
     );
     assert_eq!(
         place["identity_tier"].as_str(),
@@ -1389,28 +1410,51 @@ fn should_carry_no_subprocess_on_any_path_that_reaches_a_cluster() {
     // at all. This half needs no cluster, which is why it is the half that runs everywhere — the
     // live half above proves the machine had no `kubectl`, and this one proves the code would not
     // have used one if it had.
+    // Recursive, where it used to be a flat `read_dir` over two directories. That was true of the
+    // tree the day it was written and is not the property claimed: a module moved into a
+    // subdirectory would have been invisible to it, and a scan that holds only while the layout
+    // does not change is not a guard.
+    //
+    // `src/` and not `tests/`, and the boundary is deliberate rather than convenient. A test's
+    // source legitimately *quotes* the forbidden string — `logs.rs` has a sibling of this scan
+    // that forbids `Command::new` and therefore contains it — so a scan over `tests/` would have
+    // to distinguish spawning from forbidding, which is a text-matching problem with a wrong
+    // answer in both directions. What ships is `src/`, and that is what is scanned.
     let mut checked = 0;
     for crate_directory in ["ono-provider-kubernetes", "ono-kubernetes-plugin"] {
-        let source = workspace().join("crates").join(crate_directory).join("src");
-        let files = std::fs::read_dir(&source).expect("the crate has sources");
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|kind| kind.to_str()) != Some("rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("the source reads");
-            for forbidden in ["Command::new", "std::process::Command"] {
-                assert!(
-                    !text.contains(forbidden),
-                    "§51.4 and Gate M: `{forbidden}` has no place in {}",
-                    path.display()
-                );
-            }
-            checked += 1;
-        }
+        let root = workspace().join("crates").join(crate_directory).join("src");
+        checked += scan_for_subprocesses(&root);
     }
     assert!(
         checked > 20,
         "the scan read {checked} files, which is too few to have read the tree"
     );
+}
+
+/// Reads every `.rs` under `root`, refusing a spawn, and answers how many files it read.
+fn scan_for_subprocesses(root: &std::path::Path) -> usize {
+    let mut checked = 0;
+    let entries = std::fs::read_dir(root).unwrap_or_else(|error| {
+        panic!("{} reads: {error}", root.display());
+    });
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            checked += scan_for_subprocesses(&path);
+            continue;
+        }
+        if path.extension().and_then(|kind| kind.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("the source reads");
+        for forbidden in ["Command::new", "std::process::Command"] {
+            assert!(
+                !text.contains(forbidden),
+                "§51.4 and Gate M: `{forbidden}` has no place in {}",
+                path.display()
+            );
+        }
+        checked += 1;
+    }
+    checked
 }
