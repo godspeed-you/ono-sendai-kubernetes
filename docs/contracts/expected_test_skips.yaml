@@ -53,6 +53,9 @@ declared:
   - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_type_a_custom_kind_the_cluster_learned_after_this_package_was_built"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` installs the three CRDs this test reads"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_enter_a_custom_kind_the_cluster_learned_after_this_package_was_built"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` installs the CRD this test stands on"
   - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_keep_two_lifetimes_of_one_name_apart_across_a_delete_and_a_recreate"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — the recreate is the harness's own, because this provider creates nothing it was not asked to change"
@@ -80,7 +83,10 @@ declared:
   # These contact no cluster: the API server is a `TcpListener` in the test process answering from
   # recorded documents (§59.1). What they need is the **shell**, and `ono` is built from core.
   # Setting `ONO_BINARY`, or putting a built core checkout beside this one, is the whole of the
-  # prerequisite — and CI's `gate` job supplies neither today, which is why these rows exist.
+  # prerequisite. **CI's `gate` job now supplies it**: it checks core out beside this repository at
+  # the revision `Cargo.toml` pins, builds `ono` and exports `ONO_BINARY`, so these tests run on
+  # every ordinary CI run rather than announcing a skip. The rows remain because a contributor with
+  # no core checkout is still a supported case, and a skip nobody declared would fail the gate.
   - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_hand_a_watch_to_the_shell_as_a_stream_rather_than_a_table"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"

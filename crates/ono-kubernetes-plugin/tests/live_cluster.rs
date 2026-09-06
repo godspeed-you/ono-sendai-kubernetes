@@ -639,6 +639,72 @@ fn should_type_a_custom_kind_the_cluster_learned_after_this_package_was_built() 
 }
 
 #[test]
+fn should_enter_a_custom_kind_the_cluster_learned_after_this_package_was_built() {
+    // **Gate A's fifth verb**, and the last of the five to be proven. §62.1 asks that a CRD
+    // invented after Ono is built can be "installed, discovered, queried, entered and watched
+    // without recompiling Ono". The other four are proven above and beside; nothing entered one,
+    // and the coverage map recorded it as very likely a missing test rather than a missing
+    // capability — which is exactly why it had to be written instead of assumed.
+    //
+    // What makes it work is `ADR-0584 (core)`: every schema a package declares is a kind of
+    // place, keyed on the schema id. `k8s-resource` declares one and identifies by `uid`, so a
+    // Widget is a place for the same reason a Pod is, and the shell needed no word about
+    // Kubernetes to make it one.
+    let live = match Live::open() {
+        Ok(live) => live,
+        Err(missing) => {
+            return announce_skip(
+                "should_enter_a_custom_kind_the_cluster_learned_after_this_package_was_built",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let home = plugin_home(&live, "enter-crd");
+
+    let run = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-resource {} --kind Widget --group {GROUP} --namespace {ALPHA} --name gauge \
+             | enter; look | to json",
+            as_admin(&home)
+        ),
+    );
+    let here = run.only();
+    let place = &here["place"];
+
+    assert_eq!(
+        place["object_type"].as_str(),
+        Some("io.github.godspeed-you.kubernetes.resource/1"),
+        "the kind of place is the schema the package declared for a discovered kind, got {place}"
+    );
+    let uid = place["identity"]["uid"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the place is identified by uid, got {place}"));
+    assert!(
+        !uid.is_empty(),
+        "and the uid is the cluster's, not a name standing in for one: {place}"
+    );
+    assert_eq!(
+        place["identity_tier"].as_str(),
+        Some("lifetime"),
+        "§35.4: a place is bound to one resource lifetime, for a Widget exactly as for a Pod, \
+         got {place}"
+    );
+
+    assert_eq!(
+        place["canonical_ref"]["uid"].as_str(),
+        Some(uid),
+        "and an action can revalidate through it (§33.2), got {place}"
+    );
+    assert!(
+        place["tombstone"].is_null(),
+        "a Widget the cluster is still serving is not reported as gone, got {place}"
+    );
+}
+
+#[test]
 fn should_keep_two_lifetimes_of_one_name_apart_across_a_delete_and_a_recreate() {
     // Gate C (§62.3), driven end to end on a live cluster: read the object, delete it through the
     // provider's own `remove k8s-resource`, put one of the same name back, read it again. The two
