@@ -28,11 +28,11 @@
 
 use std::fmt;
 
-use serde_json::Value as Json;
+use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::condition::Stage;
 use crate::coverage::{Coverage, Gap, Outcome, Scope};
-use crate::discovery::Gvk;
+use crate::discovery::{Gvk, Gvr};
 use crate::object::{Identity, Object};
 
 // --- the target ---------------------------------------------------------------------------------
@@ -401,6 +401,20 @@ impl Action {
         }
     }
 
+    /// The API server's own verb for this action, as discovery and an authorization review
+    /// spell it (§11.5, §21.2).
+    ///
+    /// Not [`Self::verb`]: that is the word a record is reported under, and `apply` is not a
+    /// Kubernetes verb. Server-side apply is a `PATCH`, so an authorizer asked about `apply`
+    /// answers about nothing.
+    #[must_use]
+    pub fn api_verb(&self) -> &'static str {
+        match self {
+            Self::Apply(_) => "patch",
+            Self::Delete(_) => "delete",
+        }
+    }
+
     /// Whether the action removes something rather than changing it (§56.3).
     #[must_use]
     pub fn is_destructive(&self) -> bool {
@@ -657,15 +671,30 @@ impl Dependent {
 
 // --- the surroundings of a plan --------------------------------------------------------------------
 
-/// Whether the caller may do this, as far as anybody asked (§46.2).
+/// Whether the caller may do this, as far as anybody asked (§21.2, §46.2).
 ///
 /// [`Self::NotChecked`] is the default and is not a permission. A boolean here would default to
 /// one of the two answers, and whichever it defaulted to would be claimed by every plan built
 /// before the preflight was written.
+///
+/// Four members for §21.6's three words, because "nobody asked" and "the answer was not one" are
+/// different facts about a cluster and the same thing to a user: both are `unknown / unchecked`,
+/// and neither is a denial. §21.4 calls both of them `not queried`, and the distinction between
+/// an unserved review API, a failed review request and an authorizer with no opinion is exactly
+/// what the reason string carries.
+///
+/// **Nothing here is authority.** §21.1 leaves the Kubernetes authorizer as the only authorizer,
+/// so [`Self::Allowed`] is a fact about a moment that has already passed and [`Self::Denied`] is
+/// what one API server said when asked, not a decision this provider made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Preflight {
     /// Nobody asked the API server (§21.1: it remains the authority).
     NotChecked,
+    /// A check was attempted and produced no answer, for this reason (§21.4 `not queried`).
+    ///
+    /// An unserved `authorization.k8s.io`, a review request the server refused, or an authorizer
+    /// that neither allowed nor denied. None of them is a denial and none of them is a grant.
+    NotAnswered(String),
     /// A `SelfSubjectAccessReview` said yes.
     Allowed,
     /// A `SelfSubjectAccessReview` said no, for this reason.
@@ -679,21 +708,138 @@ impl Preflight {
         Self::Denied(reason.into())
     }
 
+    /// A check that was attempted and produced no answer, with what stopped it.
+    #[must_use]
+    pub fn not_answered(reason: impl Into<String>) -> Self {
+        Self::NotAnswered(reason.into())
+    }
+
     /// Whether a preflight actually granted this — true for [`Self::Allowed`] alone.
     #[must_use]
     pub fn permits(&self) -> bool {
         matches!(self, Self::Allowed)
     }
+
+    /// What a `SelfSubjectAccessReview` the API server answered with amounts to (§21.2).
+    ///
+    /// The upstream status has two booleans rather than one, and the difference is the whole
+    /// reason this function is not `allowed.into()`. `allowed: true` is a grant. `denied: true`
+    /// is a refusal. **`allowed: false` with `denied: false` is neither**: it means no authorizer
+    /// expressed an opinion, which upstream is explicit about, and reading it as a refusal would
+    /// be this provider deciding an authorization question the API server declined to decide
+    /// (§21.1). It usually *would* be refused, because the aggregate authorizer defaults to deny
+    /// — but "usually" is not a word a plan may put in the place of an answer.
+    ///
+    /// `evaluationError` travels the same way. An authorizer that could not finish evaluating has
+    /// not denied anything, and §21.3's warning that a rules summary is not a complete oracle is
+    /// the same caution one step earlier.
+    #[must_use]
+    pub fn from_review(review: &Json) -> Self {
+        let Some(status) = review.get("status") else {
+            return Self::not_answered(
+                "the API server's SelfSubjectAccessReview came back without a status",
+            );
+        };
+        let flag = |name: &str| status.get(name).and_then(Json::as_bool).unwrap_or(false);
+        let text = |name: &str| {
+            status
+                .get(name)
+                .and_then(Json::as_str)
+                .filter(|s| !s.is_empty())
+        };
+        if flag("allowed") {
+            return Self::Allowed;
+        }
+        if flag("denied") {
+            return Self::Denied(
+                text("reason")
+                    .unwrap_or("the API server denied this and gave no reason")
+                    .to_owned(),
+            );
+        }
+        let mut said = Vec::new();
+        if let Some(error) = text("evaluationError") {
+            said.push(format!(
+                "the authorizer could not finish evaluating: {error}"
+            ));
+        }
+        if let Some(reason) = text("reason") {
+            said.push(reason.to_owned());
+        }
+        if said.is_empty() {
+            said.push(
+                "no authorizer expressed an opinion: the review neither allowed nor denied this"
+                    .to_owned(),
+            );
+        }
+        Self::NotAnswered(said.join("; "))
+    }
 }
 
 impl fmt::Display for Preflight {
+    /// §21.6's three words, and never a fourth.
+    ///
+    /// A reason follows the words rather than replacing them, because §46.2 asks a plan for the
+    /// preflight *result* and a user reading a denial needs to know what to ask to be granted.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotChecked => f.write_str("not checked"),
-            Self::Allowed => f.write_str("allowed"),
-            Self::Denied(reason) => write!(f, "denied: {reason}"),
+            Self::NotChecked => f.write_str("unknown / unchecked"),
+            Self::NotAnswered(reason) => write!(f, "unknown / unchecked: {reason}"),
+            Self::Allowed => f.write_str("allowed by preflight check"),
+            Self::Denied(reason) => write!(f, "denied by preflight check: {reason}"),
         }
     }
+}
+
+/// The `SelfSubjectAccessReview` that asks whether this identity may make this change (§21.2).
+///
+/// Three arguments and no constants: the target's GVR comes from discovery because §13.1 makes the
+/// REST collection a different string from the kind, and the review's own GVK comes from discovery
+/// too because §5.3 forbids assuming which version of `authorization.k8s.io` a cluster serves.
+///
+/// The verb is the API server's, not the plan's: a server-side apply is a `PATCH`, so a review
+/// that asked about `apply` would be asking about a verb no Kubernetes authorizer has an opinion
+/// on, and would come back unanswered while looking like a check.
+#[must_use]
+pub fn access_review(plan: &Plan, target: &Gvr, review: &Gvk) -> Json {
+    let mut attributes = JsonMap::new();
+    attributes.insert(
+        "verb".to_owned(),
+        Json::String(plan.action().api_verb().to_owned()),
+    );
+    attributes.insert("group".to_owned(), Json::String(target.group().to_owned()));
+    attributes.insert(
+        "version".to_owned(),
+        Json::String(target.version().to_owned()),
+    );
+    attributes.insert(
+        "resource".to_owned(),
+        Json::String(target.resource().to_owned()),
+    );
+    attributes.insert(
+        "name".to_owned(),
+        Json::String(plan.target().name().to_owned()),
+    );
+    // §9.2: a cluster-scoped object has no namespace, and inventing one would ask about an
+    // object that does not exist. An absent namespace here means cluster scope to the authorizer.
+    if let Some(namespace) = plan.target().namespace() {
+        attributes.insert("namespace".to_owned(), Json::String(namespace.to_owned()));
+    }
+    let mut spec = JsonMap::new();
+    spec.insert("resourceAttributes".to_owned(), Json::Object(attributes));
+
+    let mut document = JsonMap::new();
+    document.insert(
+        "apiVersion".to_owned(),
+        Json::String(if review.group().is_empty() {
+            review.version().to_owned()
+        } else {
+            format!("{}/{}", review.group(), review.version())
+        }),
+    );
+    document.insert("kind".to_owned(), Json::String(review.kind().to_owned()));
+    document.insert("spec".to_owned(), Json::Object(spec));
+    Json::Object(document)
 }
 
 /// How the outcome of this action could be verified afterwards (§46.3).
@@ -769,6 +915,10 @@ pub enum Caveat {
     AdmissionEffectsNotPreviewed,
     /// No permission preflight granted this (§46.2, §21.1).
     PermissionNotVerified,
+    /// A preflight granted this, and a grant is not a guarantee (§21.2).
+    PermissionCheckIsAdvisory,
+    /// A preflight said this identity may not do this, for this reason (§21.2, §21.6).
+    PermissionDeniedByPreflight(String),
     /// Nothing guards the target against a concurrent write or a recreation (§56).
     NoPreconditionGuardsTheTarget(String),
     /// The outcome of this action cannot be verified by this provider (§46.3).
@@ -808,6 +958,16 @@ impl fmt::Display for Caveat {
             Self::PermissionNotVerified => {
                 f.write_str("no permission preflight granted this; the API server decides")
             }
+            Self::PermissionCheckIsAdvisory => f.write_str(
+                "a permission check said this is allowed, which is advisory: authorization can \
+                 change between the check and the request, and the API server decides on the \
+                 request itself",
+            ),
+            Self::PermissionDeniedByPreflight(reason) => write!(
+                f,
+                "a permission check said this identity may not make this change: {reason}. The \
+                 API server remains the authority and would decide again on the request"
+            ),
             Self::NoPreconditionGuardsTheTarget(reason) => write!(
                 f,
                 "no precondition guards the target, so a concurrent write or a recreated object \
@@ -1229,7 +1389,9 @@ impl Plan {
             lines.push(format!("  effect {effect}"));
         }
         lines.push(format!("recovery: {}", self.recovery().describe()));
-        lines.push(format!("permission preflight: {}", self.preflight));
+        // Appendix E's `AUTHORIZATION` block, in one line: what the check said, and — through
+        // the caveat every state of it produces — that the request is where it is really decided.
+        lines.push(format!("authorization: {}", self.preflight));
         lines.push(format!("verification: {}", self.verification));
         if !self.dependents.is_empty() {
             lines.push(format!(
@@ -1292,8 +1454,17 @@ impl Plan {
                 ));
             }
         }
-        if !self.preflight.permits() {
-            caveats.push(Caveat::PermissionNotVerified);
+        // §21.2: every one of the four states says something a reader needs, and "allowed" is
+        // the one most easily mistaken for a guarantee, so it is the one that carries a caveat
+        // rather than the one that loses it.
+        match &self.preflight {
+            Preflight::Allowed => caveats.push(Caveat::PermissionCheckIsAdvisory),
+            Preflight::Denied(reason) => {
+                caveats.push(Caveat::PermissionDeniedByPreflight(reason.clone()));
+            }
+            Preflight::NotChecked | Preflight::NotAnswered(_) => {
+                caveats.push(Caveat::PermissionNotVerified);
+            }
         }
         if self.verification == VerificationRule::NoneKnown {
             caveats.push(Caveat::NoVerificationRule);

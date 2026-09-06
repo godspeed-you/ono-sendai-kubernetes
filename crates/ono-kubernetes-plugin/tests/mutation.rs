@@ -151,10 +151,29 @@ enum Scenario {
     Admission,
 }
 
+/// What the recorded API server's `SelfSubjectAccessReview` says, and whether it serves one.
+///
+/// A third member rather than an `Option<bool>`, because §21.4 keeps "denied" and "not queried"
+/// apart and a cluster that serves no `authorization.k8s.io` has answered neither way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Authorization {
+    /// The review says the identity may make the change (§21.2).
+    #[default]
+    Allowed,
+    /// The review explicitly denies it, with the reason the authorizer gave.
+    Denied,
+    /// The cluster serves no `authorization.k8s.io` group at all.
+    Unserved,
+}
+
+/// The reason the recorded authorizer gives when it denies.
+const DENIAL: &str = "no RBAC policy matched for user \"deploy-bot\"";
+
 /// An API server that answers from recorded documents, reached through `network.connect`.
 #[derive(Clone, Default)]
 struct RecordedCluster {
     scenario: Scenario,
+    authorization: Authorization,
     /// How many times the Deployment has been read, so the read *after* the write can show what
     /// the write did without the read *before* it having shown it already.
     reads: Arc<std::sync::atomic::AtomicUsize>,
@@ -172,6 +191,7 @@ impl std::fmt::Debug for RecordedCluster {
         formatter
             .debug_struct("RecordedCluster")
             .field("scenario", &self.scenario)
+            .field("authorization", &self.authorization)
             .finish()
     }
 }
@@ -180,6 +200,14 @@ impl RecordedCluster {
     fn playing(scenario: Scenario) -> Arc<Self> {
         Arc::new(Self {
             scenario,
+            ..Self::default()
+        })
+    }
+
+    /// The same cluster, answering a permission check in a particular way.
+    fn authorising(authorization: Authorization) -> Arc<Self> {
+        Arc::new(Self {
+            authorization,
             ..Self::default()
         })
     }
@@ -352,14 +380,56 @@ fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
 
     match (method, path_only) {
         ("GET", "/api") => ok(&json!({"kind": "APIVersions", "versions": ["v1"]})),
-        ("GET", "/apis") => ok(&json!({
-            "kind": "APIGroupList",
-            "groups": [{
+        ("GET", "/apis") => {
+            let mut groups = vec![json!({
                 "name": "apps",
                 "versions": [{"groupVersion": "apps/v1", "version": "v1"}],
                 "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"},
-            }],
-        })),
+            })];
+            // §5.2: what the cluster serves is learnt rather than assumed, and a cluster that
+            // serves no review API is an ordinary cluster rather than an error.
+            if cluster.authorization != Authorization::Unserved {
+                groups.push(json!({
+                    "name": "authorization.k8s.io",
+                    "versions": [{"groupVersion": "authorization.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {
+                        "groupVersion": "authorization.k8s.io/v1", "version": "v1",
+                    },
+                }));
+            }
+            ok(&json!({"kind": "APIGroupList", "groups": groups}))
+        }
+        ("GET", "/apis/authorization.k8s.io/v1")
+            if cluster.authorization != Authorization::Unserved =>
+        {
+            ok(&json!({
+                "kind": "APIResourceList",
+                "groupVersion": "authorization.k8s.io/v1",
+                "resources": [{
+                    "name": "selfsubjectaccessreviews", "kind": "SelfSubjectAccessReview",
+                    // Cluster-scoped, and `create` is the only verb it offers: the review is a
+                    // question posed as a POST and the API server stores nothing (§21.2).
+                    "namespaced": false, "verbs": ["create"],
+                }],
+            }))
+        }
+        ("POST", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews") => {
+            let status = match cluster.authorization {
+                Authorization::Allowed => json!({
+                    "allowed": true, "denied": false,
+                    "reason": "RBAC: allowed by ClusterRoleBinding/deployers",
+                }),
+                Authorization::Denied => json!({
+                    "allowed": false, "denied": true, "reason": DENIAL,
+                }),
+                Authorization::Unserved => return not_found(path_only),
+            };
+            ok(&json!({
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "SelfSubjectAccessReview",
+                "status": status,
+            }))
+        }
         ("GET", "/api/v1") => ok(&json!({
             "kind": "APIResourceList",
             "groupVersion": "v1",
@@ -681,9 +751,13 @@ async fn should_answer_what_a_change_would_do_without_making_it() {
     );
 
     // The point of the target: it is read-only, and this is what proves it rather than says it.
+    // The one request that is not a `GET` is §21.2's `SelfSubjectAccessReview` — a create by the
+    // REST verb, a question by its semantics, and a request the API server answers without
+    // storing anything. Nothing else may be write-shaped on this path.
     let heads = cluster.heads();
     assert!(
-        heads.iter().all(|head| head.starts_with("GET ")),
+        heads.iter().all(|head| head.starts_with("GET ")
+            || head.starts_with("POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews")),
         "asking what a change would do must change nothing: {heads:?}"
     );
 }
@@ -721,6 +795,212 @@ async fn should_refuse_a_plan_whose_target_carries_no_precondition() {
         error.message.contains("overwritten"),
         "and what it would have prevented: {}",
         error.message
+    );
+}
+
+// --- the authorization preflight (§21.2, §21.6, §46.2, Appendix E) --------------------------------
+
+#[tokio::test]
+async fn should_ask_the_api_server_whether_a_change_is_allowed_before_describing_it() {
+    // §21.2, §46.2 and Appendix E's `AUTHORIZATION` block. The review is resolved through
+    // discovery like every other resource — no compile-time assumption that this cluster serves
+    // `authorization.k8s.io/v1` — and it asks about the verb the API server would see, which for
+    // a server-side apply is `patch` rather than the word this package reports the action under.
+    let cluster = RecordedCluster::authorising(Authorization::Allowed);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .query(
+            "k8s-plan",
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("set", json!({"/spec/replicas": 1})),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let records = records(&events);
+    let plan = &records[0];
+
+    assert_eq!(
+        text(plan, "preflight"),
+        "allowed by preflight check",
+        "§21.6's first word, verbatim"
+    );
+    let caveats = list_of(plan, "caveats");
+    assert!(
+        caveats.iter().any(|caveat| caveat.contains("advisory")),
+        "§21.2: a grant is advisory and the API server decides on the request: {caveats:?}"
+    );
+    assert!(
+        !caveats
+            .iter()
+            .any(|caveat| caveat.contains("no permission preflight granted this")),
+        "a preflight ran, so the plan no longer says nobody asked: {caveats:?}"
+    );
+    assert!(
+        text(plan, "statement").contains("authorization:"),
+        "Appendix E gives a plan an AUTHORIZATION line: {}",
+        text(plan, "statement")
+    );
+
+    let posts = cluster.requests("POST");
+    assert_eq!(posts.len(), 1, "one review, for one prospective change");
+    let (head, body) = &posts[0];
+    assert!(
+        head.starts_with("POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews "),
+        "the review is created at the collection discovery named: {head}"
+    );
+    let review: Json = serde_json::from_str(body).expect("the review is JSON");
+    let attributes = &review["spec"]["resourceAttributes"];
+    assert_eq!(
+        attributes["verb"],
+        json!("patch"),
+        "a server-side apply is a PATCH, and that is the verb an authorizer has an opinion on"
+    );
+    assert_eq!(attributes["group"], json!("apps"));
+    assert_eq!(
+        attributes["resource"],
+        json!("deployments"),
+        "§13.1: the review names the REST collection, not the kind"
+    );
+    assert_eq!(attributes["namespace"], json!("default"));
+    assert_eq!(attributes["name"], json!("api"));
+}
+
+#[tokio::test]
+async fn should_describe_a_change_the_preflight_denied_rather_than_hiding_it() {
+    // §21.1: a denied preflight is still a plan. Ono runs no RBAC evaluator, so what it has is
+    // one API server's answer — and a user who cannot see the change they are asking to be
+    // granted has no way to ask for the right grant.
+    let cluster = RecordedCluster::authorising(Authorization::Denied);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .query(
+            "k8s-plan",
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("set", json!({"/spec/replicas": 1})),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let plan = &records(&events)[0];
+
+    let preflight = text(plan, "preflight");
+    assert!(
+        preflight.starts_with("denied by preflight check"),
+        "§21.6's second word: {preflight}"
+    );
+    assert!(
+        preflight.contains(DENIAL),
+        "with the reason the API server gave (§46.2): {preflight}"
+    );
+    assert_eq!(
+        list_of(plan, "changes"),
+        vec!["/spec/replicas: 3 -> 1"],
+        "the change is still described"
+    );
+    assert!(
+        cluster.requests("PATCH").is_empty(),
+        "and describing it still wrote nothing: {:?}",
+        cluster.heads()
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_a_change_the_api_server_says_this_identity_may_not_make() {
+    // §21.2 is advisory and §21.1 keeps the API server the authority, so this refusal is this
+    // package's own safety rule rather than an authorization decision: it relays the answer the
+    // API server gave a moment ago. What it buys is that nobody has to send a write to find out
+    // — and it is `contribution.refused`, the code this package refuses under, rather than a
+    // denial code that would claim the cluster refused the write it never received.
+    let cluster = RecordedCluster::authorising(Authorization::Denied);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+
+    assert_eq!(result.status, InvokeStatus::Failed);
+    assert!(records(&events).is_empty(), "no change was made");
+    let error = result.error.expect("a refusal carries an error");
+    assert_eq!(error.name, "contribution.refused");
+    assert!(
+        error.message.contains(DENIAL),
+        "the refusal carries the reason the API server gave: {}",
+        error.message
+    );
+    assert!(
+        cluster.requests("PATCH").is_empty(),
+        "and nothing write-shaped but the review reached the cluster: {:?}",
+        cluster.heads()
+    );
+}
+
+#[tokio::test]
+async fn should_not_report_a_permission_as_denied_when_the_cluster_serves_no_review() {
+    // §21.4 and §5.2: an API the cluster does not serve is `not queried`. It is never `denied`
+    // and never `allowed` — and it must not stop a change either, because a provider that
+    // refused every write against a cluster without `authorization.k8s.io` would have made its
+    // own advisory check into the authorizer §21.1 forbids.
+    let cluster = RecordedCluster::authorising(Authorization::Unserved);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .query(
+            "k8s-plan",
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("set", json!({"/spec/replicas": 1})),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let plan = &records(&events)[0];
+    let preflight = text(plan, "preflight");
+    assert!(
+        preflight.starts_with("unknown / unchecked"),
+        "§21.6's third word: {preflight}"
+    );
+    assert!(
+        preflight.contains("authorization.k8s.io"),
+        "and what could not be asked: {preflight}"
+    );
+    assert!(
+        list_of(plan, "caveats")
+            .iter()
+            .any(|caveat| caveat.contains("no permission preflight granted this")),
+        "nobody granted this, and the plan says so"
+    );
+
+    let invocation = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "an unanswered check is not a refusal: {:?}",
+        result.error
+    );
+    assert_eq!(records(&events).len(), 1);
+    assert_eq!(
+        cluster.requests("PATCH").len(),
+        1,
+        "the API server decides, which is exactly §21.1"
     );
 }
 

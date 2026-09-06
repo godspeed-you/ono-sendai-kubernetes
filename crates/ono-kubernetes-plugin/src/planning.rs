@@ -7,12 +7,21 @@
 //!
 //! Four properties decide the shape of everything below.
 //!
-//! **Asking is a read.** `k8s-plan` is a *target*, so `get k8s-plan` answers it and the only
-//! request it makes of the API server is the `GET` of the object plus discovery. There is no
-//! server dry run on this path: a dry-run `PATCH` is a write-shaped request that runs admission
-//! webhooks, and a target a user may point at anything must not do that. The plan says so —
-//! `Caveat::AdmissionEffectsNotPreviewed` — rather than leaving the omission to be inferred, and
-//! the dry run lives on `set k8s-resource`, where the risk is declared (§44.5, ADR-0024).
+//! **Asking is a read.** `k8s-plan` is a *target*, so `get k8s-plan` answers it and it changes
+//! nothing: discovery, the `GET` of the object, and §21.2's `SelfSubjectAccessReview` — which is
+//! a `POST` by the REST verb and a question by its semantics, because the API server computes the
+//! answer and stores no object. There is no server dry run on this path: a dry-run `PATCH` is a
+//! write-shaped request that runs admission webhooks, and a target a user may point at anything
+//! must not do that. The plan says so — `Caveat::AdmissionEffectsNotPreviewed` — rather than
+//! leaving the omission to be inferred, and the dry run lives on `set k8s-resource`, where the
+//! risk is declared (§44.5, ADR-0024).
+//!
+//! **The permission check is advisory and never an authorizer.** §21.1 leaves the API server the
+//! only authority, so the review's answer is a plan field (§46.2, Appendix E's `AUTHORIZATION`
+//! line) and every plan carries a caveat about it: a grant can lapse before the request, and
+//! everything that is not an explicit denial — an unserved review API, an authorizer with no
+//! opinion, a review the server would not answer — is §21.4's `not queried` rather than a
+//! refusal this package invented.
 //!
 //! **Preconditions come from the object or the plan is refused.** Nothing an invocation can say
 //! supplies a `resourceVersion` or a UID: the only source is the object that
@@ -38,11 +47,12 @@ use ono_provider_kubernetes::coverage::Scope;
 use ono_provider_kubernetes::discovery::{self, Discovery, Resource, Verb};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::plan::{
-    Action, Dependent, Effect, FieldChange, Plan, PlanRefusal, Preconditions, Propagation,
+    Action, Dependent, Effect, FieldChange, Plan, PlanRefusal, Preconditions, Preflight,
+    Propagation, access_review,
 };
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::session::Session;
-use ono_provider_kubernetes::transport::{ByteStream, Client};
+use ono_provider_kubernetes::transport::{ByteStream, Client, create_request};
 use ono_value::{ErrorValue, MapValue, Provenance, RecordValue, Schema, Value};
 use serde_json::{Map as JsonMap, Value as Json};
 
@@ -50,7 +60,7 @@ use crate::contributions::{Field, Target, Writes};
 use crate::dynamic::Selector;
 use crate::query::{
     Answer, Conversation, Endpoint, UNAVAILABLE, UNAVAILABLE_CODE, UNSUPPORTED, UNSUPPORTED_CODE,
-    converse, document, failure, fetch, resolve_in,
+    converse, document, failure, fetch, group_version_of, resolve_in, resource_list,
 };
 use crate::sessions::Sessions;
 
@@ -373,11 +383,107 @@ pub(crate) fn plan_on<S: ByteStream>(
     })?;
     let plan = Plan::of(guarded.object(), intent.action(guarded.object()))
         .map_err(|refusal| refused(&refusal))?;
+    // §46.2's `permission preflight result`, and Appendix E's `AUTHORIZATION` line. Last, because
+    // the review asks about the action the plan turned out to describe, and because a plan that
+    // could not be built is a plan whose authorization nobody needs to have asked about.
+    let preflight = preflight_for(session, client, endpoint, &served, &plan, &resource);
+    let plan = plan.with_preflight(preflight);
     Ok(Planned {
         plan,
         resource,
         scope,
     })
+}
+
+/// The API group that answers "may this identity do that" (§21.2).
+const REVIEW_GROUP: &str = "authorization.k8s.io";
+
+/// The kind that asks about one action for the caller's own identity.
+///
+/// `SelfSubjectAccessReview` and not `SubjectAccessReview`: the second asks about *another*
+/// identity and needs a privilege this provider has no business holding (§8.1).
+const REVIEW_KIND: &str = "SelfSubjectAccessReview";
+
+/// Asks the API server whether this identity may make this change (§21.2, §46.2, Appendix E).
+///
+/// **This is the one write a read-only path makes, and it changes nothing.** A
+/// `SelfSubjectAccessReview` is a create by the REST verb — a `POST` to a collection — and a
+/// question by its semantics: the API server computes the answer, returns it in `status`, and
+/// stores no object. So `get k8s-plan` stays a read of the cluster while gaining the line
+/// Appendix E puts on a plan.
+///
+/// **It never fails a plan, and it never denies one on this provider's behalf.** Every way this
+/// can go wrong — an unserved `authorization.k8s.io`, a resource list that did not read, a review
+/// the server refused, an authorizer with no opinion — is §21.4's `not queried`, which reaches a
+/// user as §21.6's `unknown / unchecked` with the reason attached. A provider that turned "I
+/// could not ask" into "you may not" would be answering an authorization question the API server
+/// never answered (§21.1).
+fn preflight_for<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    served: &Discovery,
+    plan: &Plan,
+    target: &Resource,
+) -> Preflight {
+    // §5.3 and §11.1: which version of the review API this cluster serves is learnt, not assumed.
+    let Some(version) = served.preferred_version(REVIEW_GROUP) else {
+        return Preflight::not_answered(format!(
+            "this cluster serves no `{REVIEW_GROUP}` API group, so no permission check \
+             could be asked"
+        ));
+    };
+    let group_version = group_version_of(REVIEW_GROUP, version);
+    let Ok(catalogue) = resource_list(session, client, endpoint, &group_version) else {
+        return Preflight::not_answered(format!(
+            "the resource list of `{group_version}` could not be read, so no permission \
+             check could be asked"
+        ));
+    };
+    let Some(review) = catalogue.by_kind(&group_version, REVIEW_KIND) else {
+        return Preflight::not_answered(format!(
+            "this cluster's `{group_version}` serves no `{REVIEW_KIND}`, so no permission \
+             check could be asked"
+        ));
+    };
+    // §11.5: a verb the server does not offer is not a permission the caller is missing.
+    if !review.supports(Verb::Create) {
+        return Preflight::not_answered(format!(
+            "this cluster serves `{}` and does not offer `create` on it, so no permission \
+             check could be asked",
+            review.gvr()
+        ));
+    }
+    let scope = match review.scope() {
+        discovery::Scope::Cluster => Scope::cluster(),
+        discovery::Scope::Namespaced => endpoint.scope.clone(),
+    };
+    let request = endpoint.authorise(create_request(
+        review.gvr(),
+        &scope,
+        &access_review(plan, target.gvr(), review.gvk()),
+    ));
+    let response = match client.connection().send(&request) {
+        Ok(response) => response,
+        Err(error) => {
+            return Preflight::not_answered(format!(
+                "the permission check could not be sent: {error}"
+            ));
+        }
+    };
+    if !(200..300).contains(&response.status()) {
+        return Preflight::not_answered(format!(
+            "the API server answered the permission check with {} {}",
+            response.status(),
+            response.reason()
+        ));
+    }
+    match serde_json::from_slice::<Json>(response.body()) {
+        Ok(review) => Preflight::from_review(&review),
+        Err(error) => Preflight::not_answered(format!(
+            "the API server's answer to the permission check did not read: {error}"
+        )),
+    }
 }
 
 /// A change the cluster does not offer on this resource (§11.5).

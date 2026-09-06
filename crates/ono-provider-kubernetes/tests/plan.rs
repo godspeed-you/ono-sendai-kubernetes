@@ -19,7 +19,7 @@
 )]
 
 use ono_provider_kubernetes::coverage::{Coverage, Gap, Outcome, Scope};
-use ono_provider_kubernetes::discovery::Gvk;
+use ono_provider_kubernetes::discovery::{Gvk, Gvr};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::plan::{
     Action, Caveat, EffectKind, FieldChange, MissingPrecondition, Plan, PlanRefusal, Preflight,
@@ -411,6 +411,170 @@ fn should_not_report_permission_as_granted_when_no_preflight_ran() {
         denied
             .describe()
             .contains("patch deployments is not allowed")
+    );
+}
+
+/// §21.2 and §21.6: a `SelfSubjectAccessReview` that said yes is *advisory*, and the plan says so
+/// rather than dropping the subject once the answer was pleasant. The mistake is a plan that
+/// reports `allowed` and carries no caveat at all, which reads as a guarantee the API server never
+/// gave — authorization can change between the check and the request (§21.1).
+#[test]
+fn should_report_an_allowed_preflight_as_advisory_rather_than_as_permission() {
+    let review = json!({
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "SelfSubjectAccessReview",
+        "status": {"allowed": true, "denied": false, "reason": "RBAC: allowed by ClusterRole/edit"},
+    });
+    let preflight = Preflight::from_review(&review);
+    assert_eq!(preflight, Preflight::Allowed);
+    assert!(preflight.permits());
+    assert_eq!(preflight.to_string(), "allowed by preflight check");
+
+    let plan = Plan::of(&object(DEPLOYMENT), image_change())
+        .expect("guarded")
+        .with_preflight(preflight);
+    assert!(
+        !plan
+            .caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::PermissionNotVerified)),
+        "a preflight ran and granted it, so `nobody asked` is no longer true"
+    );
+    assert!(
+        plan.caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::PermissionCheckIsAdvisory)),
+        "§21.2: the check is advisory and the API request remains authoritative: {:?}",
+        plan.caveats()
+    );
+    assert!(
+        plan.describe().contains("authorization"),
+        "Appendix E gives a plan an AUTHORIZATION line: {}",
+        plan.describe()
+    );
+}
+
+/// §21.1 and §21.4: an authorizer that expressed no opinion said neither yes nor no, and turning
+/// `allowed: false` into a denial is this provider deciding an authorization question the API
+/// server declined to decide. `denied: true` is the only denial there is.
+#[test]
+fn should_not_read_an_authorizer_with_no_opinion_as_a_denial() {
+    let no_opinion = Preflight::from_review(&json!({
+        "kind": "SelfSubjectAccessReview",
+        "status": {"allowed": false, "denied": false},
+    }));
+    assert!(!no_opinion.permits(), "nothing granted this");
+    assert!(
+        !matches!(no_opinion, Preflight::Denied(_)),
+        "no authorizer denied it either: {no_opinion:?}"
+    );
+    assert!(
+        no_opinion.to_string().starts_with("unknown / unchecked"),
+        "§21.6's third word: {no_opinion}"
+    );
+
+    let incomplete = Preflight::from_review(&json!({
+        "kind": "SelfSubjectAccessReview",
+        "status": {"allowed": false, "evaluationError": "webhook authorizer timed out"},
+    }));
+    assert!(!matches!(incomplete, Preflight::Denied(_)));
+    assert!(
+        incomplete
+            .to_string()
+            .contains("webhook authorizer timed out"),
+        "what kept the answer from being one is the answer: {incomplete}"
+    );
+
+    let denied = Preflight::from_review(&json!({
+        "kind": "SelfSubjectAccessReview",
+        "status": {"allowed": false, "denied": true, "reason": "no RBAC policy matched"},
+    }));
+    assert_eq!(
+        denied,
+        Preflight::denied("no RBAC policy matched"),
+        "an explicit denial is the only denial"
+    );
+}
+
+/// §21.6: three words reach a user, and every state of the check maps onto exactly one of them.
+/// The mistake is a fourth word — "unavailable", "error", "skipped" — which a reader has to
+/// decide the safety of on their own.
+#[test]
+fn should_state_a_preflight_in_the_three_words_of_section_21_6() {
+    assert_eq!(Preflight::Allowed.to_string(), "allowed by preflight check");
+    assert!(
+        Preflight::denied("no RBAC policy matched")
+            .to_string()
+            .starts_with("denied by preflight check"),
+        "a denial names the reason after the words, and never instead of them"
+    );
+    assert_eq!(Preflight::NotChecked.to_string(), "unknown / unchecked");
+    assert!(
+        Preflight::not_answered("this cluster serves no authorization.k8s.io API group")
+            .to_string()
+            .starts_with("unknown / unchecked"),
+        "a cluster that does not serve the review is not queried, never denied and never allowed"
+    );
+    assert!(!Preflight::not_answered("unserved").permits());
+}
+
+/// §21.2 and §13.1: the review names the action the plan would actually take, in the API server's
+/// own vocabulary — a server-side apply is a `patch`, and the collection is the GVR's plural
+/// rather than the GVK's kind. A review that asks about the wrong verb answers a question nobody
+/// asked, truthfully.
+#[test]
+fn should_ask_about_the_action_the_plan_would_take_in_the_api_servers_words() {
+    let review_kind = Gvk::new("authorization.k8s.io", "v1", "SelfSubjectAccessReview");
+    let deployments = Gvr::new("apps", "v1", "deployments");
+
+    let apply = Plan::of(&object(DEPLOYMENT), image_change()).expect("guarded");
+    let document = ono_provider_kubernetes::plan::access_review(&apply, &deployments, &review_kind);
+    assert_eq!(document["apiVersion"], json!("authorization.k8s.io/v1"));
+    assert_eq!(document["kind"], json!("SelfSubjectAccessReview"));
+    let attributes = &document["spec"]["resourceAttributes"];
+    assert_eq!(attributes["verb"], json!("patch"), "an apply is a PATCH");
+    assert_eq!(attributes["group"], json!("apps"));
+    assert_eq!(attributes["version"], json!("v1"));
+    assert_eq!(
+        attributes["resource"],
+        json!("deployments"),
+        "§13.1: the REST collection, not the kind"
+    );
+    assert_eq!(attributes["namespace"], json!("shop"));
+    assert_eq!(attributes["name"], json!("checkout"));
+
+    let removal =
+        Plan::of(&object(DEPLOYMENT), Action::delete(Propagation::Background)).expect("guarded");
+    let document =
+        ono_provider_kubernetes::plan::access_review(&removal, &deployments, &review_kind);
+    assert_eq!(
+        document["spec"]["resourceAttributes"]["verb"],
+        json!("delete")
+    );
+}
+
+/// §21.1: a denied preflight is still a plan. The provider does not evaluate RBAC, so it reports
+/// what the API server said and keeps describing the change — hiding it would leave a user with
+/// no way to see what they are asking to be granted.
+#[test]
+fn should_still_describe_a_change_whose_preflight_denied_it() {
+    let plan = Plan::of(&object(DEPLOYMENT), image_change())
+        .expect("guarded")
+        .with_preflight(Preflight::denied("no RBAC policy matched"));
+
+    assert!(!plan.preflight().permits());
+    assert!(
+        plan.caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::PermissionDeniedByPreflight(_))),
+        "the denial is a caveat of its own, not the absence of a grant: {:?}",
+        plan.caveats()
+    );
+    let described = plan.describe();
+    assert!(described.contains("no RBAC policy matched"));
+    assert!(
+        described.contains("shop/web:1.3.0"),
+        "the change is still described: {described}"
     );
 }
 

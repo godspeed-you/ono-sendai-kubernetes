@@ -1753,6 +1753,23 @@ pub fn get_request(gvr: &Gvr, scope: &Scope, name: &str) -> Request {
     Request::get(object_path(gvr, scope, name))
 }
 
+/// The request that creates one object in a collection (§43.2).
+///
+/// A `POST` to the collection endpoint, because the object being created has no name in the URL
+/// yet — a `PUT` to an object path is a replacement of something that is supposed to be there.
+///
+/// **This is the one create a read-only path is allowed to make.** §21.2's
+/// `SelfSubjectAccessReview` is a create by the REST verb and a question by its semantics: the API
+/// server computes the answer, puts it in `status` and stores nothing, so nothing about the
+/// cluster is different afterwards. Every other create changes a cluster and belongs on the
+/// mutation path, where a risk and a granted capability are declared (§43.3).
+#[must_use]
+pub fn create_request(gvr: &Gvr, scope: &Scope, body: &Json) -> Request {
+    Request::new(Method::Post, collection_path(gvr, scope))
+        .header("Content-Type", "application/json")
+        .body(body.to_string().into_bytes())
+}
+
 /// The request that reads one page of a collection.
 #[must_use]
 pub fn list_request(gvr: &Gvr, scope: &Scope, options: &ListOptions) -> Request {

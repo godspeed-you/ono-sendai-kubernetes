@@ -24,7 +24,7 @@ use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::transport::{
     ApiError, BreakReason, Client, Continuity, EndpointCategory, ErrorKind, FixedClock,
     FixtureStream, Freshness, HttpConnection, ListOptions, Method, ObservedAt, Operation, Origin,
-    Read, Request, Retryability, Status, get_request, list_request, watch_request,
+    Read, Request, Retryability, Status, create_request, get_request, list_request, watch_request,
 };
 
 // --- fixtures ---------------------------------------------------------------------------------
@@ -331,6 +331,36 @@ fn should_address_a_single_object_below_its_collection() {
     let request = get_request(&pods(), &Scope::in_namespace("shop"), "web-7f9");
 
     assert_eq!(request.path(), "/api/v1/namespaces/shop/pods/web-7f9");
+}
+
+#[test]
+fn should_post_a_create_to_the_collection_with_the_document_as_its_body() {
+    // §21.2's `SelfSubjectAccessReview` is the one create this provider's read-only path makes,
+    // and it is a create in the ordinary sense: a `POST` to the collection endpoint, carrying the
+    // object as JSON. Sending it to an object path, or as a `PUT`, addresses a resource that has
+    // no name yet — the API server answers the review it computed rather than storing anything
+    // (§43.1: reads do not mutate, and this one changes nothing on the server).
+    let request = create_request(
+        &Gvr::new("authorization.k8s.io", "v1", "selfsubjectaccessreviews"),
+        &Scope::cluster(),
+        &serde_json::json!({"kind": "SelfSubjectAccessReview"}),
+    );
+
+    assert_eq!(request.method(), Method::Post);
+    assert_eq!(
+        request.path(),
+        "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
+    );
+    let wire = String::from_utf8(request.serialise("cluster.test")).expect("a request is text");
+    assert!(
+        wire.starts_with("POST /apis/authorization.k8s.io/v1/selfsubjectaccessreviews "),
+        "{wire}"
+    );
+    assert!(wire.contains("Content-Type: application/json"), "{wire}");
+    assert!(
+        wire.contains(r#"{"kind":"SelfSubjectAccessReview"}"#),
+        "{wire}"
+    );
 }
 
 #[test]

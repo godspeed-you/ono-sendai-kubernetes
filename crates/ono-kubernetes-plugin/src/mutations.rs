@@ -40,7 +40,7 @@ use ono_provider_kubernetes::mutation::{
     apply_request, delete_request,
 };
 use ono_provider_kubernetes::object::Object;
-use ono_provider_kubernetes::plan::{Plan, VerificationRule};
+use ono_provider_kubernetes::plan::{Plan, Preflight, VerificationRule};
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::session::Session;
 use ono_provider_kubernetes::transport::{
@@ -246,11 +246,46 @@ impl Conversation for Mutating<'_> {
         // then carried out, and a second route from arguments to a request would be a second
         // place for a precondition to go missing (§46.1, §56).
         let planned = plan_on(self.session, client, self.endpoint, self.intent)?;
+        refuse_a_denied_change(&planned.plan)?;
         match self.writes {
             Writes::Fields => apply(client, self.endpoint, &planned, self.how),
             Writes::Object => delete(client, self.endpoint, &planned, self.how),
         }
     }
+}
+
+/// Stops a change the API server's own permission check has already refused (§21.2, §21.6).
+///
+/// **This is a safety rule of this package and not an authorization decision.** §21.1 leaves the
+/// Kubernetes authorizer as the only authorizer, and nothing here evaluates RBAC: the sentence
+/// below relays what the API server said seconds ago, in answer to a question about exactly this
+/// verb on exactly this object. The refusal is `contribution.refused` for that reason — a denial
+/// code would claim the cluster refused a write it never received.
+///
+/// Only an **explicit** denial stops anything. An authorizer with no opinion, an unserved review
+/// API and a review the server would not answer are all `unknown / unchecked`, and every one of
+/// them goes to the API server to be decided (§21.4). The check is made again on every
+/// invocation and nothing about it is cached, so a grant that lands makes the same command work.
+fn refuse_a_denied_change(plan: &Plan) -> Result<(), WireError> {
+    let Preflight::Denied(reason) = plan.preflight() else {
+        return Ok(());
+    };
+    Err(failure(
+        planning::REFUSED_CODE,
+        planning::REFUSED,
+        format!(
+            "the API server's own permission check says this identity may not `{}` `{}`: {reason}",
+            plan.action().api_verb(),
+            plan.target(),
+        ),
+        "The check is a `SelfSubjectAccessReview` this package sent a moment ago, and it is \
+         advisory: the API server remains the authority and would decide again on the request \
+         itself (§21.1, §21.2). It is relayed as a refusal rather than sent anyway because a \
+         user should not have to make a write to find out, and because the answer names the \
+         grant that is missing. Nothing is cached: the check runs again on the next \
+         invocation, so the same command works as soon as the grant exists. `get k8s-plan` \
+         describes the change either way.",
+    ))
 }
 
 /// Sends the apply, reads what it means, and looks once at the target afterwards.
