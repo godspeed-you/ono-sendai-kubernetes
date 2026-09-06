@@ -355,11 +355,16 @@ between here and a claimed level:
   `Plugin::concurrent_invocations(n)` and `runtime.max_concurrent_invocations`, and rewrite
   `tests/isolation.rs` so the two contexts overlap. Nothing about this is Kubernetes knowledge,
   and it is the last thing K0 waits on.
-- **A Kubernetes object that is somewhere (Gate A, K1, K2, §35.2, §35.3, §35.5, §35.6, §53.1–3).**
-  Contribute kinds of place and relations between them, now that core registers both
-  (`ADR-0584`, `ADR-0585`). It closes Gate A's "entered", which is all that K1 waits on, and K2's
-  spatial requirement, and four of §69's eleven verbs. The addresses already exist: `place.rs`
-  builds them and every edge record carries two.
+- ~~**A Kubernetes object that is somewhere (Gate A, K1, K2, §35.2, §35.3, §35.5, §35.6,
+  §53.1–3).**~~ **Done, but for `up` and `map`.** `package/manifest.yaml` declares thirty-three
+  `contributions.relations` shapes between the schemas its targets already declare, and
+  `spatial.rs` answers for the shell's own `spatial-relation` target under a `relation.write`
+  grant. `enter`, `near` and `follow` reach a cluster over the real `ono` binary
+  (`tests/spatial_shell.rs`), and **Gate A's five verbs are all reachable**, "entered" included,
+  for a CRD invented after the build. `up` refuses with `spatial.no_parent` because §36.4's
+  aggregate space is not a package's to declare, and the spatial parent is reachable instead as
+  the `…_to_namespace` relation, distinct from `…_to_replicaset` because §35.6 is explicit that
+  where a Pod *is* and what owns it are two questions. `map` is untried and unclaimed. ADR-0027.
 - **A live view rather than a live stream (§41.1, K3).** The one unmet K3 requirement. `live.rs`
   is written, tested and unimported, and `stale` is the state that reaches nobody.
 - **A `SelfSubjectAccessReview` (§21.2, §46.2, K4).** The one unmet K4 requirement, and the
@@ -387,6 +392,21 @@ both halves:
 [ADR-0002](adr/ADR-0002-the-package-is-a-native-process-and-owns-its-http.md).
 
 ## Found, not yet filed
+
+- **A package cannot read `~/.kube/config` through a real host.** The supervisor sets a package's
+  `HOME` to its sandbox working directory (`sandbox.rs`), and the host matches a `filesystem.read`
+  grant against a *canonicalised absolute* path — so the scope this package's manifest declares,
+  `~/.kube/config`, matches nothing a package can ask for, whether the package expands the tilde
+  itself or passes it through. An operator must pass `kubeconfig` with an absolute path, or name
+  the endpoint with `host`/`port`. Found while making the argument-less invocation answer
+  (ADR-0027); it is core's boundary rather than this package's, and it is why the standing query
+  rather than `current-context` is the first fallback.
+- **`near` without `relation.write` is indistinguishable from a place with no neighbours.** §35.5
+  has the host filter before the merge, and `ADR-0585 (core)` implements it by dropping a
+  package's shapes at load — so a package without the grant is never asked and there is nobody to
+  say why the answer is empty. This package refuses clearly where it can: invoking its
+  contribution directly is `capability.denied` naming the capability. A shell-side hint — "one
+  loaded package would contribute exits here and holds no `relation.write`" — is core's to add.
 
 - **The isolation flake was a fixture defect, and the answer is worth keeping (2026-09-06).**
   Diagnosed and fixed, recorded here because the *method* matters more than the fix. The cause was

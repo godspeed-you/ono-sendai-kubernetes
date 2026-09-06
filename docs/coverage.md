@@ -237,15 +237,23 @@ SDK's handler bound is `Fn(&mut Ctx) -> Outcome + Send + Sync`; and neither the 
 header still says the SDK serves one request at a time, which is true of the revision this
 repository builds against and no longer true of core. **This blocks K0's claim** and nothing else.
 
-**2. Nothing is a place, so four of the eleven verbs of §69 do not reach Kubernetes.** `enter`,
-`near`, `up` and `map` need a Kubernetes object to *be* somewhere rather than to carry a string
-that describes where it is. Core opened this in the same window: `ADR-0584 (core)` makes a
-contributed target a kind of place and `ADR-0585 (core)` runs a contributed relation between two
-contributed kinds. This package declares no contributed kinds of place and no
-`contributions.relations`, and holds no `relation.write` grant. **This blocks Gate A's "entered",
-and therefore K1's claim although all seven of K1's requirements are met; it blocks K2's spatial
-requirement; and it is §35.2, §35.3, §35.5, §35.6, §53.1, §53.2, §53.3 and §65.2.** It is the
-single largest thing between this package and two claimable levels.
+**2. ~~Nothing is a place.~~ Closed but for `up` and `map`.** A Kubernetes object *is* somewhere
+now. Every schema this package declares a target for is a kind of place (`ADR-0584 (core)`, which
+needed no line here), `package/manifest.yaml` declares thirty-three `contributions.relations`
+shapes between them, and a command answering for the shell's own `spatial-relation` target asserts
+the edges under a `relation.write` grant that is never given by default. **`enter`, `near` and
+`follow` reach a cluster**, proved over the real `ono` binary in
+`crates/ono-kubernetes-plugin/tests/spatial_shell.rs`, and **Gate A's five verbs are all
+reachable** — "entered" included, for a CRD invented after this package was built. ADR-0027
+records the decision and what it cost: the shell re-reads a place with an invocation carrying no
+arguments at all, so an invocation that names no cluster now stands where the operator's last one
+stood, and falls back to the kubeconfig's `current-context` behind that (§7.1). Two of §69's
+eleven verbs still do not reach Kubernetes. **`up`** cannot: landing on a parent needs the
+plugin-defined aggregate space of §36.4 and `docs/contracts/kuang/contributions.v1.yaml` gives a
+package no way to declare one, so it refuses with `spatial.no_parent` naming exactly that — the
+spatial parent is reachable instead as a `…_to_namespace` relation, kept distinct from ownership
+because §35.6 is explicit that it is (`…_to_replicaset` is the other shape). **`map`** was not
+exercised and is not claimed.
 
 **3. There is a live stream and no live view.** §41.1's `MUST` is to use the inherited live-view
 contract; the package opens no host view, `live.rs` has no importer, and `stale` — the one of

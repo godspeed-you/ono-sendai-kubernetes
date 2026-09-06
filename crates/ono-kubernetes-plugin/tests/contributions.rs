@@ -16,6 +16,7 @@ use ono_kuang_sdk::protocol::Capability;
 use ono_kubernetes_plugin::contributions::{
     COMMAND_SCHEMAS, COMMANDS, IDENTITY, Reads, TARGETS, target,
 };
+use ono_kubernetes_plugin::spatial::{SHAPES, Shape};
 use ono_value::{Value, builtin_schemas, from_yaml};
 
 const SCHEMAS: &str = include_str!("../../../package/contributions/schemas.yaml");
@@ -877,4 +878,199 @@ fn should_carry_no_field_by_which_an_acceptance_could_read_as_an_outcome() {
             );
         }
     }
+}
+
+// --- the spatial contribution (§35.5, §35.6, §36.1; `ADR-0584 (core)`, `ADR-0585 (core)`) ------
+
+/// The manifest, which is where a relation shape is declared and where the capability that gates
+/// it is requested. Not a `contributions/*.yaml`: `ADR-0585 (core)` reads the shapes from the
+/// manifest and the schema ids from the target document, and settles one against the other
+/// **before the runtime is spawned**. These tests ask the same question of the same two files.
+const MANIFEST: &str = include_str!("../../../package/manifest.yaml");
+
+/// The `contributions.relations` the manifest declares, in order.
+fn declared_shapes() -> Vec<String> {
+    let Ok(Value::Map(map)) = from_yaml(MANIFEST, builtin_schemas()) else {
+        panic!("the manifest is a mapping");
+    };
+    let Some(Value::Map(contributions)) = map.get("contributions") else {
+        panic!("the manifest declares `contributions`");
+    };
+    let Some(Value::List(shapes)) = contributions.get("relations") else {
+        panic!(
+            "the manifest declares `contributions.relations`: without it no Kubernetes object is \
+             related to any other in Ono's graph, so `near` finds nothing and `follow` has \
+             nothing to follow (`ADR-0585 (core)`)"
+        );
+    };
+    shapes
+        .iter()
+        .map(|shape| match shape {
+            Value::String(text) => text.to_string(),
+            other => panic!("a shape is text, and it is {other:?}"),
+        })
+        .collect()
+}
+
+/// The capability ids the manifest asks for, required and optional together.
+fn requested_capabilities() -> Vec<String> {
+    let Ok(Value::Map(map)) = from_yaml(MANIFEST, builtin_schemas()) else {
+        panic!("the manifest is a mapping");
+    };
+    let Some(Value::Map(capabilities)) = map.get("capabilities") else {
+        panic!("the manifest declares `capabilities`");
+    };
+    ["required", "optional"]
+        .iter()
+        .filter_map(|key| capabilities.get(key))
+        .filter_map(|value| match value {
+            Value::List(entries) => Some(entries.to_vec()),
+            _ => None,
+        })
+        .flatten()
+        .map(|entry| match entry {
+            // `network.connect` is a bare word; `filesystem.read: {paths: [...]}` is a mapping of
+            // one key, which is the capability id with its scope beside it.
+            Value::String(id) => id.to_string(),
+            Value::Map(scoped) => scoped
+                .iter()
+                .next()
+                .map(|(id, _)| id.to_string())
+                .unwrap_or_default(),
+            other => {
+                panic!("a capability request is a word or a scoped mapping, and it is {other:?}")
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn should_declare_the_same_relation_shapes_in_the_manifest_and_in_the_table() {
+    // The manifest is what the host reads before this package runs and `spatial::SHAPES` is what
+    // the package answers edges for. A shape in only one of them is either a relation a user can
+    // `follow` into silence or an edge the host drops on arrival, and both read as "there is
+    // nothing there" (`ADR-0585 (core)`).
+    let declared = declared_shapes();
+    let table: Vec<String> = SHAPES.iter().map(Shape::declaration).collect();
+    assert_eq!(
+        declared, table,
+        "`package/manifest.yaml`'s `contributions.relations` and `spatial::SHAPES` are one \
+         declaration written twice, in the same order"
+    );
+}
+
+#[test]
+fn should_name_only_schemas_this_package_declares_a_target_for_at_both_ends_of_every_shape() {
+    // The check the host makes at load, made here against the same two documents. `ADR-0585
+    // (core)`: an endpoint is a declared §3.3 type or "the id of a schema one of this package's
+    // `contributions.targets` declares", and anything else is `package.invalid` before the
+    // runtime is spawned. Every endpoint of every shape below is of the second kind, so this is
+    // the whole of what a host would check.
+    let on_disk: Vec<String> = document(TARGETS_DOCUMENT, "targets")
+        .iter()
+        .map(|target| text(target, "schema"))
+        .collect();
+    for shape in declared_shapes() {
+        let (from, to) = shape
+            .split_once("->")
+            .unwrap_or_else(|| panic!("`{shape}` is a `<from>-><to>` pair"));
+        for endpoint in [from, to] {
+            assert!(
+                on_disk.iter().any(|schema| schema == endpoint),
+                "`{endpoint}` of `{shape}` names no schema `package/contributions/targets.yaml` \
+                 declares a target for, so the host would refuse this package at load"
+            );
+        }
+    }
+}
+
+#[test]
+fn should_relate_only_kinds_the_contribution_actually_reads() {
+    // A declared shape whose ends are not kinds this package lists is a relation that can never
+    // carry an edge — the far end would have no `uid` to bind a place to, so the host would
+    // resolve nothing and `follow` would arrive nowhere. Every schema a shape names is therefore
+    // a target that reads a Kubernetes kind, rather than one of the eleven targets that answer a
+    // *question about* an object (`k8s-relation`, `k8s-why`, `k8s-plan`, and the rest).
+    for shape in SHAPES {
+        for endpoint in [shape.from, shape.to] {
+            let target = TARGETS
+                .iter()
+                .find(|target| target.schema == endpoint)
+                .unwrap_or_else(|| panic!("`{endpoint}` is a schema this package contributes"));
+            assert!(
+                matches!(target.reads, Reads::Kind { .. }),
+                "`{endpoint}` is answered by `{}`, which reads no Kubernetes kind, so no object \
+                 of it could ever be an end of an edge",
+                target.name
+            );
+        }
+    }
+}
+
+#[test]
+fn should_request_the_capability_that_gates_every_contributed_relation() {
+    // §35.5 puts the filter before the merge and `ADR-0585 (core)` implements it by dropping the
+    // shapes of a package that holds no `relation.write`. A manifest that declared shapes and
+    // never asked for the capability would contribute nothing, silently, on every machine.
+    assert!(
+        requested_capabilities()
+            .iter()
+            .any(|capability| capability == "relation.write"),
+        "the manifest declares relation shapes, so it must request `relation.write`; it is never \
+         granted by default"
+    );
+}
+
+#[test]
+fn should_name_the_relations_a_host_would_register_for_these_shapes() {
+    // The id is derived from the shape's *text* — the local name of each schema id, lower-cased,
+    // inside the package's own namespace (`ADR-0585 (core)`). It is the word a user types after
+    // `follow`, so it is asserted rather than described.
+    let ids: Vec<String> = SHAPES.iter().map(Shape::relation_id).collect();
+    assert!(
+        ids.contains(&"io.github.godspeed-you.kubernetes.pod_to_node".to_owned()),
+        "a Pod is related to the Node it runs on, got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"io.github.godspeed-you.kubernetes.pod_to_namespace".to_owned()),
+        "§35.6's spatial parent has a relation of its own, got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"io.github.godspeed-you.kubernetes.pod_to_replicaset".to_owned()),
+        "and it is not the same relation as the one that owns the Pod, got {ids:?}"
+    );
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "two shapes registering one id would be two relations under one word, got {ids:?}"
+    );
+}
+
+#[test]
+fn should_answer_for_the_core_spatial_relation_target_and_declare_its_capability() {
+    // §36.1: a package contributes a relationship provider by answering for the shell's own
+    // `spatial-relation` target. A command rather than a target, because a contributed target
+    // declares no capability and this contribution is gated on one at every invocation.
+    let contribution = ono_kubernetes_plugin::spatial::contribution();
+    assert_eq!(contribution.target, "spatial-relation");
+    assert_eq!(contribution.verb, "get");
+    assert_eq!(contribution.output, "stream<ono.spatial-relation/1>");
+    assert!(
+        contribution
+            .capabilities
+            .contains(&"relation.write".to_owned()),
+        "the host checks the capability before this package's code runs, got {:?}",
+        contribution.capabilities
+    );
+    assert!(
+        contribution.risk.is_none(),
+        "reading what is related to what changes nothing"
+    );
+    assert!(
+        requested_capabilities().contains(&"network.connect".to_owned()),
+        "the edges are read from a cluster, so the command needs the connection too"
+    );
 }

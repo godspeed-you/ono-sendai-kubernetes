@@ -206,12 +206,22 @@ struct Derived {
 
 /// Every edge the object states about itself: no second object, so no derived class (§23.1–§23.2).
 fn stated(derived: &mut Derived) {
-    let object = derived.source.object();
-    derived.edges.extend(Graph::edges_of(object));
+    derived.edges.extend(stated_edges(derived.source.object()));
+}
+
+/// The edges one object states about itself, with no second reading (§23.1–§23.2).
+///
+/// Lifted out of [`stated`] so that the spatial contribution derives its edges through exactly
+/// this rule rather than through a second copy of it (v0.4.1 §39.1): a relationship a user reads
+/// with `get k8s-relation` and one they walk with `follow` must be the same relationship, decided
+/// once.
+pub(crate) fn stated_edges(object: &Object) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    edges.extend(Graph::edges_of(object));
     // §22.4's references, which are ordinary edges in the ordinary vocabulary. The Pod cases
     // already came from `edges_of`, so only the ServiceAccount's own two are taken here — adding
     // the whole set would emit each Pod reference twice.
-    derived.edges.extend(
+    edges.extend(
         redaction::secret_references(object)
             .into_iter()
             .filter(|edge| {
@@ -228,25 +238,26 @@ fn stated(derived: &mut Derived) {
     // guard is on group and kind, never on version: §5.3 forbids rejecting an unfamiliar one, and
     // `gateway_edges` checks its own versions because §27.3 makes that adapter version-aware.
     if is(object, "networking.k8s.io", "Ingress") {
-        derived.edges.extend(Workload::ingress_edges(object));
+        edges.extend(Workload::ingress_edges(object));
     }
-    derived.edges.extend(Workload::gateway_edges(object));
+    edges.extend(Workload::gateway_edges(object));
     if is(object, "apps", "StatefulSet") {
-        derived.edges.extend(Workload::governing_service(object));
+        edges.extend(Workload::governing_service(object));
     }
     // §26.2 and §26.4: an endpoint with no target reference stays an endpoint fact rather than
     // being forced into a Pod relationship, which is why this reads the edge and not the address.
     if is(object, "discovery.k8s.io", "EndpointSlice") {
-        derived.edges.extend(
+        edges.extend(
             Workload::endpoints(object)
                 .into_iter()
                 .filter_map(|endpoint| endpoint.pod_edge().cloned()),
         );
     }
+    edges
 }
 
 /// Whether the object is of that group and kind — GVK identity without the version (§13.1, §5.3).
-fn is(object: &Object, group: &str, kind: &str) -> bool {
+pub(crate) fn is(object: &Object, group: &str, kind: &str) -> bool {
     object.gvk().group() == group && object.gvk().kind() == kind
 }
 

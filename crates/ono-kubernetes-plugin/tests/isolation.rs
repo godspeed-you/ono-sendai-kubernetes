@@ -1,19 +1,19 @@
-//! Gate J (§62.10): two kubeconfig contexts, queried in one session, with no cache, credential
+//! Gate J (§62.10): two kubeconfig contexts, queried **concurrently**, with no cache, credential
 //! or namespace crossover.
 //!
 //! §6.5 is the requirement underneath it: multiple provider instances MUST coexist without
 //! resource identity collision, cache collision, watch checkpoint collision, credential leakage
-//! or accidental namespace carry-over. Today nothing is shared between two queries of this
-//! package — each opens its own connection, resolves its own context and builds its own
-//! discovery snapshot — so nothing *can* cross over. That is a good state and a weak proof: an
-//! architecture in which crossover is impossible looks exactly like one in which it merely has
-//! not happened yet, and §12.4's schema cache and §20's informer cache are both on the roadmap.
+//! or accidental namespace carry-over. Two things now make that worth proving rather than
+//! assuming. The package holds a session across invocations (ADR-0021), so there *is* something
+//! two queries could share; and since `ADR-0586 (core)` a package answers more than one
+//! invocation at a time, so two queries can be inside it at once — which is the word §62.10 uses
+//! and the one this file used to be unable to honour.
 //!
-//! **So this file is written to fail the day one appears and is keyed on the wrong thing.** Two
-//! recorded clusters, two certificate authorities, two bearer tokens, two default namespaces and
-//! two `kube-system` UIDs, reached through two contexts of one kubeconfig by one loaded instance
-//! of the package. Every assertion below is about something a shared, wrongly-keyed cache would
-//! break:
+//! **So this file is written to fail the day a session is keyed on the wrong thing, or reached by
+//! two threads that can see each other's.** Two recorded clusters, two certificate authorities,
+//! two bearer tokens, two default namespaces and two `kube-system` UIDs, reached through two
+//! contexts of one kubeconfig by one loaded instance of the package. Every assertion below is
+//! about something a shared, wrongly-keyed cache would break:
 //!
 //! ```text
 //! records          each answer holds only its own cluster's object
@@ -22,13 +22,17 @@
 //! trust            each session verified against only its own authority — a real handshake
 //! identity         each answer is its own provider instance, with its own fingerprint
 //! order            querying one context does not change what the other answers afterwards
+//! overlap          neither invocation could finish before the other had started
 //! ```
 //!
-//! What it does **not** prove is stated where it is proven, in
-//! `should_answer_two_contexts_in_one_session_without_crossover`: the KUANG/11 SDK serves one
-//! request at a time, so §62.10's word "concurrently" is not reachable against one package
-//! instance today. Two queries in one session is the strongest form the protocol allows, and it
-//! is the form every shared-state defect would show up in anyway.
+//! **"At the same time" is a fact here rather than a hope about scheduling.** The credit window
+//! is one value, so an invocation that still owes records is stopped inside `emit` and cannot
+//! end until this test consumes what it has already sent. Alpha is put in that state *before*
+//! beta is asked anything, so beta's whole conversation with its own API server happens inside
+//! alpha's invocation — and [`Overlap`], the transcript both recorded servers write to, holds
+//! the line-by-line evidence that it did. A package that had gone back to answering one
+//! invocation at a time would not pass by luck: it would refuse the second query with
+//! `runtime.concurrency_limit` while the first was open.
 
 #![allow(
     clippy::unwrap_used,
@@ -167,6 +171,47 @@ fn encrypt(connection: &mut rustls::ServerConnection, replies: &[Vec<u8>]) -> Ve
     outbound
 }
 
+// --- watching two invocations overlap ----------------------------------------------------------
+
+/// One transcript across both recorded servers, with the test's own markers in the same line.
+///
+/// §62.10 asks for two contexts queried *concurrently*, and `tokio::join!` over two `collect()`
+/// calls would only ask the scheduler nicely: the first invocation may finish before the second
+/// is dispatched, and the test would pass for a package that answers one invocation at a time.
+/// So the overlap is *held* by the credit window (see
+/// `should_answer_two_contexts_queried_at_the_same_time_without_crossover`) and *observed* here:
+/// every request either server was asked, in order, interleaved with the moments the test
+/// reached. A beta request recorded between "alpha delivered its first record" and "alpha
+/// delivered its last" happened while alpha's invocation was open, and no scheduling accident
+/// can produce that line.
+#[derive(Debug, Default)]
+struct Overlap {
+    entries: Mutex<Vec<String>>,
+}
+
+impl Overlap {
+    fn note(&self, entry: String) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.push(entry);
+        }
+    }
+
+    fn entries(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .map(|entries| entries.clone())
+            .unwrap_or_default()
+    }
+
+    /// Where `entry` sits in the transcript, for an assertion about what happened before what.
+    fn at(entries: &[String], entry: &str) -> usize {
+        entries
+            .iter()
+            .position(|line| line == entry)
+            .unwrap_or_else(|| panic!("`{entry}` is not in the transcript: {entries:?}"))
+    }
+}
+
 // --- two recorded clusters -------------------------------------------------------------------
 
 /// One recorded API server, with everything about it different from the other one's.
@@ -180,14 +225,20 @@ struct Cluster {
     /// The namespace its context defaults to. A query that reached the other cluster's would be
     /// §6.5's "accidental namespace carry-over".
     namespace: &'static str,
-    /// The one Pod it holds, named so that an answer from the wrong cluster is unmistakable.
-    pod: &'static str,
+    /// The Pods it holds, named so that an answer from the wrong cluster is unmistakable.
+    ///
+    /// More than one where a test needs the answer to be *held open*: a handler that still owes
+    /// records is an invocation that cannot end until the host grants it credit, which is how
+    /// this file keeps two of them open at the same time without a clock.
+    pods: &'static [&'static str],
     /// The bearer token its context carries. It must never appear on the other server.
     token: &'static str,
     tls: Arc<rustls::ServerConfig>,
     /// Every request head this server received, decrypted — the only place a leaked credential
     /// or a carried-over namespace can be observed rather than inferred.
     heads: Arc<Mutex<Vec<String>>>,
+    /// The transcript both servers share, when a test needs to see the two queries overlap.
+    watching: Option<Arc<Overlap>>,
 }
 
 impl Cluster {
@@ -291,16 +342,16 @@ impl Cluster {
                 "kind": "PodList",
                 "apiVersion": "v1",
                 "metadata": {"resourceVersion": "9000"},
-                "items": [{
+                "items": self.pods.iter().map(|pod| json!({
                     "metadata": {
-                        "name": self.pod,
+                        "name": pod,
                         "namespace": self.namespace,
-                        "uid": format!("{}-pod", self.kube_system_uid),
+                        "uid": format!("{}-{pod}", self.kube_system_uid),
                         "creationTimestamp": "2026-09-01T09:00:00Z",
                     },
                     "spec": {"containers": [{"name": "app"}]},
                     "status": {"phase": "Running"},
-                }],
+                })).collect::<Vec<_>>(),
             }),
             _ => return Self::not_found(path),
         };
@@ -387,6 +438,19 @@ impl HostServices for Fleet {
                 for (method, path, head) in requests(&mut buffered) {
                     if let Ok(mut heads) = cluster.heads.lock() {
                         heads.push(head);
+                    }
+                    if let Some(watching) = &cluster.watching {
+                        // Recorded rather than withheld. A server that held its answer back until
+                        // the other cluster had been asked would be the obvious way to force an
+                        // overlap, and it deadlocks the host: `host_streams_next` fills a brokered
+                        // read inside the supervisor's own actor loop, so an unanswered read
+                        // stalls every other invocation's host calls too. The credit window holds
+                        // the invocations open instead, and this transcript watches it happen.
+                        watching.note(format!(
+                            "{} asked {}",
+                            cluster.server_name,
+                            path.split('?').next().unwrap_or(&path)
+                        ));
                     }
                     replies.push(cluster.document(&method, &path));
                 }
@@ -497,10 +561,28 @@ struct Fixture {
     /// The kubeconfig this fixture wrote, kept so that a test can ask whether the file on disk
     /// is still the one it wrote rather than another fixture's.
     document: String,
+    /// The transcript the two clusters share, when this fixture was built to watch two
+    /// invocations overlap.
+    watching: Option<Arc<Overlap>>,
 }
 
 impl Fixture {
     fn build() -> Self {
+        Self::build_with(false)
+    }
+
+    /// A fixture whose servers share one transcript and hold three Pods each.
+    ///
+    /// Three rather than one because that is what makes an invocation *holdable*: under a credit
+    /// window of one, a handler that still owes records is stopped inside `emit` until the host
+    /// grants demand, and demand is granted by consumption. So the test decides when each
+    /// invocation may finish, and can decide that neither may until both have started.
+    fn watched() -> Self {
+        Self::build_with(true)
+    }
+
+    fn build_with(watched: bool) -> Self {
+        let watching = watched.then(|| Arc::new(Overlap::default()));
         let alpha_authority = Authority::issuing("alpha.test");
         let beta_authority = Authority::issuing("beta.test");
         let alpha = Arc::new(Cluster {
@@ -508,20 +590,30 @@ impl Fixture {
             kube_system_uid: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             identity: "alice@alpha.example",
             namespace: "shop",
-            pod: "alpha-till",
+            pods: if watched {
+                &["alpha-till", "alpha-scanner", "alpha-scales"]
+            } else {
+                &["alpha-till"]
+            },
             token: "alpha-token",
             tls: alpha_authority.server_config(),
             heads: Arc::default(),
+            watching: watching.clone(),
         });
         let beta = Arc::new(Cluster {
             server_name: "beta.test",
             kube_system_uid: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
             identity: "bob@beta.example",
             namespace: "warehouse",
-            pod: "beta-forklift",
+            pods: if watched {
+                &["beta-forklift", "beta-pallet", "beta-crane"]
+            } else {
+                &["beta-forklift"]
+            },
             token: "beta-token",
             tls: beta_authority.server_config(),
             heads: Arc::default(),
+            watching: watching.clone(),
         });
 
         let document = format!(
@@ -570,10 +662,41 @@ contexts:
             directory,
             kubeconfig,
             document,
+            watching,
         }
     }
 
+    /// Writes the test's own marker into the transcript the two servers are writing.
+    fn note(&self, entry: &str) {
+        if let Some(watching) = &self.watching {
+            watching.note(entry.to_owned());
+        }
+    }
+
+    /// Every request either server was asked, and every marker the test wrote, in order.
+    fn transcript(&self) -> Vec<String> {
+        self.watching
+            .as_ref()
+            .map(|watching| watching.entries())
+            .unwrap_or_default()
+    }
+
     async fn loaded(&self) -> ono_kuang_supervisor::LoadedPlugin {
+        self.loaded_with_credit(HostLimits::default().queue_depth)
+            .await
+    }
+
+    /// The same instance under a credit window of one value.
+    ///
+    /// This is the mechanism §62.10's "concurrently" rests on. With one value of credit a handler
+    /// emits one record and then waits inside `emit` for demand, holding no host call open while
+    /// it waits — so the supervisor stays free to dispatch the *other* invocation, and the test
+    /// decides when either may finish (`ADR-0586 (core)` §1, §5).
+    async fn loaded_holding_records(&self) -> ono_kuang_supervisor::LoadedPlugin {
+        self.loaded_with_credit(1).await
+    }
+
+    async fn loaded_with_credit(&self, queue_depth: u32) -> ono_kuang_supervisor::LoadedPlugin {
         let readable = options(&[("paths", json!([format!("{}/**", self.directory.display())]))]);
         // The default host call deadline is five seconds, and this suite reads a recorded
         // cluster over several round trips. Under a loaded machine — the whole workspace suite
@@ -584,6 +707,7 @@ contexts:
         // from the question; nothing here is testing how fast a host answers.
         let limits = HostLimits {
             call_deadline_ms: 120_000,
+            queue_depth,
             ..HostLimits::default()
         };
         TestHost::new(PLUGIN, MANIFEST)
@@ -706,38 +830,60 @@ fn should_give_every_fixture_a_kubeconfig_no_other_fixture_can_overwrite() {
 }
 
 #[tokio::test]
-async fn should_answer_two_contexts_in_one_session_without_crossover() {
-    // Gate J (§62.10) and §6.5, on one loaded instance of the package.
+async fn should_answer_two_contexts_queried_at_the_same_time_without_crossover() {
+    // Gate J (§62.10) as worded, and §6.5 underneath it: two contexts, **concurrently**, on one
+    // loaded instance of the package.
     //
-    // **What "concurrently" can mean here, measured rather than assumed.** The KUANG/11 SDK
-    // serves one request at a time: `Plugin::run_io` reads an envelope, answers it, and reads
-    // the next. Opening a second `provider.query` before the first has been drained was tried
-    // and does not work — the supervisor quarantines the instance with
-    // `runtime.protocol_violation`, because the second request arrives where the package is
-    // waiting for the response to one of its own host calls. So two queries against one instance
-    // are *sequential in one session*, and that is the strongest form of §62.10 the protocol
-    // currently allows. The finding is on the board rather than pinned here, because a test that
-    // asserted the violation would make it the contract.
+    // **What makes this concurrent rather than hopeful.** The credit window is one value, so a
+    // handler that has emitted a record and still owes two is stopped inside `emit` until the
+    // host grants demand — and demand is granted by consumption, which this test controls. So
+    // alpha is *held open* before beta is asked for anything: its invocation cannot end, and it
+    // holds no host call open while it waits, which is what leaves the supervisor free to
+    // dispatch beta at all (`ADR-0586 (core)` §1). Beta's entire conversation with its own API
+    // server therefore happens inside alpha's invocation, and the transcript both servers share
+    // says so line by line.
     //
-    // The isolation this test proves is therefore about shared state between two reads in one
-    // process, which is what §6.5's five prohibitions are about, and it would fail the day a
-    // cache, a session or a credential is held across queries and keyed on anything but the
-    // provider instance.
-    let fixture = Fixture::build();
-    let plugin = fixture.loaded().await;
+    // A recorded server that withheld its answer until both clusters had been asked would be the
+    // more obvious way to force the overlap, and it does not work: `host_streams_next` fills a
+    // brokered read inside the supervisor's own actor loop, so a read nobody answers stalls every
+    // other invocation's host calls with it. Credit is the mechanism that holds an invocation
+    // open *without* holding the host.
+    //
+    // What the package brings to the overlap is one session registry reached by two workers at
+    // once. The registry is locked to look a session up and unlocked before the invocation uses
+    // it, so two queries genuinely overlap; each session is then locked by the invocation that
+    // claimed it, and the key that finds it is the provider instance, the resolved endpoint and
+    // the transport posture (ADR-0021). Two threads cannot reach one session by two keys, which
+    // is what "no cache crossover" means once there are threads.
+    let fixture = Fixture::watched();
+    let plugin = fixture.loaded_holding_records().await;
 
-    let (alpha_events, alpha_result) = plugin
+    let mut alpha = plugin
         .query("k8s-pod", fixture.context("alpha"))
         .await
-        .expect("the alpha query starts")
-        .collect()
-        .await;
-    let (beta_events, beta_result) = plugin
+        .expect("the alpha query starts");
+    let alpha_first = alpha
+        .next()
+        .await
+        .expect("alpha delivers a record, so its invocation is running");
+    fixture.note("alpha delivered its first record");
+
+    // Alpha is now open and cannot close: it owes records it has no credit to send. Everything
+    // beta does from here happens while alpha's invocation is alive.
+    let mut beta = plugin
         .query("k8s-pod", fixture.context("beta"))
         .await
-        .expect("the beta query starts in the same session")
-        .collect()
-        .await;
+        .expect("a second invocation is accepted while the first one is still open");
+    let beta_first = beta
+        .next()
+        .await
+        .expect("beta delivers a record while alpha is still holding its own");
+    fixture.note("beta delivered its first record");
+
+    let ((alpha_rest, alpha_result), (beta_rest, beta_result)) =
+        tokio::join!(alpha.collect(), beta.collect());
+    let alpha_events: Vec<StreamEvent> = std::iter::once(alpha_first).chain(alpha_rest).collect();
+    let beta_events: Vec<StreamEvent> = std::iter::once(beta_first).chain(beta_rest).collect();
     assert_eq!(
         alpha_result.status,
         InvokeStatus::Completed,
@@ -751,45 +897,97 @@ async fn should_answer_two_contexts_in_one_session_without_crossover() {
         beta_result.error
     );
 
+    // --- overlap: beta was asked and answered inside alpha's invocation ---
+    let seen = fixture.transcript();
+    let alpha_holding = Overlap::at(&seen, "alpha delivered its first record");
+    let beta_holding = Overlap::at(&seen, "beta delivered its first record");
+    let beta_asked: Vec<usize> = seen
+        .iter()
+        .enumerate()
+        .filter_map(|(at, line)| line.starts_with("beta.test asked").then_some(at))
+        .collect();
+    assert!(
+        !beta_asked.is_empty(),
+        "beta's server was never asked anything: {seen:?}"
+    );
+    assert!(
+        beta_asked.iter().all(|at| *at > alpha_holding),
+        "beta's requests were expected inside alpha's invocation, and one of them is not: {seen:?}"
+    );
+    assert!(
+        beta_asked.iter().all(|at| *at < beta_holding),
+        "beta answered before it asked, which is not a transcript of a query: {seen:?}"
+    );
+    assert_eq!(
+        records(&alpha_events).len(),
+        3,
+        "alpha delivered every record it owed, so it was still owing them — still open — while \
+         beta was being asked and answered"
+    );
+
     // --- records: each answer is its own cluster's ---
     let alpha_records = records(&alpha_events);
     let beta_records = records(&beta_events);
-    assert_eq!(alpha_records.len(), 1, "alpha holds one pod");
-    assert_eq!(beta_records.len(), 1, "beta holds one pod");
+    assert_eq!(alpha_records.len(), 3, "alpha holds three pods");
+    assert_eq!(beta_records.len(), 3, "beta holds three pods");
+    let names = |answer: &[Arc<RecordValue>]| {
+        let mut names: Vec<String> = answer
+            .iter()
+            .filter_map(|record| text_of(record, "name"))
+            .collect();
+        names.sort();
+        names
+    };
     assert_eq!(
-        text_of(&alpha_records[0], "name").as_deref(),
-        Some("alpha-till")
+        names(&alpha_records),
+        vec![
+            "alpha-scales".to_owned(),
+            "alpha-scanner".to_owned(),
+            "alpha-till".to_owned(),
+        ],
     );
     assert_eq!(
-        text_of(&beta_records[0], "name").as_deref(),
-        Some("beta-forklift")
+        names(&beta_records),
+        vec![
+            "beta-crane".to_owned(),
+            "beta-forklift".to_owned(),
+            "beta-pallet".to_owned(),
+        ],
     );
-    assert_eq!(
-        text_of(&alpha_records[0], "namespace").as_deref(),
-        Some("shop"),
-        "each context's own default namespace decided its scope (§7.5)"
-    );
-    assert_eq!(
-        text_of(&beta_records[0], "namespace").as_deref(),
-        Some("warehouse")
-    );
-    assert_ne!(
-        text_of(&alpha_records[0], "uid"),
-        text_of(&beta_records[0], "uid"),
+    for record in &alpha_records {
+        assert_eq!(
+            text_of(record, "namespace").as_deref(),
+            Some("shop"),
+            "each context's own default namespace decided its scope (§7.5)"
+        );
+    }
+    for record in &beta_records {
+        assert_eq!(text_of(record, "namespace").as_deref(), Some("warehouse"));
+    }
+    let identities = |answer: &[Arc<RecordValue>]| {
+        answer
+            .iter()
+            .filter_map(|record| text_of(record, "uid"))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert!(
+        identities(&alpha_records).is_disjoint(&identities(&beta_records)),
         "§6.5: no resource identity collision between two instances"
     );
 
     // --- provenance: each record says which provider instance observed it ---
-    for (record, instance) in [
-        (&alpha_records[0], "kubernetes:alpha"),
-        (&beta_records[0], "kubernetes:beta"),
+    for (answer, instance) in [
+        (&alpha_records, "kubernetes:alpha"),
+        (&beta_records, "kubernetes:beta"),
     ] {
-        let source = record.provenance().source().unwrap_or_default().to_owned();
-        assert!(
-            source.contains(&format!("provider_instance={instance}")),
-            "a record carries the instance that read it, so two answers cannot be confused \
-             downstream: {source}"
-        );
+        for record in answer.iter() {
+            let source = record.provenance().source().unwrap_or_default().to_owned();
+            assert!(
+                source.contains(&format!("provider_instance={instance}")),
+                "a record carries the instance that read it, so two answers cannot be confused \
+                 downstream: {source}"
+            );
+        }
     }
 
     // --- credentials: §6.5's "credential leakage", observed rather than argued ---
@@ -811,6 +1009,23 @@ async fn should_answer_two_contexts_in_one_session_without_crossover() {
         !beta_seen.contains("alpha-token"),
         "and alpha's must never reach beta's: {beta_seen}"
     );
+
+    // Every request head, not merely one of them. This is the assertion two invocations at once
+    // could break that one invocation could not: each request each server saw was authorised
+    // with that context's own credential, so no invocation was answered with a credential
+    // another invocation had resolved (§8.1).
+    for (name, cluster, token) in [
+        ("alpha", &fixture.alpha, "alpha-token"),
+        ("beta", &fixture.beta, "beta-token"),
+    ] {
+        for head in cluster.heads() {
+            assert!(
+                head.contains(&format!("Authorization: Bearer {token}")),
+                "{name} saw a request with no credential of its own on it while two invocations \
+                 were open: {head}"
+            );
+        }
+    }
 
     // --- namespaces: §6.5's "accidental namespace carry-over" ---
     assert!(
@@ -839,6 +1054,51 @@ async fn should_answer_two_contexts_in_one_session_without_crossover() {
         "both sessions verified their own server against their own context's authority"
     );
 
+    // --- no object of one cluster appears anywhere in the other's answer ---
+    // Field by field rather than through the fields this test happens to name: a crossover that
+    // put one of beta's pods into an alpha record would be caught wherever in the record it
+    // landed.
+    let alpha_text = format!("{alpha_records:?}");
+    let beta_text = format!("{beta_records:?}");
+    for (name, answer, foreign) in [
+        (
+            "alpha",
+            &alpha_text,
+            ["beta-forklift", "warehouse", "bbbbbbbb"],
+        ),
+        ("beta", &beta_text, ["alpha-till", "shop", "aaaaaaaa"]),
+    ] {
+        for word in foreign {
+            assert!(
+                !answer.contains(word),
+                "`{word}` is the other cluster's and it reached {name}'s answer: {answer}"
+            );
+        }
+    }
+
+    // --- afterwards: a concurrent partner leaves nothing behind ---
+    // The two invocations shared a process, a registry and a moment. Asked again on its own,
+    // each context answers exactly what it answered while the other one was running — §6.5 put
+    // as a question about time rather than about structure.
+    for (context, expected) in [
+        ("alpha", names(&alpha_records)),
+        ("beta", names(&beta_records)),
+    ] {
+        let (events, result) = plugin
+            .query("k8s-pod", fixture.context(context))
+            .await
+            .expect("the query starts")
+            .collect()
+            .await;
+        assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+        assert_eq!(
+            names(&records(&events)),
+            expected,
+            "`{context}` answers what it answered beside another context, and nothing the other \
+             one read"
+        );
+    }
+
     plugin.shutdown(ShutdownReason::Unload).await;
     fixture.discard();
 }
@@ -848,6 +1108,14 @@ async fn should_give_each_context_its_own_instance_identity_and_cluster_fingerpr
     // §10.1 and §10.3 under Gate J: the diagnostic is what makes isolation *inspectable* rather
     // than merely true. Two contexts, two identities, two fingerprints, and no operation
     // anywhere that would fold them into one.
+    //
+    // One at a time, deliberately, and the reason is worth writing down. A diagnostic answers
+    // exactly one record, so there is no second record for a credit window to hold it on — the
+    // mechanism that makes `should_answer_two_contexts_queried_at_the_same_time_without_crossover`
+    // provably concurrent does not reach this shape of answer. Two `k8s-cluster` queries of one
+    // *instance* would also be two invocations of one session, and those take turns by design
+    // (ADR-0026). What this test is for is what the two answers *say*, and that does not depend
+    // on when they were read.
     let fixture = Fixture::build();
     let plugin = fixture.loaded().await;
 

@@ -2677,6 +2677,272 @@ contexts:
 }
 
 #[tokio::test]
+async fn should_stand_where_the_last_named_endpoint_stood_when_a_query_names_none() {
+    // The shell re-reads a place, and resolves the far end of a contributed edge, by querying a
+    // contributed target with **no arguments at all** — no `host`, no `context`, no `namespace`.
+    // Without an answer to that invocation a Kubernetes object can be entered and then reported
+    // gone, and no contributed edge can resolve either of its ends (ADR-0027).
+    //
+    // What answers it is what the operator already typed, in this process, at the query they are
+    // standing on the result of. It is a replay of their own words rather than a guess, and an
+    // invocation that names an endpoint of its own is unaffected.
+    let plugin = loaded(2).await;
+
+    let named = plugin
+        .query("k8s-pod", at_cluster(&[("namespace", json!("shop"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = named.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records(&events).len(),
+        1,
+        "the named query reads the namespace it named"
+    );
+
+    let unnamed = plugin
+        .query("k8s-pod", options(&[]))
+        .await
+        .expect("the query starts");
+    let (events, result) = unnamed.collect().await;
+    let records = records(&events);
+
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records.len(),
+        1,
+        "the second invocation named nothing and stood where the first one stood"
+    );
+    assert_eq!(text_of(&records[0], "namespace").as_deref(), Some("shop"));
+    let provenance = records[0]
+        .provenance()
+        .source()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        provenance.contains("provider_instance=kubernetes:recorded"),
+        "§7.4: which cluster answered is on the record rather than implied, got {provenance}"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_stand_on_the_collection_a_resource_query_named_as_well_as_on_its_endpoint() {
+    // `k8s-resource` names its collection in the query rather than in a table, so a place entered
+    // from `get k8s-resource --kind Sprocket` is re-read by an invocation that carries no `kind`
+    // at all. Without the collection standing too, that re-read is `resolve.ambiguous` and the
+    // shell reports a live custom resource as gone — which is Gate A's "entered" undone one
+    // statement after it was reached (ADR-0027).
+    let cluster = RecordedCluster::with_custom_resources();
+    let plugin = loaded_against(cluster).await;
+
+    let named = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[
+                ("kind", json!("Sprocket")),
+                ("group", json!("menagerie.example")),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = named.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let named: Vec<Option<String>> = records(&events)
+        .iter()
+        .map(|record| text_of(record, "uid"))
+        .collect();
+
+    let unnamed = plugin
+        .query("k8s-resource", options(&[]))
+        .await
+        .expect("the query starts");
+    let (events, result) = unnamed.collect().await;
+    let records = records(&events);
+
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "a re-read that names no collection stands where the query that entered the place stood: \
+         {:?}",
+        result.error
+    );
+    let again: Vec<Option<String>> = records
+        .iter()
+        .map(|record| text_of(record, "uid"))
+        .collect();
+    assert!(
+        !named.is_empty(),
+        "the named query read the collection at all"
+    );
+    assert_eq!(again, named, "and the re-read reads the same objects");
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_let_a_query_that_names_an_endpoint_replace_the_standing_one() {
+    // The standing endpoint is a fallback and never an override: §7.4 keeps context switching
+    // explicit, and a query that says which cluster it is about is exactly that.
+    let plugin = loaded(2).await;
+
+    let shop = plugin
+        .query("k8s-pod", at_cluster(&[("namespace", json!("shop"))]))
+        .await
+        .expect("the query starts");
+    let (_, result) = shop.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+
+    let default = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the query starts");
+    let (events, result) = default.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records(&events).len(),
+        2,
+        "the second query named its own endpoint and read `default`, not the standing `shop`"
+    );
+
+    let unnamed = plugin
+        .query("k8s-pod", options(&[]))
+        .await
+        .expect("the query starts");
+    let (events, result) = unnamed.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records(&events).len(),
+        2,
+        "the endpoint that answered last is the one still standing"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_take_the_kubeconfig_s_current_context_when_a_query_names_no_endpoint() {
+    // §7.1 lists "current context as an optional default" among the elements a provider MUST
+    // support, and this is the query that has no other way to name a cluster: the host invokes a
+    // contributed target with no arguments at all when it re-reads a place or asks a package for
+    // its edges, so a provider that refuses to default is a provider with no place in the spatial
+    // model (ADR-0027). The default is taken, and the instance it resolved to is on every record.
+    let authority = Authority::issuing("cluster.test");
+    let (directory, path) = kubeconfig_at(
+        "current-context",
+        &format!(
+            r#"
+apiVersion: v1
+kind: Config
+current-context: recorded
+clusters:
+  - name: recorded
+    cluster:
+      server: https://cluster.test:6443
+      certificate-authority-data: {}
+users:
+  - {{name: operator, user: {{token: recorded-token}}}}
+contexts:
+  - {{name: recorded, context: {{cluster: recorded, user: operator, namespace: shop}}}}
+"#,
+            authority.certificate_authority_data()
+        ),
+    );
+    let cluster = RecordedCluster::over_tls(&authority);
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(Arc::clone(&cluster) as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads");
+
+    let invocation = plugin
+        .query(
+            "k8s-pod",
+            // No `host` and no `context`: everything about which cluster this is comes from the
+            // file, exactly as it does when the shell re-reads a place.
+            options(&[("kubeconfig", json!(path.display().to_string()))]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    let records = records(&events);
+
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records.len(),
+        1,
+        "the current context's namespace decided what was listed, and `shop` holds one pod"
+    );
+    assert_eq!(text_of(&records[0], "name").as_deref(), Some("shop-till"));
+    let provenance = records[0]
+        .provenance()
+        .source()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        provenance.contains("provider_instance=kubernetes:recorded"),
+        "§7.4: which context answered is visible on the record rather than implied, got \
+         {provenance}"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
+async fn should_refuse_a_query_naming_no_endpoint_when_the_kubeconfig_names_no_current_context() {
+    // The other half of the default: a file that defines contexts and elects none of them has
+    // not chosen a cluster, and choosing one here would be this package deciding which cluster
+    // an operator meant (§7.4's "context switching MUST remain explicit").
+    let (directory, path) = kubeconfig_at(
+        "no-current-context",
+        r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: recorded, cluster: {server: http://cluster.test:8001}}
+users:
+  - {name: operator, user: {token: recorded-token}}
+contexts:
+  - {name: recorded, context: {cluster: recorded, user: operator}}
+  - {name: staging, context: {cluster: recorded, user: operator}}
+"#,
+    );
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(RecordedCluster::with_pods(2))
+        .load()
+        .await
+        .expect("the package loads");
+
+    let invocation = plugin
+        .query(
+            "k8s-pod",
+            options(&[("kubeconfig", json!(path.display().to_string()))]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty(), "nothing was fabricated");
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert_eq!(error.name, "provider.unavailable");
+    let help = error.help.unwrap_or_default();
+    assert!(
+        help.contains("recorded") && help.contains("staging"),
+        "the refusal names the contexts the file does define, got {help}"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
 async fn should_say_that_a_denied_kubeconfig_read_is_a_capability_decision() {
     // §21.4's distinction, applied to configuration: "the host would not let me read the file"
     // and "the file has no such context" are different states, and a refusal that blurs them
@@ -6214,5 +6480,306 @@ async fn should_answer_every_question_asked_about_an_object_from_the_cluster_s_o
             );
         }
     }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- the edges between the places this package contributes (§35.5, §35.6, §36.1) ----------------
+
+/// The command the shell invokes when it asks a package for its edges (§36.1).
+const EDGES: &str = "io.github.godspeed-you.kubernetes.command.spatial-relations";
+
+/// A package loaded with the grant §35.5 gates the contribution on.
+async fn contributing(cluster: &Arc<RecordedCluster>) -> ono_kuang_supervisor::LoadedPlugin {
+    TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant(Capability::RelationWrite)
+        .host(Arc::clone(cluster) as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads under its own manifest")
+}
+
+/// The edges one invocation asserted, as the five fields the host reads off each one.
+struct Asserted {
+    relation: String,
+    source_type: String,
+    source_key: String,
+    target_type: String,
+    target_key: String,
+}
+
+fn asserted(events: &[StreamEvent]) -> Vec<Asserted> {
+    records(events)
+        .iter()
+        .map(|record| {
+            let text = |field: &str| {
+                text_of(record, field)
+                    .unwrap_or_else(|| panic!("`{field}` is on every asserted edge"))
+            };
+            Asserted {
+                relation: text("relation"),
+                source_type: text("source_type"),
+                source_key: text("source_key"),
+                target_type: text("target_type"),
+                target_key: text("target_key"),
+            }
+        })
+        .collect()
+}
+
+/// Every edge the package asserts, standing where the operator's own query stood.
+async fn edges_of_the_recorded_cluster(
+    plugin: &ono_kuang_supervisor::LoadedPlugin,
+) -> Vec<Asserted> {
+    // The operator's query first: the shell asks a package for its edges with **no arguments**,
+    // and what says which cluster that is about is the endpoint the last invocation named
+    // (ADR-0027). Standing here is exactly what a user does before typing `near`.
+    let standing = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the query starts");
+    let (_, result) = standing.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+
+    let invocation = plugin
+        .invoke(EDGES, JsonMap::new())
+        .await
+        .expect("the contribution runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    asserted(&events)
+}
+
+#[tokio::test]
+async fn should_assert_an_edge_between_two_kinds_of_place_this_package_contributes() {
+    // §36.1 and `ADR-0585 (core)`: a package asserts edges as `ono.spatial-relation/1` records
+    // naming both ends by the key the target that answers for them is keyed on. This is the
+    // whole of what `near` and `follow` stand on, and it is the half that did not exist.
+    let cluster = RecordedCluster::with_relations();
+    let plugin = contributing(&cluster).await;
+    let edges = edges_of_the_recorded_cluster(&plugin).await;
+
+    let scheduled: Vec<&Asserted> = edges
+        .iter()
+        .filter(|edge| edge.relation == "scheduled-on")
+        .collect();
+    assert_eq!(
+        scheduled.len(),
+        2,
+        "both Pods of the namespace state the Node they run on, got {:?}",
+        edges.iter().map(|e| &e.relation).collect::<Vec<_>>()
+    );
+    let api = scheduled
+        .iter()
+        .find(|edge| edge.source_key == "11111111-1111-1111-1111-111111111111")
+        .expect("the Pod the fixture calls `api-7d9f-abc`");
+    assert_eq!(
+        api.source_type, "io.github.godspeed-you.kubernetes.pod/1",
+        "the near end is the kind of place a Pod is"
+    );
+    assert_eq!(
+        api.target_type, "io.github.godspeed-you.kubernetes.node/1",
+        "the far end is the kind of place a Node is"
+    );
+    assert_eq!(
+        api.target_key, "44444444-4444-4444-4444-444444444444",
+        "and it is the Node's own lifetime identity, not `node-a`"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_key_both_ends_of_a_contributed_edge_on_a_lifetime_and_never_on_a_name() {
+    // §35.4 and §4 invariants 4–5. Every schema this package declares is keyed on `uid`, so the
+    // host resolves an end by asking the target for `uid == <key>`. A key that were a name would
+    // bind a place to a word two resource lifetimes can share — and `node-a`, `api` and
+    // `api-7d9f-abc` are exactly such words in this fixture.
+    let cluster = RecordedCluster::with_relations();
+    let plugin = contributing(&cluster).await;
+    let edges = edges_of_the_recorded_cluster(&plugin).await;
+
+    assert!(!edges.is_empty(), "the fixture asserts edges at all");
+    let names = ["node-a", "api", "api-7d9f-abc", "api-token", "default"];
+    for edge in &edges {
+        for key in [&edge.source_key, &edge.target_key] {
+            assert!(
+                !names.contains(&key.as_str()),
+                "`{key}` is a name and not a lifetime identity, on the `{}` edge",
+                edge.relation
+            );
+            assert!(
+                key.len() == 36 && key.matches('-').count() == 4,
+                "`{key}` is not a `metadata.uid`, on the `{}` edge",
+                edge.relation
+            );
+        }
+    }
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_offer_a_service_its_selected_pods_before_its_slices_and_its_routes() {
+    // §35.5's own prioritisation, which `place.rs`'s `Neighbourhood::ranked` holds: "for a
+    // Service, its selected Pods, its EndpointSlices, its routes". The order is not re-decided
+    // at this boundary, and this test is what would catch it being re-decided.
+    let cluster = RecordedCluster::with_relations();
+    let plugin = contributing(&cluster).await;
+    let edges = edges_of_the_recorded_cluster(&plugin).await;
+
+    let from_service: Vec<&str> = edges
+        .iter()
+        .filter(|edge| edge.source_key == "a4a4a4a4-0000-0000-0000-000000000001")
+        .map(|edge| edge.relation.as_str())
+        .collect();
+    let selects = from_service
+        .iter()
+        .position(|relation| *relation == "selects")
+        .unwrap_or_else(|| {
+            panic!("the Service selects the Pod whose labels match: {from_service:?}")
+        });
+    let endpoints = from_service
+        .iter()
+        .position(|relation| *relation == "has-endpoints")
+        .unwrap_or_else(|| panic!("the Service is represented by a slice: {from_service:?}"));
+    assert!(
+        selects < endpoints,
+        "the Pods a Service selects come before the slices that carry its addresses: \
+         {from_service:?}"
+    );
+    assert_eq!(
+        from_service.last(),
+        Some(&"in-namespace"),
+        "and where it lives comes after everything it is related to: {from_service:?}"
+    );
+
+    // The same ordering where it is *not* the order the edges were derived in. `Graph::edges_of`
+    // reads a Pod's owner references before its `spec.nodeName`, and §35.5 ranks where a thing
+    // runs above what owns it — so a boundary that emitted edges in the order it built them
+    // would put `controlled-by` first here and `Neighbourhood::ranked` puts `scheduled-on` first.
+    let from_pod: Vec<&str> = edges
+        .iter()
+        .filter(|edge| edge.source_key == "11111111-1111-1111-1111-111111111111")
+        .map(|edge| edge.relation.as_str())
+        .collect();
+    assert_eq!(
+        from_pod.first(),
+        Some(&"scheduled-on"),
+        "where the Pod runs outranks what owns it, whatever order the edges were derived in: \
+         {from_pod:?}"
+    );
+    let placement = from_pod
+        .iter()
+        .position(|relation| *relation == "scheduled-on")
+        .expect("the Pod states the Node it runs on");
+    let lineage = from_pod
+        .iter()
+        .position(|relation| *relation == "controlled-by")
+        .expect("the Pod states its controller");
+    let dependency = from_pod
+        .iter()
+        .position(|relation| *relation == "runs-as")
+        .expect("the Pod states the account it runs as");
+    assert!(
+        placement < lineage && lineage < dependency,
+        "placement, then lineage, then what it needs to run: {from_pod:?}"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_relate_a_pod_to_its_namespace_and_to_its_owner_as_two_different_relations() {
+    // §35.6: "a namespace is a Pod's spatial parent even though a ReplicaSet owns it". The two
+    // are separate shapes, so they register separate relations and a user follows one or the
+    // other deliberately. Routing containment through ownership would land `up` on whichever
+    // controller happened to create the object.
+    let cluster = RecordedCluster::with_relations();
+    let plugin = contributing(&cluster).await;
+    let edges = edges_of_the_recorded_cluster(&plugin).await;
+
+    let pod = "11111111-1111-1111-1111-111111111111";
+    let holder = edges
+        .iter()
+        .find(|edge| edge.source_key == pod && edge.relation == "in-namespace")
+        .expect("the Pod is in a namespace, and that is a spatial fact about it");
+    assert_eq!(
+        holder.target_type,
+        "io.github.godspeed-you.kubernetes.namespace/1"
+    );
+    assert_eq!(
+        holder.target_key, "33333333-3333-3333-3333-333333333333",
+        "the namespace is bound by its own lifetime identity"
+    );
+
+    let owner = edges
+        .iter()
+        .find(|edge| edge.source_key == pod && edge.relation == "controlled-by")
+        .expect("the Pod states a controlling owner reference");
+    assert_eq!(
+        owner.target_type, "io.github.godspeed-you.kubernetes.replicaset/1",
+        "what owns the Pod is a ReplicaSet, and it is not where the Pod is"
+    );
+    assert_ne!(
+        holder.target_type, owner.target_type,
+        "containment and ownership are two shapes, so they are two relations"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_assert_no_edge_whose_far_end_this_pass_could_not_bind_to_a_lifetime() {
+    // §24.1: an edge whose far end nobody read is a relationship, and it is not a *place* —
+    // there is no lifetime for one to bind to. The Ingress of this fixture routes to a Service
+    // called `assets` that the cluster does not serve, and the honest answer is that the edge
+    // contributes no place rather than one keyed on the word `assets`. It stays visible through
+    // `get k8s-relation`, where `target_resolved` says so in a field.
+    let cluster = RecordedCluster::with_relations();
+    let plugin = contributing(&cluster).await;
+    let edges = edges_of_the_recorded_cluster(&plugin).await;
+
+    let routes: Vec<&Asserted> = edges
+        .iter()
+        .filter(|edge| edge.relation == "routes-to")
+        .collect();
+    assert_eq!(
+        routes.len(),
+        1,
+        "only the backend the pass actually read becomes an edge between two places"
+    );
+    assert_eq!(
+        routes[0].target_key, "a4a4a4a4-0000-0000-0000-000000000001",
+        "and it is the Service's lifetime identity"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_contribute_no_edge_without_the_relation_write_grant() {
+    // §35.5 puts the filter before the merge, and `relation.write` is never granted by default
+    // (§31.19). The host refuses the invocation before any of this package's code runs, and the
+    // refusal names the capability — which is a different answer from a `near` that comes back
+    // empty, and the difference is the whole point.
+    let cluster = RecordedCluster::with_relations();
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .host(Arc::clone(&cluster) as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads under its own manifest");
+
+    let refusal = plugin
+        .invoke(EDGES, JsonMap::new())
+        .await
+        .expect_err("a contribution without the grant is refused");
+    assert_eq!(refusal.name, "capability.denied");
+    assert!(
+        format!("{refusal:?}").contains("relation.write"),
+        "the refusal names the capability the operator would have to grant, got {refusal:?}"
+    );
+
     plugin.shutdown(ShutdownReason::Unload).await;
 }

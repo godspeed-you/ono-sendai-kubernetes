@@ -29,6 +29,18 @@ runtime:
   memory_max: 256MiB
   cpu_budget: interactive
   startup: lazy
+  # How many invocations the operator lets one instance have open at once (spec §31.15,
+  # `ADR-0586 (core)`). This is the *budget*, and it is a different statement from the one the
+  # code makes: `CONCURRENT_INVOCATIONS` in `lib.rs` says the handlers are safe to run beside each
+  # other, and no manifest can assert that on the author's behalf. The smaller of the two wins,
+  # host policy caps whatever is declared, and a null here would take the host's default of four.
+  #
+  # Three, because three is what one instance's work costs at its widest: a live watch holds its
+  # invocation for as long as the operator watches (ADR-0023), and the two contexts of Gate J
+  # (§62.10) are meant to be answerable while it does. Each open invocation is a worker, a
+  # brokered connection and a TLS session inside the 256 MiB above, and §49.1 requires this
+  # provider to bound its concurrency rather than to take whatever the host offers.
+  max_concurrent_invocations: 3
 
 roles: [provider]
 
@@ -60,6 +72,13 @@ capabilities:
     - secret.use
     - clock.read
     - state.persist
+    # The edges of `contributions.relations` below. **Never granted by default** (spec §31.19,
+    # §35.5): a package without it contributes no relation at all, so the filtering §35.5 puts
+    # before the merge happens by the contribution never existing. An operator who wants the
+    # spatial half grants it explicitly — `load plugin io.github.godspeed-you.kubernetes --grant
+    # relation.write` — and one who does not gets a Kubernetes place with no exits and a refusal
+    # that names the capability, rather than a `near` that answers with nothing.
+    - relation.write
 
 network:
   # Every byte leaves through the broker, which is where the operator's scope is enforced.
@@ -74,3 +93,66 @@ contributions:
   commands: [contributions/commands.yaml]
   targets: [contributions/targets.yaml]
   schemas: [contributions/schemas.yaml]
+
+  # Which kinds of place this package relates to which, so that `near` and `follow` reach a
+  # cluster (spec §35.5, §35.6, §36.1; `ADR-0584 (core)`, `ADR-0585 (core)`, ADR-0027 here).
+  #
+  # **A contributed target is already a kind of place**, keyed on the schema it declares, and that
+  # needs no line here: `KubernetesPod` is a `--type` and `get k8s-pod | enter` projects a record
+  # into a place the moment the package loads. What a shape adds is the *graph* — a place with no
+  # edges has no neighbours and nothing to follow.
+  #
+  # **Each endpoint is the id of a schema one of `contributions/targets.yaml`'s own targets
+  # declares**, never a display name and never another package's schema. The host settles that
+  # against these two documents at load, before this package's runtime is spawned, so a wrong
+  # declaration is `package.invalid` naming the shape rather than a `follow` that says the word
+  # means nothing. The relation it registers is derived from the shape's text: the pair above
+  # gives `io.github.godspeed-you.kubernetes.pod_to_node`.
+  #
+  # **A shape carries no word of its own**, so every Kubernetes relationship between one pair of
+  # kinds arrives under one relation and says which it is in the edge's `relation` field. The
+  # comment on each line is what runs along it, in §35.7's vocabulary.
+  #
+  # **`in-namespace` is §35.6's spatial parent and not ownership.** A Pod's namespace is where it
+  # is; its ReplicaSet is what owns it; they are two shapes because they are two questions. Note
+  # what this does *not* buy: `up` still refuses, because landing on a parent needs the
+  # plugin-defined aggregate space of §36.4 that no package can declare (`ADR-0584 (core)`).
+  relations:
+    # §35.5's own order for `near`: what a place selects, what carries its addresses, and what routes to it.
+    - "io.github.godspeed-you.kubernetes.service/1->io.github.godspeed-you.kubernetes.pod/1"   # selects
+    - "io.github.godspeed-you.kubernetes.service/1->io.github.godspeed-you.kubernetes.endpointslice/1"   # has-endpoints
+    - "io.github.godspeed-you.kubernetes.endpointslice/1->io.github.godspeed-you.kubernetes.pod/1"   # endpoint-for
+    - "io.github.godspeed-you.kubernetes.ingress/1->io.github.godspeed-you.kubernetes.service/1"   # routes-to
+    # Where it runs (§28.1).
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.node/1"   # scheduled-on
+    # Lineage, read from the child that states its own owner reference (§24.1, §24.3).
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.replicaset/1"   # owned-by, controlled-by
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.statefulset/1"   # owned-by, controlled-by
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.daemonset/1"   # owned-by, controlled-by
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.job/1"   # owned-by, controlled-by
+    - "io.github.godspeed-you.kubernetes.replicaset/1->io.github.godspeed-you.kubernetes.deployment/1"   # owned-by, controlled-by
+    - "io.github.godspeed-you.kubernetes.job/1->io.github.godspeed-you.kubernetes.cronjob/1"   # owned-by, controlled-by
+    # What it needs in order to run (§29 to §32).
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.serviceaccount/1"   # runs-as
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.configmap/1"   # references-config
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.secret/1"   # references-secret
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.persistentvolumeclaim/1"   # mounts
+    - "io.github.godspeed-you.kubernetes.persistentvolumeclaim/1->io.github.godspeed-you.kubernetes.persistentvolume/1"   # bound-to
+    - "io.github.godspeed-you.kubernetes.statefulset/1->io.github.godspeed-you.kubernetes.service/1"   # uses-service
+    - "io.github.godspeed-you.kubernetes.ingress/1->io.github.godspeed-you.kubernetes.secret/1"   # uses-tls-secret
+    - "io.github.godspeed-you.kubernetes.serviceaccount/1->io.github.godspeed-you.kubernetes.secret/1"   # uses-secret, uses-image-pull-secret
+    # §35.6's spatial parent, which is the namespace and never the owner.
+    - "io.github.godspeed-you.kubernetes.pod/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.service/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.endpointslice/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.ingress/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.replicaset/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.deployment/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.statefulset/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.daemonset/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.job/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.cronjob/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.serviceaccount/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.configmap/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.secret/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    - "io.github.godspeed-you.kubernetes.persistentvolumeclaim/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace

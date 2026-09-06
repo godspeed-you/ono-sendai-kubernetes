@@ -19,6 +19,7 @@
 //! dynamic         a resource nobody compiled in: resolving it, and typing it from the cluster
 //! records         one Kubernetes object, as a record of the target's schema
 //! relations       one object's relationships, as a record per edge with its evidence
+//! spatial         the same objects as places in Ono's graph, and the edges between them
 //! events          the Events regarding one object, and the refusal to read none as none
 //! evidence        what a Node states about the machine under it, exported rather than resolved
 //! logs            one container's log, as lines that carry the bounds of the read
@@ -45,10 +46,11 @@ pub mod query;
 pub mod records;
 pub mod relations;
 pub mod sessions;
+pub mod spatial;
 pub mod timeline;
 pub mod why;
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ono_kuang_sdk::Plugin;
 
@@ -66,6 +68,25 @@ pub const PACKAGE: &str = "io.github.godspeed-you.kubernetes";
 /// package does not load.
 pub const VERSION: &str = "0.1.0";
 
+/// How many invocations this package's code is willing to answer at once (spec §49.1).
+///
+/// **Three, and the number is the work rather than a round figure.** `ADR-0586 (core)` splits the
+/// declaration in two on purpose: this one is the *author's* — the handlers are safe to run beside
+/// each other, and this is how many of them the package is prepared to spawn — while
+/// `runtime.max_concurrent_invocations` in `package/manifest.yaml` is the *operator's* budget, and
+/// the smaller of the two wins. A manifest cannot raise this number, which is the point: no
+/// operator can assert thread-safety on somebody else's behalf.
+///
+/// Three is what this package's own shapes of work need at once. One slot is a live watch: §19's
+/// `k8s-change` borrows its invocation for as long as the operator keeps watching (ADR-0023), so
+/// it holds its slot for minutes rather than for a round trip. Two more are the two contexts of
+/// §62.10, which is the case the specification asks to be possible while something else is going
+/// on. A fourth slot would buy a second simultaneous watch and cost a fourth worker, a fourth
+/// brokered connection and a fourth TLS session inside one instance's 256 MiB; §49.1 says this
+/// provider MUST bound its concurrency because Ono is an interactive shell rather than a load
+/// generator, and a bound that stops at the work it can name is a bound.
+pub const CONCURRENT_INVOCATIONS: u32 = 3;
+
 /// The plugin, with every contribution declared and every target wired to a handler.
 ///
 /// The schemas go across the handshake beside the targets that name them: the host registers a
@@ -76,13 +97,14 @@ pub fn plugin() -> Plugin {
     // One registry for the whole process, shared by every handler. It is built here because this
     // is the only place that outlives an invocation: a `Ctx` is the invocation, and a session
     // held on one would be discarded between two queries — which is §50.2's cost written as a
-    // lifetime. `Rc` rather than `Arc` because the SDK serves one request at a time on one
-    // thread, and a handler is `Fn` rather than `FnMut`, so the interior mutability lives in
-    // `Sessions` where §6.5's key can be checked beside it.
-    let sessions = Rc::new(Sessions::new());
-    let mut plugin = Plugin::new(PACKAGE, VERSION);
+    // lifetime. `Arc` rather than `Rc` because a handler is
+    // `Fn(&mut Ctx) -> Outcome + Send + Sync` since `ADR-0586 (core)` and runs on a worker of its
+    // own; the interior mutability lives in `Sessions`, where §6.5's key is checked beside the
+    // lock that arbitrates who may use the session that key names.
+    let sessions = Arc::new(Sessions::new());
+    let mut plugin = Plugin::new(PACKAGE, VERSION).concurrent_invocations(CONCURRENT_INVOCATIONS);
     for target in contributions::TARGETS {
-        let sessions = Rc::clone(&sessions);
+        let sessions = Arc::clone(&sessions);
         plugin = plugin
             .contribute_schema(target.schema_contribution())
             .contribute_target(target.target_contribution())
@@ -116,12 +138,23 @@ pub fn plugin() -> Plugin {
     // neither — and the host checks the capability at every invocation, before any of this
     // package's code runs (§31.22, §31.75). ADR-0024.
     for declared in contributions::COMMANDS {
-        let sessions = Rc::clone(&sessions);
+        let sessions = Arc::clone(&sessions);
         plugin = plugin
             .contribute_command(declared.contribution())
             .command(&declared.id(), move |ctx| {
                 mutations::answer(declared, &sessions, ctx)
             });
+    }
+    // The edges between the places the targets above became. A command answering for the shell's
+    // own `spatial-relation` target, because §36.1 is how a package contributes a relationship
+    // provider and §35.5 wants the capability checked before anything is merged — which a target
+    // contribution has nowhere to declare and a command contribution does (`ADR-0585 (core)`,
+    // ADR-0027).
+    {
+        let sessions = Arc::clone(&sessions);
+        plugin = plugin
+            .contribute_command(spatial::contribution())
+            .command(spatial::COMMAND, move |ctx| spatial::answer(&sessions, ctx));
     }
     plugin
 }

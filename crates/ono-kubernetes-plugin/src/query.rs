@@ -121,7 +121,13 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
     };
     // Read before the connection opens, because the brokered stream borrows the context for as
     // long as it lives and the query's own words are needed after that.
-    let selector = Selector::from_options(ctx.arguments());
+    //
+    // The standing query fills in what an invocation carrying no arguments did not say. It is
+    // read here as well as in [`Endpoint::resolve`] because `k8s-resource` names its collection
+    // in the *selector* rather than in the endpoint: a place entered from a query that named a
+    // kind is re-read by an invocation with no kind at all, and a re-read that cannot say which
+    // collection to look in reports a live object as gone (ADR-0027).
+    let selector = Selector::from_options(&standing_arguments(ctx));
     let lookup = ctx
         .arguments()
         .get("name")
@@ -1253,9 +1259,25 @@ impl Endpoint {
     ///
     /// Three ways in, in this order: an explicit `host` (§7.3's explicit configuration, which
     /// automation and the test host use), a named `context` resolved through the kubeconfig
-    /// (§7.4), or neither — which is refused rather than defaulted.
+    /// (§7.4), or neither — in which case the kubeconfig's own `current-context` is taken.
+    ///
+    /// §7.1 lists "current context as an optional default" among the elements this provider MUST
+    /// support, and the default is what makes this package reachable from the spatial layer at
+    /// all: the shell invokes a contributed target with **no arguments** when it re-reads a place
+    /// or resolves the end of a contributed edge, so a provider that refuses to default cannot be
+    /// entered, cannot be looked at without being reported gone, and has no neighbours. ADR-0027.
+    ///
+    /// It stays a default rather than a guess. Which context answered is on every record's
+    /// provenance as `provider_instance=kubernetes:<context>` (§6.2, §7.4), a file that elects no
+    /// context is refused with the ones it does define, and a kubeconfig that could not be read
+    /// is refused rather than replaced by an endpoint nobody named.
     pub(crate) fn resolve(ctx: &mut Ctx<'_>) -> Result<Self, WireError> {
-        let options = ctx.arguments().clone();
+        let mut options = ctx.arguments().clone();
+        if names_an_endpoint(&options) {
+            remember_endpoint(&options);
+        } else {
+            replay_standing_endpoint(&mut options);
+        }
         let context = options
             .get("context")
             .and_then(Json::as_str)
@@ -1269,8 +1291,7 @@ impl Endpoint {
 
         match (host, context) {
             (Some(host), context) => Self::explicit(&options, &host, context.as_deref()),
-            (None, Some(context)) => Self::from_kubeconfig(ctx, &options, &context),
-            (None, None) => Err(no_endpoint()),
+            (None, context) => Self::from_kubeconfig(ctx, &options, context.as_deref()),
         }
     }
 
@@ -1314,10 +1335,17 @@ impl Endpoint {
     }
 
     /// An endpoint resolved from a kubeconfig context (§7.1, §7.4, §8).
+    ///
+    /// `context` is [`None`] where the query named none, and the file's `current-context` is then
+    /// the answer. A read that failed is reported as itself where a context was named and as
+    /// "nothing named an API server" where none was, because a query that asked for no cluster in
+    /// particular has not been denied a kubeconfig — it has simply not said which cluster it
+    /// meant, and §4's "missing permission is not absence" is served by naming the read failure in
+    /// the help rather than by dropping it.
     fn from_kubeconfig(
         ctx: &mut Ctx<'_>,
         options: &JsonMap<String, Json>,
-        context: &str,
+        context: Option<&str>,
     ) -> Result<Self, WireError> {
         let path = options
             .get("kubeconfig")
@@ -1325,7 +1353,11 @@ impl Endpoint {
             .filter(|path| !path.is_empty())
             .unwrap_or(DEFAULT_KUBECONFIG)
             .to_owned();
-        let document = read_file(ctx, &path, "the kubeconfig")?;
+        let document = match read_file(ctx, &path, "the kubeconfig") {
+            Ok(document) => document,
+            Err(error) if context.is_none() => return Err(no_endpoint_and_no_kubeconfig(&error)),
+            Err(error) => return Err(error),
+        };
         let text = String::from_utf8(document).map_err(|error| {
             failure(
                 UNAVAILABLE_CODE,
@@ -1342,8 +1374,42 @@ impl Endpoint {
                 "The file was read; what is in it is not a kubeconfig this provider understands.",
             )
         })?;
-        let connection = config.connection(context).map_err(|error| {
+        let contexts = |config: &Kubeconfig| -> String {
             let known: Vec<&str> = config.contexts().collect();
+            if known.is_empty() {
+                "none".to_owned()
+            } else {
+                known.join(", ")
+            }
+        };
+        // §7.1's "current context as an optional default". A file that elects none has not chosen
+        // a cluster, and choosing one here would be this package deciding which cluster the
+        // operator meant — which is exactly what §7.4 keeps explicit.
+        let context = match context {
+            Some(context) => context.to_owned(),
+            None => match config.current_context() {
+                Some(current) => current.to_owned(),
+                None => {
+                    return Err(failure(
+                        UNAVAILABLE_CODE,
+                        UNAVAILABLE,
+                        format!(
+                            "the query named neither a kubeconfig `context` nor a `host`, and \
+                             `{path}` elects no `current-context` to fall back to"
+                        ),
+                        &format!(
+                            "`{path}` defines these contexts: {}. Pass one as `context`, or pass \
+                             `host` (and `port`, which defaults to 8001) to name an endpoint \
+                             directly, which speaks plain HTTP/1.1 and so reaches an API server \
+                             through `kubectl proxy` rather than over TLS.",
+                            contexts(&config)
+                        ),
+                    ));
+                }
+            },
+        };
+        let context = context.as_str();
+        let connection = config.connection(context).map_err(|error| {
             failure(
                 UNAVAILABLE_CODE,
                 UNAVAILABLE,
@@ -1351,11 +1417,7 @@ impl Endpoint {
                 &format!(
                     "`{path}` defines these contexts: {}. Naming one that is not there is a \
                      different answer from connecting to the wrong one.",
-                    if known.is_empty() {
-                        "none".to_owned()
-                    } else {
-                        known.join(", ")
-                    }
+                    contexts(&config)
                 ),
             )
         })?;
@@ -1749,6 +1811,122 @@ pub(crate) fn handshake_failure(endpoint: &Endpoint, error: &TlsError) -> WireEr
          context trusts. A cluster with a private certificate authority names it in its \
          kubeconfig as `certificate-authority-data`.",
     )
+}
+
+/// The options an invocation that named a cluster is remembered by.
+///
+/// Only what an operator typed: nothing the cluster answered and nothing resolved from a
+/// credential. Replaying these re-reads the kubeconfig and re-resolves the credential from
+/// scratch, so §8.1's boundary is untouched — a rotated token takes effect on the next call, as
+/// it does on the path that named the endpoint outright.
+///
+/// The last four are not "which cluster" but "which collection", and they are here because
+/// `k8s-resource` needs them to answer at all: a place entered from a query that named a kind is
+/// re-read by an invocation carrying none, and a re-read that cannot name the collection reports
+/// a live object as gone. The cost is that one process remembers one such query, so a place of a
+/// kind older than the last `k8s-resource` question is re-read against the newer kind and answers
+/// as absent. That is the shape of the gap rather than a decision taken here: the shell has no
+/// way to tell a package which place it is re-reading (ADR-0027).
+const STANDING_OPTIONS: &[&str] = &[
+    "host",
+    "port",
+    "context",
+    "kubeconfig",
+    "namespace",
+    "all_namespaces",
+    "max_pages",
+    "kind",
+    "group",
+    "version",
+    "resource",
+];
+
+/// The endpoint options of the last invocation in this process that named one (§6.5, §7.4).
+///
+/// A `Mutex` rather than a `RefCell` because a package may answer more than one invocation at a
+/// time, and what is behind it is a plain map of what somebody typed.
+fn standing_endpoint() -> &'static std::sync::Mutex<Option<JsonMap<String, Json>>> {
+    static STANDING: std::sync::OnceLock<std::sync::Mutex<Option<JsonMap<String, Json>>>> =
+        std::sync::OnceLock::new();
+    STANDING.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// An invocation's own arguments, with the standing query's filled in where it named nothing.
+///
+/// The same merge [`Endpoint::resolve`] makes, exposed for the one caller that needs more of it
+/// than the endpoint: which collection to read.
+pub(crate) fn standing_arguments(ctx: &Ctx<'_>) -> JsonMap<String, Json> {
+    let mut options = ctx.arguments().clone();
+    if !names_an_endpoint(&options) {
+        replay_standing_endpoint(&mut options);
+    }
+    options
+}
+
+/// Whether these options say which API server the query is about.
+fn names_an_endpoint(options: &JsonMap<String, Json>) -> bool {
+    ["host", "context"].iter().any(|key| {
+        options
+            .get(*key)
+            .and_then(Json::as_str)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
+/// Records what an invocation named, so that a later one that names nothing can stand where this
+/// one stood (§6.5).
+fn remember_endpoint(options: &JsonMap<String, Json>) {
+    let standing: JsonMap<String, Json> = STANDING_OPTIONS
+        .iter()
+        .filter_map(|key| {
+            options
+                .get(*key)
+                .map(|value| ((*key).to_owned(), value.clone()))
+        })
+        .collect();
+    if let Ok(mut held) = standing_endpoint().lock() {
+        *held = Some(standing);
+    }
+}
+
+/// Puts the standing endpoint back into an invocation that named none.
+///
+/// **This is what makes the package reachable from the spatial layer** (ADR-0027). The shell
+/// invokes a contributed target with no arguments at all when it re-reads a place (§33.2 of the
+/// generic provider contract) or resolves the end of a contributed edge, and the invocation
+/// carries no way to say which cluster the place was entered from. What it does carry is the
+/// process: the same loaded instance answered the query the operator wrote, so the cluster they
+/// named is the cluster that is still standing.
+///
+/// It is not a guess and it cannot switch behind an operator's back, which is §7.4's rule. The
+/// only thing replayed is what somebody typed, an invocation that names an endpoint of its own
+/// keeps it and replaces the standing one, and every record still carries
+/// `provider_instance=kubernetes:<context>` so a reader can see which cluster answered.
+fn replay_standing_endpoint(options: &mut JsonMap<String, Json>) {
+    let Ok(held) = standing_endpoint().lock() else {
+        return;
+    };
+    let Some(standing) = held.as_ref() else {
+        return;
+    };
+    for (key, value) in standing {
+        options.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
+/// No endpoint was named and the kubeconfig that would have defaulted one did not read.
+///
+/// The read failure travels in the help rather than being dropped: a denied `filesystem.read` is
+/// a capability decision and an absent file is a fact about the machine, and neither of them is
+/// "there is no cluster" (§4 invariant 13, §21.4).
+fn no_endpoint_and_no_kubeconfig(cause: &WireError) -> WireError {
+    let mut refusal = no_endpoint();
+    refusal.help = Some(format!(
+        "{}\n\nThe kubeconfig that would have supplied a default was not read: {}",
+        refusal.help.unwrap_or_default(),
+        cause.message
+    ));
+    refusal
 }
 
 /// No endpoint was named, and this package will not invent one.

@@ -36,11 +36,19 @@ rustls-pemfile = "2"
 ring = "0.17"
 webpki-roots = "0.26"
 
-# What a KUANG/11 package is written against. A git dependency because the SDK is not published;
-# `Cargo.lock` pins the exact revision, so a build is reproducible even though the reference moves.
-ono-kuang-sdk = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
-ono-kuang-protocol = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
-ono-value = { git = "https://github.com/godspeed-you/ono-sendai", branch = "main" }
+# What a KUANG/11 package is written against. A git dependency because the SDK is not published.
+#
+# A **revision** rather than a branch, and the revision is deliberate: `ADR-0586` in core — a
+# package answers more than one invocation at a time — is what §62.10's word "concurrently" needs,
+# and it is on core's `implementation` branch rather than on `main`. Tracking `main` would silently
+# undo this provider's concurrency the moment the lock file were regenerated, and tracking
+# `implementation` would let a disposable branch decide what this repository builds against. So the
+# reference names the commit that carries the change, and moves when somebody moves it on purpose.
+# All four crates come from one revision: they share `ono-kuang-protocol`, and two revisions of it
+# in one tree are two incompatible copies of every type that crosses the boundary.
+ono-kuang-sdk = { git = "https://github.com/godspeed-you/ono-sendai", rev = "6167ba586c150db29a68520c2c2725a560a808ba" }
+ono-kuang-protocol = { git = "https://github.com/godspeed-you/ono-sendai", rev = "6167ba586c150db29a68520c2c2725a560a808ba" }
+ono-value = { git = "https://github.com/godspeed-you/ono-sendai", rev = "6167ba586c150db29a68520c2c2725a560a808ba" }
 
 [profile.dev]
 # Line tables keep test backtraces readable at a fraction of full debuginfo's disk cost.
