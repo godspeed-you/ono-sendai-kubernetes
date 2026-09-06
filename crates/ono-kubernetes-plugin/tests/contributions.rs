@@ -591,6 +591,15 @@ fn should_declare_the_same_arguments_in_the_document_and_across_the_handshake() 
 
 /// The workflow that builds the shell the live suite drives.
 const CI: &str = include_str!("../../../.github/workflows/ci.yml");
+
+/// The specification, for the one claim that has to agree with the workflow: §5.1's window.
+const SPECIFICATION: &str = include_str!("../../../docs/architecture/kubernetes-provider.md");
+
+/// What an operator reads instead of the specification.
+const README: &str = include_str!("../../../README.md");
+
+/// The script a maintainer runs to make a cluster, whose default is part of the same claim.
+const CLUSTER_SCRIPT: &str = include_str!("../../../scripts/cluster.sh");
 /// The workspace manifest, which pins the revision this package is built against.
 const WORKSPACE: &str = include_str!("../../../Cargo.toml");
 
@@ -1346,5 +1355,64 @@ fn should_key_curated_semantics_rather_than_branch_on_a_kind_in_query_code() {
             "resource.gvk().group().is_empty() && resource.gvk().kind() == \"Namespace\""
         ),
         "the sole allowed branch is {allowed:?}, and it reads the group as well as the kind"
+    );
+}
+
+#[test]
+fn should_test_the_support_matrix_the_specification_declares_and_the_readme_claims() {
+    // §5.1: "the support statement MUST be expressed as a tested compatibility matrix, not as a
+    // parser guard that rejects other versions", and §62.14's Gate N: "release CI passes against
+    // the declared oldest and newest supported Kubernetes minor versions."
+    //
+    // Nothing asserted anything about it. The matrix existed as three legs in a workflow, and
+    // three claims elsewhere — the specification's §5.1 window, the README's compatibility row,
+    // and `scripts/cluster.sh`'s default version — each of which could drift from the workflow
+    // without a single test noticing. A matrix nobody checks is a claim, and §5.1 asks for a
+    // tested one.
+    //
+    // Three things have to agree, and they are three because each is what a different reader
+    // believes: the specification says which minors are supported, the workflow says which are
+    // exercised, and the README is what an operator reads instead of either.
+    let declared: BTreeSet<&str> = SPECIFICATION
+        .lines()
+        .find(|line| line.contains("that means v1.35 through v1.37"))
+        .map(|_| ["v1.35", "v1.36", "v1.37"].into_iter().collect())
+        .expect("§5.1 declares the support window");
+
+    // What CI actually creates a cluster at, reduced to minors.
+    let exercised: BTreeSet<String> = CI
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- version: "))
+        .map(|version| version.split('.').take(2).collect::<Vec<_>>().join("."))
+        .collect();
+    assert!(
+        !exercised.is_empty(),
+        "the workflow names the versions it creates clusters at"
+    );
+
+    let exercised_refs: BTreeSet<&str> = exercised.iter().map(String::as_str).collect();
+    assert_eq!(
+        exercised_refs, declared,
+        "§62.14: CI exercises exactly the minors §5.1 declares — the oldest and the newest are \
+         the two Gate N names, and a leg that is not in the window is a leg nobody promised"
+    );
+
+    // And the README, because it is what an operator reads instead of the specification.
+    for minor in &declared {
+        assert!(
+            README.contains(minor),
+            "the README's compatibility row names {minor}, which §5.1 declares and CI exercises"
+        );
+    }
+
+    // The default a maintainer gets from `scripts/cluster.sh` is the newest, so an unqualified
+    // local run tests the end of the window most likely to have moved (§59.3).
+    let newest = declared.iter().max().expect("the window is not empty");
+    assert!(
+        CLUSTER_SCRIPT
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("DEFAULT_VERSION="))
+            .is_some_and(|default| default.trim_matches('"').starts_with(newest)),
+        "`scripts/cluster.sh` defaults to the newest declared minor"
     );
 }
