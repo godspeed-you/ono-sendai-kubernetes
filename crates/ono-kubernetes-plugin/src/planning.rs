@@ -815,7 +815,13 @@ pub(crate) fn plan_on<S: ByteStream>(
         plan
     };
     // §55.2: a Namespace deletion "MUST receive enhanced prospective analysis".
-    let plan = if plan.action().is_destructive() && resource.kind() == "Namespace" {
+    //
+    // Group *and* kind, because §13.5 makes GVK the identity. A custom resource called
+    // `Namespace` in somebody else's group is not this Namespace, and counting a cluster's
+    // namespaced inventory as the contents of one would attach a page of unrelated objects to a
+    // deletion plan — and read as a warning about them.
+    let namespace = resource.gvk().group().is_empty() && resource.gvk().kind() == "Namespace";
+    let plan = if plan.action().is_destructive() && namespace {
         let (counted, coverage) =
             namespace_contents(session, client, endpoint, &served, plan.target().name());
         plan.with_contents(counted, coverage)

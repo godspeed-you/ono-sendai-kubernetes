@@ -1256,3 +1256,73 @@ fn should_answer_for_the_core_spatial_relation_target_and_declare_its_capability
         "the edges are read from a cluster, so the command needs the connection too"
     );
 }
+
+// --- §58.4: curated semantics are keyed, not scattered -------------------------------------------
+
+/// Every module of the package crate that answers a query, as source.
+///
+/// `include_str!` rather than a directory walk: a walk over `src/` would pass on a machine where
+/// the files moved, and this asserts a property of *these* modules.
+const HANDLERS: &[(&str, &str)] = &[
+    ("query.rs", include_str!("../src/query.rs")),
+    ("relations.rs", include_str!("../src/relations.rs")),
+    ("spatial.rs", include_str!("../src/spatial.rs")),
+    ("events.rs", include_str!("../src/events.rs")),
+    ("changes.rs", include_str!("../src/changes.rs")),
+    ("evidence.rs", include_str!("../src/evidence.rs")),
+    ("conditions.rs", include_str!("../src/conditions.rs")),
+    ("timeline.rs", include_str!("../src/timeline.rs")),
+    ("why.rs", include_str!("../src/why.rs")),
+    ("logs.rs", include_str!("../src/logs.rs")),
+    ("cluster.rs", include_str!("../src/cluster.rs")),
+    ("mutations.rs", include_str!("../src/mutations.rs")),
+    ("dynamic.rs", include_str!("../src/dynamic.rs")),
+    ("records.rs", include_str!("../src/records.rs")),
+];
+
+#[test]
+fn should_key_curated_semantics_rather_than_branch_on_a_kind_in_query_code() {
+    // §58.4: "curated semantics SHOULD be registered by type capability rather than scattered
+    // `if kind == ...` branches across query code."
+    //
+    // The failure it names is specific and worth stating plainly, because it is the shape this
+    // package would have drifted into one convenience at a time: a handler that asks "is this a
+    // Pod?" in the middle of answering, then a second one that asks it slightly differently, and
+    // eventually a kind whose behaviour depends on which handler you reached it through. The
+    // rule that prevents it is that a kind's semantics are looked up from one table, in the
+    // domain crate, and a handler applies whatever it is handed.
+    //
+    // This counts the branches. Two are allowed and both are named below; a third has to justify
+    // itself here before it can exist, which is the point.
+    let allowed = [
+        // §55.2 requires enhanced prospective analysis for a Namespace deletion by name. Keyed on
+        // the whole GVK, because a custom resource called `Namespace` in somebody else's group is
+        // not this one (§13.5), and counting a cluster's inventory as its contents would attach a
+        // page of unrelated objects to a deletion plan.
+        ("planning.rs", "Namespace"),
+    ];
+    let mut found = Vec::new();
+    for (module, source) in HANDLERS {
+        for (at, line) in source.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or(line);
+            if code.contains("kind() == \"") || code.contains("kind == \"") {
+                found.push(format!("{module}:{}: {}", at + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "§58.4: a handler that branches on a kind is how a package acquires two answers for one \
+         object. These belong in a table in the domain crate:\n{}",
+        found.join("\n")
+    );
+
+    // And the one branch that does exist is keyed on the GVK rather than on the kind alone.
+    let planning = include_str!("../src/planning.rs");
+    assert!(
+        planning.contains(
+            "resource.gvk().group().is_empty() && resource.gvk().kind() == \"Namespace\""
+        ),
+        "the sole allowed branch is {allowed:?}, and it reads the group as well as the kind"
+    );
+}
