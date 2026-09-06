@@ -467,21 +467,16 @@ both halves:
   disagreement (on disk, not answered at handshake) *is* refused, with a good message. This is
   why a discovered CRD cannot earn a name today (ADR-0010), and the asymmetry is worth reporting
   on its own.
-- **A target contribution has nowhere to declare its options, so `--kind` cannot be completed or
-  helped.** `docs/contracts/kuang/contributions.v1.yaml` gives a target `name`, `schema`,
-  `summary` and `identity_doc` and nothing else; the wire type matches and `TargetDocument` is
-  `deny_unknown_fields`, so adding an `options:` key is a hard parse failure. Contributed
-  *commands* have an `options` key in the contract and core drops it anyway
-  (`contract.rs`: "A contribution declares no selectors or options"). `k8s-resource --kind` is
-  therefore discoverable only through its `summary` line and this document.
-- **A contributed command cannot declare its options either, and there it is worse.**
-  `CommandContribution` carries `id`, `verb`, `target`, `summary`, `input`, `output`,
-  `capabilities`, `argument_mode`, `risk` and `examples`. Core's own command contracts additionally
-  carry `selectors` and `options`, and `contributions.v1.yaml` says a contributed command uses "the
-  same metadata schema core commands use" — but the wire type does not carry them and is
-  `deny_unknown_fields`. So `dry_run`, `set`, `unset`, `force_because` and `propagation` are
-  documented in `package/contributions/commands.yaml` and in each summary, and a shell can complete
-  none of them. `dry_run` is the argument that decides whether a cluster changes (ADR-0024).
+- **~~A target contribution has nowhere to declare its options.~~ Closed in core, taken here.**
+  `ADR-0587 (core)` gave a contribution an `options` key that reaches the registry, and every
+  target and command in this package declares every argument its handler reads —
+  `should_declare_only_arguments_a_handler_actually_reads` fails on a declared option nothing
+  consumes, and `should_reach_the_registry_with_every_argument_this_package_declares` drives the
+  real binary. **The lesson that cost the most**: `map` is not a `DeclaredType`, and declaring one
+  made `set k8s-resource` stop resolving in the shell while every test stayed green.
+- **~~A contributed command cannot declare its options either.~~ Closed with the above.**
+  `dry_run`, `set`, `unset`, `force_because` and `propagation` are declared and reach the
+  registry, so the argument that decides whether a cluster changes is one a shell can complete.
 - **The KUANG/11 provider role has one method, and it is a read.** `protocol.v1.yaml` gives the
   provider role `provider.query` and nothing else, so a mutating provider action must be delivered
   as `command.invoke` — which is why the risk and the capability live on a command contribution.
@@ -495,11 +490,12 @@ both halves:
   keys belonging to other domains, and an unknown capability id makes the manifest
   `package.invalid`, so neither claiming one nor inventing a thirtieth is open. What is missing is
   a `provider.mutate` family scoped by provider instance and resource class (ADR-0024).
-- **`audit.event` has no observable channel in the test host.** Generic contract §27.6 asks a
-  security-sensitive provider operation to emit an audit record. The host call exists and needs no
-  capability, and `Shared::plugin_events` in the supervisor has no public accessor — so a test
-  cannot assert that a record was emitted or what it contained, and under "no test, no code" the
-  emission was not written. §51.6 is unmet for that reason and no other.
+- **~~`audit.event` has no observable channel in the test host.~~ Closed in core, taken here.**
+  `ADR-0589 (core)` found that `audit.event` pushed a package's records onto a vector nothing read
+  — not `LoadedPlugin::audit()`, not `get audit`, not the persisted trail — and joined them to the
+  trail the broker writes, under host attribution and a host clock so a package cannot forge
+  either. §51.6 is met: `audit.rs` records connect, denial and mutation, and no function in it
+  takes an `Object` ([ADR-0047](adr/ADR-0047-what-the-broker-cannot-see-is-what-is-worth-recording.md)).
 - **The error registry has no code for a refusal by a provider's own safety rule.** A plan refused
   for a missing precondition reports `safety.policy_denied`, whose summary says *configured*
   policy; nothing was configured, the rule is this provider's. The two nearer codes are worse:
@@ -516,10 +512,9 @@ both halves:
   not in the handshake registry does not decode, and one that decodes but does not match the
   target's declared schema is a `runtime.schema_violation`. So a target with an undeclared schema
   would load happily and fail at its first emit, at runtime rather than at load.
-- **§18.4's "more may exist" does not reach the user.** A listing stopped by a page budget is
-  coverage-complete by design, so the invocation completes and the `may_have_more` flag the domain
-  layer sets is dropped. The value stream has nowhere to carry it, which is the same protocol
-  constraint ADR-0004 records for coverage.
+- **~~§18.4's "more may exist" does not reach the user.~~ Closed.** It reaches twice over:
+  `upstream=more-available` on each record's provenance, and `max_pages` as a declared option so a
+  caller who bounded the answer can see that they did.
 - **The plugin's partial-coverage failure path has no end-to-end test.** It is proven at the
   domain level (`tests/transport.rs` keeps the pages that arrived and attaches the error) and the
   mapping from partial coverage to a failed invocation is read rather than run.
