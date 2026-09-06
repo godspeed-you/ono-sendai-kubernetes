@@ -22,3 +22,9 @@ target
 
 # The gate builds here; nothing under it is source.
 /target
+
+# `scripts/cluster.sh up` writes the ephemeral cluster's kubeconfig under `target/kind/`, which
+# `/target` above already ignores. Named here anyway, because that file carries a client
+# certificate and a bound ServiceAccount token: a reader deciding whether it could ever be
+# committed should not have to reason about which rule covers it.
+/target/kind/

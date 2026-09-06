@@ -16,9 +16,12 @@
 //! fail when it is absent. `ono` is built from core, this repository pins core as a git
 //! dependency, and a test that built a whole second workspace to run would make `cargo test`
 //! here depend on a checkout nobody promised is present. `ONO_BINARY` names it, and a sibling
-//! `ono-sendai` checkout is tried after that. What is skipped is printed, because a test that
+//! `ono-sendai` checkout is tried after that. What is skipped is **announced**, in core's
+//! vocabulary — `SKIPPED <test>: <category>: <detail>` (`ADR-0513 (core)`) — because a test that
 //! quietly does nothing is worse than one that is not there (AGENTS.md §7's rule for anything
-//! outside the deterministic path).
+//! outside the deterministic path). Every row is declared in
+//! `docs/contracts/expected_test_skips.yaml`, which `scripts/gate.sh` checks against this file in
+//! both directions.
 //!
 //! The host must carry `ADR-0584 (core)` and `ADR-0585 (core)`. Against an older `ono` these
 //! tests fail rather than skip, and that is deliberate: an `ono` that has the binary but not the
@@ -50,12 +53,23 @@ const SECOND_POD: &str = "pod-uid-2";
 
 // --- the shell -----------------------------------------------------------------------------------
 
-/// The `ono` binary, or [`None`] with the reason printed.
-fn ono() -> Option<PathBuf> {
+/// Announces a skip the way `ADR-0513 (core)` writes one: `SKIPPED <test>: <category>: <detail>`,
+/// with the category from the closed set of core's §38.4.
+///
+/// The test's own name and its category are passed as literals rather than derived, because
+/// `scripts/gate.sh` reads these call sites to check `docs/contracts/expected_test_skips.yaml`
+/// against the tree. A skip only the running process can name is a skip no register can be
+/// checked against — and the ad-hoc `eprintln!("skipped: …")` this replaced was exactly that.
+fn announce_skip(test: &str, category: &str, detail: &str) {
+    eprintln!("SKIPPED {test}: {category}: {detail}");
+}
+
+/// The `ono` binary, or the sentence a skip should carry.
+fn ono() -> Result<PathBuf, String> {
     if let Some(named) = std::env::var_os("ONO_BINARY") {
         let path = PathBuf::from(named);
         if path.is_file() {
-            return Some(path);
+            return Ok(path);
         }
         panic!(
             "`ONO_BINARY` names `{}`, which is not a file",
@@ -67,15 +81,13 @@ fn ono() -> Option<PathBuf> {
         .parent()
         .map(|parent| parent.join("ono-sendai/target/debug/ono"));
     match sibling {
-        Some(path) if path.is_file() => Some(path),
-        _ => {
-            eprintln!(
-                "skipped: no `ono` binary. `ono` is built from the core repository, which this \
-                 one pins as a git dependency rather than checks out. Set `ONO_BINARY`, or put a \
-                 built core checkout beside this one, to run the spatial outcome tests."
-            );
-            None
-        }
+        Some(path) if path.is_file() => Ok(path),
+        _ => Err(
+            "no `ono` binary. `ono` is built from the core repository, which this one pins as a \
+             git dependency rather than checks out. Set `ONO_BINARY`, or put a built core \
+             checkout beside this one, to run the spatial outcome tests."
+                .to_owned(),
+        ),
     }
 }
 
@@ -415,12 +427,82 @@ fn standing_on_the_pod(cluster: &RecordedCluster, grants: &[&str], then: &str) -
 // --- the tests -----------------------------------------------------------------------------------
 
 #[test]
+fn should_reach_the_registry_with_every_argument_this_package_declares() {
+    // The one thing every other test in this file assumes and none of them checked: that the
+    // *host* reads this package's declarations and accepts them. The package's own tests drive
+    // it through the deterministic test host, which never consults the shell's command registry —
+    // so a declaration the registry refuses passes every one of them and fails the only way a
+    // user would ever meet it.
+    //
+    // It was refused. `set` was declared `map`, which is not a name in the registry's parameter
+    // vocabulary, and the consequence was not a degraded help page: `set k8s-resource` stopped
+    // resolving at all — `resolve.command_not_found`, the whole mutating command gone from the
+    // shell while every test in this repository stayed green. This test is why that cannot
+    // happen quietly again.
+    //
+    // No cluster and no recorded server: what is under test is the declaration, which the host
+    // reads from the documents on disk before any of this package's code runs (§31.68 in core's
+    // specification).
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_reach_the_registry_with_every_argument_this_package_declares",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let home = plugin_home("registry");
+
+    for word in ["get k8s-pod", "set k8s-resource", "remove k8s-resource"] {
+        let run = shell(&binary, &home, &format!("{}; help {word}", load(&[])));
+        assert!(
+            !run.stdout.contains("resolve.command_not_found")
+                && !run.stderr.contains("resolve.command_not_found"),
+            "`{word}` has to resolve in the shell, not only in the test host: {}{}",
+            run.stdout,
+            run.stderr
+        );
+        assert!(
+            run.stdout.contains("--context"),
+            "`{word}` declares `--context`, so its help page shows it: {}{}",
+            run.stdout,
+            run.stderr
+        );
+    }
+
+    // The declared default is the one that decides whether a cluster changes (§44.5), and a
+    // default the registry never accepted is a safe value that exists only in this repository.
+    let run = shell(
+        &binary,
+        &home,
+        &format!("{}; help set k8s-resource", load(&[])),
+    );
+    assert!(
+        run.stdout.contains("--dry_run") && run.stdout.contains("bool (default true)"),
+        "the host applies `dry_run`'s declared default, so the help page states it: {}{}",
+        run.stdout,
+        run.stderr
+    );
+}
+
+#[test]
 fn should_enter_a_kubernetes_object_as_a_place_bound_to_its_lifetime() {
     // Gate A's "entered", and §35.4. The place carries `identity: {uid: …}` and an
     // `identity_tier` of `lifetime`, so the shell is standing on one resource lifetime rather
     // than on the word `checkout` — and `look` reports it as *there*, which needs the re-read of
     // §33.2 to have found it (ADR-0027).
-    let Some(binary) = ono() else { return };
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_enter_a_kubernetes_object_as_a_place_bound_to_its_lifetime",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
     let cluster = RecordedCluster::start();
     let home = plugin_home("enter");
     let run = shell(
@@ -462,7 +544,16 @@ fn should_keep_two_pods_of_one_name_apart_as_two_places() {
     // §4 invariants 4–5 and §35.4, at the one boundary where they could still have been lost: a
     // shell that bound a place to a display name would answer with one place here, because both
     // Pods are called `checkout`.
-    let Some(binary) = ono() else { return };
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_keep_two_pods_of_one_name_apart_as_two_places",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
     let cluster = RecordedCluster::start();
     let home = plugin_home("identity");
     let run = shell(
@@ -504,7 +595,16 @@ fn should_answer_near_with_the_neighbours_this_package_contributes() {
     // reaches the Node the Pod runs on, the ReplicaSet that controls it, the account it runs as,
     // the Service that selects it and the namespace it is in — each of them a place with its own
     // lifetime identity, along a relation this package's manifest declared.
-    let Some(binary) = ono() else { return };
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_answer_near_with_the_neighbours_this_package_contributes",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
     let cluster = RecordedCluster::start();
     let home = plugin_home("near");
     let run = shell(
@@ -572,7 +672,16 @@ fn should_follow_a_contributed_relation_to_the_node_a_pod_runs_on() {
     // §6.4 and §35.7: `follow` traverses one named relationship and leaves the session standing
     // on the far end. The word is the relation the shape registered, because `ADR-0585 (core)`
     // gives a contributed relation no shorter name of its own.
-    let Some(binary) = ono() else { return };
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_follow_a_contributed_relation_to_the_node_a_pod_runs_on",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
     let cluster = RecordedCluster::start();
     let home = plugin_home("follow");
     let run = shell(
@@ -605,7 +714,16 @@ fn should_reach_the_namespace_a_pod_is_in_without_routing_it_through_the_owner()
     // are separate shapes, so following the containment relation lands on the namespace and
     // following the ownership relation lands on the ReplicaSet — and neither is a rename of the
     // other.
-    let Some(binary) = ono() else { return };
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_reach_the_namespace_a_pod_is_in_without_routing_it_through_the_owner",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
     let cluster = RecordedCluster::start();
     let home = plugin_home("containment");
     let run = shell(
@@ -649,7 +767,16 @@ fn should_say_why_up_has_nowhere_to_go_from_a_kubernetes_place() {
     // `docs/contracts/kuang/contributions.v1.yaml` gives a package no way to declare
     // (`ADR-0584 (core)`). What matters is that the refusal says *that* rather than claiming the
     // user has reached the top of this host — a place in a cluster is not the top of a laptop.
-    let Some(binary) = ono() else { return };
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_say_why_up_has_nowhere_to_go_from_a_kubernetes_place",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
     let cluster = RecordedCluster::start();
     let home = plugin_home("up");
     let run = shell(
@@ -676,7 +803,16 @@ fn should_open_no_exit_from_a_kubernetes_place_without_the_relation_write_grant(
     // the *shell* does not draw, because a package without the grant is never asked. The package
     // draws it where it can: invoking the contribution directly is `capability.denied` naming
     // `relation.write`, which `tests/query.rs` holds.
-    let Some(binary) = ono() else { return };
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_open_no_exit_from_a_kubernetes_place_without_the_relation_write_grant",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
     let cluster = RecordedCluster::start();
     let home = plugin_home("ungranted");
     let run = shell(

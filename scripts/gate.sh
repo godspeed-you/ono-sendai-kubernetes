@@ -117,6 +117,73 @@ for file in README.md AGENTS.md CLAUDE.md; do
 done
 echo "instructions: README.md, AGENTS.md and CLAUDE.md name the specification"
 
+# --- every skip is declared, and every declaration is still a skip --------------------------------
+# `docs/contracts/expected_test_skips.yaml` is the register, and this is what makes it one. A live
+# integration test is allowed to skip where its cluster is absent (AGENTS.md section 7), but only
+# visibly: cargo reports a test that returned early as a pass, so an undeclared skip is a green
+# result nobody earned. Core reached the same conclusion in ADR-0513 and this repository borrows
+# its marker rather than inventing a second one.
+#
+# Checked in both directions, because each catches what the other cannot:
+#
+#   tree -> register   a skip site nobody declared is a quiet escape hatch;
+#   register -> tree   a row whose test is gone, or which no longer skips, is a register that has
+#                      fallen behind the suite and can no longer be trusted about the rest.
+#
+# A skip site is a call to `announce_skip("<test>", "<category>", …)`. The test name and the
+# category are literals at the call site precisely so this check can read them without running
+# anything; rustfmt wraps the call across lines, hence the newline squeeze before the match.
+step "skips"
+register="docs/contracts/expected_test_skips.yaml"
+if [[ ! -f "$register" ]]; then
+  fail "$register is missing; every test that can skip has to be declared somewhere"
+else
+  sites="$(mktemp)"; declared="$(mktemp)"
+  trap 'rm -f "$sites" "$declared"' EXIT
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    while IFS= read -r found; do
+      [[ -z "$found" ]] && continue
+      test_name="${found%% *}"
+      category="${found#* }"
+      printf '%s::%s %s\n' "$file" "$test_name" "$category" >> "$sites"
+    done < <(tr '\n' ' ' < "$file" \
+      | grep -oE 'announce_skip\( *"[a-z0-9_]+", *"[a-z_]+"' \
+      | sed -E 's/announce_skip\( *"//; s/", *"/ /; s/"$//')
+    # The ad-hoc form ADR-0513 in core replaced. It reads like a skip and carries no category, so
+    # nothing can check it. Comment lines are stripped first: a file is allowed to *describe* the
+    # shape it no longer uses, and the module documentation of `spatial_shell.rs` does.
+    if sed -E 's|^[[:space:]]*//.*||' "$file" | grep -q 'eprintln!("skipped'; then
+      fail "$file announces a skip without a category; use \`announce_skip\` (ADR-0513 in core)"
+    fi
+  done < <(tracked_and_new 'crates/*/tests/*.rs')
+  sed -nE 's/^  - id: "(.*)"$/\1/p' "$register" > "$declared"
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    if ! grep -qF "$id " "$sites"; then
+      fail "$register declares \`$id\`, which no longer announces a skip"
+      continue
+    fi
+    path="${id%%::*}"
+    name="${id##*::}"
+    grep -qE "fn $name\(" "$path" 2>/dev/null \
+      || fail "$register declares \`$id\`, and $path has no \`fn $name\`"
+    row_category="$(awk -v id="$id" '
+      $0 ~ "^  - id: \"" id "\"$" { found = 1; next }
+      found && /^    category: / { print $2; exit }' "$register")"
+    site_category="$(grep -F "$id " "$sites" | head -1 | awk '{print $2}')"
+    [[ "$row_category" == "$site_category" ]] \
+      || fail "$register declares \`$id\` as \`$row_category\`; it announces \`$site_category\`"
+  done < "$declared"
+  while IFS= read -r site; do
+    [[ -z "$site" ]] && continue
+    id="${site%% *}"
+    grep -qxF "$id" "$declared" \
+      || fail "$id can announce a skip and $register does not declare it"
+  done < "$sites"
+  echo "skips: $(wc -l < "$declared" | tr -d ' ') declared, $(sort -u "$sites" | wc -l | tr -d ' ') announced in the tree"
+fi
+
 # --- the code ------------------------------------------------------------------------------------
 # Skipped only when there is no workspace to build, so that this script keeps working in a
 # checkout that predates the first crate. It is not a way to opt out of the Rust bar.

@@ -26,5 +26,115 @@ jobs:
 
       # The same script a developer runs before every commit, with no CI-only variant: a gate that
       # differs between the two is a gate that disagrees with itself (AGENTS.md section 10).
+      #
+      # It runs **without a cluster**, and that is deliberate. Specification section 59.1 requires
+      # every mandatory conformance test to run without production credentials, so the live suite
+      # skips here — visibly, with the markers `docs/contracts/expected_test_skips.yaml` declares
+      # and this script checks. A gate that needed a cluster to be green would have made the live
+      # tests mandatory by the back door.
       - name: gate
         run: scripts/gate.sh
+
+  kubernetes:
+    # Specification section 62.14, Gate N: "Release CI passes against the declared oldest and
+    # newest supported Kubernetes minor versions." Section 5.1 declares that window as v1.35
+    # through v1.37, section 0.5 records that upstream maintained v1.35, v1.36 and v1.37 when the
+    # specification was written, and section 5.5 asks for "oldest actively supported Kubernetes
+    # minor release targeted by the provider" and "latest actively supported minor release" at
+    # minimum. The two legs below are those two ends.
+    #
+    # Section 59.3's "disposable local Kubernetes clusters such as kind" is `scripts/cluster.sh`,
+    # which creates the cluster and installs every fixture over the Kubernetes API with `curl`.
+    # There is no `kubectl` in this job at any point — the step below removes the one the runner
+    # image ships and proves it is gone, which is what makes Gate M (section 62.13) an observation
+    # here rather than an assumption.
+    name: kubernetes ${{ matrix.version }} (${{ matrix.end }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Both ends are reported. A failure on the oldest supported release is exactly the finding
+      # this matrix exists to surface, and cancelling the newest leg to save a runner minute would
+      # throw away half of the answer.
+      fail-fast: false
+      matrix:
+        include:
+          - version: v1.35.8
+            end: oldest supported minor release
+          - version: v1.37.0
+            end: newest supported minor release
+    env:
+      # The revision of core this repository builds against, from `[workspace.dependencies]` in
+      # `Cargo.toml`. The shell the live tests drive is built from the same commit the package is
+      # compiled against; two revisions in one run would be two incompatible copies of every type
+      # that crosses the boundary.
+      ONO_CORE_REV: e1a44fd7246e0beb99d7edbd95a9a09991963c41
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+    steps:
+      # The two checkouts are laid out as siblings because that is how the repositories sit on a
+      # development machine, and `tests/live_cluster.rs` looks for `../ono-sendai/target/debug/ono`
+      # when `ONO_BINARY` is unset. Here it is set explicitly all the same: a path that is right by
+      # accident is a path that breaks silently.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ono-sendai-kubernetes
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: godspeed-you/ono-sendai
+          ref: ${{ env.ONO_CORE_REV }}
+          path: ono-sendai
+
+      # Gate M, made true rather than assumed. The `ubuntu-latest` image ships `kubectl`, so a run
+      # on it would otherwise prove nothing about a machine without one — and
+      # `should_answer_a_live_read_on_a_machine_with_no_kubectl` fails the run if it finds one on
+      # `PATH`, so this step is load-bearing rather than tidy.
+      - name: remove kubectl
+        run: |
+          for _ in 1 2 3 4 5; do
+            path="$(command -v kubectl 2>/dev/null)" || break
+            sudo rm -f "$path"
+          done
+          if command -v kubectl >/dev/null 2>&1; then
+            echo "kubectl is still on PATH at $(command -v kubectl)" >&2
+            exit 1
+          fi
+          echo "no kubectl on PATH (specification section 62.13)"
+
+      # Pinned by version *and* by digest. kind is the cluster's own installer; a supply chain
+      # that resolves "latest" at run time would decide what this gate ran against.
+      - name: install kind
+        run: |
+          curl -fsSLo /tmp/kind \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  /tmp/kind" | sha256sum --check --strict -
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          kind version
+
+      # `ono` is core's binary, and this repository pins core as a git dependency rather than
+      # vendoring it, so the shell the live tests drive has to be built here. It is built once per
+      # matrix leg rather than shared as an artifact: passing it between jobs would add two more
+      # third-party actions to pin for the sake of a few minutes, and the honest trade is stated in
+      # ADR-0034 rather than hidden in a cache key.
+      - name: build ono from core
+        working-directory: ono-sendai
+        run: cargo build -p ono-cli --bin ono
+
+      - name: create the cluster and its fixtures
+        working-directory: ono-sendai-kubernetes
+        run: |
+          echo "ONO_K8S_KUBECONFIG=$(scripts/cluster.sh up --version '${{ matrix.version }}')" \
+            >> "$GITHUB_ENV"
+
+      # The live acceptance gates (specification section 59.3), plus the spatial outcome tests,
+      # which skip on the `gate` job for want of an `ono` binary and have one here.
+      - name: live acceptance gates against ${{ matrix.version }}
+        working-directory: ono-sendai-kubernetes
+        env:
+          ONO_BINARY: ${{ github.workspace }}/ono-sendai/target/debug/ono
+          ONO_K8S_EXPECT_VERSION: ${{ matrix.version }}
+        run: cargo test -p ono-kubernetes-plugin --test live_cluster --test spatial_shell
+
+      # `up` deletes the cluster it created when it fails, and this deletes the one it did not.
+      - name: delete the cluster
+        if: always()
+        working-directory: ono-sendai-kubernetes
+        run: scripts/cluster.sh down

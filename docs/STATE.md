@@ -345,30 +345,64 @@ plain HTTP. What it establishes is that the route exists and the contracts hold 
 
 ## In progress
 
-Nothing is half-written. The three items this section carried are all done. What is next, in the
-order the phases make each other verifiable — and the first two are the only two things standing
-between here and a claimed level:
+Everything this section carried on the morning of 2026-09-06 is done and committed: Gate J's
+concurrency, the spatial half, the log `follow`, the `SelfSubjectAccessReview` preflight, K5's two
+requirements, the three K2 relationship gaps, and the ephemeral-cluster harness.
 
-- **Two invocations at once (Gate J, §6.5, §62.10, K0).** Bump the pinned core past `ADR-0586`,
-  make `sessions::Sessions` `Send + Sync` — `Arc` and a lock where `Rc` and `RefCell` are today,
-  and the reason the ADR gave for the latter has expired — declare
-  `Plugin::concurrent_invocations(n)` and `runtime.max_concurrent_invocations`, and rewrite
-  `tests/isolation.rs` so the two contexts overlap. Nothing about this is Kubernetes knowledge,
-  and it is the last thing K0 waits on.
-- ~~**A Kubernetes object that is somewhere (Gate A, K1, K2, §35.2, §35.3, §35.5, §35.6,
-  §53.1–3).**~~ **Done, but for `up` and `map`.** `package/manifest.yaml` declares thirty-three
-  `contributions.relations` shapes between the schemas its targets already declare, and
-  `spatial.rs` answers for the shell's own `spatial-relation` target under a `relation.write`
-  grant. `enter`, `near` and `follow` reach a cluster over the real `ono` binary
-  (`tests/spatial_shell.rs`), and **Gate A's five verbs are all reachable**, "entered" included,
-  for a CRD invented after the build. `up` refuses with `spatial.no_parent` because §36.4's
-  aggregate space is not a package's to declare, and the spatial parent is reachable instead as
-  the `…_to_namespace` relation, distinct from `…_to_replicaset` because §35.6 is explicit that
-  where a Pod *is* and what owns it are two questions. `map` is untried and unclaimed. ADR-0027.
-- **A live view rather than a live stream (§41.1, K3).** The one unmet K3 requirement. `live.rs`
-  is written, tested and unimported, and `stale` is the state that reaches nobody.
-- **A `SelfSubjectAccessReview` (§21.2, §46.2, K4).** The one unmet K4 requirement, and the
-  `AUTHORIZATION` line of Appendix E. `plan::Preflight` has the slot.
+**One thing is written and not committed**: `scripts/cluster.sh`, `tests/live_cluster.rs`,
+`docs/contracts/expected_test_skips.yaml`, the `skips` step in `scripts/gate.sh`, the Kubernetes
+matrix in `.github/workflows/ci.yml` and `ADR-0034`. The gate was green over exactly that tree
+(726 tests, `skips: 17 declared, 17 announced`) and both cluster legs ran — `kindest/node:v1.35.8`
+and `v1.37.0`, 11 live tests each, with `kubectl` absent from the machine. It is uncommitted only
+because the session's shell became unusable before the commit (see *Deferred / blocked*).
+
+### What the audit of 2026-09-06 found still open
+
+A requirement-by-requirement audit of the whole specification and of the inherited generic
+contract, taken against the tree rather than against this board. **Five unmet `MUST`s**, in the
+order their absence bites:
+
+1. **§34.2 — an unavailable aggregated API group fails the whole provider.** `query::document`
+   returns `provider.unavailable` for any non-200 on a discovery path, and `resolve_in` and
+   `relations::catalogue` propagate it with `?` while looping over every preferred group-version.
+   One `APIService` answering 503 breaks `get k8s-resource` without `--group`, `get k8s-relation`
+   and every catalogue query. This is §4 invariant 16 and generic §3.5 as well, and §34.2's second
+   sentence — coverage reports the failed group-version separately — falls out of the same change:
+   record a `Gap` on the query's `Coverage` and continue.
+2. **§57.1 — manifest-declared capability is not distinguished from session-effective capability.**
+   `Session::negotiate`/`negotiated` have no production caller and `CLUSTER_FIELDS` carries no
+   capability. Generic §26.1 says the same thing in the generic vocabulary.
+3. **§41.1 — the inherited live-view contract is not used.** `live.rs` still has no importer, so
+   `stale` is the one of §41.4's six states that reaches nobody. `ADR-0588 (core)` removed the
+   reason it could not be wired: a contributed target now declares whether its answer ends, and an
+   unbounded one becomes the stream the shell's live view is fed by. Bumping the pin and declaring
+   `k8s-change` unbounded is the first half; a view state that reaches a record is the second.
+4. **Generic §16.5 — a successful mutation invalidates nothing.** `mutations.rs` touches the
+   session only for discovery, so a watch-seeded cache keeps serving the pre-change object with
+   `origin=cache` after `set k8s-resource` succeeds. The `MUST NOT` half holds; the `MUST` half
+   needs `Session::forget_object` on the mutation path.
+5. **§11.4 — discovery refresh has no caller.** `crd_updated`, `group_version_changed` and
+   `group_withdrawn` are written and tested and nothing invokes them; only a cluster *replacement*
+   clears discovery. §33.2's five CRD-lifecycle detections are the same gap.
+
+**The `SHOULD`s worth taking, roughly in order of operational bite:** server-side label and field
+selectors are never pushed (§17.3–§17.5 — `ListOptions::label_selector` has no caller outside its
+own tests); `Coverage::may_have_more` reaches no record, so `--max_pages 1` on a ten-page
+collection looks complete (§18.4); `Client::list` buffers every page before emitting (§18.5,
+generic §12.4); `budget.rs` is still unimported, so nothing estimates breadth (§17.6), throttles
+(§49.5) or honours `Retry-After` (§49.2) even though all three are written and tested; aggregated
+Discovery is never negotiated (§11.2); NetworkPolicy has no selector-derived edge (§31.1,
+Appendix A row 19); Pod/container runtime IDs and load-balancer addresses are not exported as
+evidence (§47.3, §47.4); no plan warns that an HPA may reconcile a replica change (§54.2, §54.1);
+a Namespace deletion gets no enhanced analysis (§55.2); the action surface is one JSON-pointer
+apply rather than §43.3's seven, and it is not labelled the low-level escape hatch §43.4 asks for;
+a `--set` at `/status/...` is neither routed to the subresource nor refused (§33.6); Tier 2's
+seventeen kinds are readable dynamically and none is curated (§15.3); `release_watch` has no
+caller (§19.7); eight of Appendix B's words have no producer.
+
+**Two documents to correct:** `README.md` still says no CI job runs against any Kubernetes version,
+which `.github/workflows/ci.yml` contradicts; and `docs/coverage.md` is a snapshot at `ad03456`,
+nine commits and nine ADRs stale.
 
 ## The transport decision, and what it costs
 
@@ -574,6 +608,23 @@ both halves:
   deliberate opt-in default is worth adding is open.
 
 ## Deferred / blocked
+
+- **The session's shell died on a full `/tmp`, and one increment is uncommitted because of it
+  (2026-09-06).** `/tmp` on this machine is a 30.4 GB tmpfs mounted `usrquota`, and uid 1000
+  reached its quota during the day's work — a docker image build with a 56 GB repository as its
+  context, two `kind` clusters and the test suites' scratch directories between them. Every write
+  under `/tmp` then returns `EDQUOT`, and the agent harness stages each shell command there, so
+  every command — down to `true` — exits 1 with no output. Diagnosed with `Read`/`Write` probes
+  after the shell stopped answering: a six-byte write to `/tmp` gives `EDQUOT`, the same write to
+  `/home` and to `/dev/shm` succeeds, `/proc/meminfo` shows `Shmem: 24 GB`, and `/` is not full.
+
+  Nothing is lost: the work is on disk and the gate was green over it. What is owed is one commit,
+  after a shell outside the session runs `du -xh --max-depth=1 /tmp | sort -h | tail` and clears
+  the scratch entries — which also returns the 24 GB to RAM, `/tmp` being tmpfs. What to keep
+  while clearing: `/tmp/claude-*`. **The lesson worth keeping**: `scripts/acceptance.sh` builds
+  with the repository root as the docker context, and `target/` in this tree and in core's is
+  56 GB of it. A `.dockerignore` naming `target/` would have prevented the whole failure, and it
+  belongs in core beside the Dockerfile.
 
 - **A discovered CRD earning a *name* is still open**, and needs a change in core. `k8s-resource`
   is the floor: every kind is reachable, spelled as options. The nicer shape — a discovered

@@ -1,0 +1,107 @@
+# The expected test skip set of the Kubernetes provider, as data.
+#
+# `AGENTS.md` §2 reserves `docs/contracts/` for exactly this: a **contract** is a machine-readable
+# file, a **specification** is a narrative one, and this is the first of the former this
+# repository has needed. It is modelled on core's
+# `docs/contracts/hardening/expected_test_skips.yaml` and shares its vocabulary, because a second
+# spelling of the same idea is how two registries start disagreeing.
+#
+# Why it exists here. `AGENTS.md` §7 allows live integration tests "behind explicit credentials
+# and CI gates", and says they are "never what the gate depends on". That is only true while a
+# skip is *visible*: a test that returns quietly is reported by cargo as a pass, and a suite whose
+# live half silently does nothing looks exactly like one whose live half works. So every test that
+# can skip announces `SKIPPED <test>: <category>: <detail>` (`ADR-0513 (core)`), and this file is
+# the list of tests allowed to say it.
+#
+# `scripts/gate.sh` checks this register against the tree in both directions:
+#
+#   * a skip site with no row here fails the gate — nobody gets to add a quiet escape hatch;
+#   * a row whose test no longer exists, or no longer has a skip site, fails it too — the register
+#     cannot fall behind the suite it describes.
+#
+# Fields of a row
+#
+#   id            `<path>::<test>`, the form a proof is named by.
+#   category      one of the six of core's §38.4:
+#                 `missing_kernel_feature | missing_privilege | unsupported_arch |
+#                  unsupported_distribution | external_tool_unavailable | fixture_not_applicable`
+#   prerequisite  what a maintainer would have to supply for the test to run. This is the sentence
+#                 read when deciding whether CI could supply it instead.
+
+version: 1
+
+declared:
+  # --- the live cluster suite ------------------------------------------------------------------
+  #
+  # Specification §59.3's disposable local cluster. Every row shares one prerequisite, because
+  # `Live::open` resolves all three of its preconditions together and skips on the first one that
+  # is missing: the `ono` binary (built from core, which this repository pins as a git dependency
+  # rather than checks out), `ONO_K8S_KUBECONFIG` naming a kubeconfig, and `curl` for the two
+  # objects the harness itself has to create. `scripts/cluster.sh up` supplies the second and
+  # prints the path.
+  #
+  # **CI supplies these on the `kubernetes` matrix job and nowhere else.** The `gate` job runs
+  # without a cluster on purpose: the deterministic suite is what the gate depends on (§59.1), and
+  # a gate that needed a cluster to be green would have made the live tests mandatory by the back
+  # door.
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_reach_a_cluster_a_kubeconfig_context_names_and_report_the_version_it_serves"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` makes the cluster and prints the kubeconfig"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_list_a_built_in_kind_and_read_one_object_at_its_own_endpoint"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` makes the cluster and prints the kubeconfig"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_type_a_custom_kind_the_cluster_learned_after_this_package_was_built"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` installs the three CRDs this test reads"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_keep_two_lifetimes_of_one_name_apart_across_a_delete_and_a_recreate"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — the recreate is the harness's own, because this provider creates nothing it was not asked to change"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_report_a_denied_namespace_as_a_denial_rather_than_an_empty_result"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — the kubeconfig must carry the `ono-restricted` context `scripts/cluster.sh up` writes"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_report_a_deletion_held_by_a_finalizer_as_terminating_rather_than_deleted"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` installs the ConfigMap held by `ono.test/hold`"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_walk_a_deployment_to_the_node_over_objects_a_control_plane_produced"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` waits for the ReplicaSet and the scheduled Pod before it returns"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_reach_the_pod_behind_a_service_through_the_endpointslice_the_cluster_wrote"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` waits for the EndpointSlice the control plane writes"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_observe_a_real_create_on_a_watch_of_a_kind_invented_for_the_test"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — the create the watch observes is made by the test while the watch is open"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_answer_a_live_read_on_a_machine_with_no_kubectl"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — and a machine with no `kubectl` on `PATH`, which the test asserts rather than assumes (Gate M)"
+
+  # --- the spatial outcome suite ----------------------------------------------------------------
+  #
+  # These contact no cluster: the API server is a `TcpListener` in the test process answering from
+  # recorded documents (§59.1). What they need is the **shell**, and `ono` is built from core.
+  # Setting `ONO_BINARY`, or putting a built core checkout beside this one, is the whole of the
+  # prerequisite — and CI's `gate` job supplies neither today, which is why these rows exist.
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_reach_the_registry_with_every_argument_this_package_declares"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_enter_a_kubernetes_object_as_a_place_bound_to_its_lifetime"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_keep_two_pods_of_one_name_apart_as_two_places"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_answer_near_with_the_neighbours_this_package_contributes"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_follow_a_contributed_relation_to_the_node_a_pod_runs_on"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_reach_the_namespace_a_pod_is_in_without_routing_it_through_the_owner"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_say_why_up_has_nowhere_to_go_from_a_kubernetes_place"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_open_no_exit_from_a_kubernetes_place_without_the_relation_write_grant"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
