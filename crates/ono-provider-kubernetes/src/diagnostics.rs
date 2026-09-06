@@ -914,6 +914,15 @@ pub enum ProviderCapability {
     Attach,
     /// Forwarding a local port into the cluster (§42.5).
     PortForward,
+    /// Merging several kubeconfig files the way `KUBECONFIG` asks for (§7.2).
+    ///
+    /// Reported because §7.2 requires it. Its sentence is conditional — "if the host chooses to
+    /// honor `KUBECONFIG` multi-file merge semantics, it SHOULD match standard Kubernetes client
+    /// behavior" — and then unconditional: "any intentional deviation MUST be documented **and
+    /// surfaced by `explain provider` or equivalent diagnostics**". This provider reads one file,
+    /// which is a deviation from what a `kubectl` user expects, and a deviation a reader has to
+    /// find in a document is one they find after it has already surprised them.
+    KubeconfigMerge,
 }
 
 impl ProviderCapability {
@@ -929,6 +938,7 @@ impl ProviderCapability {
             Self::RemoteExec => "remote exec",
             Self::Attach => "attach",
             Self::PortForward => "port forward",
+            Self::KubeconfigMerge => "kubeconfig merge",
         }
     }
 
@@ -947,13 +957,15 @@ impl ProviderCapability {
             | Self::Mutations
             | Self::RemoteLogs
             | Self::SubjectAccessReview => Support::ByProvider,
-            Self::RemoteExec | Self::Attach | Self::PortForward => Support::NotByProvider,
+            Self::RemoteExec | Self::Attach | Self::PortForward | Self::KubeconfigMerge => {
+                Support::NotByProvider
+            }
         }
     }
 
     /// Every capability this provider reports on, in one fixed order.
     #[must_use]
-    pub fn all() -> [Self; 8] {
+    pub fn all() -> [Self; 9] {
         [
             Self::Watch,
             Self::Relationships,
@@ -963,6 +975,7 @@ impl ProviderCapability {
             Self::RemoteExec,
             Self::Attach,
             Self::PortForward,
+            Self::KubeconfigMerge,
         ]
     }
 }

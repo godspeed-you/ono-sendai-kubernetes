@@ -961,3 +961,32 @@ async fn should_record_what_the_broker_cannot_see_in_the_audit_trail() {
     }
     plugin.shutdown(ShutdownReason::Unload).await;
 }
+
+#[tokio::test]
+async fn should_surface_the_kubeconfig_deviation_rather_than_only_documenting_it() {
+    // §7.2's unconditional half: "any intentional deviation MUST be documented and surfaced by
+    // `explain provider` or equivalent diagnostics". This provider reads one kubeconfig file and
+    // does not merge a `KUBECONFIG` list, which is a deviation from what a `kubectl` user
+    // expects — and a deviation a reader has to find in a document is one they find after it has
+    // surprised them.
+    //
+    // It rides on §57.1's report rather than on a mechanism of its own, because the question is
+    // the same question: what does this provider support, and what did this session find.
+    let cluster = RecordedCluster::new("kube-system-uid", Review::Answers);
+    let plugin = loaded(Arc::clone(&cluster)).await;
+    let (events, result) = plugin
+        .query("k8s-cluster", at("cluster.test", "recorded"))
+        .await
+        .expect("the diagnostic answers")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let record = records(&events).first().cloned().expect("one record");
+
+    assert_eq!(
+        capability_of(&record, "kubeconfig merge"),
+        "not supported by provider, unavailable in any session",
+        "a `kubectl` user reading this finds out here rather than by losing a context"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
