@@ -1669,6 +1669,150 @@ const CLUSTER_FIELDS: &[Field] = &[
     Field::nullable("discovery", "map"),
 ];
 
+// --- §15.3's Tier 2: platform operation ----------------------------------------------------------
+//
+// The seventeen kinds §15.3 lists, in the order it lists them. They are curated for the reason
+// §15.1 gives: every one of them was already readable through `k8s-resource`, and a curated noun
+// is "a better answer for a kind rather than the only answer for it". What makes them *better* is
+// the projection — a Role's rules kept as rules rather than as an untyped blob, a quota's `hard`
+// beside its `used`, an autoscaler's desired count beside its current one.
+//
+// Most of them are rules rather than state, and §15.5's projection for a rule is to keep it: which
+// keys an RBAC rule or an admission webhook states *is* the intent, and flattening one into a
+// sentence would be §12.3's prohibition with extra steps.
+
+const HORIZONTALPODAUTOSCALER_FIELDS: [Field; 19] = with_metadata(
+    true,
+    &[
+        Field::nullable("scale_target", "string"),
+        Field::nullable("min_replicas", "int"),
+        Field::nullable("max_replicas", "int"),
+        Field::nullable("current_replicas", "int"),
+        Field::nullable("desired_replicas", "int"),
+        Field::nullable("last_scale_time", "timestamp"),
+    ],
+);
+
+const PODDISRUPTIONBUDGET_FIELDS: [Field; 20] = with_metadata(
+    true,
+    &[
+        Field::nullable("min_available", "string"),
+        Field::nullable("max_unavailable", "string"),
+        Field::nullable("selector", "map"),
+        Field::nullable("disruptions_allowed", "int"),
+        Field::nullable("current_healthy", "int"),
+        Field::nullable("desired_healthy", "int"),
+        Field::nullable("expected_pods", "int"),
+    ],
+);
+
+const RESOURCEQUOTA_FIELDS: [Field; 16] = with_metadata(
+    true,
+    &[
+        Field::nullable("hard", "map"),
+        Field::nullable("used", "map"),
+        Field::nullable("scopes", "list<string>"),
+    ],
+);
+
+const LIMITRANGE_FIELDS: [Field; 14] =
+    with_metadata(true, &[Field::nullable("limits", "list<map>")]);
+
+const ROLE_FIELDS: [Field; 14] = with_metadata(true, &[Field::nullable("rules", "list<map>")]);
+
+const CLUSTERROLE_FIELDS: [Field; 14] = with_metadata(
+    false,
+    &[
+        Field::nullable("rules", "list<map>"),
+        Field::nullable("aggregation_rule", "map"),
+    ],
+);
+
+const ROLEBINDING_FIELDS: [Field; 15] = with_metadata(
+    true,
+    &[
+        Field::nullable("role_ref", "map"),
+        Field::nullable("subjects", "list<map>"),
+    ],
+);
+
+const CLUSTERROLEBINDING_FIELDS: [Field; 14] = with_metadata(
+    false,
+    &[
+        Field::nullable("role_ref", "map"),
+        Field::nullable("subjects", "list<map>"),
+    ],
+);
+
+const LEASE_FIELDS: [Field; 17] = with_metadata(
+    true,
+    &[
+        Field::nullable("holder", "string"),
+        Field::nullable("lease_duration_seconds", "int"),
+        Field::nullable("renew_time", "timestamp"),
+        Field::nullable("acquire_time", "timestamp"),
+    ],
+);
+
+const PRIORITYCLASS_FIELDS: [Field; 16] = with_metadata(
+    false,
+    &[
+        Field::nullable("value", "int"),
+        Field::nullable("global_default", "bool"),
+        Field::nullable("preemption_policy", "string"),
+        Field::nullable("description", "string"),
+    ],
+);
+
+const RUNTIMECLASS_FIELDS: [Field; 15] = with_metadata(
+    false,
+    &[
+        Field::nullable("handler", "string"),
+        Field::nullable("overhead", "map"),
+        Field::nullable("scheduling", "map"),
+    ],
+);
+
+const CSIDRIVER_FIELDS: [Field; 17] = with_metadata(
+    false,
+    &[
+        Field::nullable("attach_required", "bool"),
+        Field::nullable("pod_info_on_mount", "bool"),
+        Field::nullable("storage_capacity", "bool"),
+        Field::nullable("fs_group_policy", "string"),
+        Field::nullable("volume_lifecycle_modes", "list<string>"),
+    ],
+);
+
+const CSINODE_FIELDS: [Field; 13] =
+    with_metadata(false, &[Field::nullable("drivers", "list<map>")]);
+
+const VOLUMEATTACHMENT_FIELDS: [Field; 17] = with_metadata(
+    false,
+    &[
+        Field::nullable("attacher", "string"),
+        Field::nullable("node", "string"),
+        Field::nullable("source_volume", "string"),
+        Field::nullable("attached", "bool"),
+        Field::nullable("attach_error", "string"),
+    ],
+);
+
+const MUTATINGWEBHOOKCONFIGURATION_FIELDS: [Field; 13] =
+    with_metadata(false, &[Field::nullable("webhooks", "list<map>")]);
+
+const VALIDATINGWEBHOOKCONFIGURATION_FIELDS: [Field; 13] =
+    with_metadata(false, &[Field::nullable("webhooks", "list<map>")]);
+
+const VALIDATINGADMISSIONPOLICY_FIELDS: [Field; 15] = with_metadata(
+    false,
+    &[
+        Field::nullable("failure_policy", "string"),
+        Field::nullable("match_constraints", "map"),
+        Field::nullable("validations", "list<map>"),
+    ],
+);
+
 /// The targets this package answers for.
 ///
 /// **All nineteen of §15.2's Tier 1 set, in the order §15.2 lists them**, plus the dynamic noun
@@ -1952,6 +2096,252 @@ pub static TARGETS: &[Target] = &[
             kind: "NetworkPolicy",
         },
         fields: &NETWORKPOLICY_FIELDS,
+    },
+    Target {
+        name: "k8s-horizontalpodautoscaler",
+        schema: "io.github.godspeed-you.kubernetes.horizontalpodautoscaler/1",
+        schema_name: "KubernetesHorizontalPodAutoscaler",
+        schema_summary: "An autoscaler: what it scales, the bounds it may scale between, and \
+                         where the controller has it now.",
+        summary: "HorizontalPodAutoscalers, what they scale, and where the replica count stands.",
+        identity_doc: "Two observations are the same autoscaler when their `metadata.uid` \
+                       matches.",
+        reads: Reads::Kind {
+            group: "autoscaling",
+            kind: "HorizontalPodAutoscaler",
+        },
+        fields: &HORIZONTALPODAUTOSCALER_FIELDS,
+    },
+    Target {
+        name: "k8s-poddisruptionbudget",
+        schema: "io.github.godspeed-you.kubernetes.poddisruptionbudget/1",
+        schema_name: "KubernetesPodDisruptionBudget",
+        schema_summary: "A disruption budget: what it protects, the intent it states, and how \
+                         much room the controller says is left.",
+        summary: "PodDisruptionBudgets, and how much voluntary disruption they currently allow.",
+        identity_doc: "Two observations are the same budget when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "policy",
+            kind: "PodDisruptionBudget",
+        },
+        fields: &PODDISRUPTIONBUDGET_FIELDS,
+    },
+    Target {
+        name: "k8s-resourcequota",
+        schema: "io.github.godspeed-you.kubernetes.resourcequota/1",
+        schema_name: "KubernetesResourceQuota",
+        schema_summary: "A quota: the limits set on a namespace, what has been consumed against \
+                         them, and which objects they apply to.",
+        summary: "ResourceQuotas: what a namespace may use, and what it has used.",
+        identity_doc: "Two observations are the same quota when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "",
+            kind: "ResourceQuota",
+        },
+        fields: &RESOURCEQUOTA_FIELDS,
+    },
+    Target {
+        name: "k8s-limitrange",
+        schema: "io.github.godspeed-you.kubernetes.limitrange/1",
+        schema_name: "KubernetesLimitRange",
+        schema_summary: "A limit range: the per-object bounds and defaults a namespace applies, \
+                         in the structure the API states them.",
+        summary: "LimitRanges, and the defaults and bounds they impose on a namespace.",
+        identity_doc: "Two observations are the same range when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "",
+            kind: "LimitRange",
+        },
+        fields: &LIMITRANGE_FIELDS,
+    },
+    Target {
+        name: "k8s-role",
+        schema: "io.github.godspeed-you.kubernetes.role/1",
+        schema_name: "KubernetesRole",
+        schema_summary: "A namespaced role: the rules it grants, in the structure the API states \
+                         them.",
+        summary: "Roles, and the rules they grant inside one namespace.",
+        identity_doc: "Two observations are the same role when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "rbac.authorization.k8s.io",
+            kind: "Role",
+        },
+        fields: &ROLE_FIELDS,
+    },
+    Target {
+        name: "k8s-clusterrole",
+        schema: "io.github.godspeed-you.kubernetes.clusterrole/1",
+        schema_name: "KubernetesClusterRole",
+        schema_summary: "A cluster-wide role: the rules it grants, and whether it is assembled \
+                         from others.",
+        summary: "ClusterRoles, and the rules they grant across a cluster.",
+        identity_doc: "Two observations are the same role when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "rbac.authorization.k8s.io",
+            kind: "ClusterRole",
+        },
+        fields: &CLUSTERROLE_FIELDS,
+    },
+    Target {
+        name: "k8s-rolebinding",
+        schema: "io.github.godspeed-you.kubernetes.rolebinding/1",
+        schema_name: "KubernetesRoleBinding",
+        schema_summary: "A namespaced binding: the role it grants and the subjects it grants it \
+                         to.",
+        summary: "RoleBindings: who holds which role in a namespace.",
+        identity_doc: "Two observations are the same binding when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "rbac.authorization.k8s.io",
+            kind: "RoleBinding",
+        },
+        fields: &ROLEBINDING_FIELDS,
+    },
+    Target {
+        name: "k8s-clusterrolebinding",
+        schema: "io.github.godspeed-you.kubernetes.clusterrolebinding/1",
+        schema_name: "KubernetesClusterRoleBinding",
+        schema_summary: "A cluster-wide binding: the role it grants and the subjects it grants it \
+                         to.",
+        summary: "ClusterRoleBindings: who holds which role across the whole cluster.",
+        identity_doc: "Two observations are the same binding when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "rbac.authorization.k8s.io",
+            kind: "ClusterRoleBinding",
+        },
+        fields: &CLUSTERROLEBINDING_FIELDS,
+    },
+    Target {
+        name: "k8s-lease",
+        schema: "io.github.godspeed-you.kubernetes.lease/1",
+        schema_name: "KubernetesLease",
+        schema_summary: "A lease: who holds it, for how long, and when it was last renewed.",
+        summary: "Leases, and which identity currently holds one.",
+        identity_doc: "Two observations are the same lease when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "coordination.k8s.io",
+            kind: "Lease",
+        },
+        fields: &LEASE_FIELDS,
+    },
+    Target {
+        name: "k8s-priorityclass",
+        schema: "io.github.godspeed-you.kubernetes.priorityclass/1",
+        schema_name: "KubernetesPriorityClass",
+        schema_summary: "A priority class: the value it carries, whether it is the default, and \
+                         what it may preempt.",
+        summary: "PriorityClasses, and what they mean to the scheduler.",
+        identity_doc: "Two observations are the same class when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "scheduling.k8s.io",
+            kind: "PriorityClass",
+        },
+        fields: &PRIORITYCLASS_FIELDS,
+    },
+    Target {
+        name: "k8s-runtimeclass",
+        schema: "io.github.godspeed-you.kubernetes.runtimeclass/1",
+        schema_name: "KubernetesRuntimeClass",
+        schema_summary: "A runtime class: the handler it selects, the overhead it declares, and \
+                         where it may be scheduled.",
+        summary: "RuntimeClasses, and which container runtime handler each selects.",
+        identity_doc: "Two observations are the same class when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "node.k8s.io",
+            kind: "RuntimeClass",
+        },
+        fields: &RUNTIMECLASS_FIELDS,
+    },
+    Target {
+        name: "k8s-csidriver",
+        schema: "io.github.godspeed-you.kubernetes.csidriver/1",
+        schema_name: "KubernetesCsiDriver",
+        schema_summary: "A registered CSI driver: what the kubelet must do for it, and which \
+                         volume lifecycles it supports.",
+        summary: "CSIDrivers registered on this cluster, and what each supports.",
+        identity_doc: "Two observations are the same driver when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "storage.k8s.io",
+            kind: "CSIDriver",
+        },
+        fields: &CSIDRIVER_FIELDS,
+    },
+    Target {
+        name: "k8s-csinode",
+        schema: "io.github.godspeed-you.kubernetes.csinode/1",
+        schema_name: "KubernetesCsiNode",
+        schema_summary: "One node's CSI driver registrations, including the node id each driver \
+                         knows it by.",
+        summary: "CSINode registrations: which drivers each node has, and what the storage system \
+                  calls it there.",
+        identity_doc: "Two observations are the same registration when their `metadata.uid` \
+                       matches. A CSINode shares its *name* with the Node it describes and is a \
+                       different object with its own lifetime, which is exactly why §4 invariants \
+                       4 and 5 key on the uid.",
+        reads: Reads::Kind {
+            group: "storage.k8s.io",
+            kind: "CSINode",
+        },
+        fields: &CSINODE_FIELDS,
+    },
+    Target {
+        name: "k8s-volumeattachment",
+        schema: "io.github.godspeed-you.kubernetes.volumeattachment/1",
+        schema_name: "KubernetesVolumeAttachment",
+        schema_summary: "One attachment of one volume to one node, with what the attacher said if \
+                         it failed.",
+        summary: "VolumeAttachments: which volume is attached to which node, and whether the \
+                  attach succeeded.",
+        identity_doc: "Two observations are the same attachment when their `metadata.uid` \
+                       matches.",
+        reads: Reads::Kind {
+            group: "storage.k8s.io",
+            kind: "VolumeAttachment",
+        },
+        fields: &VOLUMEATTACHMENT_FIELDS,
+    },
+    Target {
+        name: "k8s-mutatingwebhookconfiguration",
+        schema: "io.github.godspeed-you.kubernetes.mutatingwebhookconfiguration/1",
+        schema_name: "KubernetesMutatingWebhookConfiguration",
+        schema_summary: "A mutating admission configuration: each webhook, what it intercepts, \
+                         and what happens when it does not answer.",
+        summary: "MutatingWebhookConfigurations: what rewrites objects on the way in.",
+        identity_doc: "Two observations are the same configuration when their `metadata.uid` \
+                       matches.",
+        reads: Reads::Kind {
+            group: "admissionregistration.k8s.io",
+            kind: "MutatingWebhookConfiguration",
+        },
+        fields: &MUTATINGWEBHOOKCONFIGURATION_FIELDS,
+    },
+    Target {
+        name: "k8s-validatingwebhookconfiguration",
+        schema: "io.github.godspeed-you.kubernetes.validatingwebhookconfiguration/1",
+        schema_name: "KubernetesValidatingWebhookConfiguration",
+        schema_summary: "A validating admission configuration: each webhook, what it intercepts, \
+                         and what happens when it does not answer.",
+        summary: "ValidatingWebhookConfigurations: what can refuse a change.",
+        identity_doc: "Two observations are the same configuration when their `metadata.uid` \
+                       matches.",
+        reads: Reads::Kind {
+            group: "admissionregistration.k8s.io",
+            kind: "ValidatingWebhookConfiguration",
+        },
+        fields: &VALIDATINGWEBHOOKCONFIGURATION_FIELDS,
+    },
+    Target {
+        name: "k8s-validatingadmissionpolicy",
+        schema: "io.github.godspeed-you.kubernetes.validatingadmissionpolicy/1",
+        schema_name: "KubernetesValidatingAdmissionPolicy",
+        schema_summary: "An in-process admission policy: what it matches, what it asserts, and \
+                         what happens when an assertion fails.",
+        summary: "ValidatingAdmissionPolicies, where the cluster serves them.",
+        identity_doc: "Two observations are the same policy when their `metadata.uid` matches.",
+        reads: Reads::Kind {
+            group: "admissionregistration.k8s.io",
+            kind: "ValidatingAdmissionPolicy",
+        },
+        fields: &VALIDATINGADMISSIONPOLICY_FIELDS,
     },
     Target {
         name: "k8s-resource",

@@ -228,6 +228,12 @@ struct RecordedCluster {
     deny_pod_list: bool,
     /// Whether RBAC refuses `get` on one Pod, which is a refused read and never an absence.
     deny_pod_get: bool,
+    /// Whether the server serves §15.3's Tier 2 set: the seventeen platform-operation kinds.
+    ///
+    /// A separate flag from `tier_one` and never layered over it. These kinds answer a different
+    /// question — what a platform is *configured* to allow — and a fixture serving both would
+    /// make either suite's failures ambiguous.
+    tier_two: bool,
     /// Whether the server serves the whole Tier 1 operational set of §15.2, rather than the
     /// five kinds the earlier tests need. Off by default so that adding a kind to this fixture
     /// cannot change what those tests prove.
@@ -636,6 +642,15 @@ impl RecordedCluster {
     }
 
     /// A server serving every kind of §15.2's Tier 1 operational set.
+    /// A server serving §15.3's Tier 2 set, one object of each kind.
+    fn with_tier_two() -> Arc<Self> {
+        Arc::new(Self {
+            apps: false,
+            tier_two: true,
+            ..Self::default()
+        })
+    }
+
     fn with_tier_one() -> Arc<Self> {
         Arc::new(Self {
             pods: 2,
@@ -767,6 +782,9 @@ fn base_group_list(cluster: &RecordedCluster) -> Json {
     }
     if cluster.tier_one {
         return tier_one_document("/apis").expect("the tier one fixture answers the group list");
+    }
+    if cluster.tier_two {
+        return tier_two_document("/apis").expect("the tier two fixture answers the group list");
     }
     if !cluster.apps {
         return json!({"kind": "APIGroupList", "groups": []});
@@ -2169,6 +2187,11 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     }
     if cluster.relations
         && let Some(body) = relations_document(path)
+    {
+        return response(&body.to_string());
+    }
+    if cluster.tier_two
+        && let Some(body) = tier_two_document(path)
     {
         return response(&body.to_string());
     }
@@ -8295,4 +8318,566 @@ async fn should_name_every_read_a_derived_edge_rests_on_and_no_read_it_did_not_u
         "nothing was read to find a field of the subject, so nothing else is a source of it"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- §15.3: the Tier 2 set answers -----------------------------------------------------------
+
+#[tokio::test]
+async fn should_answer_for_every_kind_of_the_platform_operation_tier() {
+    // §15.3 lists seventeen kinds a second tier SHOULD include, and until this test they were
+    // reachable only through `k8s-resource`. That was not *wrong* — §15.1 makes the discovered
+    // floor the answer for any kind — but it is not what §15.3 asks for either, and the
+    // difference is the projection: a Role's rules kept as rules, a quota's `hard` beside its
+    // `used`, an autoscaler's decision beside its observation.
+    //
+    // One assertion per kind, on the field that could only have come from that kind's own
+    // pointer. Every object in the fixture states a value no other object states, so a
+    // projection reading the wrong pointer produces a visibly wrong record rather than a
+    // plausible one.
+    let plugin = loaded_against(RecordedCluster::with_tier_two()).await;
+    let of = async |target: &str, kind: &str| -> Arc<RecordValue> {
+        let schema = format!(
+            "io.github.godspeed-you.kubernetes.{}/1",
+            kind.to_lowercase()
+        );
+        let records = answered(&plugin, target, &schema).await;
+        assert_eq!(records.len(), 1, "`{target}` answers the one object served");
+        assert_eq!(
+            text_of(&records[0], "kind").as_deref(),
+            Some(kind),
+            "`{target}` reads the kind it declared and not another"
+        );
+        Arc::clone(&records[0])
+    };
+
+    // Autoscaling and disruption: the two kinds whose whole content is a controller's arithmetic.
+    let hpa = of("k8s-horizontalpodautoscaler", "HorizontalPodAutoscaler").await;
+    assert_eq!(
+        text_of(&hpa, "scale_target").as_deref(),
+        Some("Deployment/checkout"),
+        "a locator, never an identity: `scaleTargetRef` names no uid"
+    );
+    assert_eq!(hpa.get("min_replicas"), Some(&Value::Int(2)));
+    assert_eq!(hpa.get("max_replicas"), Some(&Value::Int(11)));
+    assert_eq!(
+        (hpa.get("current_replicas"), hpa.get("desired_replicas")),
+        (Some(&Value::Int(4)), Some(&Value::Int(7))),
+        "what the controller observed beside what it decided — differing is the ordinary state \
+         of an autoscaler that is working"
+    );
+    assert!(matches!(
+        hpa.get("last_scale_time"),
+        Some(Value::Timestamp(_))
+    ));
+
+    let pdb = of("k8s-poddisruptionbudget", "PodDisruptionBudget").await;
+    assert_eq!(
+        text_of(&pdb, "min_available").as_deref(),
+        Some("60%"),
+        "§12.4: a percentage is not a count, and parsing it into one would invent a number"
+    );
+    assert_eq!(pdb.get("max_unavailable"), Some(&Value::Null));
+    assert_eq!(pdb.get("disruptions_allowed"), Some(&Value::Int(1)));
+
+    // Namespace budgets: the two kinds where intent and consumption are different fields.
+    let quota = of("k8s-resourcequota", "ResourceQuota").await;
+    let hard = map_of(&quota, "hard");
+    assert!(
+        hard.iter().any(|(key, value)| key == "memory"
+            && matches!(value, Value::String(text) if &**text == "48Gi")),
+        "a quantity stays the string the API stated it in: {hard:?}"
+    );
+    assert!(
+        map_of(&quota, "used").iter().any(|(key, _)| key == "cpu"),
+        "what has been consumed is a separate field from what is allowed"
+    );
+
+    let range = of("k8s-limitrange", "LimitRange").await;
+    assert!(
+        matches!(range.get("limits"), Some(Value::List(entries)) if entries.len() == 1),
+        "each limit entry is kept whole: which keys it sets is the intent"
+    );
+
+    // RBAC: four kinds, and the one place §9.5 decides where a role is looked up.
+    let role = of("k8s-role", "Role").await;
+    assert!(matches!(role.get("rules"), Some(Value::List(_))));
+    let cluster_role = of("k8s-clusterrole", "ClusterRole").await;
+    assert!(matches!(cluster_role.get("rules"), Some(Value::List(_))));
+    assert!(
+        matches!(cluster_role.get("aggregation_rule"), Some(Value::Map(_))),
+        "an aggregated role says so, because its rules are what a controller last filled in"
+    );
+
+    let binding = of("k8s-rolebinding", "RoleBinding").await;
+    let role_ref = map_of(&binding, "role_ref");
+    assert!(
+        role_ref.iter().any(|(key, value)| key == "kind"
+            && matches!(value, Value::String(text) if &**text == "Role")),
+        "§9.5 lives in this field: a `Role` is looked up in the binding's namespace and a \
+         `ClusterRole` is not: {role_ref:?}"
+    );
+    assert!(matches!(binding.get("subjects"), Some(Value::List(_))));
+    let cluster_binding = of("k8s-clusterrolebinding", "ClusterRoleBinding").await;
+    assert!(matches!(
+        cluster_binding.get("role_ref"),
+        Some(Value::Map(_))
+    ));
+
+    // Coordination and scheduling.
+    let lease = of("k8s-lease", "Lease").await;
+    assert_eq!(
+        text_of(&lease, "holder").as_deref(),
+        Some("node-a_9f3c"),
+        "a string the holder chose, not an identity this cluster assigned"
+    );
+    assert_eq!(lease.get("lease_duration_seconds"), Some(&Value::Int(15)));
+    assert!(matches!(lease.get("renew_time"), Some(Value::Timestamp(_))));
+
+    let priority = of("k8s-priorityclass", "PriorityClass").await;
+    assert_eq!(priority.get("value"), Some(&Value::Int(900_000)));
+    assert_eq!(priority.get("global_default"), Some(&Value::Bool(false)));
+    assert_eq!(
+        text_of(&priority, "description").as_deref(),
+        Some("for the checkout path"),
+        "a priority number without the author's sentence is unreadable"
+    );
+
+    let runtime = of("k8s-runtimeclass", "RuntimeClass").await;
+    assert_eq!(text_of(&runtime, "handler").as_deref(), Some("kata"));
+    assert!(matches!(runtime.get("overhead"), Some(Value::Map(_))));
+
+    // Storage: three kinds, and the node id §47.5 exports at the node end.
+    let driver = of("k8s-csidriver", "CSIDriver").await;
+    assert_eq!(driver.get("attach_required"), Some(&Value::Bool(true)));
+    assert_eq!(driver.get("pod_info_on_mount"), Some(&Value::Bool(false)));
+    assert_eq!(
+        list_of(&driver, "volume_lifecycle_modes"),
+        Some(vec!["Persistent".to_owned(), "Ephemeral".to_owned()])
+    );
+
+    let csi_node = of("k8s-csinode", "CSINode").await;
+    assert!(
+        matches!(csi_node.get("drivers"), Some(Value::List(entries)) if entries.len() == 1),
+        "each registration whole, including the `nodeID` the storage system knows this node by"
+    );
+
+    let attachment = of("k8s-volumeattachment", "VolumeAttachment").await;
+    assert_eq!(
+        text_of(&attachment, "source_volume").as_deref(),
+        Some("pvc-9f3")
+    );
+    assert_eq!(
+        attachment.get("attached"),
+        Some(&Value::Bool(false)),
+        "false is a reported failure; absent would be an attachment nothing has reported on"
+    );
+    assert_eq!(
+        text_of(&attachment, "attach_error").as_deref(),
+        Some("volume is attached to node-b"),
+        "§48.1: the attacher's own sentence is the only thing anyone can act on"
+    );
+
+    // Admission: the three kinds an operator reaches for when an apply came back changed or
+    // refused and nothing in RBAC explains it.
+    let mutating = of(
+        "k8s-mutatingwebhookconfiguration",
+        "MutatingWebhookConfiguration",
+    )
+    .await;
+    assert!(matches!(mutating.get("webhooks"), Some(Value::List(_))));
+    let validating = of(
+        "k8s-validatingwebhookconfiguration",
+        "ValidatingWebhookConfiguration",
+    )
+    .await;
+    assert!(matches!(validating.get("webhooks"), Some(Value::List(_))));
+
+    let policy = of("k8s-validatingadmissionpolicy", "ValidatingAdmissionPolicy").await;
+    assert_eq!(text_of(&policy, "failure_policy").as_deref(), Some("Fail"));
+    assert!(matches!(
+        policy.get("match_constraints"),
+        Some(Value::Map(_))
+    ));
+    assert!(
+        matches!(policy.get("validations"), Some(Value::List(entries)) if entries.len() == 1),
+        "the expression is reported and never evaluated: what a policy would decide about a \
+         particular object is the API server's answer (§21.3)"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- §15.3's Tier 2 fixture ----------------------------------------------------------------------
+
+/// The seventeen kinds of §15.3, one object each, on the groups that serve them.
+///
+/// Every object states a value no other object here states, so a projection reading the wrong
+/// pointer produces a visibly wrong record rather than a plausible one. A separate fixture from
+/// `tier_one_document` and not layered over it: these kinds answer a different question — what a
+/// platform is *configured* to allow — and mixing them would make either suite's failures
+/// ambiguous.
+fn tier_two_document(path: &str) -> Option<Json> {
+    let one = |kind: &str, api_version: &str, object: Json| {
+        Some(collection(kind, api_version, &[object]))
+    };
+    Some(match path {
+        "/apis" => json!({
+            "kind": "APIGroupList",
+            "groups": [
+                group_at("autoscaling", "v2"),
+                group_at("policy", "v1"),
+                group_at("rbac.authorization.k8s.io", "v1"),
+                group_at("coordination.k8s.io", "v1"),
+                group_at("scheduling.k8s.io", "v1"),
+                group_at("node.k8s.io", "v1"),
+                group_at("storage.k8s.io", "v1"),
+                group_at("admissionregistration.k8s.io", "v1"),
+            ],
+        }),
+        "/api/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "v1",
+            "resources": [
+                {"name": "namespaces", "kind": "Namespace", "namespaced": false,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "resourcequotas", "kind": "ResourceQuota", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "limitranges", "kind": "LimitRange", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+        "/apis/autoscaling/v2" => resource_list(
+            "autoscaling/v2",
+            &[("horizontalpodautoscalers", "HorizontalPodAutoscaler", true)],
+        ),
+        "/apis/policy/v1" => resource_list(
+            "policy/v1",
+            &[("poddisruptionbudgets", "PodDisruptionBudget", true)],
+        ),
+        "/apis/rbac.authorization.k8s.io/v1" => resource_list(
+            "rbac.authorization.k8s.io/v1",
+            &[
+                ("roles", "Role", true),
+                ("rolebindings", "RoleBinding", true),
+                ("clusterroles", "ClusterRole", false),
+                ("clusterrolebindings", "ClusterRoleBinding", false),
+            ],
+        ),
+        "/apis/coordination.k8s.io/v1" => {
+            resource_list("coordination.k8s.io/v1", &[("leases", "Lease", true)])
+        }
+        "/apis/scheduling.k8s.io/v1" => resource_list(
+            "scheduling.k8s.io/v1",
+            &[("priorityclasses", "PriorityClass", false)],
+        ),
+        "/apis/node.k8s.io/v1" => resource_list(
+            "node.k8s.io/v1",
+            &[("runtimeclasses", "RuntimeClass", false)],
+        ),
+        "/apis/storage.k8s.io/v1" => resource_list(
+            "storage.k8s.io/v1",
+            &[
+                ("csidrivers", "CSIDriver", false),
+                ("csinodes", "CSINode", false),
+                ("volumeattachments", "VolumeAttachment", false),
+            ],
+        ),
+        "/apis/admissionregistration.k8s.io/v1" => resource_list(
+            "admissionregistration.k8s.io/v1",
+            &[
+                (
+                    "mutatingwebhookconfigurations",
+                    "MutatingWebhookConfiguration",
+                    false,
+                ),
+                (
+                    "validatingwebhookconfigurations",
+                    "ValidatingWebhookConfiguration",
+                    false,
+                ),
+                (
+                    "validatingadmissionpolicies",
+                    "ValidatingAdmissionPolicy",
+                    false,
+                ),
+            ],
+        ),
+
+        "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers" => {
+            return one(
+                "HorizontalPodAutoscaler",
+                "autoscaling/v2",
+                json!({
+                    "metadata": tier_two_metadata("checkout", Some("default"), "t2-hpa"),
+                    "spec": {
+                        "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment",
+                                           "name": "checkout"},
+                        "minReplicas": 2, "maxReplicas": 11,
+                    },
+                    "status": {"currentReplicas": 4, "desiredReplicas": 7,
+                               "lastScaleTime": "2026-08-30T09:15:00Z"},
+                }),
+            );
+        }
+        "/apis/policy/v1/namespaces/default/poddisruptionbudgets" => {
+            return one(
+                "PodDisruptionBudget",
+                "policy/v1",
+                json!({
+                    "metadata": tier_two_metadata("checkout", Some("default"), "t2-pdb"),
+                    "spec": {"minAvailable": "60%", "selector": {"matchLabels": {"app": "checkout"}}},
+                    "status": {"disruptionsAllowed": 1, "currentHealthy": 5, "desiredHealthy": 3,
+                               "expectedPods": 6},
+                }),
+            );
+        }
+        "/api/v1/namespaces/default/resourcequotas" => {
+            return one(
+                "ResourceQuota",
+                "v1",
+                json!({
+                    "metadata": tier_two_metadata("team", Some("default"), "t2-quota"),
+                    "spec": {"hard": {"cpu": "12", "memory": "48Gi"}, "scopes": ["NotTerminating"]},
+                    "status": {"used": {"cpu": "3500m", "memory": "9Gi"}},
+                }),
+            );
+        }
+        "/api/v1/namespaces/default/limitranges" => {
+            return one(
+                "LimitRange",
+                "v1",
+                json!({
+                    "metadata": tier_two_metadata("defaults", Some("default"), "t2-range"),
+                    "spec": {"limits": [{
+                        "type": "Container",
+                        "default": {"cpu": "500m"},
+                        "defaultRequest": {"cpu": "100m"},
+                        "max": {"cpu": "4"},
+                    }]},
+                }),
+            );
+        }
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/default/roles" => {
+            return one(
+                "Role",
+                "rbac.authorization.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("reader", Some("default"), "t2-role"),
+                    "rules": [{"apiGroups": [""], "resources": ["configmaps"],
+                               "verbs": ["get", "list"]}],
+                }),
+            );
+        }
+        "/apis/rbac.authorization.k8s.io/v1/clusterroles" => {
+            return one(
+                "ClusterRole",
+                "rbac.authorization.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("view-all", None, "t2-clusterrole"),
+                    "rules": [{"apiGroups": ["apps"], "resources": ["deployments"],
+                               "verbs": ["get", "list", "watch"]}],
+                    "aggregationRule": {
+                        "clusterRoleSelectors": [{"matchLabels": {"rbac.example/aggregate": "true"}}],
+                    },
+                }),
+            );
+        }
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/default/rolebindings" => {
+            return one(
+                "RoleBinding",
+                "rbac.authorization.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("readers", Some("default"), "t2-rolebinding"),
+                    "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role",
+                                "name": "reader"},
+                    "subjects": [{"kind": "ServiceAccount", "name": "deploy-bot",
+                                  "namespace": "default"}],
+                }),
+            );
+        }
+        "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings" => {
+            return one(
+                "ClusterRoleBinding",
+                "rbac.authorization.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("viewers", None, "t2-clusterrolebinding"),
+                    "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole",
+                                "name": "view-all"},
+                    "subjects": [{"kind": "Group", "name": "sre"}],
+                }),
+            );
+        }
+        "/apis/coordination.k8s.io/v1/namespaces/default/leases" => {
+            return one(
+                "Lease",
+                "coordination.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("scheduler", Some("default"), "t2-lease"),
+                    "spec": {"holderIdentity": "node-a_9f3c", "leaseDurationSeconds": 15,
+                             "acquireTime": "2026-08-30T09:00:00Z",
+                             "renewTime": "2026-08-30T09:14:52Z"},
+                }),
+            );
+        }
+        "/apis/scheduling.k8s.io/v1/priorityclasses" => {
+            return one(
+                "PriorityClass",
+                "scheduling.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("high", None, "t2-priorityclass"),
+                    "value": 900_000,
+                    "globalDefault": false,
+                    "preemptionPolicy": "PreemptLowerPriority",
+                    "description": "for the checkout path",
+                }),
+            );
+        }
+        "/apis/node.k8s.io/v1/runtimeclasses" => {
+            return one(
+                "RuntimeClass",
+                "node.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("sandboxed", None, "t2-runtimeclass"),
+                    "handler": "kata",
+                    "overhead": {"podFixed": {"cpu": "250m", "memory": "120Mi"}},
+                    "scheduling": {"nodeSelector": {"sandbox": "yes"}},
+                }),
+            );
+        }
+        "/apis/storage.k8s.io/v1/csidrivers" => {
+            return one(
+                "CSIDriver",
+                "storage.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("block.example.test", None, "t2-csidriver"),
+                    "spec": {"attachRequired": true, "podInfoOnMount": false,
+                             "storageCapacity": true, "fsGroupPolicy": "File",
+                             "volumeLifecycleModes": ["Persistent", "Ephemeral"]},
+                }),
+            );
+        }
+        "/apis/storage.k8s.io/v1/csinodes" => {
+            return one(
+                "CSINode",
+                "storage.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("node-a", None, "t2-csinode"),
+                    "spec": {"drivers": [{
+                        "name": "block.example.test",
+                        "nodeID": "i-0123456789abcdef",
+                        "topologyKeys": ["topology.block.example.test/zone"],
+                    }]},
+                }),
+            );
+        }
+        "/apis/storage.k8s.io/v1/volumeattachments" => {
+            return one(
+                "VolumeAttachment",
+                "storage.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("csi-9f3", None, "t2-volumeattachment"),
+                    "spec": {"attacher": "block.example.test", "nodeName": "node-a",
+                             "source": {"persistentVolumeName": "pvc-9f3"}},
+                    "status": {"attached": false,
+                               "attachError": {"message": "volume is attached to node-b"}},
+                }),
+            );
+        }
+        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations" => {
+            return one(
+                "MutatingWebhookConfiguration",
+                "admissionregistration.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("registry-rewrite", None, "t2-mutating"),
+                    "webhooks": [{
+                        "name": "rewrite.example.test",
+                        "failurePolicy": "Ignore",
+                        "sideEffects": "None",
+                        "timeoutSeconds": 5,
+                        "rules": [{"apiGroups": [""], "apiVersions": ["v1"],
+                                   "operations": ["CREATE"], "resources": ["pods"]}],
+                    }],
+                }),
+            );
+        }
+        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations" => {
+            return one(
+                "ValidatingWebhookConfiguration",
+                "admissionregistration.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("policy-gate", None, "t2-validating"),
+                    "webhooks": [{
+                        "name": "gate.example.test",
+                        "failurePolicy": "Fail",
+                        "sideEffects": "None",
+                        "timeoutSeconds": 10,
+                        "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"],
+                                   "operations": ["CREATE", "UPDATE"], "resources": ["deployments"]}],
+                    }],
+                }),
+            );
+        }
+        "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies" => {
+            return one(
+                "ValidatingAdmissionPolicy",
+                "admissionregistration.k8s.io/v1",
+                json!({
+                    "metadata": tier_two_metadata("no-latest", None, "t2-admissionpolicy"),
+                    "spec": {
+                        "failurePolicy": "Fail",
+                        "matchConstraints": {"resourceRules": [{
+                            "apiGroups": ["apps"], "apiVersions": ["v1"],
+                            "operations": ["CREATE"], "resources": ["deployments"],
+                        }]},
+                        "validations": [{
+                            "expression": "!object.spec.template.spec.containers.exists(c, c.image.endsWith(':latest'))",
+                            "message": "images must be pinned",
+                        }],
+                    },
+                }),
+            );
+        }
+        _ => return None,
+    })
+}
+
+/// One object's metadata, with the fields every record's projection reads.
+fn tier_two_metadata(name: &str, namespace: Option<&str>, uid: &str) -> Json {
+    let mut metadata = json!({
+        "name": name,
+        "uid": uid,
+        "resourceVersion": "7700",
+        "creationTimestamp": "2026-08-01T00:00:00Z",
+    });
+    if let Some(namespace) = namespace
+        && let Some(map) = metadata.as_object_mut()
+    {
+        map.insert("namespace".to_owned(), json!(namespace));
+    }
+    metadata
+}
+
+/// One group, at a version that is not always `v1` — `autoscaling` serves its Tier 2 kind at `v2`.
+fn group_at(name: &str, version: &str) -> Json {
+    let group_version = format!("{name}/{version}");
+    json!({
+        "name": name,
+        "versions": [{"groupVersion": group_version, "version": version}],
+        "preferredVersion": {"groupVersion": group_version, "version": version},
+    })
+}
+
+/// An `APIResourceList`, from the plural, kind and scope of each resource it serves.
+fn resource_list(group_version: &str, resources: &[(&str, &str, bool)]) -> Json {
+    json!({
+        "kind": "APIResourceList",
+        "groupVersion": group_version,
+        "resources": resources
+            .iter()
+            .map(|(plural, kind, namespaced)| json!({
+                "name": plural, "kind": kind, "namespaced": namespaced,
+                "verbs": ["get", "list", "watch"],
+            }))
+            .collect::<Vec<_>>(),
+    })
 }

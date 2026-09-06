@@ -963,7 +963,13 @@ fn field_value(name: &str, guarded: &Guarded) -> Value {
         "restarts" => restarts(object),
 
         // --- Deployment ---
-        "desired_replicas" => field_int(object, "/spec/replicas"),
+        // A controller states its intent in `spec.replicas`; an autoscaler states the count it
+        // most recently decided in `status.desiredReplicas`. One question, two spellings, and no
+        // object carries both — so the fallback disambiguates without a kind branch.
+        "desired_replicas" => match field_int(object, "/spec/replicas") {
+            Value::Null => field_int(object, "/status/desiredReplicas"),
+            replicas => replicas,
+        },
         "ready_replicas" => field_int(object, "/status/readyReplicas"),
         "updated_replicas" => field_int(object, "/status/updatedReplicas"),
         "available_replicas" => field_int(object, "/status/availableReplicas"),
@@ -975,7 +981,10 @@ fn field_value(name: &str, guarded: &Guarded) -> Value {
         "reconciliation" => reconciliation(object),
 
         // --- ReplicaSet, StatefulSet ---
-        "current_replicas" => field_int(object, "/status/replicas"),
+        "current_replicas" => match field_int(object, "/status/replicas") {
+            Value::Null => field_int(object, "/status/currentReplicas"),
+            replicas => replicas,
+        },
 
         // --- ReplicaSet, Job: the controller above this object (§24.3, §25.2, §25.5) ---
         "controller" => text(controller(object).map(OwnerReference::name)),
@@ -1076,10 +1085,92 @@ fn field_value(name: &str, guarded: &Guarded) -> Value {
         "is_default" => is_default_storage_class(object),
         "parameters" => map_field(object, "/parameters"),
 
+        // --- HorizontalPodAutoscaler (§15.3) ---
+        "scale_target" => scale_target(object),
+        "min_replicas" => field_int(object, "/spec/minReplicas"),
+        "max_replicas" => field_int(object, "/spec/maxReplicas"),
+        "last_scale_time" => timestamp_field(object, "/status/lastScaleTime"),
+
+        // --- PodDisruptionBudget (§15.3) ---
+        "min_available" => quantity(object, "/spec/minAvailable"),
+        "max_unavailable" => quantity(object, "/spec/maxUnavailable"),
+        "disruptions_allowed" => field_int(object, "/status/disruptionsAllowed"),
+        "current_healthy" => field_int(object, "/status/currentHealthy"),
+        "desired_healthy" => field_int(object, "/status/desiredHealthy"),
+        "expected_pods" => field_int(object, "/status/expectedPods"),
+
+        // --- ResourceQuota (§15.3) ---
+        "hard" => map_field(object, "/spec/hard"),
+        "used" => map_field(object, "/status/used"),
+        "scopes" => strings(object, "/spec/scopes"),
+
+        // --- LimitRange (§15.3) ---
+        "limits" => maps(object, "/spec/limits"),
+
+        // --- Role (§15.3) ---
+        // Two kinds state something called `rules` and they are not the same shape: an RBAC
+        // rule is a grant of verbs over resources at the object's top level, a NetworkPolicy's
+        // are ingress and egress blocks under `spec`. Neither pointer reads anything on the
+        // other's object, so the choice is made by what is there rather than by a kind branch.
+        "rules" => match maps(object, "/rules") {
+            Value::Null => policy_rules(object),
+            rules => rules,
+        },
+
+        // --- ClusterRole (§15.3) ---
+        "aggregation_rule" => map_field(object, "/aggregationRule"),
+
+        // --- RoleBinding (§15.3) ---
+        "role_ref" => map_field(object, "/roleRef"),
+        "subjects" => maps(object, "/subjects"),
+
+        // --- ClusterRoleBinding (§15.3) ---
+
+        // --- Lease (§15.3) ---
+        "holder" => text(field_str(object, "/spec/holderIdentity")),
+        "lease_duration_seconds" => field_int(object, "/spec/leaseDurationSeconds"),
+        "renew_time" => timestamp_field(object, "/spec/renewTime"),
+        "acquire_time" => timestamp_field(object, "/spec/acquireTime"),
+
+        // --- PriorityClass (§15.3) ---
+        "value" => field_int(object, "/value"),
+        "global_default" => field_bool(object, "/globalDefault"),
+        "preemption_policy" => text(field_str(object, "/preemptionPolicy")),
+        "description" => text(field_str(object, "/description")),
+
+        // --- RuntimeClass (§15.3) ---
+        "handler" => text(field_str(object, "/handler")),
+        "overhead" => map_field(object, "/overhead/podFixed"),
+        "scheduling" => map_field(object, "/scheduling/nodeSelector"),
+
+        // --- CSIDriver (§15.3) ---
+        "attach_required" => field_bool(object, "/spec/attachRequired"),
+        "pod_info_on_mount" => field_bool(object, "/spec/podInfoOnMount"),
+        "storage_capacity" => field_bool(object, "/spec/storageCapacity"),
+        "fs_group_policy" => text(field_str(object, "/spec/fsGroupPolicy")),
+        "volume_lifecycle_modes" => strings(object, "/spec/volumeLifecycleModes"),
+
+        // --- CSINode (§15.3) ---
+        "drivers" => maps(object, "/spec/drivers"),
+
+        // --- VolumeAttachment (§15.3) ---
+        "attacher" => text(field_str(object, "/spec/attacher")),
+        "source_volume" => text(field_str(object, "/spec/source/persistentVolumeName")),
+        "attached" => field_bool(object, "/status/attached"),
+        "attach_error" => text(field_str(object, "/status/attachError/message")),
+
+        // --- MutatingWebhookConfiguration (§15.3) ---
+        "webhooks" => maps(object, "/webhooks"),
+
+        // --- ValidatingWebhookConfiguration (§15.3) ---
+
+        // --- ValidatingAdmissionPolicy (§15.3) ---
+        "failure_policy" => text(field_str(object, "/spec/failurePolicy")),
+        "match_constraints" => map_field(object, "/spec/matchConstraints"),
+        "validations" => maps(object, "/spec/validations"),
         // --- NetworkPolicy (§31.1, §31.2) ---
         "pod_selector" => map_field(object, "/spec/podSelector"),
         "policy_types" => strings(object, "/spec/policyTypes"),
-        "rules" => policy_rules(object),
 
         // --- Secret and ConfigMap: key names only, and for a Secret there is by construction
         // no payload left to reach ---
@@ -1132,6 +1223,69 @@ fn timestamp(value: Option<&str>) -> Value {
     };
     ono_value::from_json(&serde_json::json!({"$timestamp": text}), builtin_schemas())
         .unwrap_or(Value::Null)
+}
+
+/// What an autoscaler scales, as `<Kind>/<name>` (§15.3).
+///
+/// A locator and never an identity: `scaleTargetRef` names no `uid`, so the workload it points at
+/// may have been deleted and replaced since — the case §4 invariant 5 exists for. Null where the
+/// reference names no kind, because `\u{2f}checkout` would read as an address and address nothing.
+fn scale_target(object: &Object) -> Value {
+    let Some(kind) = field_str(object, "/spec/scaleTargetRef/kind") else {
+        return Value::Null;
+    };
+    match field_str(object, "/spec/scaleTargetRef/name") {
+        Some(name) => Value::String(format!("{kind}/{name}").as_str().into()),
+        None => Value::String(kind.into()),
+    }
+}
+
+/// An RFC 3339 instant at a pointer, or null where the object states none (§15.3's Tier 2).
+///
+/// Distinct from [`timestamp`], which reads the one instant every object carries. These are
+/// instants a *controller* wrote — a Lease's renewal, an autoscaler's last scale — so they are
+/// that component's clock rather than the API server's and never this provider's (§14.3).
+fn timestamp_field(object: &Object, pointer: &str) -> Value {
+    timestamp(field_str(object, pointer))
+}
+
+/// A list of JSON objects at a pointer, each kept whole, or null where there are none.
+///
+/// The Tier 2 kinds of §15.3 are mostly *rules*: an RBAC rule, an admission webhook, a limit
+/// range's entries, a CSI node's driver registrations. Every one of them is a structure whose
+/// shape is the intent — which keys are present is what the author decided — so §15.5's
+/// projection here is "keep it", and the alternative of flattening each into a sentence is the
+/// one §12.3 forbids.
+///
+/// Null rather than an empty list for the reason [`list`] gives: a Role with no rules and a Role
+/// whose `rules` key the server omitted are the same observation.
+fn maps(object: &Object, pointer: &str) -> Value {
+    let Some(entries) = object.field(pointer).and_then(Json::as_array) else {
+        return Value::Null;
+    };
+    let kept: Vec<Value> = entries
+        .iter()
+        .filter(|entry| entry.is_object())
+        .map(json_value)
+        .collect();
+    if kept.is_empty() {
+        return Value::Null;
+    }
+    Value::List(kept.into())
+}
+
+/// A Kubernetes quantity or intstr at a pointer, as the text the API stated it in.
+///
+/// Both spellings arrive here: `minAvailable` is an integer or a percentage string, and a
+/// resource quantity is `1Gi` or `1000m`. They are kept as text and never parsed, because
+/// `1Gi` and `1073741824` are different claims and the difference between "two Pods" and
+/// "60 percent" is the whole content of the field (§12.4).
+fn quantity(object: &Object, pointer: &str) -> Value {
+    match object.field(pointer) {
+        Some(Json::String(stated)) => Value::String(stated.as_str().into()),
+        Some(Json::Number(number)) => Value::String(number.to_string().as_str().into()),
+        _ => Value::Null,
+    }
 }
 
 /// A `metadata` string map — `labels` or `annotations` — or null where the object carries none.

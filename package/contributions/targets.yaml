@@ -196,6 +196,134 @@ targets:
     identity_doc: "Two observations are the same policy when their `metadata.uid` matches."
 
     options: *curated-kind
+  # --- §15.3's Tier 2: platform operation ------------------------------------------------------
+  #
+  # The seventeen kinds §15.3 lists, in its order, sharing Tier 1's argument list because they ask
+  # the same question of the cluster: which context, which scope, which object, how much.
+
+  - name: k8s-horizontalpodautoscaler
+    schema: io.github.godspeed-you.kubernetes.horizontalpodautoscaler/1
+    summary: >-
+      HorizontalPodAutoscalers, what they scale, and where the replica count stands.
+    identity_doc: >-
+      Two observations are the same autoscaler when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-poddisruptionbudget
+    schema: io.github.godspeed-you.kubernetes.poddisruptionbudget/1
+    summary: >-
+      PodDisruptionBudgets, and how much voluntary disruption they currently allow.
+    identity_doc: >-
+      Two observations are the same budget when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-resourcequota
+    schema: io.github.godspeed-you.kubernetes.resourcequota/1
+    summary: >-
+      ResourceQuotas: what a namespace may use, and what it has used.
+    identity_doc: >-
+      Two observations are the same quota when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-limitrange
+    schema: io.github.godspeed-you.kubernetes.limitrange/1
+    summary: >-
+      LimitRanges, and the defaults and bounds they impose on a namespace.
+    identity_doc: >-
+      Two observations are the same range when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-role
+    schema: io.github.godspeed-you.kubernetes.role/1
+    summary: >-
+      Roles, and the rules they grant inside one namespace.
+    identity_doc: >-
+      Two observations are the same role when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-clusterrole
+    schema: io.github.godspeed-you.kubernetes.clusterrole/1
+    summary: >-
+      ClusterRoles, and the rules they grant across a cluster.
+    identity_doc: >-
+      Two observations are the same role when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-rolebinding
+    schema: io.github.godspeed-you.kubernetes.rolebinding/1
+    summary: >-
+      RoleBindings: who holds which role in a namespace.
+    identity_doc: >-
+      Two observations are the same binding when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-clusterrolebinding
+    schema: io.github.godspeed-you.kubernetes.clusterrolebinding/1
+    summary: >-
+      ClusterRoleBindings: who holds which role across the whole cluster.
+    identity_doc: >-
+      Two observations are the same binding when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-lease
+    schema: io.github.godspeed-you.kubernetes.lease/1
+    summary: >-
+      Leases, and which identity currently holds one.
+    identity_doc: >-
+      Two observations are the same lease when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-priorityclass
+    schema: io.github.godspeed-you.kubernetes.priorityclass/1
+    summary: >-
+      PriorityClasses, and what they mean to the scheduler.
+    identity_doc: >-
+      Two observations are the same class when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-runtimeclass
+    schema: io.github.godspeed-you.kubernetes.runtimeclass/1
+    summary: >-
+      RuntimeClasses, and which container runtime handler each selects.
+    identity_doc: >-
+      Two observations are the same class when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-csidriver
+    schema: io.github.godspeed-you.kubernetes.csidriver/1
+    summary: >-
+      CSIDrivers registered on this cluster, and what each supports.
+    identity_doc: >-
+      Two observations are the same driver when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-csinode
+    schema: io.github.godspeed-you.kubernetes.csinode/1
+    summary: >-
+      CSINode registrations: which drivers each node has, and what the storage system calls it
+      there.
+    identity_doc: >-
+      Two observations are the same registration when their `metadata.uid` matches. A CSINode
+      shares its *name* with the Node it describes and is a different object with its own lifetime,
+      which is exactly why §4 invariants 4 and 5 key on the uid.
+    options: *curated-kind
+  - name: k8s-volumeattachment
+    schema: io.github.godspeed-you.kubernetes.volumeattachment/1
+    summary: >-
+      VolumeAttachments: which volume is attached to which node, and whether the attach succeeded.
+    identity_doc: >-
+      Two observations are the same attachment when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-mutatingwebhookconfiguration
+    schema: io.github.godspeed-you.kubernetes.mutatingwebhookconfiguration/1
+    summary: >-
+      MutatingWebhookConfigurations: what rewrites objects on the way in.
+    identity_doc: >-
+      Two observations are the same configuration when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-validatingwebhookconfiguration
+    schema: io.github.godspeed-you.kubernetes.validatingwebhookconfiguration/1
+    summary: >-
+      ValidatingWebhookConfigurations: what can refuse a change.
+    identity_doc: >-
+      Two observations are the same configuration when their `metadata.uid` matches.
+    options: *curated-kind
+  - name: k8s-validatingadmissionpolicy
+    schema: io.github.godspeed-you.kubernetes.validatingadmissionpolicy/1
+    summary: >-
+      ValidatingAdmissionPolicies, where the cluster serves them.
+    identity_doc: >-
+      Two observations are the same policy when their `metadata.uid` matches.
+    options: *curated-kind
+
   - name: k8s-resource
     schema: io.github.godspeed-you.kubernetes.resource/1
     summary: "Any resource this cluster serves, named by `kind` and `group` (specification section 15.1)."

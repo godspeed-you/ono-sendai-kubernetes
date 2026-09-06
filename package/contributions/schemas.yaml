@@ -2217,6 +2217,1660 @@ schemas:
     default_view:
       columns: [name, namespace, policy_types, pod_selector, created]
 
+  # --- §15.3's Tier 2: platform operation ------------------------------------------------------
+  #
+  # The seventeen kinds §15.3 lists, in its order. Curated for §15.1's reason — every one was
+  # already readable through `k8s-resource`, and what a curated noun buys is the projection: a
+  # Role's rules kept as rules, a quota's `hard` beside its `used`, an autoscaler's decision
+  # beside its observation. Most of these kinds are rules rather than state, and §15.5's
+  # projection for a rule is to keep it whole: which keys an RBAC rule or an admission webhook
+  # states *is* the intent.
+
+  - id: io.github.godspeed-you.kubernetes.horizontalpodautoscaler/1
+    name: KubernetesHorizontalPodAutoscaler
+    summary: >-
+      An autoscaler: what it scales, the bounds it may scale between, and where the controller has
+      it now.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different NetworkPolicy.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      scale_target:
+        type: string
+        nullable: true
+        doc: >-
+          What the autoscaler scales, as `<Kind>/<name>` from `spec.scaleTargetRef`. A locator
+          rather than an identity: the reference names no `uid`, and the workload it points at may
+          not exist.
+      min_replicas:
+        type: int
+        nullable: true
+        doc: >-
+          The floor the autoscaler may scale to. Absent means the API server's own default applies,
+          which is not the same as one.
+      max_replicas:
+        type: int
+        nullable: true
+        doc: >-
+          The ceiling. Required by the API, and nullable here because a record states what it read.
+      current_replicas:
+        type: int
+        nullable: true
+        doc: >-
+          What the controller last observed. A status field, so it is an observation and never the
+          intent.
+      desired_replicas:
+        type: int
+        nullable: true
+        doc: >-
+          What the controller most recently decided. Differing from `current_replicas` is the
+          ordinary state of an autoscaler that is working.
+      last_scale_time:
+        type: timestamp
+        nullable: true
+        doc: >-
+          When the controller last changed the count, as it reported it. A controller's clock,
+          which §14.3 keeps distinct from this provider's.
+    default_view:
+      columns: [name, scale_target, min_replicas, max_replicas, current_replicas]
+
+  - id: io.github.godspeed-you.kubernetes.poddisruptionbudget/1
+    name: KubernetesPodDisruptionBudget
+    summary: >-
+      A disruption budget: what it protects, the intent it states, and how much room the controller
+      says is left.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different NetworkPolicy.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      min_available:
+        type: string
+        nullable: true
+        doc: >-
+          The intent, as written — a count or a percentage, kept as text because the two are
+          different claims and collapsing them would invent a number.
+      max_unavailable:
+        type: string
+        nullable: true
+        doc: >-
+          The other spelling of the same intent. A budget states one or the other, never both.
+      selector:
+        type: map
+        nullable: true
+        doc: >-
+          Which Pods the budget protects, as the API states the selector — the same projection a
+          Deployment's selector gets, because it is the same structure.
+      disruptions_allowed:
+        type: int
+        nullable: true
+        doc: >-
+          How many Pods may be evicted right now, as the controller last computed it (§37.5).
+      current_healthy:
+        type: int
+        nullable: true
+        doc: >-
+          How many matching Pods are healthy.
+      desired_healthy:
+        type: int
+        nullable: true
+        doc: >-
+          How many the budget requires to stay healthy.
+      expected_pods:
+        type: int
+        nullable: true
+        doc: >-
+          How many Pods the controller counted as matching.
+    default_view:
+      columns: [name, min_available, max_unavailable, selector, disruptions_allowed]
+
+  - id: io.github.godspeed-you.kubernetes.resourcequota/1
+    name: KubernetesResourceQuota
+    summary: >-
+      A quota: the limits set on a namespace, what has been consumed against them, and which
+      objects they apply to.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different NetworkPolicy.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      hard:
+        type: map
+        nullable: true
+        doc: >-
+          The limits, as the quantities the API states them in. Never parsed into numbers: `1Gi`
+          and `1000000000` are different strings and §12.4 keeps a quantity a quantity.
+      used:
+        type: map
+        nullable: true
+        doc: >-
+          What has been consumed, as the controller last counted it. A status field, so it is an
+          observation with the controller's lag in it.
+      scopes:
+        type: list<string>
+        nullable: true
+        doc: >-
+          Which objects the quota applies to, where it is narrowed. Empty is not narrowed rather
+          than applying to nothing.
+    default_view:
+      columns: [name, hard, used, scopes]
+
+  - id: io.github.godspeed-you.kubernetes.limitrange/1
+    name: KubernetesLimitRange
+    summary: >-
+      A limit range: the per-object bounds and defaults a namespace applies, in the structure the
+      API states them.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different NetworkPolicy.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      limits:
+        type: list<map>
+        nullable: true
+        doc: >-
+          Each entry as the API states it — the type it applies to, and whichever of `default`,
+          `defaultRequest`, `min`, `max` and `maxLimitRequestRatio` it sets. Kept whole because
+          which keys are present is the intent.
+    default_view:
+      columns: [name, limits]
+
+  - id: io.github.godspeed-you.kubernetes.role/1
+    name: KubernetesRole
+    summary: >-
+      A namespaced role: the rules it grants, in the structure the API states them.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different NetworkPolicy.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      rules:
+        type: list<map>
+        nullable: true
+        doc: >-
+          Each rule as written: its `apiGroups`, `resources`, `verbs`, and any `resourceNames` or
+          `nonResourceURLs`. Never summarised into a sentence — §21.3 forbids this provider
+          becoming an authorization oracle, and a rule list is evidence rather than a verdict.
+    default_view:
+      columns: [name, rules]
+
+  - id: io.github.godspeed-you.kubernetes.clusterrole/1
+    name: KubernetesClusterRole
+    summary: >-
+      A cluster-wide role: the rules it grants, and whether it is assembled from others.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      rules:
+        type: list<map>
+        nullable: true
+        doc: >-
+          Each rule as written. For an aggregated role these are what the controller last filled
+          in, which is an observation rather than the author's intent.
+      aggregation_rule:
+        type: map
+        nullable: true
+        doc: >-
+          The selectors that gather other ClusterRoles into this one, where it is aggregated. Null
+          is a role that states its own rules, which is a different thing from an aggregated role
+          that matched nothing.
+    default_view:
+      columns: [name, rules, aggregation_rule]
+
+  - id: io.github.godspeed-you.kubernetes.rolebinding/1
+    name: KubernetesRoleBinding
+    summary: >-
+      A namespaced binding: the role it grants and the subjects it grants it to.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different NetworkPolicy.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      role_ref:
+        type: map
+        nullable: true
+        doc: >-
+          The role granted, as `apiGroup`, `kind` and `name`. Where §9.5 matters: a `Role` is
+          looked up in the binding's namespace and a `ClusterRole` is not, and the `kind` here is
+          what decides which.
+      subjects:
+        type: list<map>
+        nullable: true
+        doc: >-
+          Who holds it, each as the API states it. A subject naming a ServiceAccount carries its
+          namespace; one naming a user or a group carries none, and inventing one would address
+          something that does not exist.
+    default_view:
+      columns: [name, role_ref, subjects]
+
+  - id: io.github.godspeed-you.kubernetes.clusterrolebinding/1
+    name: KubernetesClusterRoleBinding
+    summary: >-
+      A cluster-wide binding: the role it grants and the subjects it grants it to.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      role_ref:
+        type: map
+        nullable: true
+        doc: >-
+          The role granted. Always a `ClusterRole`: a cluster-wide binding cannot name a namespaced
+          role, and the field says so rather than this provider asserting it.
+      subjects:
+        type: list<map>
+        nullable: true
+        doc: >-
+          Who holds it, each as the API states it.
+    default_view:
+      columns: [name, role_ref, subjects]
+
+  - id: io.github.godspeed-you.kubernetes.lease/1
+    name: KubernetesLease
+    summary: >-
+      A lease: who holds it, for how long, and when it was last renewed.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different NetworkPolicy.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`.'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      holder:
+        type: string
+        nullable: true
+        doc: >-
+          The identity holding the lease, as it wrote itself. A string a component chose, not an
+          identity this cluster assigned — two components may choose the same one.
+      lease_duration_seconds:
+        type: int
+        nullable: true
+        doc: >-
+          How long a renewal is good for.
+      renew_time:
+        type: timestamp
+        nullable: true
+        doc: >-
+          When the holder last renewed, by the holder's clock. §14.3: not this provider's clock,
+          and a lease that looks expired may be one whose holder's clock is skewed.
+      acquire_time:
+        type: timestamp
+        nullable: true
+        doc: >-
+          When the current holder took it, by the holder's clock.
+    default_view:
+      columns: [name, holder, lease_duration_seconds, renew_time, acquire_time]
+
+  - id: io.github.godspeed-you.kubernetes.priorityclass/1
+    name: KubernetesPriorityClass
+    summary: >-
+      A priority class: the value it carries, whether it is the default, and what it may preempt.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      value:
+        type: int
+        nullable: true
+        doc: >-
+          The priority. Higher wins, and the number is only meaningful against the other classes on
+          this cluster.
+      global_default:
+        type: bool
+        nullable: true
+        doc: >-
+          Whether Pods that name no class get this one. At most one class on a cluster may say
+          true, and a cluster with none is a cluster where unclassed Pods have priority zero.
+      preemption_policy:
+        type: string
+        nullable: true
+        doc: >-
+          Whether Pods of this class may evict lower-priority ones.
+      description:
+        type: string
+        nullable: true
+        doc: >-
+          What the author said it is for. Kept because a priority number without it is unreadable.
+    default_view:
+      columns: [name, value, global_default, preemption_policy, description]
+
+  - id: io.github.godspeed-you.kubernetes.runtimeclass/1
+    name: KubernetesRuntimeClass
+    summary: >-
+      A runtime class: the handler it selects, the overhead it declares, and where it may be
+      scheduled.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      handler:
+        type: string
+        nullable: true
+        doc: >-
+          The CRI handler name this class selects. Configured on the node rather than declared
+          here, so a class naming a handler no node implements schedules nowhere.
+      overhead:
+        type: map
+        nullable: true
+        doc: >-
+          The fixed resources the runtime itself costs, added to every Pod of this class.
+      scheduling:
+        type: map
+        nullable: true
+        doc: >-
+          Which nodes can run it, where the class narrows them. Only the node selector: tolerations
+          are a list and belong beside it rather than inside it.
+    default_view:
+      columns: [name, handler, overhead, scheduling]
+
+  - id: io.github.godspeed-you.kubernetes.csidriver/1
+    name: KubernetesCsiDriver
+    summary: >-
+      A registered CSI driver: what the kubelet must do for it, and which volume lifecycles it
+      supports.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      attach_required:
+        type: bool
+        nullable: true
+        doc: >-
+          Whether a VolumeAttachment must be made before a volume can be mounted.
+      pod_info_on_mount:
+        type: bool
+        nullable: true
+        doc: >-
+          Whether the kubelet passes Pod metadata to the driver at mount.
+      storage_capacity:
+        type: bool
+        nullable: true
+        doc: >-
+          Whether the driver publishes capacity the scheduler may use.
+      fs_group_policy:
+        type: string
+        nullable: true
+        doc: >-
+          Who owns changing volume ownership for `fsGroup`.
+      volume_lifecycle_modes:
+        type: list<string>
+        nullable: true
+        doc: >-
+          Which lifecycles the driver supports — persistent volumes, ephemeral inline volumes, or
+          both.
+    default_view:
+      columns: [name, attach_required, pod_info_on_mount, storage_capacity, fs_group_policy]
+
+  - id: io.github.godspeed-you.kubernetes.csinode/1
+    name: KubernetesCsiNode
+    summary: >-
+      One node's CSI driver registrations, including the node id each driver knows it by.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      drivers:
+        type: list<map>
+        nullable: true
+        doc: >-
+          Each registered driver as the kubelet wrote it: its `name`, the `nodeID` that driver
+          knows this node by, and the topology keys it reports. The `nodeID` is §47.5's storage
+          evidence at the node end — a name the storage system assigned, exported and never
+          resolved.
+    default_view:
+      columns: [name, drivers]
+
+  - id: io.github.godspeed-you.kubernetes.volumeattachment/1
+    name: KubernetesVolumeAttachment
+    summary: >-
+      One attachment of one volume to one node, with what the attacher said if it failed.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      attacher:
+        type: string
+        nullable: true
+        doc: >-
+          The CSI driver asked to make the attachment.
+      node:
+        type: string
+        nullable: true
+        doc: >-
+          The node the volume is attached to, by name. A locator: a Node with this name may since
+          have been replaced (§4 invariant 5).
+      source_volume:
+        type: string
+        nullable: true
+        doc: >-
+          The PersistentVolume being attached, by name. Null for an inline volume, whose source is
+          a Pod's spec rather than an object.
+      attached:
+        type: bool
+        nullable: true
+        doc: >-
+          Whether the attacher reported success. False and absent are different: one is a reported
+          failure, the other an attachment nothing has reported on yet.
+      attach_error:
+        type: string
+        nullable: true
+        doc: >-
+          What the attacher said when it failed, verbatim. §48.1: the message is the diagnosis, and
+          summarising it away loses the only sentence anyone can act on.
+    default_view:
+      columns: [name, attacher, node, source_volume, attached]
+
+  - id: io.github.godspeed-you.kubernetes.mutatingwebhookconfiguration/1
+    name: KubernetesMutatingWebhookConfiguration
+    summary: >-
+      A mutating admission configuration: each webhook, what it intercepts, and what happens when
+      it does not answer.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      webhooks:
+        type: list<map>
+        nullable: true
+        doc: >-
+          Each webhook as the API states it: its `name`, the `rules` it intercepts, its
+          `failurePolicy`, its `sideEffects` and its `timeoutSeconds`. §44.6 is why this is curated
+          at all — a webhook is the reason an applied object comes back different from what was
+          sent, and an operator reading a surprising apply looks here.
+    default_view:
+      columns: [name, webhooks]
+
+  - id: io.github.godspeed-you.kubernetes.validatingwebhookconfiguration/1
+    name: KubernetesValidatingWebhookConfiguration
+    summary: >-
+      A validating admission configuration: each webhook, what it intercepts, and what happens when
+      it does not answer.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      webhooks:
+        type: list<map>
+        nullable: true
+        doc: >-
+          Each webhook as the API states it. A refused apply that nothing in RBAC explains is
+          usually one of these, and `failurePolicy: Fail` on a webhook whose service is down
+          refuses changes nobody configured it to refuse.
+    default_view:
+      columns: [name, webhooks]
+
+  - id: io.github.godspeed-you.kubernetes.validatingadmissionpolicy/1
+    name: KubernetesValidatingAdmissionPolicy
+    summary: >-
+      An in-process admission policy: what it matches, what it asserts, and what happens when an
+      assertion fails.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` — the lifetime identity (§16.1). A name reused after deletion is a
+          different StorageClass.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name`. A locator, never an identity (§16.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`, so the record carries the GVK it was read under (§13.1).'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`. Group, version and kind together are object identity; they are not a GVR.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.resourceVersion`, as the opaque string the server sent (§14.3). Not a
+          timestamp and never sorted as a timeline.
+      created:
+        type: timestamp
+        nullable: true
+        doc: '`metadata.creationTimestamp`. Null when the server sent none or it did not parse.'
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole. Null when the object carries none.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion was accepted and has not completed — `metadata.deletionTimestamp` is
+          present. A terminating object is still there and still answers (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      failure_policy:
+        type: string
+        nullable: true
+        doc: >-
+          What happens when the policy cannot be evaluated.
+      match_constraints:
+        type: map
+        nullable: true
+        doc: >-
+          What the policy applies to, as the API states it.
+      validations:
+        type: list<map>
+        nullable: true
+        doc: >-
+          Each assertion as written, expression and message. Never evaluated here: this provider
+          reports what a policy says, and what it would decide about a particular object is the API
+          server's answer (§21.3).
+    default_view:
+      columns: [name, failure_policy, match_constraints, validations]
+
   - id: io.github.godspeed-you.kubernetes.resource/1
     name: KubernetesResource
     summary: Any resource the cluster serves, typed by the schema the cluster publishes for it.
