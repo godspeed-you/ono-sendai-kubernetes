@@ -77,6 +77,9 @@ declared:
   - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_answer_for_the_platform_operation_tier_against_a_real_cluster"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — the seventeen kinds of specification section 15.3 are read from whatever the cluster itself serves"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_read_the_lines_a_real_container_wrote_through_the_log_subresource"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — the lines are CoreDNS's own, which every cluster prints on startup"
   - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_answer_a_live_read_on_a_machine_with_no_kubectl"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — and a machine with no `kubectl` on `PATH`, which the test asserts rather than assumes (Gate M)"

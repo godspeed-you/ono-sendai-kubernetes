@@ -392,7 +392,7 @@ fn fetch_body<S: ByteStream>(
     request: Request,
     pod: &str,
 ) -> Result<Vec<u8>, WireError> {
-    let request = endpoint.authorise(request.header("Accept", "text/plain"));
+    let request = endpoint.authorise(request.header("Accept", "*/*"));
     let response = client
         .connection()
         .send(&request)
@@ -511,7 +511,7 @@ impl Conversation for Following<'_, '_, '_> {
             emitter,
             source,
         } = self;
-        let request = endpoint.authorise(request.header("Accept", "text/plain"));
+        let request = endpoint.authorise(request.header("Accept", "*/*"));
         let mut stream = client
             .connection()
             .open(&request)

@@ -2116,6 +2116,50 @@ fn paged_pods(path: &str, cluster: &RecordedCluster) -> Option<Vec<u8>> {
     }
 }
 
+/// The `406` a real API server answers a log request with when the `Accept` names a media type
+/// its content negotiation does not offer (§42.1).
+///
+/// This is here because its absence cost §42 its whole feature. The log request asked for
+/// `text/plain` — the media type the body actually *is* — and every real cluster refused it,
+/// while this fixture answered whatever it was asked and stayed green. A fixture that never
+/// checks what it was asked with cannot fail the way the thing it stands in for fails.
+fn unacceptable(head: &str, path: &str) -> Option<Vec<u8>> {
+    if !path.split('?').next().unwrap_or(path).ends_with("/log") {
+        return None;
+    }
+    let accept = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Accept: "))
+        .unwrap_or("*/*")
+        .trim();
+    // What the API server's negotiation offers for this endpoint, and `*/*` which asks for
+    // whatever it has. `text/plain` is what the body is and not something it will negotiate to.
+    if accept == "*/*"
+        || accept.starts_with("application/json")
+        || accept.starts_with("application/yaml")
+    {
+        return None;
+    }
+    let body = json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "message": "only the following media types are accepted: application/json, \
+                    application/yaml, application/vnd.kubernetes.protobuf",
+        "reason": "NotAcceptable",
+        "code": 406,
+    })
+    .to_string();
+    Some(
+        format!(
+            "HTTP/1.1 406 Not Acceptable\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes(),
+    )
+}
+
 fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let pods = cluster.pods;
     // Read before the query string is dropped, because `watch=true` is the whole difference
@@ -2403,6 +2447,7 @@ impl HostServices for RecordedCluster {
                     }
                     replies.push(
                         aggregated_reply(&head, path.split('?').next().unwrap_or(&path), &cluster)
+                            .or_else(|| unacceptable(&head, &path))
                             .unwrap_or_else(|| document(&path, &cluster)),
                     );
                     // A paced watch answers with its head here and with its frames later, each

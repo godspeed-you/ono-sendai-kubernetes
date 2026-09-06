@@ -13,25 +13,27 @@ under *Found, not yet filed*, and the user triages it into an issue.
 ## Where the project is
 
 **The package runs, speaks TLS, resolves the cluster it talks to from a kubeconfig context, reads
-every one of §15.2's nineteen kinds and every kind the cluster serves besides, answers a direct
-lookup by name, says what one object is related to with the evidence under each edge, holds a
-session across invocations, watches a collection live and says which periods it could not observe,
-and — under a declared risk and a granted capability — predicts or makes one bounded change.**
+every one of §15.2's nineteen kinds and §15.3's seventeen besides — and every kind the cluster
+serves that nobody compiled in — answers a direct lookup by name, pushes a label selector to the
+API server, says what one object is related to with the evidence and the source reads under each
+edge, holds a session across invocations, watches a collection live and says which periods it
+could not observe, exports cross-system identity evidence for four subject families, and — under a
+declared risk and a granted capability — predicts or makes one bounded change, then says what a
+follow-up read established about it.**
 
-The counterweight is much smaller than it was this morning: **two of the twenty-four domain
-modules — `live` and `budget`, 1,474 lines and 40 tests — cannot be reached from a prompt.** It
-was eleven modules, 10,356 lines and 239 tests. The plugin now imports twenty-two of the
-twenty-four.
+Every one of the twenty-four domain modules is now imported by the package. `live` and `budget`,
+the last two that were not, reach a reader through `changes.rs` and `query.rs`.
 
 | | |
 |---|---|
 | Specification | `docs/architecture/kubernetes-provider.md` — canonical here, immutable, checksummed |
 | Domain layer | `crates/ono-provider-kubernetes`, twenty-four modules, no host and no cluster |
-| Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations |
-| Contributions | 30 targets, 2 commands, 31 schemas, **zero verbs of this package's own** |
-| Tests | 642 across the workspace — 498 domain, 144 package — all green, no live cluster and no network |
+| Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations, audit, spatial |
+| Contributions | 47 targets, 3 commands, 48 schemas, **zero verbs of this package's own** |
+| Tests | 931 across the workspace, all green; 21 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml` |
+| Live proof | 13 tests against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine |
 | Transport | HTTP/1.1 over a `rustls` session over the host's brokered `network.connect` |
-| Conformance level reached | **none claimed.** K0 and K1 are met requirement by requirement and §0.1 binds a claim to the gates; see below |
+| Conformance level reached | **none claimed.** §0.1 binds a claim to the gates; see `docs/coverage.md` for the requirement-by-requirement map |
 | Licence | Apache-2.0 (core is MIT) |
 
 The gate has grown to core's shape: `cargo fmt --check`, `cargo clippy -D warnings`, the test

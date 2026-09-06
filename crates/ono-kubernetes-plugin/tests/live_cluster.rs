@@ -1270,6 +1270,80 @@ fn should_answer_for_the_platform_operation_tier_against_a_real_cluster() {
 }
 
 #[test]
+fn should_read_the_lines_a_real_container_wrote_through_the_log_subresource() {
+    // §42.1 against a cluster, and the test that should have existed before any of it was
+    // claimed. Every log read this provider made was answered `406 Not Acceptable` by every real
+    // API server — the request asked for `Accept: text/plain`, which is what the body *is* and
+    // not something Kubernetes' content negotiation offers, so it refused before reading a byte.
+    //
+    // Nothing caught it. The recorded fixture answered whatever it was asked and never looked at
+    // the `Accept`, and the failure that did reach the shell was swallowed by the host, which
+    // read an unbounded target's empty stream as a complete empty answer. Two layers of green
+    // over a feature that had never once worked. This is the layer that cannot be fooled: a
+    // container the cluster runs, and the lines it actually printed.
+    let live = match Live::open() {
+        Ok(live) => live,
+        Err(missing) => {
+            return announce_skip(
+                "should_read_the_lines_a_real_container_wrote_through_the_log_subresource",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let home = plugin_home(&live, "logs");
+
+    // CoreDNS, because every cluster runs it and it prints its version on startup — a line that
+    // is there on a cluster created a minute ago, which is the only kind this suite makes.
+    let pod = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-pod {} --namespace kube-system --selector 'k8s-app=kube-dns' \
+             | take 1 | select name | to json",
+            as_admin(&home)
+        ),
+    )
+    .only();
+    let name = pod["name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a CoreDNS Pod, got {pod}"));
+
+    let run = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-log {} --namespace kube-system --name {name} --tail_lines 2 \
+             | select line text bounds | to json",
+            as_admin(&home)
+        ),
+    );
+    let lines = run.rows();
+    assert!(
+        !lines.is_empty(),
+        "the container printed something and the read reached it: {run:?}"
+    );
+    for line in &lines {
+        assert!(
+            line["text"].as_str().is_some(),
+            "each record carries the line it read: {line}"
+        );
+        // §42.1: "a log is never complete", so every line says what bounded the read it came
+        // from. A line with no bounds would read as a complete log, which no log is.
+        let bounds = line["bounds"]
+            .as_array()
+            .unwrap_or_else(|| panic!("every line states its bounds, got {line}"));
+        assert!(
+            bounds.iter().any(|bound| bound
+                .as_str()
+                .is_some_and(|text| text.contains("last 2 lines"))),
+            "including the tail this query asked for: {line}"
+        );
+    }
+    assert_eq!(lines.len(), 2, "and the tail was honoured: {run:?}");
+}
+
+#[test]
 fn should_answer_a_live_read_on_a_machine_with_no_kubectl() {
     // Gate M (§62.13): "core conformance works on a machine where `kubectl` is absent". Asserted
     // rather than assumed — the test looks for the binary on `PATH` itself and fails the run when

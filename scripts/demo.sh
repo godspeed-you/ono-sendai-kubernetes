@@ -171,7 +171,7 @@ note "from a later observation, and \`inconclusive\` is an honest answer."
 run "$LOAD; set k8s-resource $KUBE --namespace ono-alpha --kind Deployment --name checkout --set '{\"/spec/replicas\": 2}' --dry_run false | select dry_run acceptance stage verdict reconciliation | to json"
 
 say "14b. a conflict is an answer, and forcing takes a sentence"
-note "§44.3 and §44.4: `spec.replicas` is already owned by another field manager, so the apply"
+note "§44.3 and §44.4: \`spec.replicas\` is already owned by another field manager, so the apply"
 note "above came back as a conflict naming it rather than as a silent overwrite. There is no"
 note "\`--force\` flag in this package at all; taking ownership costs a reason a reviewer reads."
 run "$LOAD; set k8s-resource $KUBE --namespace ono-alpha --kind Deployment --name checkout --set '{\"/spec/replicas\": 2}' --dry_run false --force_because 'demonstrating that ownership is taken deliberately' | select acceptance stage verdict | to json"
