@@ -17,12 +17,40 @@ env:
   # `main`, which is the one place that guard would only get in the way.
   ONO_ALLOW_MAIN: 1
 
+  # The revision of core both jobs build the shell from, and the one `Cargo.toml` builds this
+  # package against. `should_build_the_shell_from_the_revision_this_package_is_built_against`
+  # fails when the two drift, because a green leg against the wrong shell looks exactly like a
+  # green leg.
+  ONO_CORE_REV: 29edac758293c564816b7514765236a8ee360740
+
 jobs:
   gate:
     name: gate
     runs-on: ubuntu-latest
     steps:
+      # Both repositories side by side, rather than this one at the workspace root: core's
+      # checkout nested inside it would put nine hundred of its markdown files in front of the
+      # gate's link check, which reads the working tree rather than the index.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: ono-sendai-kubernetes
+
+      # The shell the host-side tests drive. Nine tests in `tests/spatial_shell.rs` contact no
+      # cluster — the API server is a `TcpListener` in the test process — and need only a built
+      # `ono`; without one they announce a declared skip and the whole host-side layer goes
+      # unchecked: entering a place, `near`, `follow`, the namespace parent, `up`'s refusal, the
+      # `relation.write` gate, and a watch reaching the shell as a live stream. That layer is what
+      # K2 and K3 each have one requirement left in, and skipping it is the cheapest way not to
+      # know.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: godspeed-you/ono-sendai
+          ref: ${{ env.ONO_CORE_REV }}
+          path: ono-sendai
+
+      - name: build the shell
+        working-directory: ono-sendai
+        run: cargo build -p ono-cli --bin ono
 
       # The same script a developer runs before every commit, with no CI-only variant: a gate that
       # differs between the two is a gate that disagrees with itself (AGENTS.md section 10).
@@ -33,6 +61,9 @@ jobs:
       # and this script checks. A gate that needed a cluster to be green would have made the live
       # tests mandatory by the back door.
       - name: gate
+        working-directory: ono-sendai-kubernetes
+        env:
+          ONO_BINARY: ${{ github.workspace }}/ono-sendai/target/debug/ono
         run: scripts/gate.sh
 
   kubernetes:
@@ -70,7 +101,6 @@ jobs:
       # `Cargo.toml`. The shell the live tests drive is built from the same commit the package is
       # compiled against; two revisions in one run would be two incompatible copies of every type
       # that crosses the boundary.
-      ONO_CORE_REV: e1a44fd7246e0beb99d7edbd95a9a09991963c41
       KIND_VERSION: v0.33.0
       KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
     steps:

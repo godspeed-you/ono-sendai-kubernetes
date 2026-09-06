@@ -587,6 +587,45 @@ fn should_declare_the_same_arguments_in_the_document_and_across_the_handshake() 
     }
 }
 
+/// The workflow that builds the shell the live suite drives.
+const CI: &str = include_str!("../../../.github/workflows/ci.yml");
+/// The workspace manifest, which pins the revision this package is built against.
+const WORKSPACE: &str = include_str!("../../../Cargo.toml");
+
+#[test]
+fn should_build_the_shell_from_the_revision_this_package_is_built_against() {
+    // Gate N's whole evidence rests on the live legs having run, and they run the package against
+    // an `ono` built from `ONO_CORE_REV`. When that drifts from the revision `Cargo.toml` pins,
+    // the legs test the package against a shell it was not built for — and the one that matters
+    // is `ADR-0588 (core)`, without which `get k8s-change` and `get k8s-log --follow` are
+    // collected rather than streamed and never return to a prompt.
+    //
+    // It had drifted: the workflow still named the revision that was current when the harness
+    // landed. Nothing said so, because a green leg against the wrong shell looks exactly like a
+    // green leg.
+    let pinned = WORKSPACE
+        .lines()
+        .find_map(|line| {
+            line.split_once("rev = \"")?
+                .1
+                .split_once('"')
+                .map(|(rev, _)| rev)
+        })
+        .expect("the workspace pins a revision of core");
+    let built = CI
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ONO_CORE_REV:"))
+        .map(str::trim)
+        .expect("the workflow names the revision it builds the shell from");
+
+    assert_eq!(
+        built, pinned,
+        "`.github/workflows/ci.yml` builds `ono` from a different revision of core than \
+         `Cargo.toml` builds this package against, so the live legs prove nothing about the pair \
+         that ships"
+    );
+}
+
 #[test]
 fn should_declare_the_same_boundedness_in_the_document_and_across_the_handshake() {
     // `ADR-0588 (core)`. The host decides whether to collect a contributed answer *before* it
