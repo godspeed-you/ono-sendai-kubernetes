@@ -168,3 +168,63 @@ fn should_carry_a_scope_that_says_what_was_asked() {
     assert_eq!(Scope::in_namespace("shop").namespace(), Some("shop"));
     assert_eq!(Scope::cluster().namespace(), None);
 }
+
+#[test]
+fn should_name_an_unreadable_api_group_apart_from_a_request_that_failed() {
+    // §34.2: "Coverage SHOULD report the failed group/version separately." Appendix D.3 spells
+    // the row out — `custom.metrics.k8s.io: unavailable`, standing beside the complete ones —
+    // and §34.3 forbids attributing the failure generically to "the cluster". A group whose own
+    // API server is down is a ninth situation beside §21.4's eight, and folding it into
+    // `request failed` would lose the one thing an operator acts on: which group to go and fix.
+    let gap = Gap::new(
+        Scope::in_group_version("custom.metrics.k8s.io/v1beta1"),
+        Outcome::Unavailable,
+    );
+    assert_eq!(gap.describe(), "custom.metrics.k8s.io/v1beta1: unavailable");
+    assert_ne!(
+        Outcome::Unavailable.as_str(),
+        Outcome::RequestFailed.as_str()
+    );
+    assert_ne!(
+        Outcome::Unavailable.as_str(),
+        Outcome::TypeNotServed.as_str()
+    );
+    assert!(
+        !Outcome::Unavailable.is_evidence_of_absence(),
+        "a group that did not answer is not a group with nothing in it"
+    );
+}
+
+#[test]
+fn should_keep_a_group_version_scope_apart_from_a_namespace_of_the_same_name() {
+    // §9.3: API group/version is a scope dimension of its own. A gap recorded against
+    // `metrics.k8s.io/v1beta1` says the *type space* was not fully read, which is a different
+    // claim from a namespace nobody could list — and a renderer must not confuse the two.
+    let scope = Scope::in_group_version("metrics.k8s.io/v1beta1");
+    assert_eq!(scope.to_string(), "metrics.k8s.io/v1beta1");
+    assert_eq!(scope.group_version(), Some("metrics.k8s.io/v1beta1"));
+    assert_eq!(scope.namespace(), None);
+    assert_eq!(Scope::in_namespace("shop").group_version(), None);
+    assert_ne!(Scope::in_group_version("shop"), Scope::in_namespace("shop"));
+}
+
+#[test]
+fn should_not_read_an_unavailable_group_as_a_complete_answer() {
+    // §48.6: an all-resource view spanning several GVRs may keep the resources that answered,
+    // "with explicit incomplete coverage". Explicit is the operative word — the coverage has to
+    // come back incomplete, and it has to name the group-version that did not answer.
+    let mut coverage = Coverage::complete(Scope::cluster());
+    coverage.observed(Scope::cluster());
+    coverage.record(Gap::new(
+        Scope::in_group_version("metrics.k8s.io/v1beta1"),
+        Outcome::Unavailable,
+    ));
+
+    assert!(!coverage.is_complete());
+    assert!(coverage.is_empty_but_incomplete(0));
+    assert!(
+        !coverage.is_empty_but_incomplete(3),
+        "three resources answered; the view is partial rather than empty"
+    );
+    assert!(coverage.describe().contains("metrics.k8s.io/v1beta1"));
+}

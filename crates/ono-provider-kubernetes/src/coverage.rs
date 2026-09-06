@@ -18,6 +18,18 @@
 //! Collapsing those into an empty collection is how a permission boundary gets read as "there is
 //! nothing there" — wrong in the direction that costs an operator the most, because it looks like
 //! information rather than like a failure.
+//!
+//! §34.2 adds a ninth beside §21.4's eight, and a scope dimension to record it against:
+//!
+//! ```text
+//! unavailable       an API group's own server did not answer
+//! ```
+//!
+//! An aggregated API group is served by a second API server behind the aggregation layer, and
+//! that server can be down while the core one answers perfectly. §34.2 requires exactly two
+//! things of that case — that it must not make the whole provider unavailable, and that "coverage
+//! SHOULD report the failed group/version separately" — so the group-version is a [`Scope`] of its
+//! own (§9.3) and the word is its own outcome rather than a generic `request failed` (§34.3).
 
 use std::fmt;
 
@@ -38,6 +50,13 @@ pub enum Outcome {
     Disconnected,
     /// The request reached the server and failed.
     RequestFailed,
+    /// An API group's own server did not answer while the core API server did (§34.2, §48.6).
+    ///
+    /// Distinct from [`Self::Disconnected`], which is the whole provider losing the cluster, and
+    /// from [`Self::RequestFailed`], which is one request erroring against a server that is
+    /// there. This is one group-version's worth of the API surface going dark — the aggregation
+    /// layer's characteristic failure, and the one §34.2 forbids escalating to the provider.
+    Unavailable,
     /// Nobody asked. Never to be read as absence (§21.5).
     NotQueried,
 }
@@ -54,6 +73,7 @@ impl Outcome {
             Self::ListDenied => "list denied",
             Self::Disconnected => "disconnected",
             Self::RequestFailed => "request failed",
+            Self::Unavailable => "unavailable",
             Self::NotQueried => "not queried",
         }
     }
@@ -73,6 +93,7 @@ impl Outcome {
 pub struct Scope {
     namespace: Option<String>,
     all_namespaces: bool,
+    group_version: Option<String>,
 }
 
 impl Scope {
@@ -82,6 +103,7 @@ impl Scope {
         Self {
             namespace: Some(name.into()),
             all_namespaces: false,
+            group_version: None,
         }
     }
 
@@ -91,6 +113,7 @@ impl Scope {
         Self {
             namespace: None,
             all_namespaces: true,
+            group_version: None,
         }
     }
 
@@ -100,6 +123,22 @@ impl Scope {
         Self {
             namespace: None,
             all_namespaces: false,
+            group_version: None,
+        }
+    }
+
+    /// One API group-version, as `group/version` or the bare version of the core group (§9.3).
+    ///
+    /// The dimension §34.2's second sentence asks a gap to be recorded against: a group-version
+    /// that did not answer is a hole in the *type space* a query searched, which is a different
+    /// claim from a namespace nobody could list. Spelled as discovery spells it, so that the row
+    /// an operator reads names the `APIService` they have to go and look at.
+    #[must_use]
+    pub fn in_group_version(group_version: impl Into<String>) -> Self {
+        Self {
+            namespace: None,
+            all_namespaces: false,
+            group_version: Some(group_version.into()),
         }
     }
 
@@ -108,14 +147,21 @@ impl Scope {
     pub fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
     }
+
+    /// The API group-version this scope names, if any.
+    #[must_use]
+    pub fn group_version(&self) -> Option<&str> {
+        self.group_version.as_deref()
+    }
 }
 
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (&self.namespace, self.all_namespaces) {
-            (Some(name), _) => write!(f, "namespace/{name}"),
-            (None, true) => f.write_str("all-namespaces"),
-            (None, false) => f.write_str("cluster"),
+        match (&self.namespace, &self.group_version, self.all_namespaces) {
+            (Some(name), _, _) => write!(f, "namespace/{name}"),
+            (None, Some(group_version), _) => f.write_str(group_version),
+            (None, None, true) => f.write_str("all-namespaces"),
+            (None, None, false) => f.write_str("cluster"),
         }
     }
 }

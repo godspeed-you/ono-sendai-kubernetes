@@ -201,6 +201,19 @@ struct RecordedCluster {
     /// Whether the server serves the two invented API groups of the dynamic tests. Off for the
     /// curated tests, so that adding a CRD to this fixture cannot change what they prove.
     custom: bool,
+    /// Whether the server lists an aggregated API group whose own API server does not answer.
+    ///
+    /// §34.2's ordinary Tuesday. An `APIService` is registered, the aggregation layer lists its
+    /// group in `/apis`, and every request proxied to it comes back `503` because the server
+    /// behind it is down. The core API server answers perfectly throughout, which is the whole
+    /// point: the specification forbids one of those failures becoming the other.
+    degraded_aggregate: bool,
+    /// Whether the group list itself does not answer.
+    ///
+    /// The other side of §34.2's boundary. `/api` and `/apis` are not one group among many —
+    /// they are how the provider learns what is served at all (§11.1) — so a cluster that
+    /// refuses them cannot be read, and the query genuinely fails.
+    no_group_list: bool,
     /// Whether RBAC refuses `list` on the Pod collection while `get` on one Pod stays allowed.
     /// §60.5's canonical scenario, and the reason a direct lookup is a different request rather
     /// than a shortcut through the listing.
@@ -460,6 +473,42 @@ impl RecordedCluster {
         })
     }
 
+    /// A server that lists an aggregated API group whose resource list answers `503`.
+    ///
+    /// Nothing else about it is unusual: the core group, the Pods and the `apps` group are the
+    /// ones every other test reads, so what a query does differently here is caused by the one
+    /// group that is down and by nothing else.
+    fn with_a_failing_aggregated_group() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            degraded_aggregate: true,
+            ..Self::default()
+        })
+    }
+
+    /// The same failure on a server whose objects carry relationships.
+    fn with_relations_and_a_failing_aggregated_group() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            tier_one: true,
+            relations: true,
+            degraded_aggregate: true,
+            ..Self::default()
+        })
+    }
+
+    /// A server that will not say which API groups it serves.
+    fn without_a_group_list() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            no_group_list: true,
+            ..Self::default()
+        })
+    }
+
     /// A server whose RBAC allows `get` on one Pod and refuses `list` on the collection — the
     /// scenario §60.5 names, and the one that decides whether `get` is its own request.
     fn denying_pod_list() -> Arc<Self> {
@@ -588,6 +637,53 @@ fn denied(path: &str, verb: &str) -> Vec<u8> {
         body.len()
     )
     .into_bytes()
+}
+
+/// One `503`, as the aggregation layer answers for an `APIService` whose backend is down.
+///
+/// A `Status` rather than a bare code, because that is what the aggregator returns and because
+/// §48.1 asks for its structured fields to survive.
+fn unavailable(path: &str) -> Vec<u8> {
+    let body = json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "message": format!("no endpoints available for the service behind {path}"),
+        "reason": "ServiceUnavailable",
+        "code": 503,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// The aggregated group the degraded server lists and cannot serve.
+fn failing_aggregate() -> Json {
+    json!({
+        "name": "metrics.example",
+        "versions": [{"groupVersion": "metrics.example/v1beta1", "version": "v1beta1"}],
+        "preferredVersion": {
+            "groupVersion": "metrics.example/v1beta1", "version": "v1beta1",
+        },
+    })
+}
+
+/// The group list whichever fixture layer owns it would answer with, before the aggregated group
+/// that does not answer is added to it.
+fn base_group_list(cluster: &RecordedCluster) -> Json {
+    if cluster.custom {
+        return custom_document("/apis").expect("the custom fixture answers the group list");
+    }
+    if cluster.tier_one {
+        return tier_one_document("/apis").expect("the tier one fixture answers the group list");
+    }
+    if !cluster.apps {
+        return json!({"kind": "APIGroupList", "groups": []});
+    }
+    json!({"kind": "APIGroupList", "groups": [group("apps")]})
 }
 
 /// One object as the *object* endpoint sends it, which states its own `apiVersion` and `kind`.
@@ -1779,6 +1875,26 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let path = path.split('?').next().unwrap_or(path);
     if cluster.watch != Watching::NotOffered && path == "/api/v1/namespaces/default/pods" {
         return response(&watch_listing(cluster).to_string());
+    }
+    // §34.2's boundary, before any of the layered fixtures answer: the group list is how the
+    // provider learns what is served at all, so a server that refuses it is not one group down.
+    if cluster.no_group_list && path == "/apis" {
+        return unavailable(path);
+    }
+    // §34.2's case: the aggregated group is listed, and everything behind it answers `503`.
+    if cluster.degraded_aggregate {
+        if path == "/apis" {
+            let mut groups = base_group_list(cluster);
+            groups
+                .get_mut("groups")
+                .and_then(Json::as_array_mut)
+                .expect("a group list holds groups")
+                .push(failing_aggregate());
+            return response(&groups.to_string());
+        }
+        if path.starts_with("/apis/metrics.example/") {
+            return unavailable(path);
+        }
     }
     // §60.5's refusal, before any of the layered fixtures answer for the same path: a derivation
     // that reads the Pod collection must be able to meet it too, and not only a Pod query.
@@ -3489,6 +3605,203 @@ async fn should_answer_a_query_that_names_no_kind_with_the_cluster_s_own_catalog
         help.contains("Sprocket") && help.contains("Pod"),
         "the catalogue is the cluster's, and it holds the invented kind beside the built-in \
          one: {help}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_answer_from_the_groups_that_answered_when_an_aggregated_group_does_not() {
+    // §34.2: "An unavailable aggregated API group MUST NOT make the entire Kubernetes provider
+    // unavailable if the core API server remains usable." §4 invariant 16 says an aggregated API
+    // is a normal discovered API, which is exactly why one of them being down cannot be allowed
+    // to mean the cluster is. The Pods live in the core group, the core group answered, and
+    // §48.6 lets the resources that answered stay visible with explicit incomplete coverage.
+    let plugin = loaded_against(RecordedCluster::with_a_failing_aggregated_group()).await;
+    let invocation = plugin
+        .query("k8s-resource", at_cluster(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert_eq!(
+        records(&events).len(),
+        2,
+        "the core API server answered, so its Pods are the answer: one broken APIService does \
+         not make the provider unavailable (specification section 34.2)"
+    );
+    let error = result
+        .error
+        .expect("an answer read over an incomplete search says so");
+    assert!(
+        error
+            .message
+            .contains("metrics.example/v1beta1: unavailable"),
+        "coverage reports the failed group/version separately, as section 34.2's second sentence \
+         asks and Appendix D.3 spells: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("unavailable"),
+        "the word is the group's own outcome rather than a generic failure (section 34.3): {}",
+        error.message
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_not_report_a_kind_only_an_unreadable_group_could_serve_as_not_served() {
+    // §4 invariant 13 and §21.4: "could not read this group" is not "this kind is not served".
+    // The only group that could have served this kind is the one that did not answer, so the
+    // honest answer is that the search was incomplete. Saying `not served` would be this
+    // provider asserting a fact about the cluster that it has no evidence for — the same
+    // mistake as reading a denial as an empty collection, one level up.
+    let plugin = loaded_against(RecordedCluster::with_a_failing_aggregated_group()).await;
+    let invocation = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[("kind", json!("NodeMetrics"))]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        !error.message.contains("serves nothing"),
+        "a group nobody could read is not a cluster that serves no such kind: {}",
+        error.message
+    );
+    assert_eq!(
+        error.name, "provider.unavailable",
+        "the refusal is about what could not be read, not about what the cluster does not have"
+    );
+    assert!(
+        error
+            .message
+            .contains("metrics.example/v1beta1: unavailable"),
+        "it names the group-version that was not searched, as a coverage row rather than as a \
+         cluster that refused discovery: {}",
+        error.message
+    );
+    assert!(
+        !error.help.clone().unwrap_or_default().contains("at all"),
+        "the cluster is readable — one group is not — and the help must not say otherwise: {:?}",
+        error.help
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_not_present_a_search_that_could_not_read_every_group_as_unambiguous() {
+    // §35.8 with §34.2, and the reason this change is not a one-line skip. A search that reads
+    // every group and finds one candidate is unambiguous; a search that skipped a group and
+    // found one candidate is *indistinguishable from* an unambiguous one unless it says so —
+    // and §35.8 forbids resolving a shared name by anything but disambiguation. Continuing past
+    // a group that did not answer therefore costs the answer its claim to completeness.
+    let healthy = loaded_against(RecordedCluster::with_pods(2)).await;
+    let invocation = healthy
+        .query("k8s-resource", at_cluster(&[("kind", json!("Deployment"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "every group answered, so one candidate is one candidate: {:?}",
+        result.error
+    );
+    assert_eq!(records(&events).len(), 1);
+    healthy.shutdown(ShutdownReason::Unload).await;
+
+    let degraded = loaded_against(RecordedCluster::with_a_failing_aggregated_group()).await;
+    let invocation = degraded
+        .query("k8s-resource", at_cluster(&[("kind", json!("Deployment"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(
+        records(&events).len(),
+        1,
+        "the Deployment the readable group serves is true and still crosses"
+    );
+    let error = result.error.expect(
+        "the same query over a search that skipped a group is not the same answer: an \
+         incomplete search that found one candidate must say the search was incomplete",
+    );
+    assert!(
+        error
+            .message
+            .contains("metrics.example/v1beta1: unavailable"),
+        "the answer names the group it could not search: {}",
+        error.message
+    );
+    degraded.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_fail_the_whole_query_when_the_group_list_itself_does_not_answer() {
+    // §34.2's other half, and the boundary this change must not wash away. The isolation it
+    // grants is for *an aggregated group*: `/apis` is how the provider learns what is served at
+    // all (§11.1), so a cluster that will not answer it is a cluster that cannot be read, and
+    // softening that into a gap would turn a broken connection into a cheerful short answer.
+    let plugin = loaded_against(RecordedCluster::without_a_group_list()).await;
+    let invocation = plugin
+        .query("k8s-resource", at_cluster(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(
+        records(&events).is_empty(),
+        "nothing is answered from a discovery nobody could read"
+    );
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured failure");
+    assert_eq!(error.name, "provider.unavailable");
+    assert!(
+        error.message.contains("/apis"),
+        "the failure names the document that did not answer: {}",
+        error.message
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_derive_the_relationships_the_groups_that_answered_allow() {
+    // §34.2 on the relationship route, which searches the same group-versions for the object the
+    // query names. The Pod is in the core group and its stated edges need no second reading, so
+    // they are true and cross — and the answer still says which group-version it could not
+    // search, because §35.8 applies to resolving `Pod` here exactly as it does to a listing.
+    let plugin =
+        loaded_for_relations(RecordedCluster::with_relations_and_a_failing_aggregated_group())
+            .await;
+    let invocation = plugin
+        .query(
+            "k8s-relation",
+            at_cluster(&[("kind", json!("Pod")), ("name", json!("api-7d9f-abc"))]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    let answered = records(&events);
+    assert!(
+        answered
+            .iter()
+            .any(|record| text_of(record, "relation").as_deref() == Some("owned-by")),
+        "the edges the object states about itself are readable while an aggregated group is down"
+    );
+    let error = result
+        .error
+        .expect("a derivation over an incomplete search says so");
+    assert!(
+        error
+            .message
+            .contains("metrics.example/v1beta1: unavailable"),
+        "the relationship answer names the group-version it could not search: {}",
+        error.message
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

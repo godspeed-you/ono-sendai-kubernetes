@@ -144,17 +144,26 @@ impl Conversation for Related<'_> {
 
     fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
         let session = self.session;
-        let served = catalogue(session, client, self.endpoint, self.selector)?;
+        // §34.2: a group-version that did not answer is recorded and stepped over, and the
+        // derivation goes on against the groups that did. What it could not read joins this
+        // answer's coverage below, because a relationship question resolves its object through
+        // the same search a listing does and §35.8 binds it the same way.
+        let (served, unread) = catalogue(session, client, self.endpoint, self.selector)?;
         let resource = dynamic::resolve_for(self.selector, &served, Verb::Get)
             .cloned()
-            .map_err(|unresolved| query::unresolved_failure(&unresolved, self.selector, &served))?;
+            .map_err(|unresolved| {
+                query::unresolved_over(&unresolved, self.selector, &served, &unread)
+            })?;
         let scope = match resource.scope() {
             discovery::Scope::Cluster => Scope::cluster(),
             discovery::Scope::Namespaced => self.endpoint.scope.clone(),
         };
         let (object, freshness) = match query::fetch(client, &resource, &scope, self.name)? {
             // §21.4's one outcome that is a fact about the cluster: an object that is not there
-            // has no relationships, and that is an answer rather than a refusal.
+            // has no relationships, and that is an answer rather than a refusal — unless the
+            // search that chose the collection skipped a group, in which case the absence is
+            // about one resource rather than about the cluster (§34.2, §35.8).
+            Answer::Absent if !unread.is_empty() => return Err(absence_unproven(&unread)),
             Answer::Absent => return Ok(None),
             Answer::Fetched(read) => *read,
             // `fetch` is a get, and a get answers with one object or with nothing.
@@ -183,6 +192,11 @@ impl Conversation for Related<'_> {
             source: guarded,
             freshness,
         };
+        // §34.2's second sentence: the failed group/version is reported separately, beside the
+        // gaps the derivations record for themselves.
+        for gap in unread {
+            derived.coverage.record(gap);
+        }
         stated(&mut derived);
         two_sided(
             session,
@@ -408,32 +422,46 @@ fn catalogue<S: ByteStream>(
     client: &mut Client<S>,
     endpoint: &Endpoint,
     selector: &Selector,
-) -> Result<Discovery, WireError> {
+) -> Result<(Discovery, Vec<Gap>), WireError> {
     // Two documents, read once. The version list has to be *known* before the resource lists can
     // be asked for, and a builder answers only once it is built — so the same two documents are
     // parsed into a snapshot that decides the search space and again into the one the resources
     // join. `query::read` does the same for the same reason.
+    //
+    // `/api` and `/apis` still fail the query: they are how the provider learns what is served at
+    // all (§11.1), and §34.2's isolation is for the groups *behind* them.
     let core = query::document(session, client, endpoint, "/api")?;
     let groups = query::document(session, client, endpoint, "/apis")?;
     let served = versions(&core, &groups)?.build();
     let mut builder = versions(&core, &groups)?;
+    let mut unread = Vec::new();
     for group_version in search_space(&served, selector) {
-        let list = query::document(
-            session,
-            client,
-            endpoint,
-            &query::resource_list_path(&group_version),
-        )?;
-        builder = builder.resources(&list).map_err(|error| {
-            failure(
-                UNAVAILABLE_CODE,
-                UNAVAILABLE,
-                format!("the resource list of `{group_version}` did not read: {error}"),
-                "The endpoint answered, but not as a Kubernetes API server.",
-            )
-        })?;
+        let outcome = match query::group_document(session, client, endpoint, &group_version)? {
+            query::GroupRead::Document(list) => match builder.add_resources(&list) {
+                Ok(()) => continue,
+                Err(_) => CoverageOutcome::RequestFailed,
+            },
+            query::GroupRead::Unread(outcome) => outcome,
+        };
+        unread.push(Gap::new(Scope::in_group_version(&group_version), outcome));
     }
-    Ok(builder.build())
+    Ok((builder.build(), unread))
+}
+
+/// An object absent from the one resource an incomplete search resolved to (§34.2, §35.8).
+fn absence_unproven(unread: &[Gap]) -> WireError {
+    failure(
+        UNAVAILABLE_CODE,
+        UNAVAILABLE,
+        format!(
+            "the resource the search resolved to holds no such object, and the search could not \
+             read every API group: {}",
+            query::describe(unread),
+        ),
+        "An object that is not there has no relationships, and that is an answer — but only over \
+         a search that covered every group. A group whose own API server did not answer is not a \
+         group with nothing in it (specification sections 34.2 and 21.4).",
+    )
 }
 
 /// A discovery builder holding the version documents and nothing else.
@@ -603,12 +631,13 @@ fn emit(
         UNAVAILABLE_CODE,
         UNAVAILABLE,
         format!(
-            "the relationships that need a second reading could not all be derived: {}",
+            "the edges of this object could not all be established: {}",
             derived.coverage.describe()
         ),
         "The edges that did arrive are true. What is missing is named above: a selector this \
-         provider could not evaluate is not a selector that matched nothing, and an unserved API \
-         is not an object with no neighbours (specification section 21.4).",
+         provider could not evaluate is not a selector that matched nothing, an unserved API is \
+         not an object with no neighbours, and an API group whose own server did not answer is \
+         not a group with nothing in it (specification sections 21.4 and 34.2).",
     ))
 }
 

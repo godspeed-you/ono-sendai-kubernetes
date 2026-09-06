@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use ono_kuang_sdk::protocol::{WireError, method};
 use ono_kuang_sdk::{Ctx, EmitError, Outcome};
-use ono_provider_kubernetes::coverage::{Outcome as Coverage, Scope};
+use ono_provider_kubernetes::coverage::{Gap, Outcome as Coverage, Scope};
 use ono_provider_kubernetes::discovery::{self, Discovery, Resource, Verb};
 use ono_provider_kubernetes::kubeconfig::{Credential, Kubeconfig, Secret, Trust};
 use ono_provider_kubernetes::object::Object;
@@ -179,11 +179,11 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
             )
         },
     );
-    let (answer, shape) = match answer {
+    let (answer, shape, unread) = match answer {
         Ok(answer) => answer,
         Err(error) => return Outcome::Failed(error),
     };
-    emit(ctx, target, &schema, &shape, answer)
+    emit(ctx, target, &schema, &shape, answer, &unread)
 }
 
 /// The listing conversation, as one value [`converse`] can run over either kind of stream.
@@ -196,7 +196,7 @@ struct Listed<'a> {
 }
 
 impl Conversation for Listed<'_> {
-    type Answer = (Answer, Shape);
+    type Answer = (Answer, Shape, Vec<Gap>);
 
     fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
         read(
@@ -349,11 +349,16 @@ fn emit(
     schema: &Arc<Schema>,
     shape: &Shape,
     answer: Answer,
+    unread: &[Gap],
 ) -> Outcome {
     // §60.5 and §21.4 in the shape of a control flow: a named object that is not there is a
     // complete answer with nothing in it, and it is reached without emitting anything, so
     // nothing downstream has to distinguish it from a failure that emitted first.
     let (objects, freshness, listed) = match answer {
+        // Unless the search that chose the collection skipped a group. An object absent from the
+        // resource one group serves is not an object the cluster does not have, and `absent` is
+        // the one word in §21.4's vocabulary that is evidence about the cluster (§34.2, §35.8).
+        Answer::Absent if !unread.is_empty() => return Outcome::Failed(absence_unproven(unread)),
         Answer::Absent => return Outcome::Completed,
         Answer::Fetched(read) => {
             let (object, freshness) = *read;
@@ -424,10 +429,23 @@ fn emit(
     }
     let Some((complete, broken, coverage)) = listed else {
         // A get answered, so there is no collection whose coverage could be partial: one object
-        // was asked for and one object arrived.
-        return Outcome::Completed;
+        // was asked for and one object arrived. What may still be partial is the *search* that
+        // decided which collection that was (§34.2, §35.8).
+        if unread.is_empty() {
+            return Outcome::Completed;
+        }
+        return Outcome::Failed(read_over_incomplete_search(unread));
     };
-    if complete {
+    // §48.6: the resources that answered stay visible, with explicit incomplete coverage. The
+    // group-versions the search could not read join the listing's own gaps rather than replacing
+    // them — a denied namespace and an unavailable API group are two different holes in one
+    // answer, and Appendix D.3's report names both.
+    let coverage = match (coverage.is_empty(), unread.is_empty()) {
+        (_, true) => coverage,
+        (true, false) => describe(unread),
+        (false, false) => format!("{coverage}; {}", describe(unread)),
+    };
+    if complete && unread.is_empty() {
         return Outcome::Completed;
     }
     Outcome::Failed(failure(
@@ -442,9 +460,41 @@ fn emit(
             format!("the query did not see everything it asked about: {coverage}")
         },
         "The records that did arrive are true. What is missing is named above — a denial, an \
-         unserved API and an exhausted page budget are different things, and none of them means \
-         the cluster is empty.",
+         unserved API, an API group whose own server did not answer and an exhausted page budget \
+         are different things, and none of them means the cluster is empty.",
     ))
+}
+
+/// A read that answered over a search which could not cover every group (§34.2, §35.8).
+fn read_over_incomplete_search(unread: &[Gap]) -> WireError {
+    failure(
+        UNAVAILABLE_CODE,
+        UNAVAILABLE,
+        format!(
+            "the object that arrived is true, and the search that chose which resource to read \
+             it from could not read every API group: {}",
+            describe(unread),
+        ),
+        "A group whose own API server did not answer is not a group with nothing in it \
+         (specification sections 34.2 and 21.4). Another group may serve this kind too, and \
+         section 35.8 does not let this provider assume otherwise. Name `group` to settle it.",
+    )
+}
+
+/// An object absent from the one resource an incomplete search resolved to.
+fn absence_unproven(unread: &[Gap]) -> WireError {
+    failure(
+        UNAVAILABLE_CODE,
+        UNAVAILABLE,
+        format!(
+            "the resource the search resolved to holds no such object, and the search could not \
+             read every API group: {}",
+            describe(unread),
+        ),
+        "Absence is the one outcome in section 21.4's vocabulary that is evidence about the \
+         cluster rather than about the query, and a search that skipped a group has not earned \
+         it. Name `group` to ask one collection, and this becomes an answer again.",
+    )
 }
 
 /// Discovers what serves the target's kind, then reads it — one object, or the collection.
@@ -455,7 +505,7 @@ fn read<S: ByteStream>(
     endpoint: &Endpoint,
     selector: &Selector,
     lookup: Option<&str>,
-) -> Result<(Answer, Shape), WireError> {
+) -> Result<(Answer, Shape, Vec<Gap>), WireError> {
     let core = document(session, client, endpoint, "/api")?;
     let groups = document(session, client, endpoint, "/apis")?;
     // Two passes over the same two documents rather than two round trips: the preferred version
@@ -474,6 +524,10 @@ fn read<S: ByteStream>(
         })?
         .build();
 
+    // §34.2's report, carried from the search all the way to the outcome. Empty for every
+    // target that names its own group: a curated kind is one group-version's business, and
+    // failing to read *that* group is failing to answer the question that was asked.
+    let mut unread: Vec<Gap> = Vec::new();
     let (resource, shape) = match target.reads {
         Reads::Kind { group, kind } => {
             let resource = curated(session, client, endpoint, &served, group, kind)?;
@@ -550,7 +604,11 @@ fn read<S: ByteStream>(
             ));
         }
         Reads::Discovered => {
-            let resource = discovered(session, client, endpoint, &served, selector)?;
+            // §34.2 and §48.6: the search goes on past a group-version that did not answer, and
+            // what it could not read travels with the answer instead of ending it.
+            let searched = search(session, client, endpoint, &served, selector)?;
+            let resource = searched.resolve(selector, Verb::List)?;
+            unread.extend_from_slice(searched.gaps());
             let typing = typing_of(session, client, endpoint, &resource)?;
             (
                 resource.clone(),
@@ -579,12 +637,16 @@ fn read<S: ByteStream>(
         match session.lookup(resource.gvr(), &scope, scope.namespace(), name) {
             Lookup::Cached(read) => {
                 let (object, freshness) = read.into_parts();
-                return Ok((Answer::Fetched(Box::new((object, freshness))), shape));
+                return Ok((
+                    Answer::Fetched(Box::new((object, freshness))),
+                    shape,
+                    unread,
+                ));
             }
-            Lookup::ConfirmedAbsent => return Ok((Answer::Absent, shape)),
+            Lookup::ConfirmedAbsent => return Ok((Answer::Absent, shape, unread)),
             Lookup::NotWatched | Lookup::NotSynced(_) => {}
         }
-        return Ok((fetch(client, &resource, &scope, name)?, shape));
+        return Ok((fetch(client, &resource, &scope, name)?, shape, unread));
     }
 
     if !resource.supports(Verb::List) {
@@ -606,6 +668,7 @@ fn read<S: ByteStream>(
     Ok((
         Answer::Listed(Box::new(client.list(resource.gvr(), &scope, &options))),
         shape,
+        unread,
     ))
 }
 
@@ -870,22 +933,15 @@ pub(crate) fn curated<S: ByteStream>(
 /// The search is over the preferred version of every group the server lists, unless the query
 /// narrowed it — which is what makes a kind nobody compiled in reachable by name alone, and what
 /// makes §35.8's ambiguity a real possibility rather than a theoretical one.
-fn discovered<S: ByteStream>(
-    session: &mut Session,
-    client: &mut Client<S>,
-    endpoint: &Endpoint,
-    served: &Discovery,
-    selector: &Selector,
-) -> Result<Resource, WireError> {
-    resolve_in(session, client, endpoint, served, selector, Verb::List)
-}
-
-/// As [`discovered`], for a question that needs a verb other than `list`.
 ///
 /// §11.5's third state is a resource the server serves and does not let a caller enumerate, and
 /// `watch` is a fourth permission on the same collection. Resolving for the verb the question
 /// actually needs is what keeps a refusal saying which grant is missing rather than which grant
 /// this code happened to ask about first (§60.5, ADR-0012).
+///
+/// For a caller that can carry a coverage report, [`search`] is the entry point: this one turns
+/// an incomplete search into a refusal, because a `Resource` has nowhere to say that the search
+/// behind it skipped a group (§34.2, §35.8).
 pub(crate) fn resolve_in<S: ByteStream>(
     session: &mut Session,
     client: &mut Client<S>,
@@ -894,29 +950,175 @@ pub(crate) fn resolve_in<S: ByteStream>(
     selector: &Selector,
     verb: Verb,
 ) -> Result<Resource, WireError> {
+    let searched = search(session, client, endpoint, served, selector)?;
+    let resource = searched.resolve(selector, verb)?;
+    // A caller reached through this signature has a `Resource` to put the answer in and nowhere
+    // to put a coverage report, so the incompleteness has to travel as a refusal. That is not a
+    // concession to convenience in the other direction either: §35.8 forbids resolving a name
+    // several types share by anything but disambiguation, and a search that skipped a group has
+    // not established that only one type has it. The routes that *can* carry coverage —
+    // `k8s-resource` and `k8s-relation` — use [`search`] directly and keep the values.
+    if !searched.is_complete() {
+        return Err(unproven_resolution(selector, &searched));
+    }
+    Ok(resource)
+}
+
+/// Reads the discovery of every group-version the query could match in, and records the ones that
+/// did not answer instead of failing over them (§34.2, §48.6, §4 invariant 16).
+pub(crate) fn search<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    served: &Discovery,
+    selector: &Selector,
+) -> Result<Searched, WireError> {
     let group_versions = search_space(served, selector)?;
     let mut builder = Discovery::builder();
+    let mut unread = Vec::new();
     for group_version in &group_versions {
-        let list = document(
-            session,
-            client,
-            endpoint,
-            &resource_list_path(group_version),
-        )?;
-        builder = builder.resources(&list).map_err(|error| {
-            failure(
-                UNAVAILABLE_CODE,
-                UNAVAILABLE,
-                format!("the resource list of `{group_version}` did not read: {error}"),
-                "The endpoint answered, but not as a Kubernetes API server.",
-            )
-        })?;
+        let outcome = match group_document(session, client, endpoint, group_version)? {
+            // The group answered, and not as a Kubernetes API server. Still a fact about *that*
+            // group rather than about the cluster (§34.3), so it is recorded as a `503` is —
+            // and `add_resources` keeps the groups that did read.
+            GroupRead::Document(list) => match builder.add_resources(&list) {
+                Ok(()) => continue,
+                Err(_) => Coverage::RequestFailed,
+            },
+            GroupRead::Unread(outcome) => outcome,
+        };
+        unread.push(Gap::new(Scope::in_group_version(group_version), outcome));
     }
-    let discovery = builder.build();
+    Ok(Searched {
+        discovery: builder.build(),
+        unread,
+    })
+}
 
-    dynamic::resolve_for(selector, &discovery, verb)
-        .cloned()
-        .map_err(|unresolved| unresolved_failure(&unresolved, selector, &discovery))
+/// One search over the served API surface: what answered, and what did not (§34.2).
+///
+/// The type exists so that "the groups that answered" and "the groups that did not" cannot drift
+/// apart on the way to the answer. Every consumer of the first has to hold the second, which is
+/// what stops an incomplete search from quietly presenting itself as a complete one (§35.8).
+pub(crate) struct Searched {
+    discovery: Discovery,
+    unread: Vec<Gap>,
+}
+
+impl Searched {
+    /// Whether every group-version in the search space answered.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.unread.is_empty()
+    }
+
+    /// The group-versions that did not answer, as coverage gaps (§34.2's second sentence).
+    pub(crate) fn gaps(&self) -> &[Gap] {
+        &self.unread
+    }
+
+    /// The one resource the selector names among the group-versions that answered.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the selector did not resolve to, said in terms an incomplete search is entitled
+    /// to: a kind missing from a search that skipped a group is not a kind the cluster does not
+    /// serve (§21.4, §4 invariant 13).
+    pub(crate) fn resolve(&self, selector: &Selector, verb: Verb) -> Result<Resource, WireError> {
+        dynamic::resolve_for(selector, &self.discovery, verb)
+            .cloned()
+            .map_err(|unresolved| {
+                unresolved_over(&unresolved, selector, &self.discovery, &self.unread)
+            })
+    }
+}
+
+/// One group-version's resource list, or the reason the search has to do without it.
+pub(crate) enum GroupRead {
+    /// The resource list, as the group's server answered it.
+    Document(String),
+    /// It did not answer, and this is what became of it (§21.4's vocabulary, plus §34.2's word).
+    Unread(Coverage),
+}
+
+/// One group-version's resource list, read so that its failure stays its own (§34.2, §34.3).
+///
+/// [`document`] is the right shape for `/api` and `/apis`: they are how the provider learns what
+/// is served at all, and a cluster that refuses them cannot be read. A group-version is not that.
+/// An aggregated one is served by a *second* API server behind the aggregation layer, and §34.2
+/// forbids that server's outage becoming this provider's — so a non-`200` becomes a coverage
+/// outcome and the search goes on without it.
+///
+/// A transport failure is still an error, because that is the connection under every remaining
+/// request breaking rather than one group declining to answer over a connection that works.
+pub(crate) fn group_document<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    group_version: &str,
+) -> Result<GroupRead, WireError> {
+    let path = resource_list_path(group_version);
+    if let Some(held) = session.discovery_document(&path) {
+        return Ok(GroupRead::Document(held.to_owned()));
+    }
+    let request =
+        endpoint.authorise(Request::get(path.clone()).header("Accept", "application/json"));
+    let response = client
+        .connection()
+        .send(&request)
+        .map_err(|error| transport_failure(&path, &error))?;
+    if response.status() != 200 {
+        return Ok(GroupRead::Unread(unread_outcome(response.status())));
+    }
+    let Ok(text) = String::from_utf8(response.body().to_vec()) else {
+        return Ok(GroupRead::Unread(Coverage::RequestFailed));
+    };
+    session.cache_discovery_document(&path, text.clone());
+    Ok(GroupRead::Document(text))
+}
+
+/// What a status code means for a group-version that was listed and did not answer.
+///
+/// §34.3 in one function: the outcome names what happened to *this group*, so that an operator
+/// reads which `APIService` to look at rather than "the cluster failed". §48.2 keeps
+/// `service_unavailable` apart from a request that merely errored, and this is that distinction
+/// in the coverage vocabulary.
+fn unread_outcome(status: u16) -> Coverage {
+    match status {
+        403 => Coverage::ReadDenied,
+        // The group was in the list and is not there now: a CRD or an `APIService` withdrawn
+        // between the two requests, which is §11.5's state rather than a failure.
+        404 | 410 => Coverage::TypeNotServed,
+        502..=504 => Coverage::Unavailable,
+        _ => Coverage::RequestFailed,
+    }
+}
+
+/// A selector that resolved to one candidate over a search that could not read every group.
+///
+/// §35.8's property, kept where §34.2's isolation would otherwise quietly buy it away: one
+/// candidate found among the groups that answered is not one candidate served by the cluster.
+fn unproven_resolution(selector: &Selector, searched: &Searched) -> WireError {
+    failure(
+        UNAVAILABLE_CODE,
+        UNAVAILABLE,
+        format!(
+            "{} resolved against the API groups that answered, and the search could not read \
+             every group it had to cover: {}",
+            selector.spelling(),
+            describe(searched.gaps()),
+        ),
+        "A group whose own API server did not answer is not a group with nothing in it \
+         (specification sections 34.2 and 21.4), so one candidate found here is not proof that \
+         only one type has this name (section 35.8). Name `group` to ask a group that answers.",
+    )
+}
+
+/// Every gap in words, as Appendix D.3 writes a coverage row.
+pub(crate) fn describe(gaps: &[Gap]) -> String {
+    gaps.iter()
+        .map(Gap::describe)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Which group-versions the search covers.
@@ -1075,6 +1277,47 @@ pub(crate) fn resource_list_path(group_version: &str) -> String {
     } else {
         format!("/api/{group_version}")
     }
+}
+
+/// A selector that did not resolve, over a search that could not read every group (§34.2).
+///
+/// The refusal has to be *weaker* than the one a complete search earns. §21.4 and §4 invariant 13
+/// draw the line: "not served" is a fact about the cluster, and a search that skipped a group has
+/// not established it — the kind may live in exactly the group that did not answer. Every other
+/// refusal survives, with the unread groups appended so that nothing in it reads as complete.
+pub(crate) fn unresolved_over(
+    unresolved: &Unresolved,
+    selector: &Selector,
+    discovery: &Discovery,
+    unread: &[Gap],
+) -> WireError {
+    if unread.is_empty() {
+        return unresolved_failure(unresolved, selector, discovery);
+    }
+    if matches!(unresolved, Unresolved::NotServed) {
+        return failure(
+            UNAVAILABLE_CODE,
+            UNAVAILABLE,
+            format!(
+                "nothing among the API groups that answered matches {}, and the search could \
+                 not read every group: {}",
+                selector.spelling(),
+                describe(unread),
+            ),
+            "A group whose own API server did not answer is not a group with nothing in it \
+             (specification sections 34.2 and 21.4), so this is an incomplete search rather than \
+             a kind the cluster does not serve. Retry when the group answers, or name `group` to \
+             ask one that does.",
+        );
+    }
+    let mut error = unresolved_failure(unresolved, selector, discovery);
+    error.help = Some(format!(
+        "{}\n\nThe search could not read every API group, so what it did find is over an \
+         incomplete search space: {}.",
+        error.help.unwrap_or_default(),
+        describe(unread),
+    ));
+    error
 }
 
 /// A selector that did not name exactly one served, listable resource.

@@ -262,3 +262,32 @@ fn should_refuse_a_discovery_document_it_cannot_read() {
         "the error must say which document failed, got {error}"
     );
 }
+
+#[test]
+fn should_keep_the_groups_that_read_when_one_group_s_resource_list_does_not() {
+    // §34.2: "An unavailable aggregated API group MUST NOT make the entire Kubernetes provider
+    // unavailable if the core API server remains usable." A snapshot assembled group by group
+    // has to survive one of them answering with something that is not an `APIResourceList` —
+    // a builder consumed by that error would leave the caller nothing to keep the good groups in.
+    let mut builder = Discovery::builder()
+        .core_versions(CORE_VERSIONS)
+        .and_then(|builder| builder.groups(GROUPS))
+        .expect("the version documents read");
+    builder.add_resources(CORE_V1).expect("the core list reads");
+    let refused = builder.add_resources(r#"{"this":"is not an APIResourceList"#);
+    assert!(
+        refused.is_err(),
+        "a document that does not read is an error"
+    );
+    builder.add_resources(APPS_V1).expect("the apps list reads");
+
+    let discovery = builder.build();
+    assert!(
+        discovery.resource("v1", "pods").is_some(),
+        "the group read before the failure is still in the snapshot"
+    );
+    assert!(
+        discovery.resource("apps/v1", "deployments").is_some(),
+        "and the search went on to the group after it"
+    );
+}

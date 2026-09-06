@@ -437,6 +437,22 @@ impl Builder {
     ///
     /// [`DiscoveryError::ResourceList`] when the document does not read.
     pub fn resources(mut self, json: &str) -> Result<Self, DiscoveryError> {
+        self.add_resources(json)?;
+        Ok(self)
+    }
+
+    /// Reads one `APIResourceList` into the snapshot being built, keeping the builder either way.
+    ///
+    /// The same reading as [`Self::resources`], for the caller that must survive one of the
+    /// documents not reading. §34.2 forbids one API group's failure from becoming the whole
+    /// provider's, and a builder consumed by the error of the group that failed leaves that
+    /// caller with nowhere to put the groups that answered.
+    ///
+    /// # Errors
+    ///
+    /// [`DiscoveryError::ResourceList`] when the document does not read. The builder is
+    /// unchanged: the document is parsed before anything is inserted.
+    pub fn add_resources(&mut self, json: &str) -> Result<(), DiscoveryError> {
         let parsed: RawResourceList = serde_json::from_str(json)
             .map_err(|error| DiscoveryError::ResourceList(error.to_string()))?;
         let (group, version) = split_group_version(&parsed.group_version);
@@ -491,7 +507,7 @@ impl Builder {
                 resource.subresources.dedup();
             }
         }
-        Ok(self)
+        Ok(())
     }
 
     /// The snapshot.
