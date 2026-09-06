@@ -30,9 +30,12 @@
 //! mutation      what a change is sent as, what came back, and what that still does not prove
 //! tls           a TLS session, wrapping the brokered byte stream below HTTP
 //! session       what one provider instance holds between two invocations
+//! temporal      the window an answer observed, the holes in it, and which clock wrote each time
+//! causal        what `why` may say about a link, and the rung above which it cannot climb
 //! ```
 
 pub mod budget;
+pub mod causal;
 pub mod condition;
 pub mod coverage;
 pub mod diagnostics;
@@ -50,6 +53,7 @@ pub mod redaction;
 pub mod relationship;
 pub mod schema;
 pub mod session;
+pub mod temporal;
 pub mod tls;
 pub mod transport;
 pub mod watch;
