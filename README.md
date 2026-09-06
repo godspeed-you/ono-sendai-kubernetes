@@ -127,7 +127,7 @@ Both are canonical in that repository and are deliberately not copied here.
 | Ono-Sendai core, to build | the revision `Cargo.toml` pins, which carries `ADR-0588 (core)` — a contributed target declares whether its answer ends, which is what lets a watch reach the shell as a live stream rather than as a table that never arrives |
 | Ono-Sendai core, to run | **at or after `ADR-0588 (core)`.** Earlier hosts answer everything else; `get k8s-change` and `get k8s-log --follow` are the two words that need it, because an earlier host collects an answer that has no end |
 | Kubernetes versions | **v1.35 – v1.37**, which is what upstream maintained on the specification's snapshot date (§0.5, §5.1). The claim is a tested matrix rather than a parser guard: nothing in the provider inspects `gitVersion`, and a cluster outside the window may work perfectly (§5.2) |
-| Kubernetes versions actually exercised | **v1.35.8 and v1.37.0**, the declared oldest and newest, on ephemeral `kind` clusters in CI and on demand through `scripts/cluster.sh` (§5.5, §59.3, Gate N). §5.5's optional intermediate release is not run |
+| Kubernetes versions actually exercised | **v1.35.8, v1.36.4 and v1.37.0** — the declared oldest, the one between and the newest — on ephemeral `kind` clusters in CI and on demand through `scripts/cluster.sh` (§5.5, §59.3, Gate N) |
 | Releases of this provider | none |
 
 The provider is discovery-first by construction: every REST path is built from what the connected

@@ -41,7 +41,9 @@ jobs:
     # through v1.37, section 0.5 records that upstream maintained v1.35, v1.36 and v1.37 when the
     # specification was written, and section 5.5 asks for "oldest actively supported Kubernetes
     # minor release targeted by the provider" and "latest actively supported minor release" at
-    # minimum. The two legs below are those two ends.
+    # minimum, plus "one intermediate release when practical". The three legs below are those two
+    # ends and the one release between them: the legs run in parallel, so the intermediate one
+    # costs a runner rather than wall-clock time, which is what makes it practical here.
     #
     # Section 59.3's "disposable local Kubernetes clusters such as kind" is `scripts/cluster.sh`,
     # which creates the cluster and installs every fixture over the Kubernetes API with `curl`.
@@ -59,6 +61,8 @@ jobs:
         include:
           - version: v1.35.8
             end: oldest supported minor release
+          - version: v1.36.4
+            end: intermediate supported minor release
           - version: v1.37.0
             end: newest supported minor release
     env:
