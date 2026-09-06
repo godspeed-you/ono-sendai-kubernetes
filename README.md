@@ -29,7 +29,7 @@ goes, and [`docs/STATE.md`](docs/STATE.md) says what is next.
 
 ## What you can type today
 
-The package contributes **30 targets, 2 commands and no verb of its own**: every operation is an
+The package contributes **47 targets, 3 commands and no verb of its own**: every operation is an
 Ono verb that already existed. Reading is `get`; the two words that write are core's own `set` and
 `remove`, aimed at the same noun `get` reads.
 
@@ -37,6 +37,9 @@ Ono verb that already existed. Reading is `get`; the two words that write are co
 > grant capability network.connect --plugin io.github.godspeed-you.kubernetes
 
 > get k8s-pod --context prod --namespace shop | where phase == "Running"
+> get k8s-pod --context prod --namespace shop --selector 'app=api,tier!=cache'   # pushed to the server
+> get k8s-pod --context prod --namespace shop | take 1 | enter; look             # an object is a place
+> near                                                  # its neighbours, with `relation.write` granted
 > get k8s-resource --context prod --kind Sprocket        # any kind the cluster serves, CRDs included
 > get k8s-relation --context prod --kind Pod --name api-7d9f --relation scheduled-on
 > get k8s-change --context prod --kind Pod               # live, until you stop it; gaps are records
@@ -44,7 +47,7 @@ Ono verb that already existed. Reading is `get`; the two words that write are co
 > get k8s-condition --context prod --kind Deployment --name checkout
 > get k8s-timeline --context prod --kind Pod --name api-7d9f
 > get k8s-why      --context prod --kind Pod --name api-7d9f
-> get k8s-log      --context prod --name api-7d9f --container api --tail-lines 200
+> get k8s-log      --context prod --name api-7d9f --container api --tail_lines 200
 > get k8s-evidence --context prod --name node-a          # what a Node says about the machine under it
 > get k8s-cluster  --context prod                        # which cluster, reachable, as whom
 > get k8s-plan     --context prod --kind Deployment --name api --set '{"/spec/replicas": 2}'
@@ -59,7 +62,7 @@ pinned to `~/.kube/config` and `~/.kube/*.yaml` rather than to the filesystem. `
 declares `risk: mutate` and `remove k8s-resource` declares `risk: destructive`, and the host
 applies its own confirmation policy to those descriptors — this package prompts for nothing of its
 own. **`dry_run` defaults to `true`**, so the shortest sentence you can write asks the API server
-to run admission and persist nothing; `--dry-run false` is the one place you are asked to be
+to run admission and persist nothing; `--dry_run false` is the one place you are asked to be
 explicit about which of the two you meant.
 
 Two honest limits on that grant. KUANG/11 has no capability family for changing state in the
@@ -69,11 +72,12 @@ to write to one.** And a contributed target or command has nowhere to declare it
 of the flags above can be completed or helped by the shell; they are documented in
 [`package/contributions/`](package/contributions/) and in each summary.
 
-**What you cannot type.** `enter`, `near`, `up`, `map`, `trace` and `diff` do not reach Kubernetes:
-an object carries an address as a *string on a record* and is not yet a place in Ono's graph.
-`--follow` on a log, a live *view* as opposed to a live stream, a permission preflight, and a
-`labelSelector` or `fieldSelector` pushed to the server are all absent and named in
-[`docs/coverage.md`](docs/coverage.md).
+**What you cannot type.** An `ExecCredential` plugin is not run, so a kubeconfig that authenticates
+through one — which is how EKS, GKE and AKS are usually configured — is refused by name rather than
+connected as somebody else (§8.2). `exec`, `attach` and `port-forward` are refusals that say what is
+missing rather than sessions (§42.3–§42.5). `up` refuses, because the space above a namespace is an
+aggregate no single package can declare. A `KUBECONFIG` naming several files reads the first and
+says so. Each is named with its reason in [`docs/coverage.md`](docs/coverage.md).
 
 ## What the provider is for
 
@@ -163,17 +167,18 @@ whether or not it is curated. Section-by-section evidence is in
 | Ingress, Gateway API | yes | yes | yes, except `has-address` | yes | yes, bounded |
 | Node, Namespace | yes | yes | yes | yes | yes, bounded |
 | ConfigMap, Secret, ServiceAccount | yes | yes | yes | yes | yes, bounded |
-| PersistentVolumeClaim, PersistentVolume, StorageClass | yes | yes | **no `bound-to` edge** (§30.2) | yes | yes, bounded |
-| NetworkPolicy | yes | yes | **no selector evaluation** (§31.1) | yes | yes, bounded |
-| RBAC (Role, RoleBinding, ClusterRole, ClusterRoleBinding) | yes | no | no (§32.2) | yes | yes, bounded |
-| HPA, PDB, quotas, admission, CSI, leases (§15.3 Tier 2) | yes | no | no | yes | yes, bounded |
+| PersistentVolumeClaim, PersistentVolume, StorageClass | yes | yes | yes, including `bound-to` and `uses-storage-class` | yes | yes, bounded |
+| NetworkPolicy | yes | yes | yes, from both ends (§31.1) | yes | yes, bounded |
+| RBAC (Role, RoleBinding, ClusterRole, ClusterRoleBinding) | yes | yes | yes, `binds` (§32.2) | yes | yes, bounded |
+| HPA, PDB, quotas, admission, CSI, leases (§15.3 Tier 2) | yes | yes | no | yes | yes, bounded |
 | Custom resources of any CRD | yes | no, and none is needed | yes, through owner references and generic rules | yes | yes, bounded |
 
 "Mutation capable" means one bounded field change or one deletion, of one object named by the
 caller, with the preconditions taken from the object that was read — never a bulk operation and
 never a scale, restart or cordon action of its own (§43.3 is not fully served). "Watch capable"
 means `get k8s-change` resolves the collection through discovery, so a kind invented after this
-package was built is watchable; the watch tests exercise Pods.
+package was built is watchable — proven against a real cluster on a CRD created while the watch was
+open.
 
 ## Maturity levels
 
