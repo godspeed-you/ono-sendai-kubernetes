@@ -19,6 +19,12 @@
 # bounded field change and its deletion. A `k8s-apply` would have been the first word of the
 # Kubernetes mini-shell §4 invariant 22 forbids.
 #
+# **And there are still only two.** §43.3's seven candidate actions — scale, set image, restart
+# rollout, cordon/uncordon, label, annotate, delete — are *arguments* of these two verbs rather
+# than words of their own. A package that grew one command per Kubernetes transition would be
+# the mini-shell §35.1 forbids, growing by verb instead of by noun, and each new word would have
+# had to declare the same risk and the same capability for the same change. ADR-0042.
+#
 # **The noun is the one `get k8s-resource` already reads.** One word for a kind, read by one verb
 # and written by another. Nothing is reachable here that `get` could not already show, and a
 # curated noun — `k8s-deployment` and the rest — is still the better *read* of the same object.
@@ -45,10 +51,20 @@
 #                                     resolved to a stable identity before it is made (§21.3 of
 #                                     the generic provider contract)
 #   dry_run                           default true. `false` writes
-#   set                               `set k8s-resource` only: a mapping from a JSON pointer to
-#                                     the value the field should hold
-#   unset                             `set k8s-resource` only: a pointer, or a list of them,
-#                                     whose fields the apply gives up rather than sets (§44.1)
+#   replicas, image, restart_rollout, `set k8s-resource` only: §43.3's curated transitions —
+#   schedulable, label, annotation    scale, set image, restart rollout, cordon/uncordon, label,
+#                                     annotate. Each reduces to the same bounded field change and
+#                                     each carries its own effects and its own verification rule
+#                                     (§46.2, §46.3). Exactly one per invocation: one plan
+#                                     describes one action. ADR-0042
+#   set                               `set k8s-resource` only, and §43.4's **low-level** path: a
+#                                     mapping from a raw JSON pointer to the value the field
+#                                     should hold. It is labelled as the escape hatch wherever a
+#                                     user meets it — here, in `help`, and as a caveat on every
+#                                     plan and record it produces
+#   unset                             `set k8s-resource` only, §43.4 again: a pointer, or a list
+#                                     of them, whose fields the apply gives up rather than sets
+#                                     (§44.1)
 #   field_manager                     `set k8s-resource` only: the name ownership is recorded
 #                                     under, default `ono-sendai` (§44.2)
 #   force_because                     `set k8s-resource` only: the reason ownership is taken from
@@ -68,14 +84,19 @@ commands:
   - id: io.github.godspeed-you.kubernetes.command.set-k8s-resource
     verb: set
     target: k8s-resource
-    summary: "Apply a bounded field change to one Kubernetes object, as a server dry run unless `dry_run false` is given (specification sections 43.3, 44)."
+    summary: "Change one Kubernetes object through a curated action — `--replicas` to scale, `--image` to set an image, `--restart_rollout`, `--schedulable` to cordon or uncordon a Node, `--label`, `--annotation` — or through the low-level `--set`/`--unset` JSON-pointer escape hatch. A server dry run unless `dry_run false` is given (specification sections 43.3, 43.4, 44)."
     output: stream<io.github.godspeed-you.kubernetes.mutation/1>
     capabilities: [network.connect]
     argument_mode: words
     risk: mutate
     examples:
-      - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/replicas\": 2}'"
-      - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/replicas\": 2}' --dry_run false"
+      - "set k8s-resource --context prod --kind Deployment --name api --replicas 2"
+      - "set k8s-resource --context prod --kind Deployment --name api --replicas 2 --dry_run false"
+      - "set k8s-resource --context prod --kind Deployment --name api --image web=registry.example/web:1.4.0"
+      - "set k8s-resource --context prod --kind Deployment --name api --restart_rollout true"
+      - "set k8s-resource --context prod --kind Node --name node-7 --schedulable false"
+      - "set k8s-resource --context prod --kind Deployment --name api --label tier=edge"
+      - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/minReadySeconds\": 10}'"
 
     options:
       - name: context
@@ -112,12 +133,37 @@ commands:
         type: bool
         doc: "Ask the API server what it would do without doing it. Default true: the shortest sentence a user can write predicts (specification section 44.5)."
         default: "true"
+      # Section 43.3's curated transitions, in the order that section lists them. Each is an
+      # argument of the verb the shell already has: no new word, and therefore no first entry of
+      # the Kubernetes mini-shell §4 invariant 22 and §35.1 forbid. ADR-0042.
+      - name: replicas
+        type: int
+        doc: "Scale: how many replicas the workload should ask for. The curated form of `/spec/replicas` (specification section 43.3)."
+      - name: image
+        type: list<string>
+        doc: "Set image: `<container>=<image>`, naming the container rather than its position in the list. Write it more than once for more than one container (specification section 43.3)."
+        repeatable: true
+      - name: restart_rollout
+        type: bool
+        doc: "Restart the rollout by marking the pod template as changed, which is what makes a controller roll its pods. Nothing is deleted (specification section 43.3)."
+      - name: schedulable
+        type: bool
+        doc: "Cordon or uncordon a Node: `false` stops the scheduler placing new pods on it, `true` lets it again. Pods already running are neither stopped nor moved (specification section 43.3)."
+      - name: label
+        type: list<string>
+        doc: "Label: `<key>=<value>`, or `<key>=` to remove the label. Write it more than once for more than one (specification sections 43.3, 14.5)."
+        repeatable: true
+      - name: annotation
+        type: list<string>
+        doc: "Annotate: `<key>=<value>`, or `<key>=` to remove the annotation. Write it more than once for more than one (specification sections 43.3, 14.5)."
+        repeatable: true
+      # Section 43.4's escape hatch, and it says which one it is in the line a user reads first.
       - name: set
         type: record
-        doc: "A mapping from a JSON pointer to the value the field should hold, e.g. `{\"/spec/replicas\": 2}`."
+        doc: "LOW-LEVEL EXPERT PATH (specification section 43.4): a mapping from a raw JSON pointer to the value the field should hold, e.g. `{\"/spec/replicas\": 2}`. It names fields against a schema you are expected to know and no curated action vouches for what they mean together. Prefer `--replicas`, `--image`, `--restart_rollout`, `--schedulable`, `--label` or `--annotation`, which each carry their own effects and verification rule."
       - name: unset
         type: list<string>
-        doc: "A pointer whose field this apply gives up rather than sets. Write it more than once for more than one (specification section 44.1)."
+        doc: "LOW-LEVEL EXPERT PATH (specification section 43.4): a pointer whose field this apply gives up rather than sets. Write it more than once for more than one (specification section 44.1)."
         repeatable: true
       - name: field_manager
         type: string

@@ -149,6 +149,9 @@ enum Scenario {
     Conflict,
     /// A mutating webhook rewrites the image registry on the way in (§44.6).
     Admission,
+    /// One namespaced collection refuses to be listed, so a namespace-deletion inventory has a
+    /// hole in it that must be reported as a hole (§55.2, §55.4, §21.4).
+    DeniedInventory,
 }
 
 /// What the recorded API server's `SelfSubjectAccessReview` says, and whether it serves one.
@@ -344,6 +347,61 @@ fn crd() -> Json {
     })
 }
 
+/// The autoscaler that governs the recorded Deployment (§54.2).
+fn autoscaler() -> Json {
+    json!({
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": {
+            "name": "api", "namespace": "default",
+            "uid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "resourceVersion": "7000", "creationTimestamp": "2026-08-01T00:00:00Z",
+        },
+        "spec": {
+            "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "api"},
+            "minReplicas": 2, "maxReplicas": 10,
+        },
+        "status": {"desiredReplicas": 4},
+    })
+}
+
+/// A Namespace with a finalizer, which is the deletion §55.2 singles out.
+fn namespace() -> Json {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": "staging", "uid": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "resourceVersion": "8000", "creationTimestamp": "2026-07-01T00:00:00Z",
+            "finalizers": ["kubernetes"],
+        },
+        "spec": {"finalizers": ["kubernetes"]},
+        "status": {"phase": "Active"},
+    })
+}
+
+/// A collection answer with the items it holds, framed as the API server frames one.
+fn collection(api_version: &str, kind: &str, items: Vec<Json>) -> Vec<u8> {
+    ok(&json!({
+        "apiVersion": api_version,
+        "kind": format!("{kind}List"),
+        "metadata": {"resourceVersion": "9000"},
+        "items": items,
+    }))
+}
+
+fn denied(path: &str) -> Vec<u8> {
+    http(
+        "403 Forbidden",
+        &json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "message": format!("no RBAC policy matched for {path}"),
+            "reason": "Forbidden", "code": 403,
+        })
+        .to_string(),
+    )
+}
+
 /// A ConfigMap nothing holds: its deletion finishes, and a later read establishes that.
 fn configmap() -> Json {
     json!({
@@ -413,6 +471,11 @@ fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
                     "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"},
                 }),
                 json!({
+                    "name": "autoscaling",
+                    "versions": [{"groupVersion": "autoscaling/v2", "version": "v2"}],
+                    "preferredVersion": {"groupVersion": "autoscaling/v2", "version": "v2"},
+                }),
+                json!({
                     "name": "apiextensions.k8s.io",
                     "versions": [{
                         "groupVersion": "apiextensions.k8s.io/v1", "version": "v1",
@@ -475,10 +538,16 @@ fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
                 {"name": "persistentvolumeclaims", "kind": "PersistentVolumeClaim",
                  "namespaced": true,
                  "verbs": ["get", "list", "watch", "patch", "delete"], "shortNames": ["pvc"]},
+                {"name": "nodes", "kind": "Node", "namespaced": false,
+                 "verbs": ["get", "list", "watch", "patch"], "shortNames": ["no"]},
+                {"name": "namespaces", "kind": "Namespace", "namespaced": false,
+                 "verbs": ["get", "list", "watch", "patch", "delete"], "shortNames": ["ns"]},
+                {"name": "pods", "kind": "Pod", "namespaced": true,
+                 "verbs": ["get", "list", "watch", "patch", "delete"], "shortNames": ["po"]},
                 // Served, readable, and not patchable or deletable by anyone: §11.5's third
                 // state, and the one a refusal has to name rather than call a denial.
-                {"name": "nodes", "kind": "Node", "namespaced": false,
-                 "verbs": ["get", "list", "watch"], "shortNames": ["no"]},
+                {"name": "componentstatuses", "kind": "ComponentStatus", "namespaced": false,
+                 "verbs": ["get", "list"], "shortNames": ["cs"]},
             ],
         })),
         ("GET", "/apis/apiextensions.k8s.io/v1") => ok(&json!({
@@ -495,15 +564,86 @@ fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
         ("GET", "/apis/apps/v1") => ok(&json!({
             "kind": "APIResourceList",
             "groupVersion": "apps/v1",
+            "resources": [
+                {"name": "deployments", "kind": "Deployment", "namespaced": true,
+                 "verbs": ["get", "list", "watch", "patch", "delete"], "shortNames": ["deploy"]},
+                // §33.5 and §33.6 as discovery spells them: the subresources hang off the
+                // collection and are learnt rather than assumed.
+                {"name": "deployments/status", "kind": "Deployment", "namespaced": true,
+                 "verbs": ["get", "patch", "update"]},
+                {"name": "deployments/scale", "kind": "Scale", "namespaced": true,
+                 "verbs": ["get", "patch", "update"]},
+            ],
+        })),
+        ("GET", "/apis/autoscaling/v2") => ok(&json!({
+            "kind": "APIResourceList",
+            "groupVersion": "autoscaling/v2",
             "resources": [{
-                "name": "deployments", "kind": "Deployment", "namespaced": true,
-                "verbs": ["get", "list", "watch", "patch", "delete"], "shortNames": ["deploy"],
+                "name": "horizontalpodautoscalers", "kind": "HorizontalPodAutoscaler",
+                "namespaced": true,
+                "verbs": ["get", "list", "watch", "patch", "delete"], "shortNames": ["hpa"],
             }],
         })),
+        ("GET", "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers") => collection(
+            "autoscaling/v2",
+            "HorizontalPodAutoscaler",
+            vec![autoscaler()],
+        ),
+        ("GET", "/apis/autoscaling/v2/namespaces/staging/horizontalpodautoscalers") => {
+            collection("autoscaling/v2", "HorizontalPodAutoscaler", Vec::new())
+        }
+        ("GET", "/api/v1/namespaces/staging") => ok(&namespace()),
+        ("DELETE", "/api/v1/namespaces/staging") => ok(&namespace()),
+        ("GET", "/api/v1/namespaces/staging/pods") => collection(
+            "v1",
+            "Pod",
+            (0..3)
+                .map(|index| {
+                    json!({
+                        "apiVersion": "v1", "kind": "Pod",
+                        "metadata": {
+                            "name": format!("worker-{index}"), "namespace": "staging",
+                            "uid": format!("pod-{index}"), "resourceVersion": "9001",
+                        },
+                    })
+                })
+                .collect(),
+        ),
+        ("GET", "/api/v1/namespaces/staging/persistentvolumeclaims") => collection(
+            "v1",
+            "PersistentVolumeClaim",
+            vec![json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": "archive", "namespace": "staging", "uid": "pvc-archive",
+                    "resourceVersion": "9002",
+                },
+            })],
+        ),
+        // §55.2's second bullet: a type that cannot be listed. The inventory has to report it as
+        // not listed rather than as a count of zero.
+        ("GET", "/api/v1/namespaces/staging/configmaps")
+            if cluster.scenario == Scenario::DeniedInventory =>
+        {
+            denied(path_only)
+        }
+        ("GET", "/api/v1/namespaces/staging/configmaps") => {
+            collection("v1", "ConfigMap", Vec::new())
+        }
+        ("GET", "/apis/apps/v1/namespaces/staging/deployments") => {
+            collection("apps/v1", "Deployment", Vec::new())
+        }
         ("GET", "/api/v1/nodes/node-a") => ok(&json!({
             "apiVersion": "v1", "kind": "Node",
             "metadata": {"name": "node-a", "uid": "44444444-4444-4444-4444-444444444444",
                          "resourceVersion": "4000"},
+            "spec": {},
+        })),
+        ("PATCH", "/api/v1/nodes/node-a") => ok(&json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "node-a", "uid": "44444444-4444-4444-4444-444444444444",
+                         "resourceVersion": "4001"},
+            "spec": {"unschedulable": true},
         })),
         ("GET", DEPLOYMENT) => {
             let seen = cluster
@@ -1497,17 +1637,17 @@ async fn should_call_an_object_absent_only_when_a_read_established_it() {
 
 #[tokio::test]
 async fn should_refuse_a_mutation_the_cluster_does_not_offer_on_that_resource() {
-    // §11.5's third state, on the write path: the cluster serves Nodes and offers no `patch` on
-    // them. That is not a permission denial and not an absent object, and the refusal says which
-    // verb is missing rather than which grant somebody should look for.
+    // §11.5's third state, on the write path: the cluster serves ComponentStatuses and offers no
+    // `patch` on them. That is not a permission denial and not an absent object, and the refusal
+    // says which verb is missing rather than which grant somebody should look for.
     let cluster = RecordedCluster::playing(Scenario::Accepted);
     let plugin = loaded(&cluster).await;
     let invocation = plugin
         .invoke(
             SET,
             at_cluster(&[
-                ("kind", json!("Node")),
-                ("name", json!("node-a")),
+                ("kind", json!("ComponentStatus")),
+                ("name", json!("scheduler")),
                 ("set", json!({"/spec/unschedulable": true})),
             ]),
         )
@@ -1660,5 +1800,516 @@ async fn should_declare_no_invalidation_for_a_change_that_was_never_made() {
     assert!(
         !statement.contains("invalidated"),
         "nothing was written, so nothing was invalidated: {statement}"
+    );
+}
+
+// --- §43.3's curated actions, reached without knowing a JSON pointer -------------------------------
+
+#[tokio::test]
+async fn should_scale_a_workload_without_the_user_naming_a_json_pointer() {
+    // §43.3 names seven candidate actions and the first of them is "scale workload". Every one of
+    // them reduces to the bounded field change this package already had; what was missing is that
+    // a user had to know that the field is `/spec/replicas` on a Deployment and a StatefulSet and
+    // that a JSON pointer is how it is spelled. §52 calls that discoverability, and a bounded
+    // action surface nobody can find is §43.4's escape hatch wearing §43.3's name.
+    //
+    // The word is `set` and there is no new one: the action is an *argument* of the verb the
+    // shell already has, which is how this stays short of the Kubernetes mini-shell §35.1 and §4
+    // invariant 22 forbid.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(
+            SET,
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("replicas", json!(1)),
+                ("dry_run", json!(false)),
+            ]),
+        )
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+
+    assert_eq!(text(outcome, "action"), "scale");
+    assert!(
+        list_of(outcome, "changes")
+            .iter()
+            .any(|change| change.contains("/spec/replicas")),
+        "the pointer is still what travels; it is just not what a user has to write: {:?}",
+        list_of(outcome, "changes")
+    );
+    assert!(
+        text(outcome, "verification").contains("controller"),
+        "§46.3's first worked example: {}",
+        text(outcome, "verification")
+    );
+    let patches = cluster.requests("PATCH");
+    assert_eq!(patches.len(), 1);
+    let body: Json = serde_json::from_str(&patches[0].1).expect("JSON");
+    assert_eq!(body["spec"]["replicas"], json!(1));
+}
+
+#[tokio::test]
+async fn should_cordon_a_node_by_its_schedulability_and_verify_it_as_one() {
+    // §43.3's "cordon / uncordon node", and §46.3's third worked example — `Node.spec.unschedulable
+    // == true`. The mission's sharp end: a cordon whose verification rule is the same as an
+    // apply's is not a curated action. It is also the action whose *effects* a field list cannot
+    // show, because `unschedulable: true` reads as an ordinary boolean and what it does is take a
+    // node out of scheduling without moving anything already on it.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(
+            SET,
+            at_cluster(&[
+                ("kind", json!("Node")),
+                ("name", json!("node-a")),
+                ("schedulable", json!(false)),
+                ("dry_run", json!(false)),
+            ]),
+        )
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+
+    assert_eq!(text(outcome, "action"), "cordon");
+    assert!(
+        text(outcome, "verification").contains("unschedulable"),
+        "§46.3: the rule is the node's own field, not an apply's: {}",
+        text(outcome, "verification")
+    );
+    assert!(
+        text(outcome, "verification").contains("neither stopped nor moved"),
+        "cordoning is not draining, and the plan says which of the two it is: {}",
+        text(outcome, "verification")
+    );
+    let body: Json =
+        serde_json::from_str(&cluster.requests("PATCH")[0].1).expect("the apply document is JSON");
+    assert_eq!(body["spec"]["unschedulable"], json!(true));
+}
+
+#[tokio::test]
+async fn should_set_an_image_by_container_name_rather_than_by_list_position() {
+    // §43.3's "set image". The container is named because §44.1 merges list entries by key rather
+    // than by position: a user who writes `--image web=...` never learns that the container is at
+    // index 0, and the apply document carries the `name` beside the `image` so that the server
+    // merges against the entry that was meant.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(
+            SET,
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("image", json!(["web=registry.io/web:2"])),
+                ("dry_run", json!(false)),
+            ]),
+        )
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+
+    assert_eq!(text(outcome, "action"), "set-image");
+    assert!(
+        text(outcome, "verification").contains("ReplicaSet"),
+        "§46.3's second worked example, not the first: {}",
+        text(outcome, "verification")
+    );
+    let body: Json =
+        serde_json::from_str(&cluster.requests("PATCH")[0].1).expect("the apply document is JSON");
+    let container = &body["spec"]["template"]["spec"]["containers"][0];
+    assert_eq!(container["name"], json!("web"));
+    assert_eq!(container["image"], json!("registry.io/web:2"));
+}
+
+#[tokio::test]
+async fn should_refuse_an_image_for_a_container_the_object_does_not_have() {
+    // The other half of naming the container: a name that matches nothing is a refusal that says
+    // which containers there are, rather than an apply document that adds a container.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(
+            SET,
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("image", json!(["sidecar=registry.io/sidecar:1"])),
+            ]),
+        )
+        .await
+        .expect("it runs");
+    let (_, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a refusal carries an error");
+    assert!(error.message.contains("sidecar"), "{}", error.message);
+    assert!(error.message.contains("web"), "{}", error.message);
+    assert!(cluster.requests("PATCH").is_empty());
+}
+
+#[tokio::test]
+async fn should_restart_a_rollout_through_the_pod_template_rather_than_by_removing_pods() {
+    // §43.3's "restart rollout through an explicit supported mechanism". The mechanism is a pod
+    // template annotation: changing the template is what makes a controller roll, and it is a
+    // change the API server and the controller both already understand. Deleting pods would be a
+    // second mechanism this provider invented, with no plan and no verification rule behind it.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(
+            SET,
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("restart_rollout", json!(true)),
+                ("dry_run", json!(false)),
+            ]),
+        )
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+
+    assert_eq!(text(outcome, "action"), "restart-rollout");
+    let body: Json =
+        serde_json::from_str(&cluster.requests("PATCH")[0].1).expect("the apply document is JSON");
+    let annotations = &body["spec"]["template"]["metadata"]["annotations"];
+    // The marker is the `resourceVersion` the restart was planned against: an opaque continuity
+    // token used as an opaque token (§14.3), which makes the annotation say *which observation*
+    // this restart was made from and needs no clock to be deterministic.
+    assert_eq!(
+        annotations["ono-sendai.io/restarted-from-resource-version"],
+        json!("4711")
+    );
+    assert!(
+        text(outcome, "verification").contains("ReplicaSet"),
+        "a restart is verified as a rollout rather than as a field that was set (§46.3): {}",
+        text(outcome, "verification")
+    );
+    assert!(
+        cluster.requests("DELETE").is_empty(),
+        "nothing was deleted to make a rollout happen"
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_more_than_one_curated_action_in_one_change() {
+    // One plan describes one transition, because §46.3 gives one verification rule per action and
+    // §46.2 one set of effects. Two curated arguments in one invocation would produce a plan whose
+    // rule belongs to one of them and whose effects belong to both.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(
+            SET,
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("replicas", json!(2)),
+                ("restart_rollout", json!(true)),
+            ]),
+        )
+        .await
+        .expect("it runs");
+    let (_, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a refusal carries an error");
+    assert!(error.message.contains("replicas"), "{}", error.message);
+    assert!(
+        error.message.contains("restart_rollout"),
+        "{}",
+        error.message
+    );
+    assert!(cluster.requests("PATCH").is_empty());
+}
+
+// --- §43.4: the escape hatch says which one it is -------------------------------------------------
+
+#[tokio::test]
+async fn should_label_the_raw_pointer_apply_as_low_level_where_a_user_meets_it() {
+    // §43.4: the generic raw mutation "MUST be explicitly low-level" and "MUST NOT become the
+    // default UX simply because it is easy to implement". Planning and confirmation were already
+    // integrated; the labelling was not, and the JSON-pointer apply was simultaneously §43.3's
+    // bounded change and the only apply there was.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin.invoke(SET, scale_down(&[])).await.expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+
+    assert_eq!(text(outcome, "action"), "apply");
+    assert!(
+        list_of(outcome, "caveats")
+            .iter()
+            .any(|caveat| caveat.contains("low-level")),
+        "the record says which of §43.3 and §43.4 this is: {:?}",
+        list_of(outcome, "caveats")
+    );
+    assert!(
+        list_of(outcome, "caveats")
+            .iter()
+            .any(|caveat| caveat.contains("scale") && caveat.contains("cordon")),
+        "and it names the curated path a reader should prefer: {:?}",
+        list_of(outcome, "caveats")
+    );
+
+    // And the same sentence is in `help`, before anybody has run anything.
+    let command = ono_kubernetes_plugin::contributions::command("set-k8s-resource")
+        .expect("the package contributes it");
+    assert!(
+        command.summary.contains("low-level") || command.summary.contains("expert"),
+        "the summary a user reads first distinguishes the two paths: {}",
+        command.summary
+    );
+    let set = command
+        .options()
+        .into_iter()
+        .find(|option| option.name == "set")
+        .expect("the raw path is an option of the curated command");
+    assert!(
+        set.doc.to_lowercase().contains("low-level"),
+        "§43.4, in the one line a user reads before writing it: {}",
+        set.doc
+    );
+}
+
+// --- §33.6: a write to observed state ----------------------------------------------------------
+
+#[tokio::test]
+async fn should_refuse_a_change_that_writes_the_status_subresource() {
+    // §33.6: preserve desired/observed semantics *and* mutation boundaries. The read half was
+    // held; the write half was absent, and `--set '{"/status/phase": "x"}'` was assembled into the
+    // object document like any other field. Refused rather than routed to `/status`: writing
+    // observed state is a controller's job, and a provider that did it would be answering "what
+    // did the controller see" with "what somebody typed" (Gate G).
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(
+            SET,
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("set", json!({"/status/availableReplicas": 9})),
+            ]),
+        )
+        .await
+        .expect("it runs");
+    let (_, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a refusal carries an error");
+    assert!(error.message.contains("status"), "{}", error.message);
+    assert!(
+        error.message.contains("controller") || error.message.contains("observed"),
+        "the refusal says why rather than only that: {}",
+        error.message
+    );
+    assert!(
+        cluster.requests("PATCH").is_empty(),
+        "and nothing was sent to find out"
+    );
+}
+
+// --- §54: a competing desired-state writer ------------------------------------------------------
+
+#[tokio::test]
+async fn should_warn_when_an_autoscaler_governs_the_replica_count_being_changed() {
+    // §54.2: "a plan for a direct replica change SHOULD warn when an HPA targets the same
+    // workload", and "the provider MUST NOT claim durable effect merely because the Deployment
+    // accepted `spec.replicas`". The `MUST NOT` half already held through `Verdict::Inconclusive`;
+    // the warning was missing, and `grep HorizontalPodAutoscaler crates/` found nothing.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .query(
+            "k8s-plan",
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("set", json!({"/spec/replicas": 1})),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let plan = &records(&events)[0];
+
+    assert!(
+        list_of(plan, "caveats")
+            .iter()
+            .any(|caveat| caveat.contains("HorizontalPodAutoscaler") && caveat.contains("api")),
+        "§54.2's warning: {:?}",
+        list_of(plan, "caveats")
+    );
+    assert!(
+        maps_of(plan, "competing_writers")
+            .iter()
+            .any(|writer| writer.contains("scaleTargetRef")),
+        "§54.1 keeps the sources apart, and this one is the HPA target: {:?}",
+        maps_of(plan, "competing_writers")
+    );
+    assert!(
+        maps_of(plan, "competing_writers")
+            .iter()
+            .any(|writer| writer.contains("managedFields")),
+        "§54.1's first source is in the same list: {:?}",
+        maps_of(plan, "competing_writers")
+    );
+    assert!(
+        !cluster
+            .heads()
+            .iter()
+            .any(|head| head.starts_with("PATCH") || head.starts_with("DELETE")),
+        "asking is still a read"
+    );
+}
+
+#[tokio::test]
+async fn should_not_look_for_an_autoscaler_for_a_change_that_is_not_a_replica_change() {
+    // §54.2 is about a *direct replica change*. A label change on the same Deployment is not one,
+    // and a provider that listed every namespace's autoscalers on every plan would be paying
+    // §50.2 for a warning that could not apply.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .query(
+            "k8s-plan",
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("name", json!("api")),
+                ("namespace", json!("default")),
+                ("set", json!({"/metadata/labels/tier": "edge"})),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (_, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        asked_for(
+            &cluster,
+            "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers"
+        ),
+        0
+    );
+}
+
+// --- §55.2: deleting a Namespace ------------------------------------------------------------------
+
+#[tokio::test]
+async fn should_enumerate_what_a_namespace_deletion_would_remove() {
+    // §55.2: "deleting a Namespace is a high-impact destructive operation and MUST receive
+    // enhanced prospective analysis", with six bullets. Before this, a Namespace deletion plan was
+    // indistinguishable from a ConfigMap's but for two generic flags.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .query(
+            "k8s-plan",
+            at_cluster(&[
+                ("kind", json!("Namespace")),
+                ("name", json!("staging")),
+                ("action", json!("delete")),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let plan = &records(&events)[0];
+
+    // The first bullet: counts by GVR.
+    let contained = maps_of(plan, "contained");
+    assert!(
+        contained.iter().any(|entry| entry.contains("v1/pods")),
+        "{contained:?}"
+    );
+    assert!(
+        contained
+            .iter()
+            .any(|entry| entry.contains("persistentvolumeclaims")),
+        "{contained:?}"
+    );
+    let caveats = list_of(plan, "caveats");
+    // The third bullet: the namespace's finalizers.
+    assert!(
+        caveats.iter().any(|caveat| caveat.contains("kubernetes")),
+        "{caveats:?}"
+    );
+    // The fourth: the PVC implication, named rather than left as one more count.
+    assert!(
+        caveats
+            .iter()
+            .any(|caveat| caveat.contains("PersistentVolumeClaim")),
+        "{caveats:?}"
+    );
+    // The sixth: external effects may outlive the deletion.
+    assert!(
+        caveats.iter().any(|caveat| caveat.contains("outlive")),
+        "{caveats:?}"
+    );
+    // The fifth is the authorization line every plan already carries.
+    assert!(!text(plan, "preflight").is_empty());
+}
+
+#[tokio::test]
+async fn should_report_a_namespace_type_that_could_not_be_listed_as_not_listed() {
+    // §55.2's second bullet, §55.4 and §45.4 in one sentence: what could not be listed is reported
+    // as not listed. A count of zero for a collection nobody was allowed to read is the single
+    // most dangerous number a namespace-deletion plan could print.
+    let cluster = RecordedCluster::playing(Scenario::DeniedInventory);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .query(
+            "k8s-plan",
+            at_cluster(&[
+                ("kind", json!("Namespace")),
+                ("name", json!("staging")),
+                ("action", json!("delete")),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let plan = &records(&events)[0];
+
+    assert!(
+        !maps_of(plan, "contained")
+            .iter()
+            .any(|entry| entry.contains("configmaps")),
+        "a collection that would not be listed is not a collection of zero: {:?}",
+        maps_of(plan, "contained")
+    );
+    assert!(
+        text(plan, "contained_coverage").contains("denied"),
+        "{}",
+        text(plan, "contained_coverage")
+    );
+    assert!(
+        list_of(plan, "caveats")
+            .iter()
+            .any(|caveat| caveat.contains("not listed")),
+        "{:?}",
+        list_of(plan, "caveats")
     );
 }

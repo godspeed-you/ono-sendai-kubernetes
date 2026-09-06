@@ -5,7 +5,14 @@
 //! that reaches it — it reads the object the change is aimed at, turns the invocation's arguments
 //! into field changes against what that object actually holds, and answers a record.
 //!
-//! Four properties decide the shape of everything below.
+//! Five properties decide the shape of everything below.
+//!
+//! **§43.3's actions are arguments, not words.** `--replicas`, `--image`, `--restart_rollout`,
+//! `--schedulable`, `--label` and `--annotation` are the seven candidate transitions of §43.3,
+//! reached through the verb the shell already has; the package still contributes zero verbs (§4
+//! invariant 22, §35.1). Exactly one per invocation, because §46.3 gives one verification rule per
+//! action. `--set` and `--unset` are §43.4's low-level escape hatch and are labelled as one
+//! everywhere a user meets them. ADR-0042.
 //!
 //! **Asking is a read.** `k8s-plan` is a *target*, so `get k8s-plan` answers it and it changes
 //! nothing: discovery, the `GET` of the object, and §21.2's `SelfSubjectAccessReview` — which is
@@ -43,24 +50,27 @@ use std::sync::Arc;
 
 use ono_kuang_sdk::protocol::WireError;
 use ono_kuang_sdk::{Ctx, EmitError, Outcome as InvocationOutcome};
-use ono_provider_kubernetes::coverage::Scope;
-use ono_provider_kubernetes::discovery::{self, Discovery, Resource, Verb};
+use ono_provider_kubernetes::coverage::{Coverage, Gap, Outcome, Scope};
+use ono_provider_kubernetes::discovery::{self, Discovery, Gvr, Resource, Verb};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::plan::{
-    Action, Dependent, Effect, FieldChange, Plan, PlanRefusal, Preconditions, Preflight,
-    Propagation, access_review,
+    Action, CompetingWriter, Contained, Curated, Dependent, Effect, FieldChange, Plan, PlanRefusal,
+    Preconditions, Preflight, Propagation, access_review,
 };
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::session::Session;
-use ono_provider_kubernetes::transport::{ByteStream, Client, create_request};
+use ono_provider_kubernetes::transport::{
+    ByteStream, Client, ListOptions, Operation, create_request,
+};
 use ono_value::{ErrorValue, MapValue, Provenance, RecordValue, Schema, Value};
 use serde_json::{Map as JsonMap, Value as Json};
 
 use crate::contributions::{Field, Target, Writes};
 use crate::dynamic::Selector;
 use crate::query::{
-    Answer, Conversation, Endpoint, UNAVAILABLE, UNAVAILABLE_CODE, UNSUPPORTED, UNSUPPORTED_CODE,
-    converse, document, failure, fetch, group_version_of, resolve_in, resource_list,
+    Answer, Conversation, Endpoint, GroupRead, UNAVAILABLE, UNAVAILABLE_CODE, UNSUPPORTED,
+    UNSUPPORTED_CODE, converse, document, failure, fetch, group_document, group_version_of,
+    resolve_in, resource_list,
 };
 use crate::sessions::Sessions;
 
@@ -79,13 +89,33 @@ pub(crate) struct Intent {
     wanted: Wanted,
 }
 
-/// The two shapes §43.3's candidate actions reduce to.
+/// What the arguments asked for, before an object has been read to express it against.
+///
+/// §43.3's seven candidate actions all reduce to a bounded field change, and reducing them is not
+/// the same as offering them: a user who has to know that scaling is `/spec/replicas` and that a
+/// JSON pointer is how it is spelled has an action surface they cannot find (§52). So each curated
+/// transition is its own member here, and the *pointers* are derived once the object is in hand —
+/// which is also the only moment a container name can be turned into a list index (§44.1).
 #[derive(Debug, Clone)]
 enum Wanted {
-    /// A bounded set of field changes, by JSON pointer.
+    /// §43.4's raw escape hatch: field changes named by JSON pointer.
     Apply {
         set: Vec<(String, Json)>,
         unset: Vec<String>,
+    },
+    /// §43.3's "scale workload".
+    Scale { replicas: i64 },
+    /// §43.3's "set image", by container name rather than by list position.
+    SetImage { images: Vec<(String, String)> },
+    /// §43.3's "restart rollout through an explicit supported mechanism".
+    RestartRollout,
+    /// §43.3's "cordon / uncordon node".
+    Schedulable { allowed: bool },
+    /// §43.3's "annotate / label", on the metadata of any object.
+    Metadata {
+        curation: Curated,
+        field: &'static str,
+        pairs: Vec<(String, Option<String>)>,
     },
     /// The object, with the propagation policy the invocation chose (§45.2).
     Delete { propagation: Propagation },
@@ -138,10 +168,7 @@ impl Intent {
             })?
             .to_owned();
         let wanted = match writes {
-            Writes::Fields => Wanted::Apply {
-                set: pointers(options)?,
-                unset: unset(options)?,
-            },
+            Writes::Fields => fields_wanted(options)?,
             Writes::Object => Wanted::Delete {
                 propagation: propagation(options)?,
             },
@@ -169,22 +196,27 @@ impl Intent {
     /// refusal naming the verb rather than a `405` somebody has to interpret.
     pub(crate) fn verb(&self) -> Verb {
         match self.wanted {
-            Wanted::Apply { .. } => Verb::Patch,
             Wanted::Delete { .. } => Verb::Delete,
+            _ => Verb::Patch,
         }
     }
 
     /// The action, expressed against what the object actually holds (§46.2).
-    fn action(&self, object: &Object) -> Action {
-        match &self.wanted {
+    ///
+    /// # Errors
+    ///
+    /// A refusal where the curated transition names something the object does not have — a
+    /// container that is not in the pod template, most of all. §44.1 merges list entries by key
+    /// rather than by position, so an image change has to find the container before it can name
+    /// an index, and a name that matches nothing is a refusal rather than a container this
+    /// provider would add.
+    fn action(&self, object: &Object) -> Result<Action, WireError> {
+        Ok(match &self.wanted {
             Wanted::Delete { propagation } => Action::delete(*propagation),
             Wanted::Apply { set, unset } => {
                 let mut changes: Vec<FieldChange> = Vec::new();
                 for (path, wanted) in set {
-                    changes.push(match object.field(path) {
-                        Some(held) => FieldChange::change(path, held.clone(), wanted.clone()),
-                        None => FieldChange::set(path, wanted.clone()),
-                    });
+                    changes.push(against(object, path, wanted.clone()));
                 }
                 for path in unset {
                     // A field that is not there cannot be removed, and taking ownership of it in
@@ -195,8 +227,361 @@ impl Intent {
                 }
                 Action::apply(changes)
             }
-        }
+            Wanted::Scale { replicas } => Action::curated(
+                Curated::Scale,
+                vec![against(object, "/spec/replicas", Json::from(*replicas))],
+            ),
+            Wanted::SetImage { images } => {
+                let base = container_base(object)?;
+                let mut changes: Vec<FieldChange> = Vec::new();
+                for (container, image) in images {
+                    let at = container_index(object, base, container)?;
+                    // The merge key travels with the value: §44.1 merges list entries by `name`,
+                    // and an index without its key is merged against whichever entry the server
+                    // chose. `mutation.rs` refuses the document that lacks it, and this is the
+                    // one place that knows the name to put there.
+                    changes.push(against(
+                        object,
+                        &format!("{base}/{at}/name"),
+                        Json::String(container.clone()),
+                    ));
+                    changes.push(against(
+                        object,
+                        &format!("{base}/{at}/image"),
+                        Json::String(image.clone()),
+                    ));
+                }
+                Action::curated(Curated::SetImage, changes)
+            }
+            Wanted::RestartRollout => {
+                if object.field("/spec/template").is_none() {
+                    return Err(failure(
+                        UNSUPPORTED_CODE,
+                        UNSUPPORTED,
+                        format!(
+                            "`{}` carries no pod template, so there is no rollout to restart",
+                            object.gvk()
+                        ),
+                        "§43.3 asks for a restart through an explicit supported mechanism, and \
+                         the mechanism is the pod template: changing it is what makes a \
+                         controller replace its pods. An object without one has no rollout, and \
+                         deleting its pods would be a second mechanism this provider invented.",
+                    ));
+                }
+                // The marker is the `resourceVersion` this restart was planned against. It is an
+                // opaque continuity token used as an opaque token — never as a time and never
+                // sorted (§14.3) — which is what lets it say *which observation* the restart was
+                // made from without this provider needing a clock.
+                let token = object.resource_version().unwrap_or("unknown").to_owned();
+                Action::curated(
+                    Curated::RestartRollout,
+                    vec![against(object, RESTART_MARKER, Json::String(token))],
+                )
+            }
+            Wanted::Schedulable { allowed } => Action::curated(
+                if *allowed {
+                    Curated::Uncordon
+                } else {
+                    Curated::Cordon
+                },
+                vec![against(
+                    object,
+                    "/spec/unschedulable",
+                    Json::Bool(!*allowed),
+                )],
+            ),
+            Wanted::Metadata {
+                curation,
+                field,
+                pairs,
+            } => {
+                let mut changes: Vec<FieldChange> = Vec::new();
+                for (key, value) in pairs {
+                    let path = format!("{field}/{}", escape(key));
+                    match value {
+                        Some(value) => {
+                            changes.push(against(object, &path, Json::String(value.clone())));
+                        }
+                        None => {
+                            if let Some(held) = object.field(&path) {
+                                changes.push(FieldChange::remove(&path, held.clone()));
+                            }
+                        }
+                    }
+                }
+                Action::curated(*curation, changes)
+            }
+        })
     }
+}
+
+/// The annotation a restarted rollout carries, as a JSON pointer (§43.3).
+const RESTART_MARKER: &str =
+    "/spec/template/metadata/annotations/ono-sendai.io~1restarted-from-resource-version";
+
+/// One field change, stated against what the object holds now (§46.2).
+fn against(object: &Object, path: &str, wanted: Json) -> FieldChange {
+    match object.field(path) {
+        Some(held) => FieldChange::change(path, held.clone(), wanted),
+        None => FieldChange::set(path, wanted),
+    }
+}
+
+/// One key as a JSON pointer segment spells it (RFC 6901).
+///
+/// `app.kubernetes.io/name` is the label convention §23.4 names, and a pointer spells the slash
+/// inside a key as `~1`. Escaping `~` first is not optional: the other order turns `~1` into `/`
+/// after having produced it.
+fn escape(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// Where an object's containers live: a pod template for a controller, the spec itself for a Pod.
+fn container_base(object: &Object) -> Result<&'static str, WireError> {
+    if object.field("/spec/template/spec/containers").is_some() {
+        return Ok("/spec/template/spec/containers");
+    }
+    if object.field("/spec/containers").is_some() {
+        return Ok("/spec/containers");
+    }
+    Err(failure(
+        UNSUPPORTED_CODE,
+        UNSUPPORTED,
+        format!(
+            "`{}` carries no container list, so there is no image to set on it",
+            object.gvk()
+        ),
+        "§43.3's `set image` is a change to a container, and this provider finds containers at \
+         `/spec/template/spec/containers` for a workload and `/spec/containers` for a Pod. A \
+         custom resource that keeps its containers elsewhere is reachable through the low-level \
+         `--set` path, which names the pointer explicitly (§43.4).",
+    ))
+}
+
+/// Which entry of the container list carries this name (§44.1).
+fn container_index(object: &Object, base: &str, container: &str) -> Result<usize, WireError> {
+    let entries = object.field(base).and_then(Json::as_array);
+    let named: Vec<String> = entries
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("name")?.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    named
+        .iter()
+        .position(|name| name == container)
+        .ok_or_else(|| {
+            failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                format!(
+                    "`{}` has no container named `{container}`; it has {}",
+                    object.name(),
+                    if named.is_empty() {
+                        "none this provider could read".to_owned()
+                    } else {
+                        named.join(", ")
+                    }
+                ),
+                "A container is named rather than numbered because server-side apply merges list \
+                 entries by key rather than by position (§44.1). A name that matches nothing \
+                 would otherwise become a container this change adds.",
+            )
+        })
+}
+
+/// Which curated transition, or which raw apply, the arguments of a field-writing command ask for.
+///
+/// Exactly one of them. §46.3 gives one verification rule per action and §46.2 one set of effects,
+/// so two curated arguments in one invocation would produce a plan whose rule belongs to one of
+/// them and whose effects belong to both. The refusal names what was written rather than telling
+/// the caller to read the documentation.
+fn fields_wanted(options: &JsonMap<String, Json>) -> Result<Wanted, WireError> {
+    let mut chosen: Vec<(&str, Wanted)> = Vec::new();
+    if let Some(replicas) = options.get("replicas") {
+        let replicas = replicas
+            .as_i64()
+            .or_else(|| replicas.as_str()?.parse().ok());
+        let replicas = replicas.ok_or_else(|| {
+            failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                "`replicas` is a whole number of replicas".to_owned(),
+                "For example `--replicas 3`. §43.3's `scale workload`, which is a change to \
+                 `/spec/replicas`.",
+            )
+        })?;
+        if replicas < 0 {
+            return Err(failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                format!("`{replicas}` is not a number of replicas"),
+                "A replica count is zero or more. Zero is a scale to nothing, which the plan \
+                 reports as stopping the pods that are running (§46.2).",
+            ));
+        }
+        chosen.push(("replicas", Wanted::Scale { replicas }));
+    }
+    let images = pairs(options, "image")?;
+    if !images.is_empty() {
+        let mut named = Vec::with_capacity(images.len());
+        for (container, image) in images {
+            let Some(image) = image else {
+                return Err(failure(
+                    UNSUPPORTED_CODE,
+                    UNSUPPORTED,
+                    format!("`{container}` names a container and no image"),
+                    "`--image <container>=<image>`, as in `--image web=registry.example/web:2`. \
+                     The container is named rather than numbered because server-side apply \
+                     merges list entries by key (§44.1).",
+                ));
+            };
+            named.push((container, image));
+        }
+        chosen.push(("image", Wanted::SetImage { images: named }));
+    }
+    if flag(options, "restart_rollout") {
+        chosen.push(("restart_rollout", Wanted::RestartRollout));
+    }
+    if let Some(schedulable) = options.get("schedulable") {
+        let allowed = schedulable
+            .as_bool()
+            .or_else(|| schedulable.as_str()?.parse().ok())
+            .ok_or_else(|| {
+                failure(
+                    UNSUPPORTED_CODE,
+                    UNSUPPORTED,
+                    "`schedulable` is true or false".to_owned(),
+                    "`--schedulable false` cordons the node and `--schedulable true` uncordons \
+                     it (§43.3). Neither moves a pod that is already running on it.",
+                )
+            })?;
+        chosen.push(("schedulable", Wanted::Schedulable { allowed }));
+    }
+    let labels = pairs(options, "label")?;
+    if !labels.is_empty() {
+        chosen.push((
+            "label",
+            Wanted::Metadata {
+                curation: Curated::Label,
+                field: "/metadata/labels",
+                pairs: labels,
+            },
+        ));
+    }
+    let annotations = pairs(options, "annotation")?;
+    if !annotations.is_empty() {
+        chosen.push((
+            "annotation",
+            Wanted::Metadata {
+                curation: Curated::Annotate,
+                field: "/metadata/annotations",
+                pairs: annotations,
+            },
+        ));
+    }
+    let set = pointers(options)?;
+    let unset = unset(options)?;
+    if !set.is_empty() || !unset.is_empty() {
+        chosen.push(("set", Wanted::Apply { set, unset }));
+    }
+    if chosen.len() > 1 {
+        let written: Vec<&str> = chosen.iter().map(|(name, _)| *name).collect();
+        return Err(failure(
+            UNSUPPORTED_CODE,
+            UNSUPPORTED,
+            format!(
+                "one change describes one action, and this one names {}",
+                written
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<String>>()
+                    .join(" and ")
+            ),
+            "§46.3 gives one verification rule per action and §46.2 one set of effects, so a plan \
+             that carried two transitions would have a rule belonging to one of them and effects \
+             belonging to both. Make them one at a time.",
+        ));
+    }
+    chosen.pop().map(|(_, wanted)| wanted).ok_or_else(|| {
+        failure(
+            UNSUPPORTED_CODE,
+            UNSUPPORTED,
+            "the invocation named no change to make".to_owned(),
+            "§43.3's curated actions are `--replicas`, `--image`, `--restart_rollout`, \
+             `--schedulable`, `--label` and `--annotation`. `--set` and `--unset` are §43.4's \
+             low-level path, which names raw JSON pointers.",
+        )
+    })
+}
+
+/// Whether a boolean argument was written and is true.
+fn flag(options: &JsonMap<String, Json>, name: &str) -> bool {
+    options.get(name).is_some_and(|value| {
+        value
+            .as_bool()
+            .or_else(|| value.as_str()?.parse().ok())
+            .unwrap_or(false)
+    })
+}
+
+/// A repeatable `<key>=<value>` argument, where an empty value means removal.
+fn pairs(
+    options: &JsonMap<String, Json>,
+    name: &str,
+) -> Result<Vec<(String, Option<String>)>, WireError> {
+    let Some(written) = options.get(name) else {
+        return Ok(Vec::new());
+    };
+    let words: Vec<String> = match written {
+        Json::String(one) => vec![one.clone()],
+        Json::Array(many) => many
+            .iter()
+            .filter_map(|entry| entry.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if words.is_empty() {
+        return Err(failure(
+            UNSUPPORTED_CODE,
+            UNSUPPORTED,
+            format!("`{name}` is written as `<key>=<value>`"),
+            "Write it more than once for more than one. A trailing `=` with nothing after it \
+             removes the entry rather than setting it to the empty string.",
+        ));
+    }
+    words
+        .iter()
+        .map(|word| {
+            let (key, value) = word.split_once('=').ok_or_else(|| {
+                failure(
+                    UNSUPPORTED_CODE,
+                    UNSUPPORTED,
+                    format!("`{word}` is not a `<key>=<value>` pair"),
+                    "For example `--label tier=edge`. A trailing `=` with nothing after it \
+                     removes the entry.",
+                )
+            })?;
+            if key.is_empty() {
+                return Err(failure(
+                    UNSUPPORTED_CODE,
+                    UNSUPPORTED,
+                    format!("`{word}` names no key"),
+                    "A key is what the value is stored under, and an empty one is not a key.",
+                ));
+            }
+            Ok((
+                key.to_owned(),
+                if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_owned())
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The JSON pointers and values an `apply` sets.
@@ -265,6 +650,24 @@ fn unset(options: &JsonMap<String, Json>) -> Result<Vec<String>, WireError> {
 }
 
 fn check_pointer(path: &str) -> Result<(), WireError> {
+    // §33.6: preserve desired/observed semantics *and* mutation boundaries. `status` is on the far
+    // side of that boundary, and this provider refuses rather than routing the write to the
+    // subresource — see ADR-0042. The refusal is here, before discovery and before any request,
+    // because a change that cannot be made should cost a cluster nothing to find out.
+    if path == "/status" || path.starts_with("/status/") {
+        return Err(failure(
+            UNSUPPORTED_CODE,
+            UNSUPPORTED,
+            format!("`{path}` writes observed state, which this provider does not write"),
+            "§33.6 asks a provider to preserve desired/observed semantics and mutation \
+             boundaries. `status` is a controller's report of what it observed, reached through \
+             its own subresource wherever one is served: sent to the object endpoint the field is \
+             dropped and the request still answers 200, and sent to the subresource it succeeds \
+             and a value meant to say what a controller saw now says what somebody typed (Gate G, \
+             §62.7). Change the desired state and let the controller write what it observes; read \
+             the observed side with `get k8s-resource`, which keeps the two apart already.",
+        ));
+    }
     if path.starts_with('/') && path.len() > 1 {
         return Ok(());
     }
@@ -395,8 +798,30 @@ pub(crate) fn plan_on<S: ByteStream>(
             "This is a defect in the Kubernetes provider, not in the cluster.",
         )
     })?;
-    let plan = Plan::of(guarded.object(), intent.action(guarded.object()))
-        .map_err(|refusal| refused(&refusal))?;
+    let action = intent.action(guarded.object())?;
+    let plan = Plan::of(guarded.object(), action).map_err(|refusal| refused(&refusal))?;
+    // §54.1 and §54.2. Only for a change that writes the replica count: §54.2 is about a *direct
+    // replica change*, and listing every namespace's autoscalers on every plan would pay §50.2
+    // for a warning that could not apply.
+    let plan = if plan
+        .field_changes()
+        .iter()
+        .any(|change| change.path() == "/spec/replicas")
+    {
+        let (autoscalers, coverage) =
+            autoscalers_targeting(session, client, endpoint, &served, &scope);
+        plan.with_competing_writers(autoscalers, coverage)
+    } else {
+        plan
+    };
+    // §55.2: a Namespace deletion "MUST receive enhanced prospective analysis".
+    let plan = if plan.action().is_destructive() && resource.kind() == "Namespace" {
+        let (counted, coverage) =
+            namespace_contents(session, client, endpoint, &served, plan.target().name());
+        plan.with_contents(counted, coverage)
+    } else {
+        plan
+    };
     // §46.2's `permission preflight result`, and Appendix E's `AUTHORIZATION` line. Last, because
     // the review asks about the action the plan turned out to describe, and because a plan that
     // could not be built is a plan whose authorization nobody needs to have asked about.
@@ -407,6 +832,172 @@ pub(crate) fn plan_on<S: ByteStream>(
         resource,
         scope,
     })
+}
+
+/// The group whose objects write a workload's replica count on their own (§54.2).
+const AUTOSCALING_GROUP: &str = "autoscaling";
+
+/// The kind that names the workload it scales in `spec.scaleTargetRef` (§54.2).
+const AUTOSCALER_KIND: &str = "HorizontalPodAutoscaler";
+
+/// How many objects one page of a namespace inventory asks for (§18.1, §50.2).
+///
+/// One page and no more. §55.2 wants counts, and a namespace-deletion plan that walked every
+/// collection to its end would cost an unbounded number of requests at the moment somebody is
+/// waiting to decide. A page that did not end is reported as a floor rather than a total, which
+/// is the honest shape of a bounded count (§18.4).
+const INVENTORY_PAGE: u32 = 500;
+
+/// The autoscalers that may write this namespace's replica counts, and what the search covered.
+///
+/// Every way this can come up empty is a coverage gap rather than an answer: §54.1 asks for
+/// *known* competing writers, and a cluster that serves no `autoscaling` group, a resource list
+/// that would not read and a listing the authorizer refused are three different reasons to have
+/// found none — and none of them is evidence that there is no autoscaler (§21.4, §4 invariant 13).
+///
+/// The matching is `plan.rs`'s: a candidate that does not name this object in `scaleTargetRef` is
+/// dropped by [`CompetingWriter::autoscaler`] rather than filtered here, so the rule that decides
+/// what counts as evidence lives beside the rest of the plan's reasoning.
+fn autoscalers_targeting<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    served: &Discovery,
+    scope: &Scope,
+) -> (Vec<Object>, Coverage) {
+    let mut coverage = Coverage::complete(scope.clone());
+    let gap = |coverage: &mut Coverage, outcome: Outcome| {
+        coverage.record(Gap::new(
+            Scope::in_group_version(AUTOSCALING_GROUP),
+            outcome,
+        ));
+    };
+    // §5.3 and §11.1: which version of the autoscaling API this cluster serves is learnt.
+    let Some(version) = served.preferred_version(AUTOSCALING_GROUP) else {
+        gap(&mut coverage, Outcome::TypeNotServed);
+        return (Vec::new(), coverage);
+    };
+    let group_version = group_version_of(AUTOSCALING_GROUP, version);
+    let Ok(catalogue) = resource_list(session, client, endpoint, &group_version) else {
+        gap(&mut coverage, Outcome::RequestFailed);
+        return (Vec::new(), coverage);
+    };
+    let Some(resource) = catalogue.by_kind(&group_version, AUTOSCALER_KIND) else {
+        gap(&mut coverage, Outcome::TypeNotServed);
+        return (Vec::new(), coverage);
+    };
+    if !resource.supports(Verb::List) {
+        gap(&mut coverage, Outcome::TypeNotServed);
+        return (Vec::new(), coverage);
+    }
+    match client.list_page(
+        resource.gvr(),
+        scope,
+        &ListOptions::new().limit(INVENTORY_PAGE),
+    ) {
+        Ok(page) => {
+            if page.continue_token().is_some() {
+                coverage.more_available();
+            }
+            coverage.observed(scope.clone());
+            (page.into_objects(), coverage)
+        }
+        Err(error) => {
+            coverage.record(Gap::new(
+                Scope::in_group_version(&group_version),
+                error.outcome(Operation::List),
+            ));
+            (Vec::new(), coverage)
+        }
+    }
+}
+
+/// What a namespace holds, counted by GVR, with what the counting could not reach (§55.2).
+///
+/// The enumeration is over the *preferred* version of every group the cluster serves, because
+/// §55.2 asks for counts by GVR and the same objects served at two versions would be counted
+/// twice (§13.4). Every group-version whose resource list did not read, and every collection that
+/// would not list, becomes a gap: §55.4 and §45.4 both say the same thing in different words, and
+/// a count of zero for a collection nobody was allowed to read is the one number this must not
+/// print.
+fn namespace_contents<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    served: &Discovery,
+    namespace: &str,
+) -> (Vec<Contained>, Coverage) {
+    let scope = Scope::in_namespace(namespace);
+    let mut coverage = Coverage::complete(scope.clone());
+    let mut counted: Vec<Contained> = Vec::new();
+    let group_versions: Vec<String> = served
+        .groups()
+        .filter_map(|group| {
+            served
+                .preferred_version(group)
+                .map(|version| group_version_of(group, version))
+        })
+        .collect();
+    for group_version in group_versions {
+        let mut builder = Discovery::builder();
+        let read = match group_document(session, client, endpoint, &group_version) {
+            Ok(GroupRead::Document(list)) => builder.add_resources(&list).is_ok(),
+            Ok(GroupRead::Unread(outcome)) => {
+                coverage.record(Gap::new(Scope::in_group_version(&group_version), outcome));
+                continue;
+            }
+            Err(_) => {
+                coverage.record(Gap::new(
+                    Scope::in_group_version(&group_version),
+                    Outcome::RequestFailed,
+                ));
+                continue;
+            }
+        };
+        if !read {
+            coverage.record(Gap::new(
+                Scope::in_group_version(&group_version),
+                Outcome::RequestFailed,
+            ));
+            continue;
+        }
+        let discovered = builder.build();
+        let namespaced: Vec<Gvr> = discovered
+            .listable()
+            .filter(|resource| resource.scope() == discovery::Scope::Namespaced)
+            .map(|resource| resource.gvr().clone())
+            .collect();
+        for gvr in namespaced {
+            match client.list_page(&gvr, &scope, &ListOptions::new().limit(INVENTORY_PAGE)) {
+                Ok(page) => {
+                    let more = page.continue_token().is_some();
+                    let seen = page.into_objects().len();
+                    let name = format!(
+                        "{}/{}",
+                        group_version_of(gvr.group(), gvr.version()),
+                        gvr.resource()
+                    );
+                    counted.push(if more {
+                        coverage.more_available();
+                        Contained::at_least(name, seen)
+                    } else {
+                        Contained::counted(name, seen)
+                    });
+                }
+                Err(error) => {
+                    // §21.4 one outcome at a time, and §55.2's second bullet in one line: this
+                    // type is a type that *could not be listed*, which is neither a count nor a
+                    // zero. It gets no entry at all, and the gap says why.
+                    coverage.record(Gap::new(
+                        Scope::in_group_version(gvr.to_string()),
+                        error.outcome(Operation::List),
+                    ));
+                }
+            }
+        }
+        coverage.observed(scope.clone());
+    }
+    (counted, coverage)
 }
 
 /// The API group that answers "may this identity do that" (§21.2).
@@ -664,15 +1255,75 @@ fn plan_field(name: &str, plan: &Plan) -> Value {
             .verification_rule()
             .established_stage()
             .map_or(Value::Null, |stage| Value::String(stage.as_str().into())),
+        "statement" => Value::String(plan.describe().into()),
+        other => analysis_field(other, plan),
+    }
+}
+
+/// The fields a plan record and a mutation record share about what *else* is true of the change.
+///
+/// On both schemas because both paths compute them: §46.1 makes a mutation a plan that was then
+/// carried out, and a §54.2 warning or a §55.2 inventory that only reached `get k8s-plan` would be
+/// invisible to the shortest sentence a user writes.
+pub(crate) fn analysis_field(name: &str, plan: &Plan) -> Value {
+    match name {
         "caveats" => Value::List(
             plan.caveats()
                 .iter()
                 .map(|caveat| Value::String(caveat.to_string().into()))
                 .collect(),
         ),
-        "statement" => Value::String(plan.describe().into()),
+        // §54.1: the five sources in one list, each entry saying which of them named it. A list
+        // with no coverage beside it reads as complete, so the coverage is a field of its own.
+        "competing_writers" => Value::List(
+            plan.competing_writers()
+                .iter()
+                .map(competing_writer)
+                .collect(),
+        ),
+        "competing_writer_coverage" => {
+            Value::String(plan.competing_writer_coverage().describe().into())
+        }
+        // §55.2, and null rather than empty for every change that is not a Namespace deletion:
+        // a count of zero for a question nobody asked is the one number this must not print.
+        "contained" => plan.contents().map_or(Value::Null, |contents| {
+            Value::List(contents.counted().iter().map(contained).collect())
+        }),
+        "contained_coverage" => plan.contents().map_or(Value::Null, |contents| {
+            Value::String(contents.coverage().describe().into())
+        }),
         other => target_field(other, plan),
     }
+}
+
+/// One competing desired-state writer, with the source that named it (§54.1).
+fn competing_writer(writer: &CompetingWriter) -> Value {
+    let mut map = MapValue::new();
+    map.insert(Arc::from("name"), Value::String(writer.name().into()));
+    map.insert(
+        Arc::from("evidence"),
+        Value::String(writer.evidence().as_str().into()),
+    );
+    map.insert(Arc::from("writes"), Value::String(writer.writes().into()));
+    map.insert(
+        Arc::from("detail"),
+        writer
+            .detail()
+            .map_or(Value::Null, |detail| Value::String(detail.into())),
+    );
+    Value::Map(Arc::new(map))
+}
+
+/// One resource type a namespace holds, and whether the number is a total or a floor (§55.2).
+fn contained(entry: &Contained) -> Value {
+    let mut map = MapValue::new();
+    map.insert(Arc::from("gvr"), Value::String(entry.gvr().into()));
+    map.insert(
+        Arc::from("count"),
+        Value::Int(i128::try_from(entry.count()).unwrap_or(i128::MAX)),
+    );
+    map.insert(Arc::from("at_least"), Value::Bool(entry.is_lower_bound()));
+    Value::Map(Arc::new(map))
 }
 
 /// The fields a plan record and a mutation record share: what the change is aimed at (§46.2).

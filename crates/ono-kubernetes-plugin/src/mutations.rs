@@ -632,7 +632,10 @@ fn mutation_field(name: &str, made: &Made) -> Value {
                 Value::Map(Arc::new(map))
             }),
         "statement" => Value::String(statement(made).into()),
-        other => planning::target_field(other, &made.plan),
+        // §54.1's writers, §55.2's inventory and the plan's caveats reach the record of the
+        // attempt as well as the record of the plan: a warning that only `get k8s-plan` showed
+        // would be a warning `set k8s-resource --dry_run true` never printed (§46.1).
+        other => planning::analysis_field(other, &made.plan),
     }
 }
 

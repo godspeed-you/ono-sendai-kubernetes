@@ -791,3 +791,84 @@ fn should_send_no_preconditions_for_an_unguarded_plan() {
     assert!(document.pointer("/metadata/uid").is_none());
     assert!(!plan.is_precondition_guarded());
 }
+
+// --- §33.6 the status subresource ----------------------------------------------------------------
+
+/// §33.6: "where a CRD separates `status`, the provider SHOULD preserve desired/observed semantics
+/// and mutation boundaries". The read half was already held — `schema.rs` keeps `Intent::Desired`
+/// and `Intent::Observed` apart — and the mutation half was missing entirely: `--set
+/// '{"/status/phase": "Running"}'` was assembled into the object document like any other field.
+///
+/// This provider refuses the write rather than routing it to `/status`. Two things go wrong
+/// otherwise, and the quiet one is worse. Sent to the object endpoint, a status field is dropped
+/// by the API server wherever the subresource exists, and the request answers `200` — a change
+/// that reports success for having done nothing. Sent to `/status`, it succeeds, and Ono has
+/// written observed state: a value that is supposed to be a controller's report of what it saw
+/// now says what Ono typed, which is exactly the desired/observed collapse Gate G (§62.7) exists
+/// to prevent. Neither is a boundary "preserved".
+#[test]
+fn should_refuse_to_write_observed_state_through_an_object_apply() {
+    let plan = Plan::of(
+        &object(DEPLOYMENT),
+        Action::apply(vec![FieldChange::set(
+            "/status/availableReplicas",
+            json!(9),
+        )]),
+    )
+    .expect("guarded");
+    let refusal =
+        apply_document(&plan).expect_err("a write to observed state is refused rather than sent");
+
+    assert_eq!(
+        refusal,
+        MutationError::ObservedStateNotWritable("/status/availableReplicas".to_owned())
+    );
+    let said = refusal.to_string();
+    assert!(said.contains("status"));
+    assert!(said.contains("controller"));
+}
+
+/// The boundary is the `status` tree and nothing wider: a CRD with a field called `statusPage` or
+/// an object whose spec holds `/spec/statusCheck` is an ordinary desired-state field, and refusing
+/// it would be this provider inventing a restriction the API server does not have.
+#[test]
+fn should_not_mistake_a_field_whose_name_begins_with_status_for_observed_state() {
+    let plan = Plan::of(
+        &object(DEPLOYMENT),
+        Action::apply(vec![FieldChange::set("/spec/statusPage", json!("on"))]),
+    )
+    .expect("guarded");
+    let document = apply_document(&plan)
+        .expect("a desired-state field whose name starts with `status` is desired state");
+
+    assert_eq!(document["spec"]["statusPage"], json!("on"));
+}
+
+// --- JSON pointer escaping (RFC 6901) -------------------------------------------------------------
+
+/// A label key contains a slash — `app.kubernetes.io/name` is the convention §23.4 names — and a
+/// JSON pointer spells a slash inside a key as `~1`. An apply document that took the escape
+/// literally would create a field called `app.kubernetes.io~1name` beside the labels rather than
+/// setting the label, and the request would succeed.
+#[test]
+fn should_write_an_escaped_pointer_segment_as_the_key_it_spells() {
+    let plan = Plan::of(
+        &object(DEPLOYMENT),
+        Action::apply(vec![FieldChange::set(
+            "/metadata/labels/app.kubernetes.io~1name",
+            json!("checkout"),
+        )]),
+    )
+    .expect("guarded");
+    let document = apply_document(&plan).expect("builds");
+
+    assert_eq!(
+        document["metadata"]["labels"]["app.kubernetes.io/name"],
+        json!("checkout")
+    );
+    assert!(
+        document["metadata"]["labels"]
+            .get("app.kubernetes.io~1name")
+            .is_none()
+    );
+}

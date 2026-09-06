@@ -11,7 +11,13 @@
 //! recreated object, a deletion that never finishes — be ordinary tests rather than a cluster
 //! somebody has to break on purpose (§59.1).
 //!
-//! Three rules run through the module.
+//! Four rules run through the module.
+//!
+//! **Observed state is not writable** (§33.6, Gate G). A field change under `/status` is refused
+//! here as well as at the boundary, with [`MutationError::ObservedStateNotWritable`]. `status` is
+//! a controller's report of what it saw: sent to the object endpoint the API server drops it and
+//! still answers `200`, and sent to the subresource it succeeds and a value that means "what a
+//! controller observed" comes to say what somebody typed. ADR-0042.
 //!
 //! **An acceptance is not an outcome** (§4 invariant 18, Gate G). [`MutationOutcome`] can reach
 //! [`Stage::ApiAccepted`] and no rung higher, whatever the server returned. Everything above that
@@ -72,6 +78,9 @@ pub enum MutationError {
     UnusablePath(String),
     /// A change reaches into a list entry without naming the key that entry is merged on (§44.1).
     UnkeyedListEntry(String),
+    /// A change writes into `status`, which is a controller's report and not desired state
+    /// (§33.6, Gate G).
+    ObservedStateNotWritable(String),
 }
 
 impl fmt::Display for MutationError {
@@ -92,6 +101,19 @@ impl fmt::Display for MutationError {
                     "`{path}` is not a field path this change can be built from"
                 )
             }
+            Self::ObservedStateNotWritable(path) => write!(
+                f,
+                "`{path}` writes into `status`, and this provider does not write observed state. \
+                 §33.6 asks a provider to preserve desired/observed semantics *and* mutation \
+                 boundaries, and `status` is on the far side of that boundary: it is a \
+                 controller's report of what it saw, reached through its own subresource where \
+                 one is served. Sent to the object endpoint the field is dropped by the API \
+                 server and the request still answers 200, which is a change that reports success \
+                 for having done nothing; sent to the subresource it succeeds, and a value that \
+                 is supposed to say what a controller observed now says what somebody typed \
+                 (Gate G, §62.7). Change the desired state instead and let the controller write \
+                 what it observes"
+            ),
             Self::UnkeyedListEntry(path) => write!(
                 f,
                 "`{path}` reaches into a list by index without setting that entry's `name`. \
@@ -307,6 +329,7 @@ pub fn apply_document(plan: &Plan) -> Result<Json, MutationError> {
     let mut document = Json::Object(document);
 
     for change in changes {
+        check_observed_state(change)?;
         check_list_keys(change, changes)?;
         if let Some(value) = change.to() {
             set_at(&mut document, change.path(), value.clone())?;
@@ -420,6 +443,20 @@ fn api_version(plan: &Plan) -> String {
     }
 }
 
+/// Refuses a change that writes into `status` (§33.6, Gate G).
+///
+/// The `status` *tree* and nothing wider: `/spec/statusPage` and a CRD field called `statusCheck`
+/// are ordinary desired state, and refusing them would be this provider inventing a restriction
+/// the API server does not have. The boundary is `/status` itself and anything under it.
+fn check_observed_state(change: &FieldChange) -> Result<(), MutationError> {
+    if change.path() == "/status" || change.path().starts_with("/status/") {
+        return Err(MutationError::ObservedStateNotWritable(
+            change.path().to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuses a list index whose entry does not also carry the key it is merged on (§44.1).
 ///
 /// Server-side apply merges list entries by key rather than by position. `containers/0/image`
@@ -443,7 +480,7 @@ fn check_list_keys(change: &FieldChange, all: &[FieldChange]) -> Result<(), Muta
 
 /// Writes a value at a JSON pointer, creating the objects and arrays on the way.
 fn set_at(document: &mut Json, path: &str, value: Json) -> Result<(), MutationError> {
-    let segments: Vec<&str> = path.split('/').skip(1).collect();
+    let segments: Vec<String> = path.split('/').skip(1).map(unescape).collect();
     if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
         return Err(MutationError::UnusablePath(path.to_owned()));
     }
@@ -473,16 +510,26 @@ fn set_at(document: &mut Json, path: &str, value: Json) -> Result<(), MutationEr
             Err(_) => {
                 let object = as_object(current, path)?;
                 if last {
-                    object.insert((*segment).to_owned(), value);
+                    object.insert(segment.clone(), value);
                     return Ok(());
                 }
-                let slot = object.entry((*segment).to_owned()).or_insert(Json::Null);
+                let slot = object.entry(segment.clone()).or_insert(Json::Null);
                 fill(slot, next_is_index);
                 slot
             }
         };
     }
     Ok(())
+}
+
+/// One JSON pointer segment as the key it spells (RFC 6901).
+///
+/// `~1` is a `/` and `~0` is a `~`, and the order matters: unescaping `~0` first would turn `~01`
+/// into `~1` and then into `/`. A label key is the reason this is not academic — the convention
+/// §23.4 names is `app.kubernetes.io/name`, and a segment left escaped would create a field beside
+/// the labels rather than setting one.
+fn unescape(segment: &str) -> String {
+    segment.replace("~1", "/").replace("~0", "~")
 }
 
 fn fill(slot: &mut Json, wants_array: bool) {

@@ -22,8 +22,9 @@ use ono_provider_kubernetes::coverage::{Coverage, Gap, Outcome, Scope};
 use ono_provider_kubernetes::discovery::{Gvk, Gvr};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::plan::{
-    Action, Caveat, EffectKind, FieldChange, MissingPrecondition, Plan, PlanRefusal, Preflight,
-    Propagation, Reversibility, Staleness, Target, VerificationRule,
+    Action, Caveat, CompetingWriter, Contained, Curated, EffectKind, FieldChange,
+    MissingPrecondition, Plan, PlanRefusal, Preflight, Propagation, Reversibility, Staleness,
+    Target, VerificationRule, WriterEvidence,
 };
 use serde_json::json;
 
@@ -683,4 +684,484 @@ fn should_describe_a_plan_without_claiming_its_outcome() {
     assert!(description.contains("not evidence"));
     // No admission preview has been run, so the defaulting this change may acquire is unknown.
     assert!(description.contains("dry run"));
+}
+
+// --- §43.3's bounded action surface, and §43.4's escape hatch ------------------------------------
+
+const NODE: &str = r#"{
+  "apiVersion":"v1","kind":"Node",
+  "metadata":{"name":"node-a","uid":"node-uid-1","resourceVersion":"5"},
+  "spec":{}
+}"#;
+
+/// §43.3: the section names seven candidate actions, and every one of them reduces to a bounded
+/// field change. What §43.3 asks for is a surface a user can *reason* about, so the plan reports
+/// the transition — `scale`, `cordon`, `restart-rollout` — rather than the mechanism that carries
+/// it. A plan that called all seven "apply" would have a bounded action surface nobody can see.
+#[test]
+fn should_name_a_curated_action_by_the_transition_it_makes_rather_than_by_apply() {
+    let scale = Plan::of(
+        &object(DEPLOYMENT),
+        Action::curated(
+            Curated::Scale,
+            vec![FieldChange::change("/spec/replicas", json!(3), json!(5))],
+        ),
+    )
+    .expect("guarded");
+    assert_eq!(scale.action().verb(), "scale");
+    assert!(!scale.action().is_low_level());
+    assert_eq!(scale.action().curation(), Some(Curated::Scale));
+    // The API verb is unchanged: a curated word is a word for a user, never a claim about a
+    // Kubernetes verb the API server would recognise (§11.5, §21.2).
+    assert_eq!(scale.action().api_verb(), "patch");
+
+    let cordon = Plan::of(
+        &object(NODE),
+        Action::curated(
+            Curated::Cordon,
+            vec![FieldChange::set("/spec/unschedulable", json!(true))],
+        ),
+    )
+    .expect("guarded");
+    assert_eq!(cordon.action().verb(), "cordon");
+}
+
+/// §46.3: "verification rules MUST match action semantics", and the section gives three worked
+/// examples. A cordon verified by an apply's rule — "the requested fields are observed" — is a
+/// curated action in name only, and a rollout verified by the same rule reports "the field is
+/// set" where §46.3 asks for "new pods ready, old ReplicaSet scaled down".
+#[test]
+fn should_verify_each_curated_action_by_its_own_semantics() {
+    let scale = Plan::of(
+        &object(DEPLOYMENT),
+        Action::curated(
+            Curated::Scale,
+            vec![FieldChange::change("/spec/replicas", json!(3), json!(5))],
+        ),
+    )
+    .expect("guarded");
+    assert_eq!(
+        scale.verification_rule(),
+        VerificationRule::ControllerConvergence
+    );
+
+    let restart = Plan::of(
+        &object(DEPLOYMENT),
+        Action::curated(
+            Curated::RestartRollout,
+            vec![FieldChange::set(
+                "/spec/template/metadata/annotations/ono-sendai.io~1restarted-from-resource-version",
+                json!("1041"),
+            )],
+        ),
+    )
+    .expect("guarded");
+    assert_eq!(
+        restart.verification_rule(),
+        VerificationRule::RolloutObserved
+    );
+
+    let cordon = Plan::of(
+        &object(NODE),
+        Action::curated(
+            Curated::Cordon,
+            vec![FieldChange::set("/spec/unschedulable", json!(true))],
+        ),
+    )
+    .expect("guarded");
+    assert_eq!(
+        cordon.verification_rule(),
+        VerificationRule::SchedulabilityObserved
+    );
+
+    let labelled = Plan::of(
+        &object(DEPLOYMENT),
+        Action::curated(
+            Curated::Label,
+            vec![FieldChange::set("/metadata/labels/tier", json!("edge"))],
+        ),
+    )
+    .expect("guarded");
+    assert_eq!(
+        labelled.verification_rule(),
+        VerificationRule::MetadataObserved
+    );
+
+    // Four rules, four different sentences: a rule that reads the same for a cordon and for a
+    // rollout is a rule that was chosen to pass rather than to verify.
+    let said = [
+        scale.verification_rule().as_str(),
+        restart.verification_rule().as_str(),
+        cordon.verification_rule().as_str(),
+        labelled.verification_rule().as_str(),
+    ];
+    let mut unique = said.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        said.len(),
+        "each rule says something of its own"
+    );
+}
+
+/// §43.3 again, on the effects: a cordon stops *scheduling* and evicts nothing. A plan that
+/// reported it as an ordinary configuration change would let an operator read "no pods stopped"
+/// as "nothing changed about this node's role in the cluster".
+#[test]
+fn should_state_that_a_cordon_stops_scheduling_without_moving_what_is_running() {
+    let cordon = Plan::of(
+        &object(NODE),
+        Action::curated(
+            Curated::Cordon,
+            vec![FieldChange::set("/spec/unschedulable", json!(true))],
+        ),
+    )
+    .expect("guarded");
+
+    let kinds: Vec<EffectKind> = cordon
+        .effects()
+        .iter()
+        .map(|effect| effect.kind())
+        .collect();
+    assert!(kinds.contains(&EffectKind::SchedulingStopped));
+    assert!(!kinds.contains(&EffectKind::PodsStopped));
+    assert!(cordon.describe().contains("already running"));
+}
+
+/// §43.4: the raw structured apply "MUST be explicitly low-level" and "MUST NOT become the default
+/// UX simply because it is easy to implement". Until now the JSON-pointer apply was both §43.3's
+/// bounded change and the only apply there was, and nothing anywhere said which of the two it is.
+#[test]
+fn should_mark_the_raw_pointer_apply_as_the_low_level_escape_hatch() {
+    let raw = Plan::of(
+        &object(DEPLOYMENT),
+        Action::apply(vec![FieldChange::change(
+            "/spec/replicas",
+            json!(3),
+            json!(5),
+        )]),
+    )
+    .expect("guarded");
+
+    assert!(raw.action().is_low_level());
+    assert!(
+        raw.caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::LowLevelChange)),
+        "a raw field change says it is the expert path: {:?}",
+        raw.caveats()
+    );
+    assert!(raw.describe().contains("low-level"));
+
+    // And the curated action that makes the same field change does not, because it is not.
+    let curated = Plan::of(
+        &object(DEPLOYMENT),
+        Action::curated(
+            Curated::Scale,
+            vec![FieldChange::change("/spec/replicas", json!(3), json!(5))],
+        ),
+    )
+    .expect("guarded");
+    assert!(!curated.action().is_low_level());
+    assert!(
+        !curated
+            .caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::LowLevelChange))
+    );
+}
+
+// --- §54 competing desired-state writers --------------------------------------------------------
+
+const AUTOSCALER: &str = r#"{
+  "apiVersion":"autoscaling/v2","kind":"HorizontalPodAutoscaler",
+  "metadata":{"name":"checkout","namespace":"shop","uid":"hpa-uid-1","resourceVersion":"2000"},
+  "spec":{
+    "scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"checkout"},
+    "minReplicas":2,"maxReplicas":20
+  },
+  "status":{"desiredReplicas":6}
+}"#;
+
+const OTHER_AUTOSCALER: &str = r#"{
+  "apiVersion":"autoscaling/v2","kind":"HorizontalPodAutoscaler",
+  "metadata":{"name":"basket","namespace":"shop","uid":"hpa-uid-2","resourceVersion":"2001"},
+  "spec":{
+    "scaleTargetRef":{"apiVersion":"apps/v1","kind":"Deployment","name":"basket"},
+    "minReplicas":1,"maxReplicas":4
+  }
+}"#;
+
+fn scale_up() -> Action {
+    Action::curated(
+        Curated::Scale,
+        vec![FieldChange::change("/spec/replicas", json!(3), json!(5))],
+    )
+}
+
+/// §54.2: "a plan for a direct replica change SHOULD warn when an HPA targets the same workload",
+/// and "the provider MUST NOT claim durable effect merely because the Deployment accepted
+/// `spec.replicas`". The failure this prevents is the quiet one: the apply succeeds, the plan says
+/// so, and the autoscaler writes the count back within the minute.
+#[test]
+fn should_warn_that_an_autoscaler_may_undo_a_direct_replica_change() {
+    let plan = Plan::of(&object(DEPLOYMENT), scale_up())
+        .expect("guarded")
+        .with_competing_writers(
+            vec![object(AUTOSCALER)],
+            Coverage::complete(Scope::in_namespace("shop")),
+        );
+
+    let writers = plan.competing_writers();
+    let autoscaler = writers
+        .iter()
+        .find(|writer| writer.evidence() == WriterEvidence::Autoscaler)
+        .expect("the HPA that targets this Deployment is a competing writer (§54.1)");
+    assert_eq!(autoscaler.name(), "checkout");
+    assert!(
+        autoscaler
+            .detail()
+            .is_some_and(|detail| detail.contains('2') && detail.contains("20"))
+    );
+
+    assert!(
+        plan.caveats().iter().any(|caveat| matches!(
+            caveat,
+            Caveat::AutoscalerMayReconcileReplicas(name) if name == "checkout"
+        )),
+        "the warning §54.2 asks for: {:?}",
+        plan.caveats()
+    );
+    assert!(plan.describe().contains("autoscaler"));
+}
+
+/// §54.1 keeps the *sources* apart, and an HPA that governs a different workload is not evidence
+/// about this one. Matching on the namespace and on the kind alone would make every HPA in the
+/// namespace a warning, which is the fastest way to teach an operator to ignore warnings.
+#[test]
+fn should_not_read_an_autoscaler_of_another_workload_as_a_competing_writer() {
+    let plan = Plan::of(&object(DEPLOYMENT), scale_up())
+        .expect("guarded")
+        .with_competing_writers(
+            vec![object(OTHER_AUTOSCALER)],
+            Coverage::complete(Scope::in_namespace("shop")),
+        );
+
+    assert!(
+        !plan
+            .competing_writers()
+            .iter()
+            .any(|writer| writer.evidence() == WriterEvidence::Autoscaler)
+    );
+    assert!(
+        !plan
+            .caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::AutoscalerMayReconcileReplicas(_)))
+    );
+}
+
+/// §54.1's first source, in the same list as the rest. The field managers were already a caveat;
+/// what was missing is that a reader of "who else writes this object" had to look in two places
+/// and could not tell that only one of the five sources had ever been consulted.
+#[test]
+fn should_carry_the_field_managers_as_competing_writers_of_their_own() {
+    let plan = Plan::of(&object(DEPLOYMENT), scale_up()).expect("guarded");
+
+    let names: Vec<&str> = plan
+        .competing_writers()
+        .iter()
+        .filter(|writer| writer.evidence() == WriterEvidence::FieldManager)
+        .map(CompetingWriter::name)
+        .collect();
+    assert!(names.contains(&"argocd-controller"));
+    assert!(names.contains(&"kube-controller-manager"));
+}
+
+/// §54.1's second source. A ReplicaSet's Deployment writes its spec back, and §24.3 keeps the
+/// *controller* owner apart from the rest: an owner reference that is not the controller is
+/// ownership for garbage collection rather than something that reconciles the object.
+#[test]
+fn should_name_the_controller_that_owns_the_object_as_a_competing_writer() {
+    let plan = Plan::of(
+        &object(REPLICA_SET),
+        Action::curated(
+            Curated::Scale,
+            vec![FieldChange::change("/spec/replicas", json!(3), json!(1))],
+        ),
+    )
+    .expect("guarded");
+
+    let owner = plan
+        .competing_writers()
+        .iter()
+        .find(|writer| writer.evidence() == WriterEvidence::Owner)
+        .expect("the controller owner is a competing writer");
+    assert_eq!(owner.name(), "Deployment checkout");
+}
+
+/// §4 invariant 13 and §21.4, applied to §54.1: a search for autoscalers that never ran, or that
+/// could not read the group, has not established that there is no autoscaler. The plan says which
+/// of the two it is rather than presenting an empty list as an answer.
+#[test]
+fn should_not_read_an_unqueried_autoscaler_search_as_no_autoscaler() {
+    let never_asked = Plan::of(&object(DEPLOYMENT), scale_up()).expect("guarded");
+    assert!(
+        never_asked
+            .caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::CompetingWriterEvidenceIncomplete(_))),
+        "nobody looked for an autoscaler: {:?}",
+        never_asked.caveats()
+    );
+
+    let mut coverage = Coverage::complete(Scope::in_namespace("shop"));
+    coverage.record(Gap::new(
+        Scope::in_group_version("autoscaling/v2"),
+        Outcome::ListDenied,
+    ));
+    let denied = Plan::of(&object(DEPLOYMENT), scale_up())
+        .expect("guarded")
+        .with_competing_writers(Vec::new(), coverage);
+    assert!(
+        denied
+            .caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::CompetingWriterEvidenceIncomplete(_)))
+    );
+
+    let looked = Plan::of(&object(DEPLOYMENT), scale_up())
+        .expect("guarded")
+        .with_competing_writers(Vec::new(), Coverage::complete(Scope::in_namespace("shop")));
+    assert!(
+        !looked
+            .caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::CompetingWriterEvidenceIncomplete(_)))
+    );
+}
+
+// --- §55.2 namespace deletion -------------------------------------------------------------------
+
+const NAMESPACE: &str = r#"{
+  "apiVersion":"v1","kind":"Namespace",
+  "metadata":{
+    "name":"shop","uid":"ns-uid-1","resourceVersion":"3000",
+    "finalizers":["kubernetes"]
+  },
+  "spec":{"finalizers":["kubernetes"]},
+  "status":{"phase":"Active"}
+}"#;
+
+/// §55.2: "deleting a Namespace is a high-impact destructive operation and MUST receive enhanced
+/// prospective analysis", and the section lists what the plan should contain. Before this, a
+/// Namespace deletion plan was indistinguishable from a ConfigMap's but for two generic flags.
+#[test]
+fn should_report_what_a_namespace_deletion_would_remove_by_gvr() {
+    let plan = Plan::of(&object(NAMESPACE), Action::delete(Propagation::Background))
+        .expect("guarded")
+        .with_contents(
+            vec![
+                Contained::counted("v1/pods", 12),
+                Contained::counted("v1/persistentvolumeclaims", 2),
+                Contained::at_least("apps/v1/deployments", 500),
+            ],
+            Coverage::complete(Scope::in_namespace("shop")),
+        );
+
+    let contents = plan.contents().expect("a namespace deletion enumerates");
+    assert_eq!(contents.counted().len(), 3);
+    let pods = contents
+        .counted()
+        .iter()
+        .find(|entry| entry.gvr() == "v1/pods")
+        .expect("pods were counted");
+    assert_eq!(pods.count(), 12);
+    assert!(!pods.is_lower_bound());
+    let deployments = contents
+        .counted()
+        .iter()
+        .find(|entry| entry.gvr() == "apps/v1/deployments")
+        .expect("deployments were counted");
+    assert!(
+        deployments.is_lower_bound(),
+        "a page that did not end is a floor, not a total"
+    );
+
+    // §55.2's fourth bullet: the PVCs are named as a storage implication rather than left as one
+    // more line in a list of counts.
+    assert!(
+        plan.caveats().iter().any(|caveat| matches!(
+            caveat,
+            Caveat::NamespaceHoldsPersistentVolumeClaims(count) if *count == 2
+        )),
+        "{:?}",
+        plan.caveats()
+    );
+    // §55.2's last bullet, in as many words.
+    assert!(
+        plan.caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::ExternalEffectsMayOutliveTheNamespace))
+    );
+    let described = plan.describe();
+    assert!(described.contains("v1/pods"));
+    assert!(described.contains("at least"));
+}
+
+/// §55.2's second bullet, §55.4 and §45.4 together: a type that could not be listed is reported as
+/// *not listed*, never as absent. A count of zero for a collection nobody was allowed to read is
+/// the single most dangerous number a namespace-deletion plan could print.
+#[test]
+fn should_report_a_namespace_type_that_could_not_be_listed_as_not_listed() {
+    let mut coverage = Coverage::complete(Scope::in_namespace("shop"));
+    coverage.record(Gap::new(
+        Scope::in_group_version("example.io/v1"),
+        Outcome::ListDenied,
+    ));
+    let plan = Plan::of(&object(NAMESPACE), Action::delete(Propagation::Background))
+        .expect("guarded")
+        .with_contents(vec![Contained::counted("v1/pods", 1)], coverage);
+
+    let contents = plan.contents().expect("enumerated");
+    assert!(!contents.coverage().is_complete());
+    assert!(
+        plan.caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::ContainedInventoryIncomplete)),
+        "{:?}",
+        plan.caveats()
+    );
+    assert!(plan.describe().contains("denied"));
+}
+
+/// The same rule one step earlier: a Namespace deletion whose contents nobody enumerated says so.
+/// §55.2 is a MUST, so a plan that skipped the analysis has to be distinguishable from one that
+/// ran it and found nothing.
+#[test]
+fn should_say_when_a_namespace_deletions_contents_were_never_enumerated() {
+    let plan =
+        Plan::of(&object(NAMESPACE), Action::delete(Propagation::Background)).expect("guarded");
+
+    assert!(plan.contents().is_none());
+    assert!(
+        plan.caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::ContainedInventoryNotEnumerated)),
+        "{:?}",
+        plan.caveats()
+    );
+    // And a deletion of something that is not a Namespace does not acquire the caveat.
+    let claim = Plan::of(
+        &object(CLAIM_WITH_FINALIZER),
+        Action::delete(Propagation::Background),
+    )
+    .expect("guarded");
+    assert!(
+        !claim
+            .caveats()
+            .iter()
+            .any(|caveat| matches!(caveat, Caveat::ContainedInventoryNotEnumerated))
+    );
 }

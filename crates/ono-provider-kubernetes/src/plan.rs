@@ -5,7 +5,15 @@
 //! of deletion). Nothing here sends anything: a plan is a value describing a change that has not
 //! happened, and it is built from an object that was read and a clock nobody has to consult.
 //!
-//! Three properties shape the module.
+//! Four properties shape the module.
+//!
+//! **A curated action is not an apply that happens to touch the right field.** §43.3 names seven
+//! bounded actions and every one of them reduces to a field change; [`Curated`] carries *which*
+//! one, because the reduction loses the three things §46.2 and §46.3 ask for — the word the change
+//! is reported under, the effects it has beyond the field it writes (a cordon stops scheduling and
+//! evicts nothing), and the rule by which its outcome could be verified. [`Action::Apply`] is what
+//! is left when nobody curated it: §43.4's raw escape hatch, which [`Action::is_low_level`] and
+//! [`Caveat::LowLevelChange`] say out loud rather than leaving to be inferred.
 //!
 //! **The guarded form is the short one.** [`Plan::of`] takes the object that was read and derives
 //! the `resourceVersion` and UID preconditions §56 asks for. A plan for a target assembled by hand
@@ -33,7 +41,7 @@ use serde_json::{Map as JsonMap, Value as Json};
 use crate::condition::Stage;
 use crate::coverage::{Coverage, Gap, Outcome, Scope};
 use crate::discovery::{Gvk, Gvr};
-use crate::object::{Identity, Object};
+use crate::object::{Identity, Object, OwnerReference};
 
 // --- the target ---------------------------------------------------------------------------------
 
@@ -365,25 +373,108 @@ impl FieldChange {
     }
 }
 
+/// One of §43.3's named state transitions.
+///
+/// §43.3 lists seven candidate actions and every one of them reduces to a bounded field change —
+/// scaling is `/spec/replicas`, cordoning is `/spec/unschedulable`, a rollout restart is an
+/// annotation on the pod template. Reducing them is not the same as *offering* them: what §43.3
+/// asks for is a surface a user can reason about, and a surface whose only word is "apply a JSON
+/// pointer" makes every one of these an exercise in knowing the schema.
+///
+/// So the transition is carried beside the fields rather than inferred from them. It decides
+/// three things a bare field list cannot: the word the change is reported under, the effects it
+/// has beyond the field (a cordon stops scheduling and evicts nothing), and the verification rule
+/// §46.3 requires to match the action's semantics. A curated action whose rule is an apply's rule
+/// is a curated action in name only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Curated {
+    /// A workload's replica count (§43.3, §46.3's first worked example).
+    Scale,
+    /// A container image in a workload's pod template, or on a Pod (§43.3, §46.3's second).
+    SetImage,
+    /// A rollout restarted through the pod-template annotation that makes controllers roll
+    /// (§43.3's "explicit supported mechanism").
+    RestartRollout,
+    /// A Node taken out of scheduling (§43.3, §46.3's third worked example).
+    Cordon,
+    /// A Node put back into scheduling (§43.3).
+    Uncordon,
+    /// Labels on the object's metadata (§43.3, §14.5).
+    Label,
+    /// Annotations on the object's metadata (§43.3, §14.5).
+    Annotate,
+}
+
+impl Curated {
+    /// The word the transition is reported under.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scale => "scale",
+            Self::SetImage => "set-image",
+            Self::RestartRollout => "restart-rollout",
+            Self::Cordon => "cordon",
+            Self::Uncordon => "uncordon",
+            Self::Label => "label",
+            Self::Annotate => "annotate",
+        }
+    }
+
+    /// What the transition does, in one line.
+    #[must_use]
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::Scale => "change how many replicas the workload asks for",
+            Self::SetImage => {
+                "change a container's image, which rolls the pods that ran the old one"
+            }
+            Self::RestartRollout => {
+                "roll every pod of the workload by marking its pod template as changed"
+            }
+            Self::Cordon => "stop the scheduler placing new pods on this node",
+            Self::Uncordon => "let the scheduler place new pods on this node again",
+            Self::Label => "change labels on the object's metadata",
+            Self::Annotate => "change annotations on the object's metadata",
+        }
+    }
+}
+
+impl fmt::Display for Curated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What the change is, in the bounded vocabulary §43.3 asks for.
 ///
-/// Two members rather than one per HTTP verb. §43.3 wants actions that map to understandable state
-/// transitions, and §43.4 wants the low-level path to be explicit rather than the default: a
-/// bounded field change and a deletion are the two shapes every candidate action in §43.3 reduces
-/// to, and the raw escape hatch is an [`Self::Apply`] whose field list somebody assembled by hand.
+/// Three members rather than one per HTTP verb. Every candidate action of §43.3 reduces to a
+/// bounded field change or to a deletion, and the third member is the difference §43.4 insists
+/// on: [`Self::Curated`] is one of §43.3's named transitions, and [`Self::Apply`] is the raw
+/// escape hatch — a field list somebody assembled by JSON pointer, which "MUST be explicitly
+/// low-level" and "MUST NOT become the default UX simply because it is easy to implement".
+/// [`Self::is_low_level`] is how the rest of the system can tell them apart, and
+/// [`Caveat::LowLevelChange`] is how a user does.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// A bounded set of field changes, applied with field ownership tracked (§43.3, §44.1).
+    /// One of §43.3's named transitions, as the bounded field change it reduces to.
+    Curated(Curated, Vec<FieldChange>),
+    /// A raw set of field changes named by JSON pointer: §43.4's expert escape hatch.
     Apply(Vec<FieldChange>),
     /// Deletion, with the propagation policy it was chosen with (§45.2).
     Delete(Propagation),
 }
 
 impl Action {
-    /// A bounded field change.
+    /// A bounded field change nobody curated: §43.4's low-level path.
     #[must_use]
     pub fn apply(fields: Vec<FieldChange>) -> Self {
         Self::Apply(fields)
+    }
+
+    /// One of §43.3's named transitions, with the field changes it makes.
+    #[must_use]
+    pub fn curated(transition: Curated, fields: Vec<FieldChange>) -> Self {
+        Self::Curated(transition, fields)
     }
 
     /// A deletion with a propagation policy.
@@ -392,10 +483,30 @@ impl Action {
         Self::Delete(propagation)
     }
 
+    /// Which of §43.3's transitions this is, where it is one of them.
+    #[must_use]
+    pub fn curation(&self) -> Option<Curated> {
+        match self {
+            Self::Curated(transition, _) => Some(*transition),
+            Self::Apply(_) | Self::Delete(_) => None,
+        }
+    }
+
+    /// Whether this is §43.4's raw escape hatch rather than one of §43.3's named transitions.
+    ///
+    /// A deletion is not low-level: `remove` is one of §43.3's own candidate actions and it says
+    /// exactly what it does. What is low-level is a field list aimed by pointer at a schema the
+    /// caller is expected to know.
+    #[must_use]
+    pub fn is_low_level(&self) -> bool {
+        matches!(self, Self::Apply(_))
+    }
+
     /// The verb this action is reported under.
     #[must_use]
     pub fn verb(&self) -> &'static str {
         match self {
+            Self::Curated(transition, _) => transition.as_str(),
             Self::Apply(_) => "apply",
             Self::Delete(_) => "delete",
         }
@@ -410,7 +521,7 @@ impl Action {
     #[must_use]
     pub fn api_verb(&self) -> &'static str {
         match self {
-            Self::Apply(_) => "patch",
+            Self::Curated(_, _) | Self::Apply(_) => "patch",
             Self::Delete(_) => "delete",
         }
     }
@@ -425,7 +536,7 @@ impl Action {
     #[must_use]
     pub fn field_changes(&self) -> &[FieldChange] {
         match self {
-            Self::Apply(fields) => fields,
+            Self::Curated(_, fields) | Self::Apply(fields) => fields,
             Self::Delete(_) => &[],
         }
     }
@@ -434,7 +545,7 @@ impl Action {
     #[must_use]
     pub fn propagation(&self) -> Option<Propagation> {
         match self {
-            Self::Apply(_) => None,
+            Self::Curated(_, _) | Self::Apply(_) => None,
             Self::Delete(policy) => Some(*policy),
         }
     }
@@ -443,7 +554,17 @@ impl Action {
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Apply(fields) => write!(f, "apply {} field change(s)", fields.len()),
+            Self::Curated(transition, fields) => write!(
+                f,
+                "{transition} — {} — through {} field change(s)",
+                transition.summary(),
+                fields.len()
+            ),
+            Self::Apply(fields) => write!(
+                f,
+                "apply {} low-level field change(s) named by JSON pointer (§43.4)",
+                fields.len()
+            ),
             Self::Delete(policy) => write!(f, "delete (propagation {policy})"),
         }
     }
@@ -464,6 +585,10 @@ pub enum EffectKind {
     PodsReplaced,
     /// Running pods are stopped and not replaced.
     PodsStopped,
+    /// The scheduler stops placing new pods here; what is already running keeps running (§43.3).
+    SchedulingStopped,
+    /// The scheduler may place new pods here again (§43.3).
+    SchedulingRestored,
     /// Requests in flight and connections held to the old pods end (§46.5).
     TrafficDisrupted,
     /// The object itself is removed; anything recreated under the name is a new lifetime (§16.3).
@@ -486,6 +611,10 @@ impl EffectKind {
             Self::ConfigurationChanged => "configuration changes",
             Self::PodsReplaced => "running pods are replaced",
             Self::PodsStopped => "running pods are stopped",
+            Self::SchedulingStopped => {
+                "no new pods are scheduled here; pods already running are neither stopped nor moved"
+            }
+            Self::SchedulingRestored => "new pods may be scheduled here again",
             Self::TrafficDisrupted => "requests in flight and existing connections end",
             Self::ObjectRemoved => "the object is removed and its lifetime ends",
             Self::DependentsRemoved => "known dependents are expected to be removed",
@@ -671,6 +800,294 @@ impl Dependent {
 
 // --- the surroundings of a plan --------------------------------------------------------------------
 
+// --- competing desired-state writers (§54) --------------------------------------------------------
+
+/// Which of §54.1's five sources named a writer.
+///
+/// A vocabulary rather than a sentence, because the sources are not equally strong and a reader
+/// deciding whether to go ahead needs to know which one spoke. A field manager on `managedFields`
+/// is a record of a write that already happened; an HPA target is a controller that is *going* to
+/// write; an owner is a controller that reconciles the whole object. Flattening the three into
+/// "something else writes this" would lose the only part that predicts what happens next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterEvidence {
+    /// `metadata.managedFields` records this manager owning fields of the object (§14.7, §44.3).
+    FieldManager,
+    /// A HorizontalPodAutoscaler names this object in `spec.scaleTargetRef` (§54.2).
+    Autoscaler,
+    /// A controller owns this object through an owner reference (§24.3).
+    Owner,
+}
+
+impl WriterEvidence {
+    /// The source in the words it is reported under.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FieldManager => "managedFields",
+            Self::Autoscaler => "HorizontalPodAutoscaler scaleTargetRef",
+            Self::Owner => "owner reference",
+        }
+    }
+}
+
+impl fmt::Display for WriterEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Something other than this change that writes this object's desired state (§54.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompetingWriter {
+    name: String,
+    evidence: WriterEvidence,
+    writes: String,
+    detail: Option<String>,
+}
+
+impl CompetingWriter {
+    /// A manager `metadata.managedFields` already records (§54.1's first source).
+    #[must_use]
+    pub fn field_manager(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            evidence: WriterEvidence::FieldManager,
+            writes: "fields of this object it already owns".to_owned(),
+            detail: None,
+        }
+    }
+
+    /// The controller that owns this object, which reconciles the whole of it (§24.3, §54.1).
+    ///
+    /// The *controller* owner and not every owner: §24.3 keeps the two apart because one owner
+    /// reference in the list is the thing that actually reconciles the object and the rest are
+    /// ownership for garbage collection. A ReplicaSet's Deployment writes its spec back; a
+    /// non-controller owner does not.
+    #[must_use]
+    pub fn controller(reference: &OwnerReference) -> Self {
+        Self {
+            name: format!("{} {}", reference.kind(), reference.name()),
+            evidence: WriterEvidence::Owner,
+            writes: "this object's spec, which it reconciles from its own".to_owned(),
+            detail: Some(
+                "a change made here may be reconciled back by the controller that owns this \
+                 object (§24.3, §54.1)"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    /// The autoscaler that governs this workload, where the candidate object is one (§54.2).
+    ///
+    /// `None` for every HorizontalPodAutoscaler that names a different workload. §54.1 asks for
+    /// *known* competing writers, and an HPA in the same namespace is not evidence about this
+    /// object: the match is `spec.scaleTargetRef` against the target's kind, group and name, which
+    /// is the reference the autoscaler itself acts on. Matching on less would make every HPA in a
+    /// busy namespace a warning, and a warning that fires on everything is read as noise.
+    #[must_use]
+    pub fn autoscaler(candidate: &Object, target: &Target) -> Option<Self> {
+        let reference = candidate.field("/spec/scaleTargetRef")?;
+        if reference.get("name").and_then(Json::as_str)? != target.name() {
+            return None;
+        }
+        if reference.get("kind").and_then(Json::as_str)? != target.gvk().kind() {
+            return None;
+        }
+        // §13.1: the reference carries an `apiVersion`, which is group *and* version. Only the
+        // group identifies the kind — a `Deployment` in `apps` and a `Deployment` in somebody
+        // else's group are different kinds, and the version is not part of that difference.
+        let referenced_group = reference
+            .get("apiVersion")
+            .and_then(Json::as_str)
+            .map_or("", |api_version| {
+                api_version.split_once('/').map_or("", |(group, _)| group)
+            });
+        if referenced_group != target.gvk().group() {
+            return None;
+        }
+        // An HPA is namespaced and scales only within its own namespace, so a match across
+        // namespaces is not a match at all.
+        if candidate.namespace() != target.namespace() {
+            return None;
+        }
+        let bounds = match (
+            candidate.field("/spec/minReplicas").and_then(Json::as_i64),
+            candidate.field("/spec/maxReplicas").and_then(Json::as_i64),
+        ) {
+            (Some(min), Some(max)) => Some(format!("it keeps the count between {min} and {max}")),
+            (None, Some(max)) => Some(format!("it keeps the count at or below {max}")),
+            _ => None,
+        };
+        Some(Self {
+            name: candidate.name().to_owned(),
+            evidence: WriterEvidence::Autoscaler,
+            writes: "/spec/replicas".to_owned(),
+            detail: bounds,
+        })
+    }
+
+    /// The writer's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Which of §54.1's sources named it.
+    #[must_use]
+    pub fn evidence(&self) -> WriterEvidence {
+        self.evidence
+    }
+
+    /// What it is known to write.
+    #[must_use]
+    pub fn writes(&self) -> &str {
+        &self.writes
+    }
+
+    /// What else is known about it, where anything is.
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
+    /// The writer in one line.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut line = format!(
+            "{} writes {} (evidence: {})",
+            self.name, self.writes, self.evidence
+        );
+        if let Some(detail) = &self.detail {
+            line.push_str("; ");
+            line.push_str(detail);
+        }
+        line
+    }
+}
+
+impl fmt::Display for CompetingWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+// --- what a namespace holds (§55.2) ---------------------------------------------------------------
+
+/// One resource type a namespace holds, and how many of it were seen (§55.2's first bullet).
+///
+/// The count carries whether it is a total or a floor. A page that ended has counted a namespace's
+/// worth of objects; a page that did not has counted the page, and printing that number as a total
+/// under-reports the blast radius of the deletion by exactly the amount that matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contained {
+    gvr: String,
+    count: usize,
+    lower_bound: bool,
+}
+
+impl Contained {
+    /// A type whose objects were all counted.
+    #[must_use]
+    pub fn counted(gvr: impl Into<String>, count: usize) -> Self {
+        Self {
+            gvr: gvr.into(),
+            count,
+            lower_bound: false,
+        }
+    }
+
+    /// A type whose enumeration stopped before the collection ended (§18.1, §18.4).
+    #[must_use]
+    pub fn at_least(gvr: impl Into<String>, count: usize) -> Self {
+        Self {
+            gvr: gvr.into(),
+            count,
+            lower_bound: true,
+        }
+    }
+
+    /// Which REST collection was counted (§13.1).
+    #[must_use]
+    pub fn gvr(&self) -> &str {
+        &self.gvr
+    }
+
+    /// How many were seen.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the number is a floor rather than a total.
+    #[must_use]
+    pub fn is_lower_bound(&self) -> bool {
+        self.lower_bound
+    }
+
+    /// The count in one line.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        if self.lower_bound {
+            format!("{}: at least {}", self.gvr, self.count)
+        } else {
+            format!("{}: {}", self.gvr, self.count)
+        }
+    }
+}
+
+impl fmt::Display for Contained {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+/// What a namespace was found to hold, and what the finding did not cover (§55.2, §55.4, §45.4).
+///
+/// The coverage travels with the counts rather than beside them, because §55.4 and §45.4 both say
+/// the same thing in different words: what could not be listed is reported as *not listed*. A list
+/// of counts with no coverage is a list that reads as complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contents {
+    counted: Vec<Contained>,
+    coverage: Coverage,
+}
+
+impl Contents {
+    /// The types that were counted, and how many of each.
+    #[must_use]
+    pub fn counted(&self) -> &[Contained] {
+        &self.counted
+    }
+
+    /// What the enumeration covered and what it did not (§21.4).
+    #[must_use]
+    pub fn coverage(&self) -> &Coverage {
+        &self.coverage
+    }
+
+    /// How many objects of a type were seen, where it was counted at all.
+    #[must_use]
+    pub fn of(&self, gvr: &str) -> Option<&Contained> {
+        self.counted.iter().find(|entry| entry.gvr == gvr)
+    }
+
+    /// The contents in one line.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let counts = if self.counted.is_empty() {
+            "nothing was counted".to_owned()
+        } else {
+            self.counted
+                .iter()
+                .map(Contained::describe)
+                .collect::<Vec<String>>()
+                .join(", ")
+        };
+        format!("{counts} ({})", self.coverage.describe())
+    }
+}
+
 /// Whether the caller may do this, as far as anybody asked (§21.2, §46.2).
 ///
 /// [`Self::NotChecked`] is the default and is not a permission. A boolean here would default to
@@ -854,6 +1271,15 @@ pub enum VerificationRule {
     FieldObserved,
     /// A controller observed the generation and converged, by a rule `condition.rs` names (§37.5).
     ControllerConvergence,
+    /// §46.3's second worked example: the pod template changed, a new ReplicaSet is observed, the
+    /// rollout progresses, new pods become ready and the old ReplicaSet scales down.
+    RolloutObserved,
+    /// §46.3's third worked example: `spec.unschedulable` holds the requested value. Nothing is
+    /// claimed about the pods already on the node — cordoning is not draining.
+    SchedulabilityObserved,
+    /// The requested labels or annotations are read back. Nothing is claimed about the selectors,
+    /// controllers or admission policies that read them (§14.5, §26.1).
+    MetadataObserved,
     /// The object is gone, or the name now holds a different lifetime (§45.1, §16.3).
     Absence,
     /// This provider has no rule for what success would look like here.
@@ -867,6 +1293,18 @@ impl VerificationRule {
         match self {
             Self::FieldObserved => "the requested fields are observed on the object",
             Self::ControllerConvergence => "a controller observes the generation and converges",
+            Self::RolloutObserved => {
+                "the pod template changed, a new ReplicaSet is observed, its new pods become ready \
+                 and the old one scales down"
+            }
+            Self::SchedulabilityObserved => {
+                "the node's `spec.unschedulable` holds the requested value; the pods already \
+                 running on it are neither stopped nor moved"
+            }
+            Self::MetadataObserved => {
+                "the requested labels or annotations are read back on the object; what selects on \
+                 them is not something this provider verifies"
+            }
             Self::Absence => "the object's lifetime has ended",
             Self::NoneKnown => "the outcome of this action cannot be verified by this provider",
         }
@@ -879,8 +1317,10 @@ impl VerificationRule {
     #[must_use]
     pub fn established_stage(self) -> Option<Stage> {
         match self {
-            Self::FieldObserved => Some(Stage::SpecObserved),
-            Self::ControllerConvergence => Some(Stage::StatusConverged),
+            Self::FieldObserved | Self::SchedulabilityObserved | Self::MetadataObserved => {
+                Some(Stage::SpecObserved)
+            }
+            Self::ControllerConvergence | Self::RolloutObserved => Some(Stage::StatusConverged),
             Self::Absence | Self::NoneKnown => None,
         }
     }
@@ -925,6 +1365,22 @@ pub enum Caveat {
     NoVerificationRule,
     /// Other field managers already own fields of this object (§44.3, §54.1).
     OtherFieldManagers(Vec<String>),
+    /// This is §43.4's raw escape hatch rather than one of §43.3's curated transitions.
+    LowLevelChange,
+    /// A HorizontalPodAutoscaler of this name governs the replica count being changed (§54.2).
+    AutoscalerMayReconcileReplicas(String),
+    /// Not every source of §54.1 was consulted, so the writers named are not all of them.
+    CompetingWriterEvidenceIncomplete(String),
+    /// Nobody enumerated what this Namespace holds, so the deletion's reach is unknown (§55.2).
+    ContainedInventoryNotEnumerated,
+    /// The enumeration of what this Namespace holds did not cover everything (§55.2, §55.4).
+    ContainedInventoryIncomplete,
+    /// This Namespace holds PersistentVolumeClaims, whose storage reclaim is a controller's
+    /// decision this provider does not make and cannot undo (§55.2, §45.5).
+    NamespaceHoldsPersistentVolumeClaims(usize),
+    /// Load balancers, DNS records and volumes provisioned for this namespace may survive it
+    /// (§55.2's last bullet, §46.5).
+    ExternalEffectsMayOutliveTheNamespace,
 }
 
 impl fmt::Display for Caveat {
@@ -981,6 +1437,44 @@ impl fmt::Display for Caveat {
                 f,
                 "other field managers already own fields of this object: {}",
                 managers.join(", ")
+            ),
+            Self::AutoscalerMayReconcileReplicas(name) => write!(
+                f,
+                "a HorizontalPodAutoscaler named `{name}` targets this workload and writes \
+                 `/spec/replicas` itself. A direct replica change may be reconciled back within \
+                 the autoscaler's next interval, and the API server accepting `spec.replicas` is \
+                 not evidence of a durable effect (§54.2)"
+            ),
+            Self::CompetingWriterEvidenceIncomplete(reason) => write!(
+                f,
+                "the search for competing desired-state writers was incomplete, so the writers \
+                 named here are not necessarily all of them: {reason} (§54.1, §21.4)"
+            ),
+            Self::ContainedInventoryNotEnumerated => f.write_str(
+                "nothing enumerated what this Namespace holds, so what the deletion would remove \
+                 with it is unknown rather than nothing (§55.2, §4 invariant 13)",
+            ),
+            Self::ContainedInventoryIncomplete => f.write_str(
+                "the enumeration of what this Namespace holds did not cover every type: what was \
+                 not listed is not listed, and never a count of zero (§55.2, §55.4, §45.4)",
+            ),
+            Self::NamespaceHoldsPersistentVolumeClaims(count) => write!(
+                f,
+                "this Namespace holds {count} PersistentVolumeClaim(s); whether their volumes are \
+                 reclaimed or retained is a StorageClass and controller decision outside this \
+                 provider's evidence, and no rollback is promised (§55.2, §45.5)"
+            ),
+            Self::ExternalEffectsMayOutliveTheNamespace => f.write_str(
+                "external side effects may outlive the namespace: cloud load balancers, DNS \
+                 records and volumes provisioned for objects in it are not removed by the API \
+                 server and this provider does not observe them (§55.2, §46.5)",
+            ),
+            Self::LowLevelChange => f.write_str(
+                "this is the low-level raw field change of §43.4: the fields are named by JSON \
+                 pointer against a schema the caller is expected to know, and no curated action \
+                 vouches for what they mean together. The curated transitions of §43.3 — scale, \
+                 set-image, restart-rollout, cordon, uncordon, label, annotate — each carry their \
+                 own effects and their own verification rule",
             ),
         }
     }
@@ -1081,6 +1575,7 @@ struct Observed {
     terminating: bool,
     finalizers: Vec<String>,
     field_managers: Vec<String>,
+    controllers: Vec<OwnerReference>,
 }
 
 /// A change described before it is made (§46.2).
@@ -1100,6 +1595,9 @@ pub struct Plan {
     dependents: Vec<Dependent>,
     dependent_coverage: Coverage,
     preflight: Preflight,
+    competing_writers: Vec<CompetingWriter>,
+    writer_coverage: Coverage,
+    contents: Option<Contents>,
     verification: VerificationRule,
     caveats: Vec<Caveat>,
 }
@@ -1123,6 +1621,12 @@ impl Plan {
             terminating: object.is_terminating(),
             finalizers: object.finalizers().to_vec(),
             field_managers: object.field_managers().to_vec(),
+            controllers: object
+                .owner_references()
+                .iter()
+                .filter(|reference| reference.is_controller())
+                .cloned()
+                .collect(),
         };
         Self::build(Target::observed(object), action, observed, None)
     }
@@ -1189,6 +1693,17 @@ impl Plan {
         // Nobody has looked for dependents yet, and §4 invariant 13's whole point is that "nobody
         // asked" is a different answer from "there are none".
         dependent_coverage.record(Gap::new(target.scope(), Outcome::NotQueried));
+        // §54.1's first source is already in hand: `managedFields` came with the object, so the
+        // managers that own fields of it are competing writers before anybody sends a request.
+        // The other four sources need a query nobody has made, so the coverage says so.
+        let mut competing_writers: Vec<CompetingWriter> = observed
+            .field_managers
+            .iter()
+            .map(CompetingWriter::field_manager)
+            .collect();
+        competing_writers.extend(observed.controllers.iter().map(CompetingWriter::controller));
+        let mut writer_coverage = Coverage::complete(target.scope());
+        writer_coverage.record(Gap::new(target.scope(), Outcome::NotQueried));
         Self {
             target,
             action,
@@ -1199,6 +1714,9 @@ impl Plan {
             dependents: Vec::new(),
             dependent_coverage,
             preflight: Preflight::NotChecked,
+            competing_writers,
+            writer_coverage,
+            contents: None,
             verification,
             caveats: Vec::new(),
         }
@@ -1225,6 +1743,35 @@ impl Plan {
     #[must_use]
     pub fn with_preflight(mut self, preflight: Preflight) -> Self {
         self.preflight = preflight;
+        self.rebuild_caveats();
+        self
+    }
+
+    /// The same plan with the competing desired-state writers a search found (§54.1, §54.2).
+    ///
+    /// The candidates are filtered through [`CompetingWriter::autoscaler`], so an object that does
+    /// not target this one does not become a warning however it was found. The coverage is kept
+    /// beside the list for the same reason the dependent preview keeps one: an empty list from a
+    /// group that would not answer is not an absence of autoscalers (§21.4).
+    ///
+    /// The field managers the object already carried stay in the list — this appends rather than
+    /// replaces, because §54.1 asks for the sources together rather than one at a time.
+    #[must_use]
+    pub fn with_competing_writers(mut self, candidates: Vec<Object>, coverage: Coverage) -> Self {
+        self.competing_writers.extend(
+            candidates
+                .iter()
+                .filter_map(|candidate| CompetingWriter::autoscaler(candidate, &self.target)),
+        );
+        self.writer_coverage = coverage;
+        self.rebuild_caveats();
+        self
+    }
+
+    /// The same plan with what an enumeration found the target Namespace to hold (§55.2).
+    #[must_use]
+    pub fn with_contents(mut self, counted: Vec<Contained>, coverage: Coverage) -> Self {
+        self.contents = Some(Contents { counted, coverage });
         self.rebuild_caveats();
         self
     }
@@ -1325,6 +1872,24 @@ impl Plan {
         &self.dependent_coverage
     }
 
+    /// What else writes this object's desired state, as far as anybody looked (§54.1).
+    #[must_use]
+    pub fn competing_writers(&self) -> &[CompetingWriter] {
+        &self.competing_writers
+    }
+
+    /// What the search for competing writers covered, and what it did not (§54.1, §21.4).
+    #[must_use]
+    pub fn competing_writer_coverage(&self) -> &Coverage {
+        &self.writer_coverage
+    }
+
+    /// What the target Namespace was found to hold, where anybody enumerated it (§55.2).
+    #[must_use]
+    pub fn contents(&self) -> Option<&Contents> {
+        self.contents.as_ref()
+    }
+
     /// Whether anybody asked the API server if this is allowed (§46.2).
     #[must_use]
     pub fn preflight(&self) -> &Preflight {
@@ -1393,6 +1958,20 @@ impl Plan {
         // the caveat every state of it produces — that the request is where it is really decided.
         lines.push(format!("authorization: {}", self.preflight));
         lines.push(format!("verification: {}", self.verification));
+        if !self.competing_writers.is_empty() {
+            lines.push(format!(
+                "competing desired-state writers: {} ({})",
+                self.competing_writers
+                    .iter()
+                    .map(CompetingWriter::describe)
+                    .collect::<Vec<String>>()
+                    .join("; "),
+                self.writer_coverage.describe()
+            ));
+        }
+        if let Some(contents) = &self.contents {
+            lines.push(format!("the namespace holds: {}", contents.describe()));
+        }
         if !self.dependents.is_empty() {
             lines.push(format!(
                 "dependents previewed: {} ({})",
@@ -1409,6 +1988,14 @@ impl Plan {
                 .to_owned(),
         );
         lines.join("\n")
+    }
+
+    /// Whether this change writes the replica count an autoscaler would reconcile (§54.2).
+    fn touches_replicas(&self) -> bool {
+        self.action
+            .field_changes()
+            .iter()
+            .any(|change| change.path() == "/spec/replicas")
     }
 
     /// Derives the caveats from the plan's parts.
@@ -1446,7 +2033,34 @@ impl Plan {
             if storage_bearing(self.target.gvk()) {
                 caveats.push(Caveat::StorageReclaimNotPromised);
             }
+            // §55.2: deleting a Namespace "MUST receive enhanced prospective analysis". The
+            // analysis is a *read* somebody has to make, so what the plan can guarantee on its
+            // own is that the reader is told which of the three states this plan is in: nobody
+            // enumerated, the enumeration was partial, or it was complete.
+            if is_namespace(self.target.gvk()) {
+                caveats.push(Caveat::ExternalEffectsMayOutliveTheNamespace);
+                match &self.contents {
+                    None => caveats.push(Caveat::ContainedInventoryNotEnumerated),
+                    Some(contents) => {
+                        if !contents.coverage.is_complete() {
+                            caveats.push(Caveat::ContainedInventoryIncomplete);
+                        }
+                        if let Some(claims) = contents
+                            .counted
+                            .iter()
+                            .find(|entry| entry.gvr.ends_with("persistentvolumeclaims"))
+                            .filter(|entry| entry.count > 0)
+                        {
+                            caveats
+                                .push(Caveat::NamespaceHoldsPersistentVolumeClaims(claims.count));
+                        }
+                    }
+                }
+            }
         } else {
+            if self.action.is_low_level() {
+                caveats.push(Caveat::LowLevelChange);
+            }
             caveats.push(Caveat::AdmissionEffectsNotPreviewed);
             if !self.observed.field_managers.is_empty() {
                 caveats.push(Caveat::OtherFieldManagers(
@@ -1465,6 +2079,20 @@ impl Plan {
             Preflight::NotChecked | Preflight::NotAnswered(_) => {
                 caveats.push(Caveat::PermissionNotVerified);
             }
+        }
+        // §54.2: the warning belongs to the change that would be undone, so it is derived from
+        // the field the change touches rather than pushed by whoever ran the search.
+        if self.touches_replicas() {
+            for writer in &self.competing_writers {
+                if writer.evidence == WriterEvidence::Autoscaler {
+                    caveats.push(Caveat::AutoscalerMayReconcileReplicas(writer.name.clone()));
+                }
+            }
+        }
+        if !self.action.is_destructive() && !self.writer_coverage.is_complete() {
+            caveats.push(Caveat::CompetingWriterEvidenceIncomplete(
+                self.writer_coverage.describe(),
+            ));
         }
         if self.verification == VerificationRule::NoneKnown {
             caveats.push(Caveat::NoVerificationRule);
@@ -1485,11 +2113,33 @@ fn effects_of(target: &Target, action: &Action) -> Vec<Effect> {
         }
     };
     match action {
-        Action::Apply(fields) => {
+        Action::Curated(_, fields) | Action::Apply(fields) => {
             push(
                 EffectKind::ConfigurationChanged,
                 Reversibility::ConfigurationReapplicable,
             );
+            // §43.3: a curated transition has effects the field it writes does not spell out. A
+            // cordon is the clearest of them — `spec.unschedulable` reads as an ordinary boolean,
+            // and what it does is take a node out of scheduling without moving anything on it.
+            match action.curation() {
+                Some(Curated::Cordon) => {
+                    push(
+                        EffectKind::SchedulingStopped,
+                        Reversibility::ConfigurationReapplicable,
+                    );
+                }
+                Some(Curated::Uncordon) => {
+                    push(
+                        EffectKind::SchedulingRestored,
+                        Reversibility::ConfigurationReapplicable,
+                    );
+                }
+                Some(Curated::RestartRollout) => {
+                    push(EffectKind::PodsReplaced, Reversibility::Irreversible);
+                    push(EffectKind::TrafficDisrupted, Reversibility::Irreversible);
+                }
+                _ => {}
+            }
             for change in fields {
                 if change.path().starts_with("/spec/template") {
                     // A pod template change is a rollout: the pods that served the old template
@@ -1545,6 +2195,23 @@ fn is_scale_down(change: &FieldChange) -> bool {
 fn rule_for(target: &Target, action: &Action) -> VerificationRule {
     match action {
         Action::Delete(_) => VerificationRule::Absence,
+        // §46.3 names three worked examples and each one is a different question. A curated
+        // transition answers with its own; reaching for the neighbouring rule is how "the field
+        // is set" comes to be reported as "the rollout finished" (Gate G).
+        Action::Curated(Curated::Cordon | Curated::Uncordon, _) => {
+            VerificationRule::SchedulabilityObserved
+        }
+        Action::Curated(Curated::Label | Curated::Annotate, _) => {
+            VerificationRule::MetadataObserved
+        }
+        Action::Curated(Curated::SetImage | Curated::RestartRollout, _)
+            if controller_backed(target.gvk()) =>
+        {
+            VerificationRule::RolloutObserved
+        }
+        Action::Curated(Curated::Scale, _) if controller_backed(target.gvk()) => {
+            VerificationRule::ControllerConvergence
+        }
         Action::Apply(_) if controller_backed(target.gvk()) => {
             VerificationRule::ControllerConvergence
         }
@@ -1552,7 +2219,7 @@ fn rule_for(target: &Target, action: &Action) -> VerificationRule {
         // can be read back, and whether a controller acted on it is not something this provider
         // has a rule for (§33.7). Reaching for the convergence rule here is how "the field is set"
         // becomes "the rollout finished".
-        Action::Apply(_) => VerificationRule::FieldObserved,
+        Action::Curated(_, _) | Action::Apply(_) => VerificationRule::FieldObserved,
     }
 }
 
@@ -1570,6 +2237,11 @@ fn controller_backed(gvk: &Gvk) -> bool {
 /// Kinds whose deletion stops running processes.
 fn runs_workload(gvk: &Gvk) -> bool {
     controller_backed(gvk) || matches!((gvk.group(), gvk.kind()), ("", "Pod" | "Namespace"))
+}
+
+/// Whether the target is a Namespace, whose deletion §55.2 singles out.
+fn is_namespace(gvk: &Gvk) -> bool {
+    matches!((gvk.group(), gvk.kind()), ("", "Namespace"))
 }
 
 /// Kinds whose deletion may reach storage this provider does not observe (§45.5).
