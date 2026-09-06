@@ -284,23 +284,21 @@ instance isolation are all done and driven end to end.
 on the shared metadata block, and the schema cache found its owner when the session was wired.
 All seven of K1's requirements are met.
 
-**Phase 3 is delivered as records and owes the spatial half.** Every Tier 1 adapter is wired, and
-`k8s-relation` routes the whole `Ingress -> Service -> EndpointSlice -> Pod -> Node` path with the
-evidence under each hop. What it still owes is `near`, `enter` and `follow` as *verbs*: a
-Kubernetes place is a string on a record rather than a place in Ono's graph. The reason changed
-this session — core's spatial vocabulary is open to a package now (`ADR-0584`, `ADR-0585`) — so
-this is work here rather than a door held shut elsewhere, and it is the largest single item on
-the board.
+**Phase 3 is closed, in both halves.** Every Tier 1 adapter is wired, `k8s-relation` routes the
+whole `Ingress -> Service -> EndpointSlice -> Pod -> Node` path with the evidence under each hop,
+and §15.3's seventeen Tier 2 kinds are curated beside them (ADR-0052). The spatial half it used to
+owe is delivered: `enter`, `near` and `follow` reach a cluster through the real `ono` binary, and
+a CRD invented after the build is entered as a place keyed on the cluster's own `uid` — Gate A's
+fifth verb, proven live.
 
-**Phase 4 is closed but for one requirement.** A watch is opened, answers while the body is open,
-continues past a gap and stops promptly when the operator does. What is missing is a live *view*:
-§41.1's inherited live-view contract is not used and `live.rs` has no importer.
+**Phase 4 is closed.** A watch is opened, answers while the body is open, continues past a gap and
+stops promptly when the operator does, and §41's live view is wired into `changes.rs` — a row that
+goes stale says so rather than staying there looking current.
 
-**Phases 5 through 8 landed out of order, and the cost is now visible rather than theoretical.**
-Events, temporal, causal, logs, plan and mutation all reach a user. Because phase 7's write landed
-in the same session as phase 4's watch, `set k8s-resource`'s answer is verified by one immediate
-observation — there is no watch to verify it against, and §46.4's `Inconclusive` is doing work
-that a live view would otherwise do.
+**Phases 5 through 8 landed out of order, and one cost of that remains.** Events, temporal,
+causal, logs, plan and mutation all reach a user. `set k8s-resource`'s answer is still verified by
+one immediate observation rather than against a watch, so §46.4's `Inconclusive` is doing work a
+live view would otherwise do — an honest answer, and a coarser one than the machinery now allows.
 
 ## Proven from a prompt (2026-09-05)
 
