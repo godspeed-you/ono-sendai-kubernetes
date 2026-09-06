@@ -19,6 +19,7 @@
 )]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ono_kuang_sdk::protocol::{Capability, InvokeStatus};
 use ono_kuang_supervisor::{Connection, HostError, HostServices, LiveStream, StreamEvent};
@@ -187,6 +188,15 @@ struct RecordedCluster {
     claim_deleting: Arc<std::sync::atomic::AtomicBool>,
     /// Every request the server received, head and body, so a test can assert what travelled.
     exchanges: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Whether the read *after* the write is swallowed and never answered (§62.12).
+    ///
+    /// The instrument for cancelling a verification. §46.3's verification is one `GET` made after
+    /// the API server accepted the change, and the state a cancellation has to be prompt in is
+    /// the one where that `GET` is still outstanding — an API server that took the write and then
+    /// went quiet, which is exactly what a cluster under admission or etcd pressure does.
+    held_verification: bool,
+    /// Signalled when a held verification read may be answered. Never, in the test that holds one.
+    release: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for RecordedCluster {
@@ -203,6 +213,14 @@ impl RecordedCluster {
     fn playing(scenario: Scenario) -> Arc<Self> {
         Arc::new(Self {
             scenario,
+            ..Self::default()
+        })
+    }
+
+    /// The same cluster, which accepts the write and then never answers the read after it.
+    fn holding_the_verification() -> Arc<Self> {
+        Arc::new(Self {
+            held_verification: true,
             ..Self::default()
         })
     }
@@ -719,6 +737,17 @@ impl HostServices for RecordedCluster {
                     let path = words.next().unwrap_or("/").to_owned();
                     if let Ok(mut held) = cluster.exchanges.lock() {
                         held.push((head.clone(), body));
+                    }
+                    // The verification read, held: a `GET` of the Deployment made after the
+                    // `PATCH` that changed it. Held here rather than in `document`, because
+                    // `document` answers synchronously and what this reproduces is a server that
+                    // has not answered yet.
+                    if cluster.held_verification
+                        && method == "GET"
+                        && path.starts_with("/apis/apps/v1/namespaces/default/deployments/api")
+                        && cluster.heads().iter().any(|head| head.starts_with("PATCH"))
+                    {
+                        cluster.release.notified().await;
                     }
                     replies.push(document(&method, &path, &cluster));
                 }
@@ -2311,5 +2340,92 @@ async fn should_report_a_namespace_type_that_could_not_be_listed_as_not_listed()
             .any(|caveat| caveat.contains("not listed")),
         "{:?}",
         list_of(plan, "caveats")
+    );
+}
+
+// --- §62.12, Gate L: the fourth operation ----------------------------------------------------------
+
+#[tokio::test]
+async fn should_terminate_a_verification_within_seconds_of_being_cancelled() {
+    // §62.12 names four operations — "large list, watch, log-follow and verification" — and
+    // three of them are measured in `performance.rs`. This is the fourth, and the one that was
+    // missing: §46.3's follow-up read, made after the API server has already accepted the write.
+    //
+    // It is the least obvious of the four and the most consequential. The other three are read
+    // paths, so a cancellation that took a deadline to be noticed would waste a shell's time and
+    // nothing else. Here the change is already made, and an operator who stops the command is
+    // waiting to find out what the cluster now holds. A package that could only end at the read
+    // deadline would leave them holding a prompt for thirty seconds *after* a write, which is
+    // the worst moment in the whole provider to be unable to say anything.
+    //
+    // The recorded server takes the `PATCH`, answers it, and then never answers the `GET` after
+    // it — the state a real cluster reaches when admission or etcd goes slow behind an accepted
+    // write. So the invocation is genuinely inside the verification read when the cancellation
+    // arrives, which is the only state in which "promptly" means anything.
+    let cluster = RecordedCluster::holding_the_verification();
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect("the change runs");
+
+    // Wait until the write has been accepted and the read after it is outstanding. Both halves
+    // matter: a cancellation before the `PATCH` would be cancelling a plan, not a verification.
+    let waiting = Instant::now();
+    loop {
+        let heads = cluster.heads();
+        let wrote = heads.iter().any(|head| head.starts_with("PATCH"));
+        let reading = heads
+            .iter()
+            .filter(|head| head.starts_with("GET /apis/apps/v1/namespaces/default/deployments/api"))
+            .count();
+        // Two: the read that produced the plan, and the held one that would verify it.
+        if wrote && reading >= 2 {
+            break;
+        }
+        assert!(
+            waiting.elapsed() < Duration::from_secs(10),
+            "the verification read never became outstanding, so there was nothing to cancel: {heads:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let started = Instant::now();
+    invocation.cancel().await;
+    let result = tokio::time::timeout(Duration::from_secs(30), invocation.finish())
+        .await
+        .expect("a cancelled verification terminates rather than hanging on a silent server");
+    let elapsed = started.elapsed();
+    println!("cancelled verification terminated in {elapsed:?}");
+
+    assert_eq!(
+        result.status,
+        InvokeStatus::Cancelled,
+        "the operator stopped it, and a server that simply has not answered yet is not a fault"
+    );
+    // The same ceiling as the listing's: a guard against "only ends at the deadline" rather than
+    // a latency budget. `ReadPolicy`'s window is a quarter of a second on every path, and the
+    // ninety seconds of patience a quiet API server is given is a separate number — if those two
+    // were ever collapsed back into one, this is one of the four tests that would say so.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a cancelled verification terminates in the window the cancellation arrived in, not when \
+         the request deadline expires: {elapsed:?}"
+    );
+
+    // And the write is not undone or retried on the way out. §46.4 is explicit that a
+    // verification which did not finish leaves the change exactly as the API server took it;
+    // §26 forbids an inverse operation being treated as a recovery. A cancelled verification is
+    // the case where a package might be tempted into either.
+    assert_eq!(
+        cluster.requests("PATCH").len(),
+        1,
+        "one write was made and the cancellation did not make a second: {:?}",
+        cluster.heads()
+    );
+    assert!(
+        cluster.requests("DELETE").is_empty(),
+        "and nothing was rolled back: {:?}",
+        cluster.heads()
     );
 }
