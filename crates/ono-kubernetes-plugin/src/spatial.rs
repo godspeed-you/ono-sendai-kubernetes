@@ -266,6 +266,17 @@ pub fn contribution() -> CommandContribution {
         output: format!("stream<{SPATIAL_RELATION}/1>"),
         capabilities: vec![RELATION_WRITE.to_owned(), "network.connect".to_owned()],
         argument_mode: "words".to_owned(),
+        // The shell invokes this one, with the place it is standing on rather than with words a
+        // user typed. The endpoint arguments are declared anyway, because an operator who
+        // invokes it directly to see what a place's exits are gets the same help and the same
+        // completion as everywhere else, and because a declared argument is how `--context`
+        // stops being a word only this repository's documentation knows about.
+        selectors: Vec::new(),
+        options: crate::contributions::CLUSTER
+            .iter()
+            .chain(std::iter::once(&crate::contributions::SCOPE[0]))
+            .map(crate::contributions::Parameter::contribution)
+            .collect(),
         risk: None,
         examples: vec![
             "get k8s-pod --context prod --namespace shop | enter; near".to_owned(),

@@ -54,16 +54,7 @@ use crate::query::{
 };
 use crate::sessions::Sessions;
 
-/// `safety.policy_denied`, as core's `docs/contracts/errors.yaml` publishes it.
-///
-/// The registry has no code for "a precondition this provider requires is missing", and the two
-/// near misses are worse than this one: `provider.unsupported` says the provider cannot do the
-/// thing, which is false — it can, and it declines — and `provider.unavailable` says the cluster
-/// did not answer, which it did. `safety` is the right *kind*: "a safety policy or confirmation
-/// requirement stopped the operation", which is exactly what ADR-0019 turned §56's SHOULD into.
-pub(crate) const REFUSED_CODE: &str = "Ono-Sendai-E0702";
-/// The dotted name of [`REFUSED_CODE`].
-pub(crate) const REFUSED: &str = "safety.policy_denied";
+pub(crate) use crate::query::{REFUSED, REFUSED_CODE};
 
 /// What a plan or a mutation was asked to do, read from one invocation's arguments.
 ///

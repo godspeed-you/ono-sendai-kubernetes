@@ -10,11 +10,14 @@
 # schemas.yaml` now declares all of them and `contributions::TARGETS` wires all of them, and
 # `tests/contributions.rs` fails if the three ever disagree again.
 #
-# **Every noun below takes the same options, and this document has nowhere to say so.** A target
-# contribution carries a `name`, a `schema`, a `summary` and an `identity_doc` and nothing else —
-# `docs/contracts/kuang/contributions.v1.yaml` in core has no `options` key for a target, and the
-# wire type is `deny_unknown_fields` — so the options are documented here and in each target's
-# `summary` line rather than in a field a shell could complete:
+# **Every noun below declares the arguments it takes**, in the `options:` list beside its schema
+# (`ADR-0587 (core)`). Until that change a target contribution carried a `name`, a `schema`, a
+# `summary` and an `identity_doc` and nothing else, so these words were prose in this comment and
+# a shell could complete none of them. They are now the same declaration a core command makes, so
+# `help get k8s-pod` prints them and `get k8s-pod --con<TAB>` completes — before this package has
+# ever been loaded, from this document alone (spec §31.68).
+#
+# What they mean:
 #
 #   context      a kubeconfig context; its server, namespace, trust anchors and credential
 #   kubeconfig   which file to read it from, default `~/.kube/config`
@@ -26,7 +29,14 @@
 #                `404` means the object is absent where a collection's means the API is not
 #                served — ADR-0012
 #   max_pages    a page budget (§18.4)
-#   kind, group, version, resource   for `k8s-resource` only: which resource to read (ADR-0010)
+#   kind, group, version, resource   for the nouns that take their kind from the query rather
+#                than from the table: which resource to read (ADR-0010)
+#
+# **`namespace` is declared on every kind, including the cluster-scoped ones.** Whether a resource
+# is namespaced is discovery's answer and never a compile-time one (§4 invariants 1–2, §9.2), so
+# this document does not carry a list of which kinds have a namespace — it would be exactly the
+# static model of Kubernetes §5.2 forbids. A namespace named for a cluster-scoped kind produces no
+# namespace segment in the request, and the record says which scope it was read in.
 #
 # The `k8s-` prefix is deliberate. `pod` and `node` are reserved in core's `docs/contracts/
 # targets.yaml` as provider-qualified words with no schema yet, and claiming them from a package
@@ -47,84 +57,164 @@ targets:
     schema: io.github.godspeed-you.kubernetes.namespace/1
     summary: "Namespaces, the primary scope dimension of a cluster."
     identity_doc: "Two observations are the same namespace when their `metadata.uid` matches."
+    options: &curated-kind
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: all_namespaces
+        type: bool
+        doc: "Every namespace the caller can see. Deliberate rather than implied: there is no silent fan-out (specification section 9.4)."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: max_pages
+        type: int
+        doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
   - name: k8s-node
     schema: io.github.godspeed-you.kubernetes.node/1
     summary: "Nodes, and the cloud instances underneath them."
     identity_doc: "Two observations are the same node when their `metadata.uid` matches; a name reused after deletion is a new node."
+    options: *curated-kind
   - name: k8s-pod
     schema: io.github.godspeed-you.kubernetes.pod/1
     summary: "Pods, the workload that actually runs."
     identity_doc: "Two observations are the same pod when their `metadata.uid` matches. A recreated pod with the same name is a different pod."
+    options: *curated-kind
   - name: k8s-deployment
     schema: io.github.godspeed-you.kubernetes.deployment/1
     summary: "Deployments, and the ReplicaSets they control."
     identity_doc: "Two observations are the same deployment when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-replicaset
     schema: io.github.godspeed-you.kubernetes.replicaset/1
     summary: "ReplicaSets, which sit between a Deployment and its Pods."
     identity_doc: "Two observations are the same ReplicaSet when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-statefulset
     schema: io.github.godspeed-you.kubernetes.statefulset/1
     summary: "StatefulSets, and the claims their templates materialise."
     identity_doc: "Two observations are the same StatefulSet when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-daemonset
     schema: io.github.godspeed-you.kubernetes.daemonset/1
     summary: "DaemonSets, and their rollout across nodes."
     identity_doc: "Two observations are the same DaemonSet when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-service
     schema: io.github.godspeed-you.kubernetes.service/1
     summary: "Services, and the Pods their selectors reach."
     identity_doc: "Two observations are the same service when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-endpointslice
     schema: io.github.godspeed-you.kubernetes.endpointslice/1
     summary: "EndpointSlices, the endpoints a Service is represented by."
     identity_doc: "Two observations are the same slice when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-ingress
     schema: io.github.godspeed-you.kubernetes.ingress/1
     summary: "Ingresses, and the Services they route to."
     identity_doc: "Two observations are the same ingress when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-job
     schema: io.github.godspeed-you.kubernetes.job/1
     summary: "Jobs, and the Pods they own."
     identity_doc: "Two observations are the same job when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-cronjob
     schema: io.github.godspeed-you.kubernetes.cronjob/1
     summary: "CronJobs, and the Jobs they create."
     identity_doc: "Two observations are the same CronJob when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-configmap
     schema: io.github.godspeed-you.kubernetes.configmap/1
     summary: "ConfigMaps, and what consumes them."
     identity_doc: "Two observations are the same ConfigMap when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-secret
     schema: io.github.godspeed-you.kubernetes.secret/1
     summary: "Secret metadata — which keys exist and what mounts them, never the values (specification section 22)."
     identity_doc: "Two observations are the same secret when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-serviceaccount
     schema: io.github.godspeed-you.kubernetes.serviceaccount/1
     summary: "ServiceAccounts, the identity a workload runs as."
     identity_doc: "Two observations are the same account when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-persistentvolumeclaim
     schema: io.github.godspeed-you.kubernetes.persistentvolumeclaim/1
     summary: "PersistentVolumeClaims, and the volumes they bind."
     identity_doc: "Two observations are the same claim when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-persistentvolume
     schema: io.github.godspeed-you.kubernetes.persistentvolume/1
     summary: "PersistentVolumes, and the storage behind them."
     identity_doc: "Two observations are the same volume when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-storageclass
     schema: io.github.godspeed-you.kubernetes.storageclass/1
     summary: "StorageClasses, and what they provision."
     identity_doc: "Two observations are the same class when their `metadata.uid` matches."
+    options: *curated-kind
   - name: k8s-networkpolicy
     schema: io.github.godspeed-you.kubernetes.networkpolicy/1
     summary: "NetworkPolicies, and the Pods their selectors govern."
     identity_doc: "Two observations are the same policy when their `metadata.uid` matches."
 
+    options: *curated-kind
   - name: k8s-resource
     schema: io.github.godspeed-you.kubernetes.resource/1
     summary: "Any resource this cluster serves, named by `kind` and `group` (specification section 15.1)."
     identity_doc: "Two observations are the same object when their `metadata.uid` matches, whatever kind they are."
 
+    options: &named-in-a-discovered-collection
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: all_namespaces
+        type: bool
+        doc: "Every namespace the caller can see. Deliberate rather than implied: there is no silent fan-out (specification section 9.4)."
+      - name: kind
+        type: string
+        doc: "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery."
+      - name: group
+        type: string
+        doc: "The API group, e.g. `example.io`. Written empty it names the core group; omitted it searches every group the server lists."
+      - name: version
+        type: string
+        doc: "One served version instead of the group's preferred one (specification section 13.4)."
+      - name: resource
+        type: string
+        doc: "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: max_pages
+        type: int
+        doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
   # What one object is related to. Not a resource: an edge has no `metadata.uid` and no collection
   # to be fetched from, so this noun names an object with `kind` and `name` and answers one record
   # per edge — with the evidence class and the fields that decided it, which is Gate D (§62.4).
@@ -134,6 +224,46 @@ targets:
     summary: "What one object is related to, with the evidence class and the fields that decided each edge (specification sections 23 to 32)."
     identity_doc: "Two observations are the same edge when the object they start at, the relationship word, the far end's address and the field that decided all match. An edge has no `metadata.uid` of its own."
 
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: all_namespaces
+        type: bool
+        doc: "Every namespace the caller can see. Deliberate rather than implied: there is no silent fan-out (specification section 9.4)."
+      - name: kind
+        type: string
+        doc: "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery."
+      - name: group
+        type: string
+        doc: "The API group, e.g. `example.io`. Written empty it names the core group; omitted it searches every group the server lists."
+      - name: version
+        type: string
+        doc: "One served version instead of the group's preferred one (specification section 13.4)."
+      - name: resource
+        type: string
+        doc: "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: max_pages
+        type: int
+        doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
+      - name: relation
+        type: string
+        doc: "One relationship word, e.g. `owned-by` or `selects`, instead of every edge this object states."
   # What changed in a collection while this provider was watching it, and — the point of the
   # exercise — every period it could not observe. §19.1's list-then-watch is one sequence, so this
   # noun acquires the collection itself rather than reading one somebody else listed. It is a
@@ -148,6 +278,46 @@ targets:
     summary: "What changed in a collection while this provider was watching it, and every period it could not observe (specification section 19)."
     identity_doc: "Two observations are the same change when the collection, the observation period, the word, the object's UID and its resourceVersion all match. A change has no `metadata.uid` of its own; the UID on the record is the object's."
 
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: all_namespaces
+        type: bool
+        doc: "Every namespace the caller can see. Deliberate rather than implied: there is no silent fan-out (specification section 9.4)."
+      - name: kind
+        type: string
+        doc: "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery."
+      - name: group
+        type: string
+        doc: "The API group, e.g. `example.io`. Written empty it names the core group; omitted it searches every group the server lists."
+      - name: version
+        type: string
+        doc: "One served version instead of the group's preferred one (specification section 13.4)."
+      - name: resource
+        type: string
+        doc: "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown."
+      - name: max_pages
+        type: int
+        doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
+      - name: max_changes
+        type: int
+        doc: "Stop after this many changes. Absent is unbounded, which is what a watch is: the operator ends it."
+      - name: reacquire
+        type: bool
+        doc: "After a continuity gap, list the collection again to resume from a known version. Default true; the gap record is emitted either way (specification section 19.4)."
   # The Events a cluster reported about one object (§38). Not a collection of the query's kind: the
   # query names the object the Events are *about*, and the Events themselves come from whichever of
   # §38.2's two representations the cluster serves. Options: `kind`/`group`/`version`/`resource` and
@@ -166,6 +336,7 @@ targets:
       of its own; what it regards is a field of it. An aggregated Event is one Event however many
       occurrences it counts.
 
+    options: *named-in-a-discovered-collection
   # What a Node states about the machine underneath it, exported for someone else to resolve (§28.3
   # to §28.5, §47). The kind is fixed — the pointers and the published keys are a Node's — so the
   # only option beyond the endpoint ones is `name`. Nothing here presents a match: each record
@@ -181,6 +352,22 @@ targets:
       Two observations are the same evidence when the Node's `metadata.uid`, the published key and
       the field pointer all match. A Node rebuilt under the same name is a different machine.
 
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
   # One container's log, as lines (§42.1). Options: `name` is the Pod, `container` names one where
   # the Pod has several, `previous` reads the one prior run the kubelet retains, `timestamps` asks
   # the server to prefix each line, and `tail_lines`, `since_seconds` and `limit_bytes` bound the
@@ -197,6 +384,43 @@ targets:
       the ordinal within the read all match. A line has no identity of its own; a process that
       printed one message twice printed it twice.
 
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: container
+        type: string
+        doc: "Which container's log, where the Pod has more than one."
+      - name: previous
+        type: bool
+        doc: "The previous instance of the container, where one is retained."
+      - name: timestamps
+        type: bool
+        doc: "Ask the API server to prefix each line with the time it wrote it."
+      - name: tail_lines
+        type: int
+        doc: "Read only the last N lines, which is a bound on the read and is reported as one."
+      - name: since_seconds
+        type: int
+        doc: "Read only what was written in the last N seconds."
+      - name: limit_bytes
+        type: int
+        doc: "Stop after N bytes. The stop is coverage, never a silently short log."
   # What is known to have happened to one object, and by whose clock (§39). Options are the object's:
   # `kind`/`group`/`version`/`resource` and `name`. Every record carries the window this provider
   # observed in, on its own clock, and both kinds of hole in it — the stretches nobody observed and
@@ -212,6 +436,40 @@ targets:
       timestamp and what was observed all match. Two observations on two clocks are never in an
       order.
 
+    options: &one-object-of-a-discovered-kind
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: all_namespaces
+        type: bool
+        doc: "Every namespace the caller can see. Deliberate rather than implied: there is no silent fan-out (specification section 9.4)."
+      - name: kind
+        type: string
+        doc: "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery."
+      - name: group
+        type: string
+        doc: "The API group, e.g. `example.io`. Written empty it names the core group; omitted it searches every group the server lists."
+      - name: version
+        type: string
+        doc: "One served version instead of the group's preferred one (specification section 13.4)."
+      - name: resource
+        type: string
+        doc: "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
   # What may be said about the state one object is in (§40). Options are the object's, plus
   # `within_ms` — how far apart two observations on one clock may be and still be reported as
   # correlated. The strongest thing a record carries is one of five claims, none of which says that
@@ -226,6 +484,43 @@ targets:
       Two observations are the same finding when the object, the claim and what the claim rests on
       all match. A finding has no `metadata.uid` of its own.
 
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: all_namespaces
+        type: bool
+        doc: "Every namespace the caller can see. Deliberate rather than implied: there is no silent fan-out (specification section 9.4)."
+      - name: kind
+        type: string
+        doc: "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery."
+      - name: group
+        type: string
+        doc: "The API group, e.g. `example.io`. Written empty it names the core group; omitted it searches every group the server lists."
+      - name: version
+        type: string
+        doc: "One served version instead of the group's preferred one (specification section 13.4)."
+      - name: resource
+        type: string
+        doc: "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: within_ms
+        type: int
+        doc: "How close in time two observations must be before they are considered together. Never a claim that one caused the other (specification section 40)."
   # The structured observations an object's controllers wrote about it (§37.1). Options are the
   # object's. One record per condition, because a Deployment can be `Available=True` on its old
   # replicas while `Progressing=False` because the new ones never came up. `observedGeneration`
@@ -240,6 +535,7 @@ targets:
       Two observations are the same condition when the object's `metadata.uid` and the condition
       `type` match. A condition that flipped is the same condition.
 
+    options: *one-object-of-a-discovered-kind
   # The provider instance itself rather than anything in the cluster: which cluster this is,
   # whether it answers, and who you are to it (§8.5, §8.6, §10, §34.3). It is the one target here
   # that is useful when the cluster is *not* reachable, which is why an unreachable API server
@@ -249,6 +545,19 @@ targets:
     summary: "Which cluster this is, whether it can be reached, and who you are to it."
     identity_doc: "Two observations are the same provider instance when their `uid` — `kubernetes:<context>` — matches. Two instances that reach one cluster share a fingerprint and are never one instance (specification section 10.3)."
 
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
   # What a change *would* do, before anything is changed (§46). A target rather than a command
   # because building a plan is read-only: one `GET` of the object the change is aimed at, plus
   # discovery, and this provider's own rules. Deliberately no server dry run on this path — a
@@ -261,3 +570,50 @@ targets:
     schema: io.github.godspeed-you.kubernetes.plan/1
     summary: "What a change would do, before anything is changed (specification section 46)."
     identity_doc: "Two records describe the same prospective change when the object lifetime, the `resourceVersion` the plan is aimed at, the action and the fields it touches all match. A plan has no `metadata.uid` of its own; the uid on the record is the target object's."
+
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: all_namespaces
+        type: bool
+        doc: "Every namespace the caller can see. Deliberate rather than implied: there is no silent fan-out (specification section 9.4)."
+      - name: kind
+        type: string
+        doc: "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery."
+      - name: group
+        type: string
+        doc: "The API group, e.g. `example.io`. Written empty it names the core group; omitted it searches every group the server lists."
+      - name: version
+        type: string
+        doc: "One served version instead of the group's preferred one (specification section 13.4)."
+      - name: resource
+        type: string
+        doc: "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: action
+        type: string
+        doc: "`apply` for a bounded field change or `delete` for the object. Default `apply` (specification section 43.3)."
+      - name: set
+        type: map
+        doc: "A mapping from a JSON pointer to the value the field should hold, e.g. `{\"/spec/replicas\": 2}`."
+      - name: unset
+        type: string
+        doc: "A pointer, or a list of them, whose fields the apply gives up rather than sets (specification section 44.1)."
+      - name: propagation
+        type: string
+        doc: "`Foreground`, `Background` or `Orphan` for a deletion's dependents (specification section 45.2)."

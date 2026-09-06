@@ -46,9 +46,9 @@ webpki-roots = "0.26"
 # reference names the commit that carries the change, and moves when somebody moves it on purpose.
 # All four crates come from one revision: they share `ono-kuang-protocol`, and two revisions of it
 # in one tree are two incompatible copies of every type that crosses the boundary.
-ono-kuang-sdk = { git = "https://github.com/godspeed-you/ono-sendai", rev = "6167ba586c150db29a68520c2c2725a560a808ba" }
-ono-kuang-protocol = { git = "https://github.com/godspeed-you/ono-sendai", rev = "6167ba586c150db29a68520c2c2725a560a808ba" }
-ono-value = { git = "https://github.com/godspeed-you/ono-sendai", rev = "6167ba586c150db29a68520c2c2725a560a808ba" }
+ono-kuang-sdk = { git = "https://github.com/godspeed-you/ono-sendai", rev = "e1a44fd7246e0beb99d7edbd95a9a09991963c41" }
+ono-kuang-protocol = { git = "https://github.com/godspeed-you/ono-sendai", rev = "e1a44fd7246e0beb99d7edbd95a9a09991963c41" }
+ono-value = { git = "https://github.com/godspeed-you/ono-sendai", rev = "e1a44fd7246e0beb99d7edbd95a9a09991963c41" }
 
 [profile.dev]
 # Line tables keep test backtraces readable at a fraction of full debuginfo's disk cost.

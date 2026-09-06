@@ -43,8 +43,8 @@ use crate::conditions::named;
 use crate::contributions::Target;
 use crate::dynamic::Selector;
 use crate::query::{
-    self, Conversation, Endpoint, Subject, UNAVAILABLE, UNAVAILABLE_CODE, UNSUPPORTED,
-    UNSUPPORTED_CODE, failure,
+    self, Conversation, Endpoint, REFUSED, REFUSED_CODE, Subject, UNAVAILABLE, UNAVAILABLE_CODE,
+    UNSUPPORTED, UNSUPPORTED_CODE, failure,
 };
 use crate::records::event_record;
 use crate::sessions::Sessions;
@@ -321,10 +321,13 @@ fn emit(
 /// by every consumer that has ever been written — and the absence of an Event never proves that
 /// nothing happened. Retention is minutes to hours, delivery is best-effort, and these
 /// observations were never a complete query of anything. ADR-0025.
+///
+/// `contribution.refused` since ADR-0028: this is the package's own rule about what an empty
+/// answer proves, and the code that used to carry it claimed the cluster had not answered.
 fn not_observed(subject: &Identity, outcome: &str) -> Outcome {
     Outcome::Failed(failure(
-        UNAVAILABLE_CODE,
-        UNAVAILABLE,
+        REFUSED_CODE,
+        REFUSED,
         format!(
             "no Event regarding `{}/{}` was observed: {outcome}",
             subject.gvk().kind(),

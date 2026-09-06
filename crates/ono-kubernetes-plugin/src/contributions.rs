@@ -20,8 +20,173 @@
 //! question instead of the answer — ADR-0010.
 
 use ono_kuang_sdk::protocol::{
-    CommandContribution, SchemaContribution, SchemaFieldContribution, TargetContribution,
+    CommandContribution, ParameterContribution, SchemaContribution, SchemaFieldContribution,
+    TargetContribution,
 };
+
+/// One argument a contribution declares, in the vocabulary a core command declares its own
+/// (`ADR-0587 (core)`).
+///
+/// Declaring an argument is not the same as accepting it: every word here already reached a
+/// handler before there was anywhere to declare it, and a word this table does not name still
+/// does. What a declaration buys is the four things the host can only do when it knows the
+/// argument exists — a help line, a completion candidate, a *type* the written word is coerced
+/// to, and a default the host supplies when the user says nothing.
+///
+/// The fourth is why the mutating commands declare theirs. `dry_run` decides whether a cluster
+/// changes, and until now its safe value was a fallback each handler had to remember
+/// (`unwrap_or(true)`); declared, it is the shell's guarantee, applied before this package's code
+/// runs. The handlers keep their fallbacks anyway, because a package that is correct only when
+/// the host is doing its job is a package with a latent write in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Parameter {
+    /// The name, without the `--` an option is written with, and spelled exactly as the handler
+    /// reads it out of the argument map.
+    pub name: &'static str,
+    /// The registry type the written word is coerced to, e.g. `string`, `int`, `bool`, `map`.
+    pub declared_type: &'static str,
+    /// One line, shown by `help` and beside a completion candidate.
+    pub doc: &'static str,
+    /// The value the host supplies when the argument is absent, as the text the registry
+    /// vocabulary coerces. `None` means the argument simply does not arrive, which is a
+    /// different thing from arriving as zero, empty or false.
+    pub default: Option<&'static str>,
+}
+
+impl Parameter {
+    /// A declared argument with no default: absent means absent.
+    const fn new(name: &'static str, declared_type: &'static str, doc: &'static str) -> Self {
+        Self {
+            name,
+            declared_type,
+            doc,
+            default: None,
+        }
+    }
+
+    /// A declared argument the host fills in when nothing is written.
+    const fn defaulting(
+        name: &'static str,
+        declared_type: &'static str,
+        doc: &'static str,
+        default: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            declared_type,
+            doc,
+            default: Some(default),
+        }
+    }
+
+    /// The parameter as the handshake and the on-disk document carry it.
+    #[must_use]
+    pub fn contribution(&self) -> ParameterContribution {
+        ParameterContribution {
+            name: self.name.to_owned(),
+            declared_type: self.declared_type.to_owned(),
+            doc: self.doc.to_owned(),
+            // Nothing here is written twice, and nothing is written without its value: an
+            // endpoint, a name and a page budget are each one word, and a flag that may stand
+            // alone would make `--dry_run` mean the opposite of `--dry_run false` by omission.
+            repeatable: false,
+            optional_value: false,
+            default: self
+                .default
+                .map(|text| serde_json::Value::String(text.to_owned())),
+        }
+    }
+}
+
+/// Which cluster the invocation is about (§7.1, §7.3, §7.4).
+///
+/// Every word this package contributes takes these four, because every one of them has to reach
+/// an API server before it can answer anything. No endpoint is ever defaulted: naming neither a
+/// `context` nor a `host` is refused rather than guessed, and the only thing that stands in for
+/// them is what a *previous* invocation in this process named (ADR-0027).
+pub(crate) const CLUSTER: &[Parameter] = &[
+    Parameter::new(
+        "context",
+        "string",
+        "A kubeconfig context: its server, default namespace, trust anchors and credential.",
+    ),
+    Parameter::new(
+        "kubeconfig",
+        "string",
+        "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`.",
+    ),
+    Parameter::new(
+        "host",
+        "string",
+        "An explicit API server host instead of a context (specification section 7.3).",
+    ),
+    Parameter::new(
+        "port",
+        "int",
+        "The API server port, where `host` names one and the default 443 is wrong.",
+    ),
+];
+
+/// Which namespace, for a read that has one (§7.5, §9.2, §9.4).
+pub(crate) const SCOPE: &[Parameter] = &[
+    Parameter::new(
+        "namespace",
+        "string",
+        "One namespace, beating the context's default (specification section 7.5).",
+    ),
+    Parameter::new(
+        "all_namespaces",
+        "bool",
+        "Every namespace the caller can see. Deliberate rather than implied: there is no silent \
+         fan-out (specification section 9.4).",
+    ),
+];
+
+/// Which resource, for the nouns that take the kind from the query rather than from the table.
+///
+/// This is ADR-0010's floor written as four arguments: a CRD invented after this package was
+/// built has no word of its own, so the question names the shape of the answer instead. `group`
+/// is a `string` and not filtered for emptiness anywhere, because `--group ''` names the core
+/// group and omitting it searches every group (§13.3).
+const RESOURCE: &[Parameter] = &[
+    Parameter::new(
+        "kind",
+        "string",
+        "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery.",
+    ),
+    Parameter::new(
+        "group",
+        "string",
+        "The API group, e.g. `example.io`. Written empty it names the core group; omitted it \
+         searches every group the server lists.",
+    ),
+    Parameter::new(
+        "version",
+        "string",
+        "One served version instead of the group's preferred one (specification section 13.4).",
+    ),
+    Parameter::new(
+        "resource",
+        "string",
+        "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown.",
+    ),
+];
+
+/// One object rather than a collection (§17.1).
+const NAMED: Parameter = Parameter::new(
+    "name",
+    "string",
+    "One object, read at its own endpoint rather than filtered out of the collection. A \
+     different request with different permissions (specification section 17.1).",
+);
+
+/// A page budget for a listing (§18.4).
+const MAX_PAGES: Parameter = Parameter::new(
+    "max_pages",
+    "int",
+    "How many pages of a listing to read before stopping. The stop is coverage, never a \
+     silently short answer (specification section 18.4).",
+);
 
 /// One field of a contributed schema, as the table spells it.
 ///
@@ -267,9 +432,174 @@ impl Target {
             schema: self.schema.to_owned(),
             summary: self.summary.to_owned(),
             identity_doc: self.identity_doc.to_owned(),
+            options: self.options().iter().map(Parameter::contribution).collect(),
         }
     }
+
+    /// The arguments this target takes, decided by what it reads.
+    ///
+    /// Every word takes the four cluster arguments, because none of them can answer without
+    /// reaching an API server. What is added beyond that is exactly what the handler reads out of
+    /// the argument map, so a declared option no code consumes cannot exist:
+    /// `tests/contributions.rs`
+    /// holds this table, the on-disk document and the handshake to each other, and the handlers
+    /// are the third reader of the same names.
+    #[must_use]
+    pub fn options(&self) -> Vec<Parameter> {
+        let mut options: Vec<Parameter> = CLUSTER.to_vec();
+        match self.reads {
+            // Which cluster, and nothing else. The diagnostic is about the instance rather than
+            // about a collection in it (§10.1, §34.3).
+            Reads::Instance => {}
+            // A curated noun already knows its kind; what a query adds is which scope and which
+            // object (§9.2, §17.1, §18.4).
+            Reads::Kind { .. } => {
+                options.extend_from_slice(SCOPE);
+                options.push(NAMED);
+                options.push(MAX_PAGES);
+            }
+            // The floor of ADR-0010: the kind comes from the query.
+            Reads::Discovered => {
+                options.extend_from_slice(SCOPE);
+                options.extend_from_slice(RESOURCE);
+                options.push(NAMED);
+                options.push(MAX_PAGES);
+            }
+            Reads::Relations => {
+                options.extend_from_slice(SCOPE);
+                options.extend_from_slice(RESOURCE);
+                options.push(NAMED);
+                options.push(MAX_PAGES);
+                options.push(Parameter::new(
+                    "relation",
+                    "string",
+                    "One relationship word, e.g. `owned-by` or `selects`, instead of every edge \
+                     this object states.",
+                ));
+            }
+            Reads::Changes => {
+                options.extend_from_slice(SCOPE);
+                options.extend_from_slice(RESOURCE);
+                options.push(MAX_PAGES);
+                options.push(Parameter::new(
+                    "max_changes",
+                    "int",
+                    "Stop after this many changes. Absent is unbounded, which is what a watch \
+                     is: the operator ends it.",
+                ));
+                options.push(Parameter::new(
+                    "reacquire",
+                    "bool",
+                    "After a continuity gap, list the collection again to resume from a known \
+                     version. Default true; the gap record is emitted either way \
+                     (specification section 19.4).",
+                ));
+            }
+            Reads::Events => {
+                options.extend_from_slice(SCOPE);
+                options.extend_from_slice(RESOURCE);
+                options.push(NAMED);
+                options.push(MAX_PAGES);
+            }
+            // A Node is cluster-scoped, so there is no namespace to name (§47.2).
+            Reads::Evidence => options.push(NAMED),
+            Reads::Logs => {
+                options.push(SCOPE[0]);
+                options.push(NAMED);
+                options.extend_from_slice(LOG_OPTIONS);
+            }
+            Reads::Timeline | Reads::Conditions => {
+                options.extend_from_slice(SCOPE);
+                options.extend_from_slice(RESOURCE);
+                options.push(NAMED);
+            }
+            Reads::Why => {
+                options.extend_from_slice(SCOPE);
+                options.extend_from_slice(RESOURCE);
+                options.push(NAMED);
+                options.push(Parameter::new(
+                    "within_ms",
+                    "int",
+                    "How close in time two observations must be before they are considered \
+                     together. Never a claim that one caused the other \
+                     (specification section 40).",
+                ));
+            }
+            Reads::Plan => {
+                options.extend_from_slice(SCOPE);
+                options.extend_from_slice(RESOURCE);
+                options.push(NAMED);
+                options.extend_from_slice(PLAN_OPTIONS);
+            }
+        }
+        options
+    }
 }
+
+/// What a log read may narrow (§42.1).
+///
+/// No `follow` here: it is declared by the target that streams, and `k8s-log` is the bounded
+/// read. See [`FOLLOW`].
+const LOG_OPTIONS: &[Parameter] = &[
+    Parameter::new(
+        "container",
+        "string",
+        "Which container's log, where the Pod has more than one.",
+    ),
+    Parameter::new(
+        "previous",
+        "bool",
+        "The previous instance of the container, where one is retained.",
+    ),
+    Parameter::new(
+        "timestamps",
+        "bool",
+        "Ask the API server to prefix each line with the time it wrote it.",
+    ),
+    Parameter::new(
+        "tail_lines",
+        "int",
+        "Read only the last N lines, which is a bound on the read and is reported as one.",
+    ),
+    Parameter::new(
+        "since_seconds",
+        "int",
+        "Read only what was written in the last N seconds.",
+    ),
+    Parameter::new(
+        "limit_bytes",
+        "int",
+        "Stop after N bytes. The stop is coverage, never a silently short log.",
+    ),
+];
+
+/// What a plan and a bounded write name about the change itself (§43.3, §44, §45.2).
+const PLAN_OPTIONS: &[Parameter] = &[
+    Parameter::new(
+        "action",
+        "string",
+        "`apply` for a bounded field change or `delete` for the object. Default `apply` \
+         (specification section 43.3).",
+    ),
+    Parameter::new(
+        "set",
+        "map",
+        "A mapping from a JSON pointer to the value the field should hold, e.g. \
+         `{\"/spec/replicas\": 2}`.",
+    ),
+    Parameter::new(
+        "unset",
+        "string",
+        "A pointer, or a list of them, whose fields the apply gives up rather than sets \
+         (specification section 44.1).",
+    ),
+    Parameter::new(
+        "propagation",
+        "string",
+        "`Foreground`, `Background` or `Orphan` for a deletion's dependents \
+         (specification section 45.2).",
+    ),
+];
 
 /// The identity field of every Kubernetes schema, without exception.
 ///
@@ -1811,6 +2141,8 @@ pub struct Command {
     pub capabilities: &'static [&'static str],
     /// What the command changes.
     pub writes: Writes,
+    /// The arguments that belong to this command alone, beyond the ones every write takes.
+    pub extra: &'static [Parameter],
     /// Documented examples.
     pub examples: &'static [&'static str],
 }
@@ -1840,6 +2172,11 @@ impl Command {
                 .map(|capability| (*capability).to_owned())
                 .collect(),
             argument_mode: "words".to_owned(),
+            // A change is aimed at one object this package resolves for itself, and every word
+            // that says which object is named rather than positional — `--name`, `--kind`,
+            // `--context`. There is nothing left for a bare word to bind to.
+            selectors: Vec::new(),
+            options: self.options().iter().map(Parameter::contribution).collect(),
             risk: Some(self.risk.to_owned()),
             examples: self
                 .examples
@@ -1848,7 +2185,76 @@ impl Command {
                 .collect(),
         }
     }
+
+    /// The arguments this command takes.
+    ///
+    /// Which cluster, which namespace, which resource, which object — the same words `get
+    /// k8s-resource` reads, because it is the same object read by one verb and written by
+    /// another — and then `dry_run`, which is the one that decides whether a cluster changes.
+    ///
+    /// **`dry_run` declares its default rather than relying on the handler's.** The handler still
+    /// falls back to `true` when the argument is absent, and that fallback is not redundant: a
+    /// package whose safe behaviour depends on the host having applied a default is a package
+    /// with a latent write in it. What the declaration adds is that the safe value is now visible
+    /// in `help`, offered by completion, and applied before this package's code runs (§44.5,
+    /// `ADR-0587 (core)`).
+    #[must_use]
+    pub fn options(&self) -> Vec<Parameter> {
+        let mut options: Vec<Parameter> = CLUSTER.to_vec();
+        // A write is aimed at one object in one namespace. `all_namespaces` is deliberately not
+        // here: §55.3 keeps bulk mutation out of this action surface, and an option that fanned a
+        // change across every namespace the caller can see is exactly the shape it forbids.
+        options.push(SCOPE[0]);
+        options.extend_from_slice(RESOURCE);
+        options.push(NAMED);
+        options.push(Parameter::defaulting(
+            "dry_run",
+            "bool",
+            "Ask the API server what it would do without doing it. Default true: the shortest \
+             sentence a user can write predicts (specification section 44.5).",
+            "true",
+        ));
+        options.extend_from_slice(self.extra);
+        options
+    }
 }
+
+/// What `set k8s-resource` names beyond the object (§44.1, §44.2, §44.4).
+const APPLY_OPTIONS: &[Parameter] = &[
+    Parameter::new(
+        "set",
+        "map",
+        "A mapping from a JSON pointer to the value the field should hold, e.g. \
+         `{\"/spec/replicas\": 2}`.",
+    ),
+    Parameter::new(
+        "unset",
+        "string",
+        "A pointer, or a list of them, whose fields this apply gives up rather than sets \
+         (specification section 44.1).",
+    ),
+    Parameter::defaulting(
+        "field_manager",
+        "string",
+        "The name field ownership is recorded under (specification section 44.2).",
+        "ono-sendai",
+    ),
+    Parameter::new(
+        "force_because",
+        "string",
+        "The reason ownership is taken from a conflicting manager. There is deliberately no \
+         `force` flag: forcing is a sentence somebody wrote (specification section 44.4).",
+    ),
+];
+
+/// What `remove k8s-resource` names beyond the object (§45.2).
+const DELETE_OPTIONS: &[Parameter] = &[Parameter::defaulting(
+    "propagation",
+    "string",
+    "`Foreground` keeps the object until its dependents are gone, `Background` removes it now \
+     and collects them afterwards, `Orphan` leaves them behind owned by nothing.",
+    "Background",
+)];
 
 /// The two words that change a cluster, and nothing else.
 ///
@@ -1881,11 +2287,12 @@ pub static COMMANDS: &[Command] = &[
         risk: "mutate",
         capabilities: &["network.connect"],
         writes: Writes::Fields,
+        extra: APPLY_OPTIONS,
         examples: &[
             "set k8s-resource --context prod --kind Deployment --name api --set \
              '{\"/spec/replicas\": 2}'",
             "set k8s-resource --context prod --kind Deployment --name api --set \
-             '{\"/spec/replicas\": 2}' --dry-run false",
+             '{\"/spec/replicas\": 2}' --dry_run false",
         ],
     },
     Command {
@@ -1901,9 +2308,10 @@ pub static COMMANDS: &[Command] = &[
         risk: "destructive",
         capabilities: &["network.connect"],
         writes: Writes::Object,
+        extra: DELETE_OPTIONS,
         examples: &[
             "remove k8s-resource --context prod --kind ConfigMap --name stale",
-            "remove k8s-resource --context prod --kind ConfigMap --name stale --dry-run false",
+            "remove k8s-resource --context prod --kind ConfigMap --name stale --dry_run false",
         ],
     },
 ];

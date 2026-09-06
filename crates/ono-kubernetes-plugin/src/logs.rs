@@ -48,8 +48,8 @@ use serde_json::Value as Json;
 use crate::conditions::named;
 use crate::contributions::Target;
 use crate::query::{
-    self, Answer, Conversation, Endpoint, UNAVAILABLE, UNAVAILABLE_CODE, UNSUPPORTED,
-    UNSUPPORTED_CODE, failure,
+    self, Answer, Conversation, Endpoint, REFUSED, REFUSED_CODE, UNAVAILABLE, UNAVAILABLE_CODE,
+    UNSUPPORTED, UNSUPPORTED_CODE, failure,
 };
 use crate::records::{Line, log_record};
 use crate::sessions::Sessions;
@@ -360,6 +360,9 @@ fn emit(
 /// reader who receives nothing concludes that the container printed nothing, and what actually
 /// happened is that the runtime rotated the log away, or the requested tail did not reach back to
 /// it, or the process writes to a file. ADR-0025.
+///
+/// `contribution.refused` since ADR-0028: the retrieval succeeded and this package declines to
+/// render its emptiness as an absence, which is not the cluster failing to answer.
 fn empty(retrieved: &Retrieved) -> Outcome {
     let bounds: Vec<String> = retrieved
         .bounds()
@@ -367,8 +370,8 @@ fn empty(retrieved: &Retrieved) -> Outcome {
         .map(|bound| bound.describe())
         .collect();
     Outcome::Failed(failure(
-        UNAVAILABLE_CODE,
-        UNAVAILABLE,
+        REFUSED_CODE,
+        REFUSED,
         format!(
             "no line was read from {} [{} run]",
             retrieved.target().describe(),

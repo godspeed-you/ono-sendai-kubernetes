@@ -32,8 +32,11 @@
 # what comes back is labelled a provider-native dry run rather than an observation (§21.4 of the
 # generic provider contract).
 #
-# **Options, which a command contribution has nowhere to declare either.** As for the targets,
-# the wire shape is closed, so they are documented here and in each summary:
+# **Options, declared beside each command** (`ADR-0587 (core)`). They used to be prose in this
+# comment, because a `CommandContribution` had nowhere to carry them — which meant `dry_run`, the
+# argument that decides whether a cluster changes, had no help line, no type and no default the
+# host could apply. It has all three now, and the safe value is the shell's guarantee rather than
+# each handler's memory. What they mean:
 #
 #   context, kubeconfig, host, port   which cluster, exactly as every target takes them
 #   namespace                         the namespace the object is in (§7.5)
@@ -74,6 +77,54 @@ commands:
       - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/replicas\": 2}'"
       - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/replicas\": 2}' --dry-run false"
 
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: kind
+        type: string
+        doc: "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery."
+      - name: group
+        type: string
+        doc: "The API group, e.g. `example.io`. Written empty it names the core group; omitted it searches every group the server lists."
+      - name: version
+        type: string
+        doc: "One served version instead of the group's preferred one (specification section 13.4)."
+      - name: resource
+        type: string
+        doc: "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: dry_run
+        type: bool
+        doc: "Ask the API server what it would do without doing it. Default true: the shortest sentence a user can write predicts (specification section 44.5)."
+        default: "true"
+      - name: set
+        type: map
+        doc: "A mapping from a JSON pointer to the value the field should hold, e.g. `{\"/spec/replicas\": 2}`."
+      - name: unset
+        type: string
+        doc: "A pointer, or a list of them, whose fields this apply gives up rather than sets (specification section 44.1)."
+      - name: field_manager
+        type: string
+        doc: "The name field ownership is recorded under (specification section 44.2)."
+        default: "ono-sendai"
+      - name: force_because
+        type: string
+        doc: "The reason ownership is taken from a conflicting manager. There is deliberately no `force` flag: forcing is a sentence somebody wrote (specification section 44.4)."
   # `destructive` rather than `mutate`: §45.1 and §45.5 are a list of the ways a deletion reaches
   # things this provider cannot get back, and `risk_levels` in core's `capabilities.yaml` defines
   # `destructive` as exactly "may cause irreversible loss". The host applies its own confirmation
@@ -90,3 +141,43 @@ commands:
     examples:
       - "remove k8s-resource --context prod --kind ConfigMap --name stale"
       - "remove k8s-resource --context prod --kind ConfigMap --name stale --dry-run false"
+
+    options:
+      - name: context
+        type: string
+        doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
+      - name: kubeconfig
+        type: string
+        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+      - name: host
+        type: string
+        doc: "An explicit API server host instead of a context (specification section 7.3)."
+      - name: port
+        type: int
+        doc: "The API server port, where `host` names one and the default 443 is wrong."
+      - name: namespace
+        type: string
+        doc: "One namespace, beating the context's default (specification section 7.5)."
+      - name: kind
+        type: string
+        doc: "The Kubernetes kind, e.g. `Widget`, resolved against the cluster's own discovery."
+      - name: group
+        type: string
+        doc: "The API group, e.g. `example.io`. Written empty it names the core group; omitted it searches every group the server lists."
+      - name: version
+        type: string
+        doc: "One served version instead of the group's preferred one (specification section 13.4)."
+      - name: resource
+        type: string
+        doc: "The REST collection name, e.g. `widgets`, where the kind is ambiguous or unknown."
+      - name: name
+        type: string
+        doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
+      - name: dry_run
+        type: bool
+        doc: "Ask the API server what it would do without doing it. Default true: the shortest sentence a user can write predicts (specification section 44.5)."
+        default: "true"
+      - name: propagation
+        type: string
+        doc: "`Foreground` keeps the object until its dependents are gone, `Background` removes it now and collects them afterwards, `Orphan` leaves them behind owned by nothing."
+        default: "Background"

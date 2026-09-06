@@ -1125,7 +1125,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "ono-adapter"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "jiff",
  "ono-core",
@@ -1139,12 +1139,12 @@ dependencies = [
 [[package]]
 name = "ono-core"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 
 [[package]]
 name = "ono-graph"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "async-trait",
  "jiff",
@@ -1159,7 +1159,7 @@ dependencies = [
 [[package]]
 name = "ono-kuang-protocol"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "ed25519-dalek",
  "globset",
@@ -1175,7 +1175,7 @@ dependencies = [
 [[package]]
 name = "ono-kuang-sdk"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "ono-kuang-protocol",
  "ono-value",
@@ -1186,7 +1186,7 @@ dependencies = [
 [[package]]
 name = "ono-kuang-supervisor"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "async-trait",
  "globset",
@@ -1208,7 +1208,7 @@ dependencies = [
 [[package]]
 name = "ono-kuang-testhost"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "ono-adapter",
  "ono-kuang-protocol",
@@ -1239,7 +1239,7 @@ dependencies = [
 [[package]]
 name = "ono-model-broker"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "async-trait",
  "jiff",
@@ -1252,7 +1252,7 @@ dependencies = [
 [[package]]
 name = "ono-pipeline"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "ono-core",
  "ono-value",
@@ -1262,7 +1262,7 @@ dependencies = [
 [[package]]
 name = "ono-provider-api"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "async-trait",
  "jiff",
@@ -1290,7 +1290,7 @@ dependencies = [
 [[package]]
 name = "ono-render"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "jiff",
  "ono-core",
@@ -1302,7 +1302,7 @@ dependencies = [
 [[package]]
 name = "ono-spatial-core"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "jiff",
  "ono-core",
@@ -1316,7 +1316,7 @@ dependencies = [
 [[package]]
 name = "ono-value"
 version = "0.4.1"
-source = "git+https://github.com/godspeed-you/ono-sendai?rev=6167ba586c150db29a68520c2c2725a560a808ba#6167ba586c150db29a68520c2c2725a560a808ba"
+source = "git+https://github.com/godspeed-you/ono-sendai?rev=e1a44fd7246e0beb99d7edbd95a9a09991963c41#e1a44fd7246e0beb99d7edbd95a9a09991963c41"
 dependencies = [
  "bytes",
  "csv",

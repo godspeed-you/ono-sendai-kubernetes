@@ -73,6 +73,23 @@ pub(crate) const UNAVAILABLE_CODE: &str = "Ono-Sendai-E0401";
 /// The dotted name of [`UNAVAILABLE_CODE`].
 pub(crate) const UNAVAILABLE: &str = "provider.unavailable";
 /// `provider.unsupported`, for a cluster that serves no such thing.
+/// `contribution.refused`, as core's `docs/contracts/kuang/errors.v1.yaml` publishes it.
+///
+/// **The package's own rule, and no other claim.** Its help says so in as many words: "this is
+/// the package's rule, not the host's policy and not the external system's answer: a precondition
+/// the package requires was not met, so it did nothing." That is exactly the sentence this
+/// provider needs for the three refusals it makes on its own authority — a plan whose precondition
+/// is missing (§56), an Event search that observed nothing (§38.6) and a log read that produced
+/// no lines (§63.6) — and none of the three is what the codes they used to borrow assert.
+///
+/// `safety.policy_denied` says a *configured* policy forbade it, and nothing was configured.
+/// `provider.unavailable` says the cluster did not answer, and it answered. `provider.unsupported`
+/// says the provider cannot, and it can and declines. ADR-0025 recorded that gap as a finding and
+/// `ADR-0587 (core)` closed it; ADR-0028 here records the migration.
+pub(crate) const REFUSED_CODE: &str = "Ono-Sendai-K11901";
+/// The dotted name of [`REFUSED_CODE`].
+pub(crate) const REFUSED: &str = "contribution.refused";
+
 pub(crate) const UNSUPPORTED_CODE: &str = "Ono-Sendai-E0402";
 /// The dotted name of [`UNSUPPORTED_CODE`].
 pub(crate) const UNSUPPORTED: &str = "provider.unsupported";

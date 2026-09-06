@@ -12,7 +12,7 @@
     reason = "a failed precondition in a test should abort the test loudly"
 )]
 
-use ono_kuang_sdk::protocol::Capability;
+use ono_kuang_sdk::protocol::{Capability, CommandDocument, ParameterContribution, TargetDocument};
 use ono_kubernetes_plugin::contributions::{
     COMMAND_SCHEMAS, COMMANDS, IDENTITY, Reads, TARGETS, target,
 };
@@ -548,6 +548,87 @@ fn should_answer_for_the_pod_target_the_milestone_names() {
     );
 }
 
+/// The arguments a document declares, read exactly as the host reads them.
+///
+/// Through the real `TargetDocument`, not through a second YAML reader written here: the point of
+/// the test below is that what the *host* would register before this package runs is what the
+/// package answers with, and a bespoke parser could agree with the table while the host disagreed
+/// with both.
+fn declared_target_options(name: &str) -> Vec<ParameterContribution> {
+    TargetDocument::parse(TARGETS_DOCUMENT)
+        .expect("the targets document reads as the host reads it")
+        .targets
+        .into_iter()
+        .find(|target| target.name == name)
+        .unwrap_or_else(|| panic!("`{name}` is declared"))
+        .options
+}
+
+#[test]
+fn should_declare_the_same_arguments_in_the_document_and_across_the_handshake() {
+    // `ADR-0587 (core)` gave a contribution somewhere to declare its arguments, and the value of
+    // the declaration is spent before this package is ever started: `help get k8s-pod` shows the
+    // `--context` line, and completion offers it, from the document on disk (§31.68). A document
+    // that declared a different argument set from the handshake would offer help for a word the
+    // running package ignores — worse than no help, because it reads as a promise.
+    for target in TARGETS {
+        let contributed = target.target_contribution().options;
+        assert_eq!(
+            declared_target_options(target.name),
+            contributed,
+            "`{}` declares different arguments on disk and across the handshake",
+            target.name
+        );
+        assert!(
+            !contributed.is_empty(),
+            "`{}` reaches an API server, so it takes at least a `--context`",
+            target.name
+        );
+    }
+}
+
+#[test]
+fn should_declare_only_arguments_a_handler_actually_reads() {
+    // A declared argument that nothing consumes is the same failure as an undeclared one that
+    // something does: the shell offers a word, the user writes it, and it changes nothing. The
+    // source of the package is the second reader — every name below is read out of an argument
+    // map somewhere in `src/`, and this test fails when a declaration outlives its handler.
+    let sources = source_text();
+    for target in TARGETS {
+        for option in target.options() {
+            assert!(
+                sources.contains(&format!("\"{}\"", option.name)),
+                "`{}` declares `--{}` and no handler names it",
+                target.name,
+                option.name
+            );
+        }
+    }
+    for command in COMMANDS {
+        for option in command.options() {
+            assert!(
+                sources.contains(&format!("\"{}\"", option.name)),
+                "`{}` declares `--{}` and no handler names it",
+                command.name,
+                option.name
+            );
+        }
+    }
+}
+
+/// Every source file of the package crate, concatenated.
+fn source_text() -> String {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut text = String::new();
+    for entry in std::fs::read_dir(root).expect("the package has sources") {
+        let path = entry.expect("a directory entry").path();
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            text.push_str(&std::fs::read_to_string(&path).expect("a source file reads"));
+        }
+    }
+    text
+}
+
 #[test]
 fn should_answer_for_every_target_the_static_document_declares() {
     // ADR-0005's rule, now that the deferral it recorded is over: a declared schema is a promise,
@@ -739,6 +820,34 @@ fn should_declare_the_same_commands_in_the_document_and_across_the_handshake() {
             })
             .collect();
         assert_eq!(capabilities, contribution.capabilities);
+    }
+    // And the arguments, through the host's own reader (`ADR-0587 (core)`). `dry_run` is the one
+    // that matters: a document that failed to declare its default would leave the safe value to
+    // the handler's memory on every route, including the ones written next year.
+    let parsed = CommandDocument::parse(COMMANDS_DOCUMENT).expect("the commands document reads");
+    for command in COMMANDS {
+        let contribution = command.contribution();
+        let entry = parsed
+            .commands
+            .iter()
+            .find(|entry| entry.id == contribution.id)
+            .expect("the document declares it");
+        assert_eq!(
+            entry.options, contribution.options,
+            "`{}` declares different arguments on disk and across the handshake",
+            command.name
+        );
+        assert!(entry.selectors.is_empty(), "every argument here is named");
+        let dry_run = entry
+            .options
+            .iter()
+            .find(|option| option.name == "dry_run")
+            .expect("a command that writes declares whether it is writing");
+        assert_eq!(
+            dry_run.default_text().as_deref(),
+            Some("true"),
+            "§44.5: the shortest sentence a user can write predicts rather than writes"
+        );
     }
 }
 
