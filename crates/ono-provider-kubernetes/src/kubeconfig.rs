@@ -16,6 +16,8 @@ use std::fmt;
 use base64::Engine as _;
 use serde::Deserialize;
 
+use crate::exec::ExecPlugin;
+
 /// What went wrong before a connection could be described.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
@@ -147,6 +149,12 @@ pub struct Connection {
     client_certificate: Option<(Vec<u8>, Secret)>,
     client_certificate_files: Vec<String>,
     trust: Trust,
+    /// The `exec` block, where the context authenticates through a credential plugin (§8.2).
+    ///
+    /// The block and never its output: reading a kubeconfig runs nothing, which is the separation
+    /// this module's own header is about. What runs the helper is the package, under an explicit
+    /// `process.exec` grant.
+    exec: Option<ExecPlugin>,
 }
 
 impl Connection {
@@ -176,6 +184,18 @@ impl Connection {
     #[must_use]
     pub fn credential(&self) -> Credential {
         self.credential
+    }
+
+    /// The credential plugin this context authenticates through, where it names one (§8.2).
+    ///
+    /// `None` means the context names no plugin, and nothing else. A block this provider refuses
+    /// to read — an unknown contract, an unknown interaction mode — never reaches here: it is a
+    /// [`ConfigError::Incomplete`] naming the refusal, raised where the file is read, because
+    /// "this context names no plugin" and "this context names one I will not run" are different
+    /// answers (§21.4) and the second is fixed in the file the operator can see.
+    #[must_use]
+    pub fn exec(&self) -> Option<&ExecPlugin> {
+        self.exec.as_ref()
     }
 
     /// The credential material, where the kubeconfig carries it inline.
@@ -364,6 +384,20 @@ impl Kubeconfig {
 
         let (credential, material) = classify(user);
         let (client_certificate, client_certificate_files) = client_certificate_of(user)?;
+        // §8.2's block, read but not run. A block this provider refuses — an unknown contract, an
+        // unknown interaction mode — is a *configuration* error and is reported here rather than
+        // at connection time, because an operator fixes it in the file they can see.
+        let exec = match user.and_then(|user| user.exec.as_ref()) {
+            None => None,
+            Some(block) => {
+                Some(
+                    ExecPlugin::parse(block).map_err(|refusal| ConfigError::Incomplete {
+                        context: context.to_owned(),
+                        detail: format!("its credential plugin cannot be run: {refusal}"),
+                    })?,
+                )
+            }
+        };
 
         Ok(Connection {
             context: context.to_owned(),
@@ -374,6 +408,7 @@ impl Kubeconfig {
             client_certificate,
             client_certificate_files,
             trust: trust_of(cluster)?,
+            exec,
         })
     }
 }

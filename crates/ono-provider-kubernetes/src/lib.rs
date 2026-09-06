@@ -42,6 +42,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod events;
 pub mod evidence;
+pub mod exec;
 pub mod kubeconfig;
 pub mod live;
 pub mod logs;

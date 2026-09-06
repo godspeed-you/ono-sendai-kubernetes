@@ -79,6 +79,20 @@ capabilities:
     # relation.write` — and one who does not gets a Kubernetes place with no exits and a refusal
     # that names the capability, rather than a `near` that answers with nothing.
     - relation.write
+    # §8.2's credential plugin, and the only capability here that causes a *program* to run.
+    # **Never granted by default, and never needed by a context that carries a token or a client
+    # certificate**: a kubeconfig authenticating through `exec` — which is how EKS, GKE and AKS are
+    # usually configured — names a helper, and §8.2 says in as many words that "execution MUST
+    # occur only through an explicit KUANG/11 process-execution capability". An operator who does
+    # not grant it gets the refusal this package gave every such context before the capability
+    # existed, naming the helper and the grant; one who does gets exactly the helper the kubeconfig
+    # names, with the environment that kubeconfig declares and nothing inherited.
+    #
+    # The scope is not pinned here for the same reason `network.connect`'s is not: the program is
+    # whatever the operator's own kubeconfig names, and a path glob written in this package would
+    # either be wrong for their cloud or wide enough to mean nothing. `programs` is the operator's
+    # to set on the grant, and it is the setting that turns "run a helper" into "run *this* one".
+    - process.exec
 
 network:
   # Every byte leaves through the broker, which is where the operator's scope is enforced.

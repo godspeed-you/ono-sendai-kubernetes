@@ -43,6 +43,45 @@ pub fn connected(ctx: &mut Ctx<'_>, instance: &str, host: &str, port: u16) {
     );
 }
 
+/// Records that a credential plugin was run, and which one (§51.6's fourth record, §8.2).
+///
+/// §51.6 names credential-plugin invocation beside connection, permission failure and mutation,
+/// and it is the one of the four with the sharpest reason: running a helper is this package
+/// causing a *program* to execute under an operator's identity, and it is the only thing it does
+/// that the capability broker cannot see for what it is — the broker checked `process.exec` on a
+/// program name and does not know a credential was the point.
+///
+/// The command and never its output, and never its environment. The output is a credential (§8.1)
+/// and the environment is where a credential is most often put.
+pub fn ran_credential_plugin(ctx: &mut Ctx<'_>, instance: &str, context: &str, command: &str) {
+    record(
+        ctx,
+        json!({
+            "action": "credential-plugin",
+            "provider_instance": instance,
+            "context": context,
+            "command": command,
+        }),
+    );
+}
+
+/// Records that a local grant this package needed was not held.
+///
+/// Distinct from [`refused`], which is the *cluster's* answer: this one never left the machine.
+/// §21.4 keeps them apart because they have different fixes — one is a grant, the other is RBAC —
+/// and a trail that spelled them the same would send an operator to the wrong place.
+pub fn refused_locally(ctx: &mut Ctx<'_>, instance: &str, capability: &str, what: &str) {
+    record(
+        ctx,
+        json!({
+            "action": "blocked",
+            "provider_instance": instance,
+            "capability": capability,
+            "operation": what,
+        }),
+    );
+}
+
 /// Records that the API server refused a read to the identity this provider is using (§21.4).
 ///
 /// The one §51.6 names that is neither a connection nor a change, and the most useful of the

@@ -87,6 +87,7 @@ use serde_json::{Map as JsonMap, Value as Json, json};
 
 use crate::broker::{BrokeredStream, Lease, ReadPolicy, decode_hex};
 use crate::contributions::{Reads, Target};
+use crate::credentials;
 use crate::dynamic::{self, Selector, Typing, Unresolved};
 use crate::records::{Upstream, dynamic_record, record};
 use crate::sessions::{Key, Sessions};
@@ -2252,7 +2253,28 @@ impl Endpoint {
             )
         })?;
 
-        let identity = client_identity(ctx, &connection, context)?;
+        // §8.2's credential plugin, run before the TLS settings are built because it may be what
+        // supplies the client certificate they carry. `None` for every other credential form, so
+        // an ordinary context pays nothing for this and no helper is composed.
+        let ran = match connection.exec() {
+            None => None,
+            Some(plugin) => Some(credentials::run(
+                ctx,
+                plugin,
+                context,
+                &connection.instance_id(),
+            )?),
+        };
+        let identity = match ran.as_ref().and_then(|ran| ran.client_certificate.as_ref()) {
+            // A plugin that returned a certificate pair supplies the identity, and the
+            // kubeconfig's own is not consulted: the helper is the more recent answer to the same
+            // question, and reading both would make which one is used depend on the file's order.
+            Some((certificate, key)) => Some(
+                ClientIdentity::new(certificate.expose().as_bytes(), key)
+                    .map_err(|error| tls_configuration_failure(context, &error))?,
+            ),
+            None => client_identity(ctx, &connection, context)?,
+        };
         let tls = if secure {
             Some(tls_settings(ctx, &connection, identity.as_ref(), context)?)
         } else {
@@ -2261,7 +2283,10 @@ impl Endpoint {
             // about inventing one.
             None
         };
-        let authorization = bearer_token(&connection, context)?;
+        let authorization = match ran.as_ref().and_then(|ran| ran.token.clone()) {
+            Some(token) => Some(token),
+            None => bearer_token(&connection)?,
+        };
 
         Ok(Self {
             authority: authority_of(&host, port, secure),
@@ -2435,31 +2460,17 @@ fn max_pages(options: &JsonMap<String, Json>) -> Option<usize> {
         .filter(|pages| *pages > 0)
 }
 
-/// The bearer token a context carries, and a refusal for a credential this build cannot produce.
+/// The bearer token a context carries in the file itself.
+///
+/// Only the file. §8.2's credential plugin is run before this is reached and its token is used in
+/// place of what this returns, so an `ExecPlugin` arriving here means the helper answered with a
+/// client *certificate* instead — the other form §8.3 allows, and not a bearer token.
 fn bearer_token(
     connection: &ono_provider_kubernetes::kubeconfig::Connection,
-    context: &str,
 ) -> Result<Option<Secret>, WireError> {
     match connection.credential() {
         Credential::BearerToken => Ok(connection.material().cloned()),
-        // §8.2: an exec credential plugin runs only under an explicit process-execution
-        // capability, and the host must honour the `Never` / `IfAvailable` / `Always` interaction
-        // modes. This package declares no such capability and implements none of those modes, so
-        // it refuses rather than connecting as somebody else: a wrong identity is worse than a
-        // refused one, and an anonymous request to a cluster that expected `alice` fails in a way
-        // that reads as a permission problem.
-        Credential::ExecPlugin => Err(failure(
-            UNSUPPORTED_CODE,
-            UNSUPPORTED,
-            format!(
-                "context `{context}` authenticates through an `exec` credential plugin, which \
-                 this provider does not run"
-            ),
-            "§8.2 requires an explicit process-execution capability and the `Never`, \
-             `IfAvailable` and `Always` interaction modes; this package declares neither. Use a \
-             context with a token or a client certificate, or obtain a token another way.",
-        )),
-        Credential::ClientCertificate | Credential::Anonymous => Ok(None),
+        Credential::ExecPlugin | Credential::ClientCertificate | Credential::Anonymous => Ok(None),
     }
 }
 

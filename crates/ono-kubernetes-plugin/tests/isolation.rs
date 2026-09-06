@@ -384,6 +384,9 @@ fn requests(buffered: &mut Vec<u8>) -> Vec<(String, String, String)> {
     taken
 }
 
+/// One program the host was asked to run: what, with which arguments, in which environment.
+type Run = (String, Vec<String>, Vec<(String, String)>);
+
 /// Two clusters behind one host, told apart by the name the query connected to.
 ///
 /// A single `HostServices`, because Gate J is about one *session* reaching two clusters. Two test
@@ -391,6 +394,13 @@ fn requests(buffered: &mut Vec<u8>) -> Vec<(String, String, String)> {
 #[derive(Clone)]
 struct Fleet {
     clusters: Vec<Arc<Cluster>>,
+    /// What a credential plugin prints, for the `helper` context (§8.2, §8.3).
+    credential: String,
+    /// Every program this host was asked to run, with its arguments and its environment.
+    ///
+    /// §51.3's least authority is a claim about *what a helper was given*, and the only place it
+    /// can be checked is here, where the host receives the request.
+    ran: Arc<std::sync::Mutex<Vec<Run>>>,
 }
 
 impl std::fmt::Debug for Fleet {
@@ -522,14 +532,35 @@ impl HostServices for Fleet {
     async fn process_signal(&self, _object: Json, _signal: String) -> Result<Json, HostError> {
         Err(HostError::unavailable("process control"))
     }
+    /// §8.2's credential plugin, as the host runs one: a program, its arguments, an environment
+    /// the caller chose, and a stream of `{stream, line}` values ending in `{exited}`.
+    ///
+    /// The helper here prints an `ExecCredential` bearing `alpha`'s own token, so a query through
+    /// the `helper` context reaches the same server as one through `alpha` and is answered — which
+    /// is what makes this a test of §8.2 rather than of a refusal. What it was *asked* is recorded,
+    /// because §51.3's least authority is a claim about the environment and the arguments and is
+    /// only checkable at this end.
     async fn process_exec(
         &self,
         _package: &str,
-        _program: String,
-        _arguments: Vec<String>,
-        _environment: Vec<(String, String)>,
+        program: String,
+        arguments: Vec<String>,
+        environment: Vec<(String, String)>,
     ) -> Result<LiveStream, HostError> {
-        Err(HostError::unavailable("program execution"))
+        if let Ok(mut ran) = self.ran.lock() {
+            ran.push((program.clone(), arguments, environment));
+        }
+        let (sender, receiver) = mpsc::channel(4);
+        let printed = self.credential.clone();
+        tokio::spawn(async move {
+            for line in printed.lines() {
+                let _ = sender
+                    .send(Ok(json!({"stream": "stdout", "line": line})))
+                    .await;
+            }
+            let _ = sender.send(Ok(json!({"exited": 0}))).await;
+        });
+        Ok(receiver)
     }
     async fn network_listen(
         &self,
@@ -632,9 +663,23 @@ clusters:
 users:
   - {{name: alice, user: {{token: {}}}}}
   - {{name: bob, user: {{token: {}}}}}
+  # §8.2's credential plugin: the same cluster as `alpha`, reached as an identity a helper
+  # supplies rather than one the file carries. `interactiveMode: Never`, because a provider
+  # invocation has no terminal and a helper that needed one is refused before it is run.
+  - name: carol
+    user:
+      exec:
+        apiVersion: client.authentication.k8s.io/v1
+        command: cloud-cli
+        args: ["token", "--cluster", "alpha"]
+        env:
+          - name: CLOUD_PROFILE
+            value: operations
+        interactiveMode: Never
 contexts:
   - {{name: alpha, context: {{cluster: alpha, user: alice, namespace: {}}}}}
   - {{name: beta, context: {{cluster: beta, user: bob, namespace: {}}}}}
+  - {{name: helper, context: {{cluster: alpha, user: carol, namespace: {}}}}}
 "#,
             alpha_authority.certificate_authority_data(),
             beta_authority.certificate_authority_data(),
@@ -642,6 +687,7 @@ contexts:
             beta.token,
             alpha.namespace,
             beta.namespace,
+            alpha.namespace,
         );
         let directory = std::env::temp_dir().join(temporary_directory_name());
         // `create_dir` rather than `create_dir_all`: the name has to be this fixture's alone, and
@@ -656,6 +702,12 @@ contexts:
         Self {
             fleet: Fleet {
                 clusters: vec![Arc::clone(&alpha), Arc::clone(&beta)],
+                credential: format!(
+                    r#"{{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1",
+                        "status":{{"token":"{}"}}}}"#,
+                    alpha.token
+                ),
+                ran: Arc::default(),
             },
             alpha,
             beta,
@@ -696,8 +748,19 @@ contexts:
         self.loaded_with_credit(1).await
     }
 
+    /// The same instance, with §8.2's process-execution grant.
+    ///
+    /// A separate loader rather than a flag on the default one, because the *absence* of the grant
+    /// is what every other test in this file runs under and is itself a behaviour §8.2 requires:
+    /// a package that was not granted it refuses by name and runs nothing.
+    async fn loaded_with_process_exec(&self) -> ono_kuang_supervisor::LoadedPlugin {
+        self.host_granting(Some(Capability::ProcessExec))
+            .load()
+            .await
+            .expect("the package loads under its own manifest")
+    }
+
     async fn loaded_with_credit(&self, queue_depth: u32) -> ono_kuang_supervisor::LoadedPlugin {
-        let readable = options(&[("paths", json!([format!("{}/**", self.directory.display())]))]);
         // The default host call deadline is five seconds, and this suite reads a recorded
         // cluster over several round trips. Under a loaded machine — the whole workspace suite
         // running beside it — a call can exceed that, the `kube-system` read fails, and the
@@ -710,14 +773,24 @@ contexts:
             queue_depth,
             ..HostLimits::default()
         };
-        TestHost::new(PLUGIN, MANIFEST)
-            .grant(Capability::NetworkConnect)
-            .grant_scoped(Capability::FilesystemRead, readable)
-            .host(Arc::new(self.fleet.clone()) as Arc<dyn HostServices>)
+        self.host_granting(None)
             .limits(limits)
             .load()
             .await
             .expect("the package loads under its own manifest")
+    }
+
+    /// A test host holding this fixture's fleet, its kubeconfig directory, and one more grant.
+    fn host_granting(&self, extra: Option<Capability>) -> TestHost {
+        let readable = options(&[("paths", json!([format!("{}/**", self.directory.display())]))]);
+        let mut host = TestHost::new(PLUGIN, MANIFEST)
+            .grant(Capability::NetworkConnect)
+            .grant_scoped(Capability::FilesystemRead, readable)
+            .host(Arc::new(self.fleet.clone()) as Arc<dyn HostServices>);
+        if let Some(capability) = extra {
+            host = host.grant(capability);
+        }
+        host
     }
 
     /// The options that reach one cluster through its own context and nothing else.
@@ -1322,4 +1395,113 @@ async fn should_hold_one_session_per_context_and_nothing_between_two() {
 
     plugin.shutdown(ShutdownReason::Unload).await;
     fixture.discard();
+}
+
+// --- §8.2 and §8.3: a credential plugin ----------------------------------------------------------
+
+#[tokio::test]
+async fn should_authenticate_through_the_credential_plugin_a_kubeconfig_names() {
+    // §8.2's `SHOULD`, and the largest single thing between this provider and most real clusters:
+    // an EKS, GKE or AKS kubeconfig authenticates through a helper, and a provider that runs none
+    // connects to none of them.
+    //
+    // The `helper` context reaches the *same* server as `alpha` as an identity the file does not
+    // carry: the recorded helper prints an `ExecCredential` bearing `alpha`'s token, so a query
+    // through it is answered exactly when the token reached the wire. That is what makes this a
+    // test of §8.2 rather than of a refusal — nothing here asserts an error.
+    let fixture = Fixture::build();
+    let plugin = fixture.loaded_with_process_exec().await;
+
+    let invocation = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records(&events)
+            .iter()
+            .filter_map(|record| text_of(record, "name"))
+            .collect::<Vec<_>>(),
+        vec!["alpha-till".to_owned()],
+        "the helper's token reached the cluster and the cluster answered"
+    );
+
+    // What the host was asked to run, checked at the only end where §51.3's least authority can
+    // be: the program and the arguments the kubeconfig named, and an environment holding the one
+    // entry it declared and nothing inherited. A helper given `PATH` or `HOME` is a helper acting
+    // as somebody the operator did not choose.
+    let ran = fixture
+        .fleet
+        .ran
+        .lock()
+        .expect("the record is readable")
+        .clone();
+    assert_eq!(ran.len(), 1, "one helper was run: {ran:?}");
+    let (program, arguments, environment) = &ran[0];
+    assert_eq!(program, "cloud-cli");
+    assert_eq!(
+        arguments,
+        &[
+            "token".to_owned(),
+            "--cluster".to_owned(),
+            "alpha".to_owned()
+        ]
+    );
+    assert_eq!(
+        environment,
+        &[("CLOUD_PROFILE".to_owned(), "operations".to_owned())],
+        "the block's own `env`, and nothing inherited"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_to_run_a_credential_plugin_without_the_capability_that_governs_it() {
+    // §8.2: "execution MUST occur only through an explicit KUANG/11 process-execution
+    // capability." The refusal is what this package did for every such context before the
+    // capability existed, and it is still what an operator who did not grant it gets.
+    //
+    // The important half is the *negative*: nothing was run. A package that composed the request
+    // and let the host refuse it would be relying on the broker to enforce a rule §8.2 puts on
+    // the provider, and the difference shows in a host whose policy is `Ask`.
+    let fixture = Fixture::build();
+    let plugin = fixture.loaded().await;
+
+    let invocation = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty(), "nothing was answered");
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("cloud-cli") && error.message.contains("process.exec"),
+        "the refusal names the helper and the grant that would run it: {error:?}"
+    );
+    assert!(
+        error
+            .help
+            .unwrap_or_default()
+            .contains("--grant process.exec"),
+        "and says how to grant it"
+    );
+    assert!(
+        fixture
+            .fleet
+            .ran
+            .lock()
+            .expect("the record is readable")
+            .is_empty(),
+        "nothing was run"
+    );
+    assert!(
+        fixture.alpha.heads().is_empty() && fixture.beta.heads().is_empty(),
+        "and no request reached either cluster"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
 }

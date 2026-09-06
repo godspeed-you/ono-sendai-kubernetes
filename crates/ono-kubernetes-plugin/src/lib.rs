@@ -38,6 +38,7 @@ pub mod changes;
 pub mod cluster;
 pub mod conditions;
 pub mod contributions;
+pub mod credentials;
 pub mod dynamic;
 pub mod events;
 pub mod evidence;
