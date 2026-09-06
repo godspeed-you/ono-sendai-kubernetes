@@ -874,6 +874,19 @@ pub enum FrameError {
     /// here, and the honest response is [`WatchFailure::Interrupted`] rather than a decoder bug
     /// report.
     Truncated,
+    /// A frame grew past the decoder's hold-back bound without ending (§18.5).
+    ///
+    /// A watch body is newline-delimited and a watch has no length, so bytes with no newline in
+    /// them are held indefinitely by a decoder that only waits. That is not a slow server: it is
+    /// a server — or a proxy, or an aggregated API server (§34.2) — turning the client's heap
+    /// into its own. The bound is stated in the refusal because a limit nobody can see is a limit
+    /// nobody can raise.
+    Oversized {
+        /// How many bytes had accumulated with no frame boundary among them.
+        held: usize,
+        /// The bound that was reached.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for FrameError {
@@ -898,6 +911,12 @@ impl fmt::Display for FrameError {
                 "the BOOKMARK carries no metadata.resourceVersion, so it checkpoints nothing",
             ),
             Self::Truncated => f.write_str("the watch stream ended part-way through a frame"),
+            Self::Oversized { held, limit } => write!(
+                f,
+                "the watch stream sent {held} bytes with no frame boundary in them, past the \
+                 {limit}-byte bound this decoder holds back (§18.5). The stream is not a watch \
+                 stream, or something between here and the API server is not framing it"
+            ),
         }
     }
 }
@@ -918,7 +937,21 @@ impl std::error::Error for FrameError {}
 pub struct WatchDecoder {
     provider_instance: String,
     buffer: Vec<u8>,
+    limit: usize,
 }
+
+/// How many bytes of an unfinished frame this decoder will hold (§18.5, core §30.4).
+///
+/// **Sixteen mebibytes, and the number is the largest object an API server admits with headroom
+/// rather than a round figure.** etcd refuses a value above about 1.5 MiB and the API server
+/// refuses the object that would make one, so a frame carrying a legitimate object is an order of
+/// magnitude below this. The headroom is for the case §34 makes real: an aggregated API server
+/// serves what it likes, and a bound tight enough to be provably sufficient for the core API
+/// would refuse a large custom resource that is perfectly valid. Above it, no legitimate framing
+/// explains the absence of a newline, and the honest answer is a break in continuity rather than
+/// a buffer that keeps growing until the process is killed — a killed process reports nothing at
+/// all, which is the one outcome §48.2's taxonomy has no word for.
+pub const FRAME_LIMIT: usize = 16 * 1024 * 1024;
 
 impl WatchDecoder {
     /// A decoder for one provider instance's stream.
@@ -931,7 +964,25 @@ impl WatchDecoder {
         Self {
             provider_instance: provider_instance.into(),
             buffer: Vec::new(),
+            limit: FRAME_LIMIT,
         }
+    }
+
+    /// The same decoder holding back at most `limit` bytes of an unfinished frame.
+    ///
+    /// [`FRAME_LIMIT`] is the default and is right for an API server. A caller that knows it is
+    /// reading something else — a test, or a stream whose objects are known to be small — states
+    /// its own bound rather than editing a constant everyone shares.
+    #[must_use]
+    pub fn holding_back(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// The bound on an unfinished frame, so a caller can report what it was bounded by (§18.5).
+    #[must_use]
+    pub fn frame_limit(&self) -> usize {
+        self.limit
     }
 
     /// Decodes every whole frame this chunk completes, holding any remainder.
@@ -952,6 +1003,18 @@ impl WatchDecoder {
                 continue;
             }
             events.push(self.frame(line)?);
+        }
+        // Whatever is left is a frame that has not ended. Bounded here rather than before the
+        // loop, so the check is against the *residue* and a chunk that happens to be large is
+        // not mistaken for a frame that never ends. The buffer is released with the refusal: a
+        // decoder that reported the fault and then kept the bytes would have refused nothing.
+        if self.buffer.len() > self.limit {
+            let held = self.buffer.len();
+            self.buffer = Vec::new();
+            return Err(FrameError::Oversized {
+                held,
+                limit: self.limit,
+            });
         }
         Ok(events)
     }

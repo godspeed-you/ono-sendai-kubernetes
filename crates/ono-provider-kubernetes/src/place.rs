@@ -299,7 +299,13 @@ impl PlaceUri {
         }
         let mut segments = segments.into_iter();
         let authority = segments.next().unwrap_or_default();
-        let instance = normalise_instance(&decode(authority, text)?)?;
+        // The authority is a **context**, and it is qualified rather than normalised. `Display`
+        // wrote `context()`, which has already had the prefix taken off; stripping a second one
+        // here would eat a level of a context whose own name begins with `kubernetes:`, and the
+        // address would round-trip into a *different* provider instance. §35.3 requires the
+        // address to survive the round trip, and Gate J (§62.10) forbids two contexts merging —
+        // an address that resolves to the wrong instance is that merge, arrived at by parsing.
+        let instance = qualify_context(&decode(authority, text)?)?;
         let tail: Vec<String> = segments
             .map(|segment| decode(segment, text))
             .collect::<Result<_, _>>()?;
@@ -1359,9 +1365,23 @@ fn is_namespace_kind(gvk: &Gvk) -> bool {
     gvk.group().is_empty() && gvk.kind() == "Namespace"
 }
 
-/// Normalises a provider instance to `kubernetes:<context>` (§6.2).
+/// The provider instance a *caller-supplied* identifier names, as `kubernetes:<context>` (§6.2).
+///
+/// Accepts either spelling — `prod` or `kubernetes:prod` — because callers hold both: an
+/// [`Identity`] carries the qualified form and a kubeconfig carries the bare context. Exactly one
+/// prefix is taken off, so the instance of a context literally called `kubernetes:prod` is
+/// `kubernetes:kubernetes:prod` and stays distinct from the instance of the context `prod`.
 fn normalise_instance(instance: &str) -> Result<String, PlaceError> {
-    let context = instance.strip_prefix(INSTANCE_PREFIX).unwrap_or(instance);
+    qualify_context(instance.strip_prefix(INSTANCE_PREFIX).unwrap_or(instance))
+}
+
+/// The provider instance a bare kubeconfig context names (§6.2).
+///
+/// Nothing is stripped here. Whatever the context is called — including `kubernetes:prod` — the
+/// instance is that string with one prefix in front of it, which is what makes the mapping from
+/// contexts to instances injective and Gate J's isolation a property of the identifier rather
+/// than of the names an operator happened to choose.
+fn qualify_context(context: &str) -> Result<String, PlaceError> {
     if context.is_empty() {
         return Err(PlaceError::EmptyComponent {
             component: "instance",

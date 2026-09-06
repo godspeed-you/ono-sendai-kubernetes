@@ -239,6 +239,9 @@ impl Object {
         let name = metadata
             .and_then(|meta| meta.get("name"))
             .and_then(Json::as_str)
+            // An empty name is not a name: §16.2's locator is built from it, and an object
+            // addressed as `.../pods/` is addressed at its collection.
+            .filter(|name| !name.is_empty())
             .ok_or_else(|| ObjectError::NotAnObject("no `metadata.name`".to_owned()))?
             .to_owned();
 
@@ -404,8 +407,29 @@ impl Object {
     }
 }
 
+/// One metadata string, where the object states one.
+///
+/// **An empty string is not a value.** The API server writes `""` where a field does not apply —
+/// `metadata.namespace` on a cluster-scoped object is the everyday case — and a hand-written
+/// manifest, a tombstone reconstruction or an aggregated API server that mints no UIDs produces
+/// the same shape for the rest. Reading `""` as present is worse than reading it as absent in
+/// every case this projection covers:
+///
+/// - `uid`: §16.5 requires an object without one to degrade identity confidence *explicitly*. An
+///   empty UID reported as lifetime-stable is not merely wrong, it collides — §16.3's recreate
+///   detection compares UIDs, so every such object would compare equal to every other and two
+///   lifetimes would merge instead of producing the discontinuity Gate C requires.
+/// - `namespace`: §9.2 turns on "has no namespace" versus "has an empty namespace slot", and an
+///   empty one makes the object unaddressable rather than cluster-scoped (§35.4).
+/// - `resourceVersion`: §14.3's continuity token. An empty one is not a position to resume from.
+/// - `deletionTimestamp`: Gate H reads its presence as "terminating". An empty one is not a
+///   deletion that was accepted.
 fn text(metadata: Option<&Json>, key: &str) -> Option<String> {
-    metadata?.get(key)?.as_str().map(str::to_owned)
+    metadata?
+        .get(key)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn string_map(metadata: Option<&Json>, key: &str) -> BTreeMap<String, String> {

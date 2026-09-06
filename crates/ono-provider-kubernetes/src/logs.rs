@@ -432,6 +432,7 @@ pub struct LogLine {
     stamp: Option<String>,
     bytes: Vec<u8>,
     terminated: bool,
+    cut: bool,
 }
 
 impl LogLine {
@@ -470,6 +471,19 @@ impl LogLine {
     pub fn is_terminated(&self) -> bool {
         self.terminated
     }
+
+    /// Whether *this provider* stopped holding the line, rather than the container ending it.
+    ///
+    /// A container may write without ever emitting a newline — `yes | tr -d '\n'` is one
+    /// command — and anybody who can run a Pod can do it. §18.5 makes the buffer this provider's
+    /// problem, so a line past [`LINE_LIMIT`] is handed over in pieces instead of held whole, and
+    /// each piece says so. Distinct from [`Self::is_terminated`], which is a fact about what the
+    /// server sent: a cut piece was not terminated *and* was not the end of the body, and a
+    /// reader that could not tell the two apart would report a bound as a container crash.
+    #[must_use]
+    pub fn was_cut(&self) -> bool {
+        self.cut
+    }
 }
 
 /// Turns the bytes of a log response into lines.
@@ -482,7 +496,18 @@ impl LogLine {
 pub struct LogDecoder {
     timestamps: bool,
     buffer: Vec<u8>,
+    limit: usize,
 }
+
+/// How many bytes of an unfinished line this decoder will hold (§18.5, core §30.4).
+///
+/// **One mebibyte, and it is a bound on the buffer rather than on the log.** A container's output
+/// has no maximum line length and nothing upstream imposes one, so an unbounded hold-back is
+/// reachable by anyone who can run a Pod — which is everybody this provider is for. A megabyte is
+/// far past any line a person reads and far short of a heap, and nothing is lost when it fires:
+/// the held bytes are handed over as a piece that says it was cut ([`LogLine::was_cut`]), which
+/// is §12.5's rule applied to a stream — data is not discarded for being awkward.
+pub const LINE_LIMIT: usize = 1024 * 1024;
 
 impl LogDecoder {
     /// A decoder for a response with no timestamp prefixes.
@@ -491,6 +516,7 @@ impl LogDecoder {
         Self {
             timestamps: false,
             buffer: Vec::new(),
+            limit: LINE_LIMIT,
         }
     }
 
@@ -500,6 +526,7 @@ impl LogDecoder {
         Self {
             timestamps: true,
             buffer: Vec::new(),
+            limit: LINE_LIMIT,
         }
     }
 
@@ -513,13 +540,42 @@ impl LogDecoder {
         }
     }
 
+    /// The same decoder holding back at most `limit` bytes of an unfinished line.
+    ///
+    /// [`LINE_LIMIT`] is the default. A caller that means to read something other than a
+    /// container's output states its own bound rather than editing a constant everyone shares.
+    #[must_use]
+    pub fn holding_back(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// The bound on an unfinished line, so a caller can say what it was bounded by (§18.5).
+    #[must_use]
+    pub fn line_limit(&self) -> usize {
+        self.limit
+    }
+
     /// Decodes every whole line this chunk completes, holding any remainder.
+    ///
+    /// A line that grows past [`Self::line_limit`] without ending is handed over in pieces rather
+    /// than held: each piece is unterminated and says it [`was_cut`](LogLine::was_cut), so the
+    /// bound is visible in the answer instead of being a silent truncation or a growing buffer.
     pub fn decode(&mut self, chunk: &[u8]) -> Vec<LogLine> {
         self.buffer.extend_from_slice(chunk);
         let mut lines = Vec::new();
-        while let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let raw: Vec<u8> = self.buffer.drain(..=end).collect();
-            lines.push(self.line(&raw[..raw.len() - 1], true));
+        loop {
+            if let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                let raw: Vec<u8> = self.buffer.drain(..=end).collect();
+                lines.push(self.line(&raw[..raw.len() - 1], true, false));
+                continue;
+            }
+            if self.buffer.len() > self.limit {
+                let raw: Vec<u8> = self.buffer.drain(..self.limit).collect();
+                lines.push(self.line(&raw, false, true));
+                continue;
+            }
+            break;
         }
         lines
     }
@@ -532,7 +588,7 @@ impl LogDecoder {
         if rest.is_empty() {
             return None;
         }
-        Some(self.line(&rest, false))
+        Some(self.line(&rest, false, false))
     }
 
     /// How many bytes are held back as an incomplete line.
@@ -543,12 +599,13 @@ impl LogDecoder {
         self.buffer.len()
     }
 
-    fn line(&self, raw: &[u8], terminated: bool) -> LogLine {
+    fn line(&self, raw: &[u8], terminated: bool, cut: bool) -> LogLine {
         let (stamp, bytes) = self.split_stamp(raw);
         LogLine {
             stamp,
             bytes,
             terminated,
+            cut,
         }
     }
 
