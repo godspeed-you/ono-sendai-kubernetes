@@ -11,18 +11,29 @@ first change. This page is the short version.
 
 ## Where the project currently is
 
-There is **no implementation yet**. This repository holds the Kubernetes Provider Specification
-and nothing else. That shapes what a useful contribution looks like right now:
+There is an implementation, and there is no release. The package connects to a cluster from a
+kubeconfig context, reads any kind the cluster serves — including one invented after the build —
+walks relationships with the evidence under each edge, watches a collection live at a terminal,
+answers what it could not observe, and makes bounded changes under a declared risk and an
+operator's grant. Most of it is proven against recorded API bytes; a live suite drives the real
+`ono` binary against ephemeral `kind` clusters at the declared oldest, middle and newest supported
+Kubernetes minor versions.
 
+[`docs/coverage.md`](docs/coverage.md) is the section-by-section map of how far it goes and where
+it stops, and it is the honest place to look for something to work on:
+
+- a section it marks partial, with the gap named;
+- a `SHOULD` nothing implements yet — §15.3's Tier 2 kinds are readable dynamically and none is
+  curated, which is the largest well-defined piece of work on the board;
+- a curated CRD ecosystem (§15.4), which is what the adapter surface exists for;
+- the §68 open questions, which are explicitly reserved for later specifications or ADRs;
 - reading [`docs/architecture/kubernetes-provider.md`](docs/architecture/kubernetes-provider.md)
   against real clusters you operate, and opening an issue where a requirement is wrong,
-  unimplementable, or would produce a misleading answer;
-- the §68 open questions, which are explicitly reserved for later specifications or ADRs;
-- deterministic fixtures for behaviour the specification already describes.
+  unimplementable, or would produce a misleading answer.
 
-Implementation work follows the order in §64: connection foundation, dynamic resource model,
-curated operational graph, live observation. Picking a later phase before an earlier one exists
-produces work that cannot be verified.
+`scripts/demo.sh` builds a cluster and runs the whole of §65's list at an `ono` prompt; it is the
+fastest way to see what exists before deciding what to add. `scripts/cluster.sh up` gives you the
+same cluster to work against.
 
 ## You do not need to know the shell
 
@@ -77,19 +88,34 @@ scripts/gate.sh
 ```
 
 It verifies that the specification is unmodified and present, that every relative markdown link
-resolves, that ADRs match `ADR-NNNN-kebab-title.md` with the required headings, and that the
-instruction files still name the specification. It refuses to run on `main`, because
-implementation belongs on `implementation` (`AGENTS.md` §11).
+resolves, that ADRs match `ADR-NNNN-kebab-title.md` with the required headings, that the
+instruction files still name the specification, and that every test which can announce a skip is
+declared in `docs/contracts/expected_test_skips.yaml` — in both directions, so an undeclared skip
+and a declaration whose test no longer skips both fail. Then `cargo fmt --check`, `cargo clippy
+-D warnings`, the whole test suite and `cargo doc -D warnings`. It refuses to run on `main`,
+because implementation belongs on `implementation` (`AGENTS.md` §11).
 
-There is no compile, lint or test step yet, because there is nothing to compile. When the first
-crate lands the gate grows to Ono-Sendai's shape and these checks stay.
+It takes about seven minutes and needs no cluster and no network: the live suite announces its
+skips and the rest runs against recorded API bytes. To run the live half, `scripts/cluster.sh up`
+and set `ONO_K8S_KUBECONFIG` to the path it prints.
 
 ## Tests
 
 Provider tests must not contact live clusters by default. The specification requires a
 deterministic test path that works without production credentials (§59), with fixtures able to
 emulate pagination, RBAC denial, rate limiting, watch streams, `410 Gone`, connection reset and
-version skew. Live integration tests may exist behind explicit credentials and CI gates.
+version skew. All of those exist as recorded API bytes.
+
+Beside them are three suites worth knowing about before you add to any of them:
+
+- `tests/live_cluster.rs` drives the real `ono` binary against a real cluster and announces a
+  declared skip when there is none, so the gate stays green without one;
+- `tests/adversarial.rs` treats every value a cluster sends as attacker-chosen, because it is —
+  anyone who can create an object names it. If you add a path that reads a name, a label, an
+  annotation or a message, it belongs here too;
+- `tests/performance.rs` asserts *counts*: how many requests a listing costs, how many objects are
+  held at once, how many rows a view rebuilds. They are contracts, and a change that adds a
+  request per object should fail one of them.
 
 Relationship or API behaviour changes should arrive **with** their fixtures, not after them
 (§66.3).

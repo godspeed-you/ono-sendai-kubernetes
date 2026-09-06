@@ -28,9 +28,10 @@ Build the Kubernetes provider specified in `docs/architecture/kubernetes-provide
 reference KUANG/11 external-system provider for Ono-Sendai — **test-driven, autonomously, without
 asking the user for input.**
 
-**There is no implementation yet.** At the time of writing this repository holds a specification
-and the documents around it. The first milestone is the Cloud-Native Validation Gate (§15), not a
-feature.
+**There is an implementation.** Two crates — `ono-provider-kubernetes` (the domain layer, no host
+and no cluster) and `ono-kubernetes-plugin` (the KUANG/11 package) — plus a live suite that drives
+the real `ono` binary against ephemeral `kind` clusters. `docs/coverage.md` says section by section
+how far it goes; `docs/STATE.md` says what the last session did and what the next one should.
 
 The rules of core's §1 hold unchanged: do not block on the user, tests are the referee, no test
 no code, be pragmatic, do not stop early, never write to `main` unless the user says so.
@@ -57,10 +58,12 @@ ono-sendai-kubernetes/
     └── STATE.md                  the work board (§9)
 ```
 
-Directories that do not exist yet and what they are reserved for, so that nobody invents a second
-name for them: `crates/` or `src/` for the implementation, `tests/` for integration tests,
-`fixtures/` for the deterministic API fixtures §59 of the specification requires, and
-`docs/contracts/` if this provider ever needs machine-readable contracts of its own.
+Beside them: `crates/` for the two crates, each with its own `tests/`; `package/` for what the
+package declares before any of its code runs; `scripts/cluster.sh` for an ephemeral cluster and
+`scripts/demo.sh` for the whole of §65 at an `ono` prompt; and `docs/contracts/` for this
+provider's own machine-readable contracts, which so far is the declared skip register. The
+deterministic fixtures §59 requires are generated in the tests that use them rather than checked
+in, so a fixture and the behaviour it pins cannot drift apart.
 
 The vocabulary is core's: a **specification** is a narrative document, a **contract** is a
 machine-readable file. Do not reintroduce a directory that means both.
@@ -230,7 +233,7 @@ board under *Found, not yet filed*; the user triages it into an issue.
 scripts/gate.sh
 ```
 
-It runs what is checkable in a repository of documents:
+It runs, in order:
 
 ```
 branch guard          refuses to run on `main` (ONO_ALLOW_MAIN=1 overrides)
@@ -238,12 +241,21 @@ specification         docs/architecture/spec.sha256 verifies, and the file it na
 links                 every relative markdown link resolves
 ADRs                  filenames, numbering and required headings
 instructions          README, AGENTS.md and CLAUDE.md name the specification
+skips                 every test that can announce a skip is declared, and every declaration
+                      still describes a test that skips — both directions (ADR-0034)
+format                cargo fmt --all -- --check
+lint                  cargo clippy --all-targets --all-features -- -D warnings
+test                  cargo test --workspace --all-features
+docs                  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
 
-**When an implementation exists, this gate grows to core's shape** — `cargo fmt --check`,
-`cargo clippy -D warnings`, the test suite, and whatever contract check this provider needs — and
-the additions above stay. Do not replace the gate; extend it. A gate that gets weaker as the
-repository gets more serious is the wrong direction.
+About seven minutes, and it needs **no cluster and no network**: the live suite announces its
+declared skips and everything else runs against recorded API bytes (§59.1). The live half is
+`scripts/cluster.sh up` and `ONO_K8S_KUBECONFIG`.
+
+The document checks came first, when this repository held a specification and nothing else; the
+Rust steps joined them when the first crate landed. That is the direction this section requires —
+the gate grows with the repository and never shrinks to match it. Do not replace it; extend it.
 
 If a gate tool is missing, **create it** rather than skipping the gate.
 
@@ -268,18 +280,21 @@ requests unless asked.
 Core's stopping rule is `scripts/release-check.sh` printing that the shell is release-ready. This
 repository has no such script yet, because it has nothing to release.
 
-Until it does, the milestone that matters is the **Cloud-Native Validation Gate** described in
+The milestone that mattered first was the **Cloud-Native Validation Gate** described in
 [`docs/strategy/cncf-readiness.md`](https://github.com/godspeed-you/ono-sendai/blob/main/docs/strategy/cncf-readiness.md)
-§2 in core. It asks whether Ono's existing concepts become *more* useful against Kubernetes
-without creating a Kubernetes-specific second shell, and it requires, among other things: direct
-API interaction with no dependency on `kubectl`, UID-aware identity, useful behaviour for kinds
-unknown at compile time, relationships with inspectable evidence, navigation through the existing
-spatial model, honest handling of RBAC denial and watch discontinuity, no Kubernetes-specific
-parser or core exception, and deterministic tests that need no live production cluster.
+§2 in core — whether Ono's existing concepts become *more* useful against Kubernetes without
+creating a Kubernetes-specific second shell. It was allowed to fail, and it did not: direct API
+interaction with no `kubectl` anywhere, UID-aware identity, kinds unknown at compile time,
+relationships with inspectable evidence, navigation through the existing spatial model, honest
+handling of RBAC denial and watch discontinuity, deterministic tests needing no live cluster, and
+**zero Kubernetes special cases in core** — the four core changes this provider needed
+(`ADR-0584` through `ADR-0589`) are all generic extensions the example package exercises. §62's
+fourteen acceptance gates are the finer-grained version of the same question.
 
-**That gate is allowed to fail.** A failed proof-of-concept is evidence worth having, and the
-readiness document says so explicitly: if Kubernetes needs pervasive core exceptions or a second
-grammar, the abstraction gets revised rather than the result being talked around.
+What replaces it, until there is something to release: **`docs/coverage.md` has no unmet `MUST`.**
+That is the bar, it is checkable, and it is the one a reader can disagree with — every row names
+the module or the test that justifies it. A `SHOULD` this repository has decided not to take is
+recorded in an ADR with its reason, which is a different thing from one nobody has looked at.
 
 ---
 

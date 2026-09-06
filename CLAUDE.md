@@ -17,9 +17,9 @@ here too and is deliberately not copied into this repository.
 - **Subject:** the Kubernetes provider for **Ono-Sendai** (binary: `ono`) — the reference KUANG/11
   external-system provider. Specification: `docs/architecture/kubernetes-provider.md`, normative
   MUST/SHOULD/MAY, **immutable** (AGENTS.md §5).
-- **There is no implementation yet.** This repository holds a specification and the documents
-  around it. The first milestone is the Cloud-Native Validation Gate, and it is allowed to fail
-  (AGENTS.md §12).
+- **There is an implementation**, in two crates, with a live suite that drives the real `ono`
+  binary against ephemeral `kind` clusters. `docs/coverage.md` is the section-by-section map;
+  `docs/STATE.md` is the board (AGENTS.md §9, §12).
 - **Naming:** the product is **Ono-Sendai**, the binary is **`ono`**, **KUANG/11** is the
   extension runtime. **GVK** (kind identity) and **GVR** (REST collection identity) are different
   things and never one string (AGENTS.md §3).
