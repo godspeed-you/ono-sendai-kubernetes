@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use ono_kuang_sdk::protocol::{Capability, InvokeStatus, ShutdownReason};
+use ono_kuang_sdk::protocol::{Capability, InvokeResult, InvokeStatus, ShutdownReason};
 use ono_kuang_supervisor::{
     Connection, HostError, HostLimits, HostServices, LiveStream, StreamEvent,
 };
@@ -216,6 +216,12 @@ struct RecordedCluster {
     /// selector deliberately excludes. Layered over `tier_one` rather than replacing it, and off
     /// by default so that giving the Pod an owner cannot change what the projection tests prove.
     relations: bool,
+    /// Whether the server also serves what the six questions *about* an object need: an Events
+    /// collection, a Node with something to say about its machine, a Pod with conditions and
+    /// field managers, a container log, and a Deployment whose controller has caught up with its
+    /// generation. Layered over `relations` rather than replacing it, and off by default so that
+    /// giving the Pod conditions cannot change what the projection tests prove.
+    observations: bool,
     /// Which watch script this server plays, where it serves a watch at all (§19).
     watch: Watching,
     /// How many times the Pod collection has been listed, so that a re-acquisition after a gap
@@ -494,6 +500,19 @@ impl RecordedCluster {
             tier_one: true,
             relations: true,
             deny_pod_list: true,
+            ..Self::default()
+        })
+    }
+
+    /// A server that also answers the questions asked *about* an object rather than about a
+    /// collection: its Events, its evidence, its log, its times and its conditions.
+    fn with_observations() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            tier_one: true,
+            relations: true,
+            observations: true,
             ..Self::default()
         })
     }
@@ -1358,6 +1377,348 @@ fn relations_document(path: &str) -> Option<Json> {
     })
 }
 
+/// The Pod the questions *about* an object are asked of.
+///
+/// `related_pod` with the two things §37.1 and §14.7 need beside it: conditions a controller
+/// wrote, and `managedFields` entries carrying the times the API server recorded for them. Both
+/// are ordinary metadata — every object may carry them — and both are here rather than in a
+/// fixture of their own because a timeline assembled from one object has to reach all of it.
+fn observed_pod() -> Json {
+    let mut pod = related_pod();
+    let Some(map) = pod.as_object_mut() else {
+        panic!("the fixture Pod is an object");
+    };
+    map.insert(
+        "status".to_owned(),
+        json!({
+            "phase": "Running",
+            "podIP": "10.1.2.3",
+            "conditions": [
+                {"type": "Initialized", "status": "True",
+                 "lastTransitionTime": "2026-09-01T09:00:05Z"},
+                // `Unknown` is a controller saying it does not know, which is a third state and
+                // not a `False` with a nicer name (§37.1).
+                {"type": "Ready", "status": "Unknown", "reason": "ContainersNotReady",
+                 "message": "containers with unready status: [api]",
+                 "lastTransitionTime": "2026-09-01T09:04:00Z"},
+            ],
+        }),
+    );
+    let Some(metadata) = map.get_mut("metadata").and_then(Json::as_object_mut) else {
+        panic!("the fixture Pod has metadata");
+    };
+    metadata.insert(
+        "managedFields".to_owned(),
+        json!([
+            {"manager": "kube-scheduler", "operation": "Update", "apiVersion": "v1",
+             "time": "2026-09-01T09:00:02Z", "fieldsType": "FieldsV1",
+             "fieldsV1": {"f:spec": {"f:nodeName": {}}}},
+            // No `time`: a manager with no recorded moment is a manager, and giving it one would
+            // be the provider inventing an instant.
+            {"manager": "kubelet", "operation": "Update", "apiVersion": "v1",
+             "fieldsType": "FieldsV1", "fieldsV1": {"f:status": {}}},
+        ]),
+    );
+    pod
+}
+
+/// One Event of the `events.k8s.io` representation.
+fn event(
+    name: &str,
+    uid: &str,
+    level: &str,
+    reason: &str,
+    regarding: Json,
+    controller: &str,
+    at: &str,
+) -> Json {
+    json!({
+        "metadata": {
+            "name": name, "namespace": "default", "uid": uid,
+            "resourceVersion": "7100",
+            "creationTimestamp": "2026-09-01T09:05:00Z",
+        },
+        "regarding": regarding,
+        "type": level,
+        "reason": reason,
+        "note": format!("{reason} happened"),
+        "action": "Binding",
+        "reportingController": controller,
+        "reportingInstance": "node-a",
+        "eventTime": at,
+    })
+}
+
+/// The Pod every Event but one is about, as a reference.
+fn about_the_pod() -> Json {
+    json!({
+        "apiVersion": "v1", "kind": "Pod", "namespace": "default",
+        "name": "api-7d9f-abc", "uid": "11111111-1111-1111-1111-111111111111",
+    })
+}
+
+/// What a cluster with Events, machine evidence, logs and conditions answers.
+///
+/// Layered over `relations_document` and `tier_one_document`, and reached before both, so that
+/// the Pod below is the one with conditions on it while every other test keeps the one without.
+fn observations_document(path: &str) -> Option<Json> {
+    Some(match path {
+        // The Events API is a group like any other, and a cluster that does not serve it is a
+        // cluster nobody may ask (§38.2, §21.4).
+        "/apis" => json!({
+            "kind": "APIGroupList",
+            "groups": [
+                group("apps"),
+                group("batch"),
+                group("discovery.k8s.io"),
+                group("events.k8s.io"),
+                group("networking.k8s.io"),
+                group("storage.k8s.io"),
+            ],
+        }),
+        // The same core surface `tier_one_document` serves, plus the subresource a log is read
+        // from. Discovery decides whether a log can be read at all, and a server that lists
+        // `pods` without `pods/log` is one on which none can be (§11.5).
+        "/api/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "v1",
+            "resources": [
+                {"name": "namespaces", "kind": "Namespace", "namespaced": false,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "nodes", "kind": "Node", "namespaced": false,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "pods", "kind": "Pod", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "pods/log", "kind": "Pod", "namespaced": true, "verbs": ["get"]},
+                {"name": "services", "kind": "Service", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "secrets", "kind": "Secret", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "configmaps", "kind": "ConfigMap", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "serviceaccounts", "kind": "ServiceAccount", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "persistentvolumeclaims", "kind": "PersistentVolumeClaim",
+                 "namespaced": true, "verbs": ["get", "list", "watch"]},
+                {"name": "persistentvolumes", "kind": "PersistentVolume", "namespaced": false,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+        "/apis/events.k8s.io/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "events.k8s.io/v1",
+            "resources": [
+                {"name": "events", "kind": "Event", "namespaced": true,
+                 "verbs": ["get", "list", "watch"], "shortNames": ["ev"]},
+            ],
+        }),
+        "/apis/events.k8s.io/v1/namespaces/default/events" => collection(
+            "Event",
+            "events.k8s.io/v1",
+            &[
+                // The one this whole target exists for: the server recorded 47 occurrences and
+                // stored one Event. Forty-six of them were never observed individually.
+                {
+                    let mut aggregated = event(
+                        "api-7d9f-abc.17a",
+                        "e1111111-0000-0000-0000-000000000001",
+                        "Warning",
+                        "BackOff",
+                        about_the_pod(),
+                        "kubelet",
+                        "2026-09-01T09:20:00Z",
+                    );
+                    let Some(map) = aggregated.as_object_mut() else {
+                        panic!("an Event is an object");
+                    };
+                    map.insert(
+                        "series".to_owned(),
+                        json!({"count": 47, "lastObservedTime": "2026-09-01T09:44:00Z"}),
+                    );
+                    aggregated
+                },
+                event(
+                    "api-7d9f-abc.17b",
+                    "e1111111-0000-0000-0000-000000000002",
+                    "Normal",
+                    "Scheduled",
+                    about_the_pod(),
+                    "default-scheduler",
+                    "2026-09-01T09:00:01Z",
+                ),
+                // A different object entirely.
+                event(
+                    "worker-1.17c",
+                    "e1111111-0000-0000-0000-000000000003",
+                    "Normal",
+                    "Pulled",
+                    json!({"apiVersion": "v1", "kind": "Pod", "namespace": "default",
+                           "name": "worker-1", "uid": "22222222-2222-2222-2222-000000000001"}),
+                    "kubelet",
+                    "2026-09-01T09:02:00Z",
+                ),
+                // The same *name* as the Pod above and a different lifetime: an Event about the
+                // Pod that used to be called this. It must not be attached to the one that is
+                // (§4 invariants 4–5).
+                event(
+                    "api-7d9f-abc.17d",
+                    "e1111111-0000-0000-0000-000000000004",
+                    "Warning",
+                    "PreviousLifetime",
+                    json!({"apiVersion": "v1", "kind": "Pod", "namespace": "default",
+                           "name": "api-7d9f-abc",
+                           "uid": "99999999-9999-9999-9999-999999999999"}),
+                    "kubelet",
+                    "2026-09-01T08:00:00Z",
+                ),
+            ],
+        ),
+
+        "/api/v1/namespaces/default/pods/api-7d9f-abc" => standalone(observed_pod(), "v1", "Pod"),
+        "/api/v1/namespaces/default/pods/worker-1" => standalone(unselected_pod(), "v1", "Pod"),
+
+        // A Node with something to say about the machine under it. The provider identifier's
+        // scheme is invented for this fixture: nothing in the provider knows what it means, and
+        // that is Gate K (§62.11).
+        "/api/v1/nodes/node-a" => standalone(
+            json!({
+                "metadata": {
+                    "name": "node-a",
+                    "uid": "44444444-4444-4444-4444-444444444444",
+                    "creationTimestamp": "2026-08-01T00:00:00Z",
+                    "labels": {
+                        "kubernetes.io/hostname": "node-a",
+                        "kubernetes.io/arch": "arm64",
+                        "kubernetes.io/os": "linux",
+                        "topology.kubernetes.io/zone": "recorded-zone-b",
+                        "topology.kubernetes.io/region": "recorded-region",
+                        "node.kubernetes.io/instance-type": "recorded.medium",
+                    },
+                },
+                "spec": {"providerID": "recorded://recorded-zone-b/machine-42"},
+                "status": {
+                    "addresses": [
+                        {"type": "Hostname", "address": "node-a"},
+                        {"type": "InternalIP", "address": "10.0.0.7"},
+                    ],
+                    "nodeInfo": {
+                        "systemUUID": "EC2F9A11-0000-4000-8000-0000000000AA",
+                        "machineID": "d0f9c1a2b3c4d5e6f70819202122",
+                    },
+                },
+            }),
+            "v1",
+            "Node",
+        ),
+        // A Node whose spec came back with no provider identifier: it has none, which is a fact
+        // about the cluster, and it is not the same as nobody having looked (§4 invariant 13).
+        "/api/v1/nodes/node-b" => standalone(
+            json!({
+                "metadata": {
+                    "name": "node-b",
+                    "uid": "44444444-4444-4444-4444-000000000002",
+                    "creationTimestamp": "2026-08-01T00:00:00Z",
+                },
+                "spec": {},
+                "status": {"nodeInfo": {}},
+            }),
+            "v1",
+            "Node",
+        ),
+
+        // A Deployment whose controller has caught up with its generation and whose replicas have
+        // not. `Available=True` sits beside it, and neither of them is convergence (§37.3).
+        "/apis/apps/v1/namespaces/default/deployments/checkout" => standalone(
+            json!({
+                "metadata": {
+                    "name": "checkout", "namespace": "default",
+                    "uid": "66666666-6666-6666-6666-000000000002",
+                    "generation": 4,
+                    "creationTimestamp": "2026-08-20T08:00:00Z",
+                },
+                "spec": {"replicas": 3, "selector": {"matchLabels": {"app": "checkout"}}},
+                "status": {
+                    "observedGeneration": 4,
+                    "replicas": 3, "updatedReplicas": 1, "availableReplicas": 1,
+                    "conditions": [
+                        {"type": "Available", "status": "True", "reason": "MinimumReplicasAvailable",
+                         "observedGeneration": 4,
+                         "lastTransitionTime": "2026-08-20T08:01:00Z"},
+                        {"type": "Progressing", "status": "True", "reason": "NewReplicaSetAvailable",
+                         "observedGeneration": 4,
+                         "lastTransitionTime": "2026-09-01T10:00:00Z"},
+                    ],
+                },
+            }),
+            "apps/v1",
+            "Deployment",
+        ),
+        _ => return None,
+    })
+}
+
+/// What the container wrote, as bytes, before anything asked for it.
+///
+/// One line that is not UTF-8, because a container writes whatever it writes and a decoder that
+/// substituted U+FFFD would hand back something that reads like this and is not it.
+fn log_lines() -> Vec<Vec<u8>> {
+    let mut broken = b"payload ".to_vec();
+    broken.extend_from_slice(&[0xff, 0xfe]);
+    vec![
+        b"listening on :8080".to_vec(),
+        broken,
+        b"shutting down".to_vec(),
+    ]
+}
+
+/// The log subresource's answer, where the path names one.
+///
+/// `None` for every other path, so the ordinary documents answer as they did.
+fn log_response(path: &str) -> Option<Vec<u8>> {
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    // A container that has printed nothing this read could reach — the case §63.6 is about.
+    if route == "/api/v1/namespaces/default/pods/worker-1/log" {
+        return Some(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        );
+    }
+    if route != "/api/v1/namespaces/default/pods/api-7d9f-abc/log" {
+        return None;
+    }
+    let mut lines = log_lines();
+    if query.contains("tailLines=2") {
+        lines.remove(0);
+    }
+    let mut body: Vec<u8> = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if query.contains("timestamps=true") {
+            // The prefix the API server writes, from the container runtime's clock on the node.
+            body.extend_from_slice(format!("2026-09-01T09:1{at}:00.000000000Z ").as_bytes());
+        }
+        body.extend_from_slice(line);
+        body.push(b'\n');
+    }
+    Some(chunked_bytes(&body))
+}
+
+/// A chunked `200 OK` whose chunk boundary lands mid-line.
+///
+/// Deliberately mid-line: HTTP's framing and a log's newline framing are unrelated, and a fixture
+/// that delivered one chunk per line would never exercise the decoder that holds a partial one.
+fn chunked_bytes(body: &[u8]) -> Vec<u8> {
+    let mut wire = Vec::from(
+        &b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+    );
+    let split = body.len() / 2;
+    for part in [&body[..split], &body[split..]] {
+        wire.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+        wire.extend_from_slice(part);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    wire
+}
+
 /// One API group with a single preferred version.
 fn group(name: &str) -> Json {
     json!({
@@ -1384,6 +1745,14 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     if cluster.watch != Watching::NotOffered && path.contains("watch=true") {
         return watch_body(cluster);
     }
+    // A log is bytes rather than JSON, and its whole answer depends on the query string: which
+    // container, whether the server prefixes timestamps, and how much of it was asked for. So it
+    // is answered before the query is dropped, as the watch above is (§42.1).
+    if cluster.observations
+        && let Some(bytes) = log_response(path)
+    {
+        return bytes;
+    }
     let path = path.split('?').next().unwrap_or(path);
     if cluster.watch != Watching::NotOffered && path == "/api/v1/namespaces/default/pods" {
         return response(&watch_listing(cluster).to_string());
@@ -1395,6 +1764,11 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     }
     if cluster.custom
         && let Some(body) = custom_document(path)
+    {
+        return response(&body.to_string());
+    }
+    if cluster.observations
+        && let Some(body) = observations_document(path)
     {
         return response(&body.to_string());
     }
@@ -4895,5 +5269,950 @@ async fn should_report_the_gap_even_where_the_query_refused_to_pay_for_a_re_acqu
         2,
         "one acquisition and one watch: the second listing is exactly what was declined"
     );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- the six questions asked *about* an object (§37 to §40, §42, §47) ---------------------------
+//
+// Every test below proves the same kind of thing twice over: that the data arrives, and that the
+// refusal the domain module was built around arrives with it. A module whose whole value is a
+// refusal is not routed until the refusal is what a user sees.
+
+async fn loaded_with_observations() -> ono_kuang_supervisor::LoadedPlugin {
+    TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .host(RecordedCluster::with_observations())
+        .load()
+        .await
+        .expect("the package loads under its own manifest")
+}
+
+/// One query with its own options, as records and the outcome that ended it.
+async fn asked(
+    plugin: &ono_kuang_supervisor::LoadedPlugin,
+    target: &str,
+    extra: &[(&str, Json)],
+) -> (Vec<Arc<RecordValue>>, InvokeResult) {
+    let invocation = plugin
+        .query(target, at_cluster(extra))
+        .await
+        .unwrap_or_else(|error| panic!("`{target}` is a contributed target: {error:?}"));
+    let (events, result) = invocation.collect().await;
+    (records(&events), result)
+}
+
+/// The records of a query that must have completed, with the schema already checked.
+async fn completed(
+    plugin: &ono_kuang_supervisor::LoadedPlugin,
+    target: &str,
+    schema: &str,
+    extra: &[(&str, Json)],
+) -> Vec<Arc<RecordValue>> {
+    let (records, result) = asked(plugin, target, extra).await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "`{target}`: {:?}",
+        result.error
+    );
+    for record in &records {
+        assert_eq!(
+            record.schema_id().to_string(),
+            schema,
+            "`{target}` answers records of the schema it declared"
+        );
+        record
+            .validate()
+            .unwrap_or_else(|error| panic!("`{target}` record does not conform: {error:?}"));
+    }
+    records
+}
+
+/// The message and the hint of an invocation that failed, joined.
+fn refusal(result: &InvokeResult) -> String {
+    let error = result
+        .error
+        .as_ref()
+        .unwrap_or_else(|| panic!("a failed invocation carries an error"));
+    format!(
+        "{} {}",
+        error.message,
+        error.help.clone().unwrap_or_default()
+    )
+}
+
+fn int_of(record: &RecordValue, field: &str) -> Option<i128> {
+    match record.get(field) {
+        Some(Value::Int(value)) => Some(*value),
+        Some(Value::Null) | None => None,
+        other => panic!("`{field}` is an integer or null, and it is {other:?}"),
+    }
+}
+
+fn bool_of(record: &RecordValue, field: &str) -> Option<bool> {
+    match record.get(field) {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::Null) | None => None,
+        other => panic!("`{field}` is a bool or null, and it is {other:?}"),
+    }
+}
+
+const EVENT_SCHEMA: &str = "io.github.godspeed-you.kubernetes.event/1";
+const EVIDENCE_SCHEMA: &str = "io.github.godspeed-you.kubernetes.evidence/1";
+const LOG_SCHEMA: &str = "io.github.godspeed-you.kubernetes.log/1";
+const TIMELINE_SCHEMA: &str = "io.github.godspeed-you.kubernetes.timeline/1";
+const WHY_SCHEMA: &str = "io.github.godspeed-you.kubernetes.why/1";
+const CONDITION_SCHEMA: &str = "io.github.godspeed-you.kubernetes.condition/1";
+
+/// The object every question below is asked about.
+fn about_a_pod() -> Vec<(&'static str, Json)> {
+    vec![("kind", json!("Pod")), ("name", json!("api-7d9f-abc"))]
+}
+
+#[tokio::test]
+async fn should_answer_an_aggregated_event_as_one_record_carrying_its_count() {
+    // §38.4, which is the whole reason `Occurrences` has no `expand`. The recorded cluster stored
+    // *one* Event whose series counts 47 occurrences, because Kubernetes aggregates precisely so
+    // that the individual ones need not be stored. Forty-six of them were never observed, and a
+    // provider that answered with 47 records would be handing back forty-six observations nobody
+    // made, indistinguishable from the one that was.
+    let plugin = loaded_with_observations().await;
+    let records = completed(&plugin, "k8s-event", EVENT_SCHEMA, &about_a_pod()).await;
+    assert_eq!(
+        records.len(),
+        2,
+        "two Events regard this Pod, and one of them stands for 47 occurrences: {:?}",
+        records
+            .iter()
+            .map(|record| text_of(record, "reason"))
+            .collect::<Vec<_>>()
+    );
+    let aggregated = records
+        .iter()
+        .find(|record| text_of(record, "reason").as_deref() == Some("BackOff"))
+        .expect("the aggregated Event is one of the two");
+    assert_eq!(int_of(aggregated, "recorded_count"), Some(47));
+    assert_eq!(int_of(aggregated, "series_count"), Some(47));
+    assert_eq!(
+        bool_of(aggregated, "aggregate"),
+        Some(true),
+        "the record says it stands for more than one occurrence rather than looking like one"
+    );
+    assert_eq!(
+        text_of(aggregated, "series_last_observed").as_deref(),
+        Some("2026-09-01T09:44:00Z"),
+        "a series still running is not a total that has stopped moving (§38.4)"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_not_attach_an_event_to_a_later_lifetime_of_the_same_name() {
+    // §4 invariants 4 and 5. The recorded cluster holds an Event whose `regarding` names this
+    // Pod's *name* and a different UID — the Pod that used to be called this. A provider matching
+    // on name would hand its failures to the Pod running now, which is the single most misleading
+    // thing this whole identity model exists to prevent.
+    let plugin = loaded_with_observations().await;
+    let records = completed(&plugin, "k8s-event", EVENT_SCHEMA, &about_a_pod()).await;
+    for record in &records {
+        assert_ne!(
+            text_of(record, "reason").as_deref(),
+            Some("PreviousLifetime"),
+            "that Event is about a Pod that no longer exists under this name"
+        );
+        assert_eq!(
+            text_of(record, "regarding_uid").as_deref(),
+            Some("11111111-1111-1111-1111-111111111111"),
+            "every Event here is about this lifetime and no other"
+        );
+    }
+    // And nothing from the Pod next door, whose Events are in the same collection.
+    assert!(
+        !records
+            .iter()
+            .any(|record| text_of(record, "regarding_name").as_deref() == Some("worker-1"))
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_to_answer_an_unobserved_event_search_with_an_empty_stream() {
+    // §38.6 and §63.6, at the boundary. No Event in the recorded cluster regards this Service, and
+    // an empty stream of records is read as absence by every consumer that has ever been written.
+    // Kubernetes Events are best-effort and retained for minutes to hours, so "none here" is a
+    // statement about the search — which is why `Found::NotObserved` carries an outcome that can
+    // never be `Absent`, and why this ends the invocation saying so. ADR-0025.
+    let plugin = loaded_with_observations().await;
+    let (records, result) = asked(
+        &plugin,
+        "k8s-event",
+        &[("kind", json!("Service")), ("name", json!("api"))],
+    )
+    .await;
+    assert!(records.is_empty());
+    assert_eq!(
+        result.status,
+        InvokeStatus::Failed,
+        "an empty stream would have said the Service is fine"
+    );
+    let said = refusal(&result);
+    assert!(
+        said.contains("not evidence that nothing happened"),
+        "the refusal states §38.6 rather than merely being empty: {said}"
+    );
+    assert!(
+        said.contains("no Event regarding `Service/api` was observed"),
+        "and it names what was searched for: {said}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_an_event_time_beside_the_clock_that_wrote_it() {
+    // §38.1 and §39.2. An Event's `eventTime` is the reporting component's clock, on whichever
+    // machine it runs. The record carries it as the string it arrived as and names the clock
+    // beside it, so there is no column a shell can sort a set of Events into — which would read
+    // as a sequence of what happened while being a picture of the skew between reporters.
+    let plugin = loaded_with_observations().await;
+    let records = completed(&plugin, "k8s-event", EVENT_SCHEMA, &about_a_pod()).await;
+    let scheduled = records
+        .iter()
+        .find(|record| text_of(record, "reason").as_deref() == Some("Scheduled"))
+        .expect("the scheduler reported one of the two");
+    assert_eq!(
+        text_of(scheduled, "event_time").as_deref(),
+        Some("2026-09-01T09:00:01Z")
+    );
+    assert_eq!(
+        text_of(scheduled, "clock").as_deref(),
+        Some("reported-by/default-scheduler"),
+        "the clock that wrote it, which is not this machine's and not the API server's"
+    );
+    assert_eq!(
+        text_of(scheduled, "reporting_controller").as_deref(),
+        Some("default-scheduler"),
+        "§38.3: an Event stripped of its reporter is an anonymous assertion"
+    );
+    assert_eq!(
+        text_of(scheduled, "reporting_instance").as_deref(),
+        Some("node-a"),
+        "one controller runs in several places and only one of them saw this"
+    );
+    assert_eq!(
+        text_of(scheduled, "representation").as_deref(),
+        Some("events.k8s.io"),
+        "§38.2's preferred representation, said rather than assumed"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_export_a_node_s_machine_evidence_with_its_pointer_class_and_strength() {
+    // §47.7's `MUST`: the evidence is *inspectable*. Every item names the field it came from, so
+    // an operator can check it against the object rather than trust it, and every item states how
+    // far it goes — because §47.2 ranks `providerID` above address or name matching and a
+    // consumer that could not see the ranking would rebuild it from key names, which is the
+    // vendor knowledge §47.1 keeps out of this provider wearing a different coat.
+    let plugin = loaded_with_observations().await;
+    let records = completed(
+        &plugin,
+        "k8s-evidence",
+        EVIDENCE_SCHEMA,
+        &[("name", json!("node-a"))],
+    )
+    .await;
+    let identifier = records
+        .iter()
+        .find(|record| text_of(record, "key").as_deref() == Some("kubernetes.node.provider-id"))
+        .expect("the Node states a provider identifier");
+    assert_eq!(
+        text_of(identifier, "value").as_deref(),
+        Some("recorded://recorded-zone-b/machine-42")
+    );
+    assert_eq!(
+        text_of(identifier, "source").as_deref(),
+        Some("/spec/providerID"),
+        "a citation a reader can resolve against the object it came from (§47.7)"
+    );
+    assert_eq!(
+        text_of(identifier, "strength").as_deref(),
+        Some("distinguishing")
+    );
+    assert_eq!(
+        text_of(identifier, "evidence_class").as_deref(),
+        Some("native-field")
+    );
+    assert_eq!(bool_of(identifier, "asserted"), Some(true));
+    assert_eq!(bool_of(identifier, "lookup_key"), Some(true));
+    // §28.4's whole permitted decomposition: a scheme and a path, with no segment labelled.
+    assert_eq!(
+        text_of(identifier, "uri_scheme").as_deref(),
+        Some("recorded")
+    );
+    assert_eq!(
+        text_of(identifier, "uri_path").as_deref(),
+        Some("recorded-zone-b/machine-42"),
+        "undivided, because knowing that a scheme puts a failure domain first is knowledge of a \
+         system this provider has not read"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_correlating_evidence_distinguishable_from_distinguishing_evidence() {
+    // §28.5 and §47.2. An address is exact, looks authoritative, and is the wrong thing to key a
+    // foreign lookup on: private ranges repeat between clusters, a public address outlives the
+    // machine that held it, and a machine id baked into a disk image is shared by every host
+    // built from it. The record has to carry that difference or a resolver will not see it.
+    let plugin = loaded_with_observations().await;
+    let records = completed(
+        &plugin,
+        "k8s-evidence",
+        EVIDENCE_SCHEMA,
+        &[("name", json!("node-a"))],
+    )
+    .await;
+    let address = records
+        .iter()
+        .find(|record| {
+            text_of(record, "key").as_deref() == Some("kubernetes.node.address")
+                && text_of(record, "qualifier").as_deref() == Some("InternalIP")
+        })
+        .expect("the Node reports an internal address");
+    assert_eq!(text_of(address, "value").as_deref(), Some("10.0.0.7"));
+    assert_eq!(text_of(address, "strength").as_deref(), Some("correlating"));
+    assert_eq!(
+        bool_of(address, "lookup_key"),
+        Some(false),
+        "§28.5: address equality does not establish a verified foreign link"
+    );
+    assert_eq!(
+        text_of(address, "qualifier").as_deref(),
+        Some("InternalIP"),
+        "the type travels with the value, so an internal address is not matched against a public \
+         inventory"
+    );
+
+    let machine = records
+        .iter()
+        .find(|record| text_of(record, "key").as_deref() == Some("kubernetes.node.machine-id"))
+        .expect("the kubelet reports a machine id");
+    assert_eq!(text_of(machine, "strength").as_deref(), Some("correlating"));
+    let system = records
+        .iter()
+        .find(|record| text_of(record, "key").as_deref() == Some("kubernetes.node.system-uuid"))
+        .expect("the kubelet reports a system UUID");
+    assert_eq!(
+        text_of(system, "strength").as_deref(),
+        Some("distinguishing"),
+        "a system UUID is issued per machine; a machine id is written into a filesystem image"
+    );
+
+    // A well-known label is a convention somebody with write access can change, which is weaker
+    // than a field the API server owns — and the record says which it is (§23.4).
+    let zone = records
+        .iter()
+        .find(|record| text_of(record, "key").as_deref() == Some("kubernetes.node.zone"))
+        .expect("the Node is labelled with a failure domain");
+    assert_eq!(text_of(zone, "strength").as_deref(), Some("placement"));
+    assert_eq!(
+        text_of(zone, "evidence_class").as_deref(),
+        Some("convention")
+    );
+    assert_eq!(bool_of(zone, "asserted"), Some(false));
+
+    // And nothing anywhere presents a match: this provider has read Kubernetes and nothing else.
+    for record in &records {
+        for forbidden in ["match", "matched", "link", "resolved", "foreign_id"] {
+            assert!(
+                record.get(forbidden).is_none(),
+                "`{forbidden}` would be a claim about a system this provider has not read (§47.1)"
+            );
+        }
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_answer_a_key_that_could_not_be_read_rather_than_omitting_it() {
+    // §4 invariant 13 at the evidence boundary. `node-b`'s spec came back and carried no provider
+    // identifier, so the Node has none — a cluster running no cloud controller. A rendering that
+    // dropped the row would read as "this Node has no cross-system identity"; one that showed it
+    // with a null value and no reason would read as a bug.
+    let plugin = loaded_with_observations().await;
+    let records = completed(
+        &plugin,
+        "k8s-evidence",
+        EVIDENCE_SCHEMA,
+        &[("name", json!("node-b"))],
+    )
+    .await;
+    let missing = records
+        .iter()
+        .find(|record| text_of(record, "key").as_deref() == Some("kubernetes.node.provider-id"))
+        .expect("a key that was not read is still a record");
+    assert_eq!(bool_of(missing, "observed"), Some(false));
+    assert_eq!(missing.get("value"), Some(&Value::Null));
+    assert_eq!(missing.get("strength"), Some(&Value::Null));
+    assert_eq!(
+        text_of(missing, "outcome").as_deref(),
+        Some("absent"),
+        "the spec was read and does not carry one, which is a fact about the cluster"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_name_no_cloud_vendor_on_the_route_that_exports_machine_evidence() {
+    // Gate K (§62.11), as a claim about this build rather than about the fixture. §47.1 keeps
+    // vendor knowledge out of the domain module and `tests/evidence.rs` checks it there; the
+    // boundary is the other place it would arrive — "just to render the instance nicely" — and
+    // the second match arm follows the first within a week.
+    const ROUTE: &str = include_str!("../src/evidence.rs");
+    for vendor in [
+        "aws",
+        "amazon",
+        "azure",
+        "gce",
+        "gcp",
+        "google",
+        "openstack",
+        "vsphere",
+        "hetzner",
+        "digitalocean",
+        "alicloud",
+        "oracle",
+        "ibmcloud",
+    ] {
+        assert!(
+            !ROUTE.to_lowercase().contains(vendor),
+            "`{vendor}` is named on the route that exports identity evidence, and this provider \
+             does not know what any scheme means (§47.1)"
+        );
+    }
+    plugin_free();
+}
+
+/// A test that asserts about source text and starts no host has nothing to shut down.
+fn plugin_free() {}
+
+#[tokio::test]
+async fn should_state_the_bounds_of_a_log_on_every_line_it_answers_with() {
+    // §42.1. The sentence the whole module exists for: a retrieved log is not the output of a
+    // container. The runtime rotated and truncated it before anybody asked, so that bound is on
+    // every line of every read — and a record that omitted it would imply completeness by saying
+    // nothing, which is exactly how a reader concludes that a message they cannot find was never
+    // printed.
+    let plugin = loaded_with_observations().await;
+    let records = completed(
+        &plugin,
+        "k8s-log",
+        LOG_SCHEMA,
+        &[("name", json!("api-7d9f-abc")), ("container", json!("api"))],
+    )
+    .await;
+    assert_eq!(records.len(), 3, "three lines were on the wire");
+    for record in &records {
+        let bounds = list_of(record, "bounds").expect("every line states its bounds");
+        assert!(
+            bounds
+                .iter()
+                .any(|bound| bound.contains("rotated and truncated")),
+            "the runtime's own truncation is in every list, requested or not: {bounds:?}"
+        );
+        assert_eq!(
+            bool_of(record, "may_contain_secrets"),
+            Some(true),
+            "§42.2: whether a log carries a credential is not decidable from the log"
+        );
+        assert_eq!(text_of(record, "instance").as_deref(), Some("current"));
+        assert_eq!(text_of(record, "container").as_deref(), Some("api"));
+        assert_eq!(
+            text_of(record, "uid").as_deref(),
+            Some("11111111-1111-1111-1111-111111111111"),
+            "the log is bound to the Pod's lifetime, not to its name (§4 invariants 4–5)"
+        );
+    }
+    assert_eq!(
+        text_of(&records[0], "text").as_deref(),
+        Some("listening on :8080")
+    );
+    assert_eq!(int_of(&records[0], "line"), Some(1));
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_a_line_that_is_not_text_as_bytes_rather_than_editing_it() {
+    // §12.5 applied to a stream. `String::from_utf8_lossy` would hand back a line that reads like
+    // the container's output and differs from it, with nothing downstream able to tell that a
+    // substitution happened — evidence edited on the way past.
+    let plugin = loaded_with_observations().await;
+    let records = completed(
+        &plugin,
+        "k8s-log",
+        LOG_SCHEMA,
+        &[("name", json!("api-7d9f-abc")), ("container", json!("api"))],
+    )
+    .await;
+    let broken = &records[1];
+    assert_eq!(
+        broken.get("text"),
+        Some(&Value::Null),
+        "null rather than an approximation of the bytes"
+    );
+    assert_eq!(
+        int_of(broken, "not_utf8_after"),
+        Some(8),
+        "and how far decoding got, so the reader knows what was there"
+    );
+    assert_eq!(int_of(broken, "bytes"), Some(10));
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_add_every_requested_bound_to_the_ones_a_log_line_states() {
+    // A tail is a second bound on top of the runtime's, and the record carries both — so "the
+    // last two lines of what had not yet been rotated away" is readable as what it is rather than
+    // as the container's output.
+    let plugin = loaded_with_observations().await;
+    let records = completed(
+        &plugin,
+        "k8s-log",
+        LOG_SCHEMA,
+        &[
+            ("name", json!("api-7d9f-abc")),
+            ("container", json!("api")),
+            ("tail_lines", json!(2)),
+            ("timestamps", json!(true)),
+        ],
+    )
+    .await;
+    assert_eq!(records.len(), 2);
+    let bounds = list_of(&records[0], "bounds").expect("bounds");
+    assert_eq!(
+        bounds.len(),
+        2,
+        "the runtime's, and the tail that was asked for: {bounds:?}"
+    );
+    assert!(bounds.iter().any(|bound| bound.contains("last 2 lines")));
+    // The prefix the server writes is the container runtime's clock on the node, and it arrives
+    // as a string with that clock named beside it (§39.2, §42.1).
+    assert_eq!(
+        text_of(&records[1], "stamp").as_deref(),
+        Some("2026-09-01T09:11:00.000000000Z")
+    );
+    assert_eq!(
+        text_of(&records[1], "clock").as_deref(),
+        Some("node/node-a")
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_to_answer_an_empty_log_with_an_empty_stream() {
+    // §63.6 and §42.1. A read that produced no lines is not a container that printed nothing: the
+    // runtime may have rotated the log away, the requested tail may not reach back to it, or the
+    // process may write to a file. The refusal carries the bounds, because they are what turns
+    // "nothing" into an answer somebody can act on. ADR-0025.
+    let plugin = loaded_with_observations().await;
+    let (records, result) = asked(&plugin, "k8s-log", &[("name", json!("worker-1"))]).await;
+    assert!(records.is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let said = refusal(&result);
+    assert!(
+        said.contains("not evidence that the container printed nothing"),
+        "the refusal says what an empty answer is not: {said}"
+    );
+    assert!(
+        said.contains("rotated and truncated"),
+        "and it names the bound that was already on the read: {said}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_carry_the_window_and_the_gaps_on_every_timeline_record() {
+    // §39.3. A stream of observations with the window on a summary somebody may not read is a
+    // stream a reader takes for a complete history. Both kinds of hole travel on every record: the
+    // stretches observation could not cover, and the scopes that were never readable.
+    let plugin = loaded_with_observations().await;
+    let records = completed(&plugin, "k8s-timeline", TIMELINE_SCHEMA, &about_a_pod()).await;
+    assert!(!records.is_empty());
+    for record in &records {
+        assert!(
+            matches!(record.get("window_opened"), Some(Value::Timestamp(_))),
+            "every observation states the window it was made in, on this provider's own clock"
+        );
+        assert!(matches!(
+            record.get("window_latest"),
+            Some(Value::Timestamp(_))
+        ));
+        assert!(
+            bool_of(record, "continuous").is_some(),
+            "and whether one unbroken stretch covers it"
+        );
+        assert!(
+            list_of(record, "gaps").is_some(),
+            "and the stretches it could not observe, empty where there are none"
+        );
+        assert!(list_of(record, "not_observed").is_some());
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_not_read_a_creation_timestamp_as_something_this_provider_observed() {
+    // §39.2, which is the sentence the whole module was built for. This Pod was created on
+    // 2026-09-01 and read for the first time a moment ago. A provider that filed its
+    // `creationTimestamp` as an observation would be claiming to have watched a period it was not
+    // running for — and every route into `Basis::Observed` goes through a watch event, which this
+    // target does not open.
+    let plugin = loaded_with_observations().await;
+    let records = completed(&plugin, "k8s-timeline", TIMELINE_SCHEMA, &about_a_pod()).await;
+    for record in &records {
+        assert_eq!(
+            text_of(record, "basis").as_deref(),
+            Some("reported"),
+            "nothing a read produces was witnessed: {:?}",
+            text_of(record, "detail")
+        );
+    }
+    let created = records
+        .iter()
+        .find(|record| text_of(record, "detail").as_deref() == Some("created"))
+        .expect("the object states when the API server accepted it");
+    assert_eq!(
+        text_of(created, "source").as_deref(),
+        Some("object-metadata")
+    );
+    assert_eq!(text_of(created, "clock").as_deref(), Some("api-server"));
+    assert_eq!(
+        text_of(created, "stamp").as_deref(),
+        Some("2026-09-01T09:00:00Z"),
+        "the string the clock wrote, and never a timestamp a shell would sort against another \
+         machine's"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_name_a_different_clock_for_every_kind_of_time_a_read_can_reach() {
+    // §39.1's sources, each arriving with the machine that wrote it. Five clocks in one answer is
+    // the ordinary case, and it is precisely why there is no single sortable column here.
+    let plugin = loaded_with_observations().await;
+    let records = completed(&plugin, "k8s-timeline", TIMELINE_SCHEMA, &about_a_pod()).await;
+    let clocks: Vec<(String, String)> = records
+        .iter()
+        .map(|record| {
+            (
+                text_of(record, "source").unwrap_or_default(),
+                text_of(record, "clock").unwrap_or_default(),
+            )
+        })
+        .collect();
+    for expected in [
+        ("resource-snapshot", "provider"),
+        ("object-metadata", "api-server"),
+        ("condition-transition", "unattributed"),
+        ("managed-field", "api-server"),
+        ("event-record", "reported-by/kubelet"),
+    ] {
+        assert!(
+            clocks
+                .iter()
+                .any(|(source, clock)| source == expected.0 && clock == expected.1),
+            "§39.1's `{}` should arrive on the `{}` clock: {clocks:?}",
+            expected.0,
+            expected.1
+        );
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_say_correlated_with_for_two_things_that_merely_happened_close_together() {
+    // §23.4 of the generic contract, and §40's ladder. The Pod was created and the scheduler wrote
+    // a field two seconds later, both on the API server's clock. That is a real observation and it
+    // is not a cause — so the claim is `CORRELATED_WITH`, it arrives with the sentence that says
+    // where it stops, and there is no stronger field anywhere on the record for a reader to take
+    // instead.
+    let plugin = loaded_with_observations().await;
+    let records = completed(&plugin, "k8s-why", WHY_SCHEMA, &about_a_pod()).await;
+    let correlated = records
+        .iter()
+        .find(|record| text_of(record, "claim").as_deref() == Some("CORRELATED_WITH"))
+        .expect("two observations one clock put two seconds apart");
+    assert_eq!(
+        text_of(correlated, "claim_means").as_deref(),
+        Some("one clock saw both, close together; proximity is not a causal link"),
+        "the limit travels with the token, because a token alone is read as strongly as its \
+         reader needs it to be"
+    );
+    assert_eq!(
+        text_of(correlated, "support_class").as_deref(),
+        Some("sequence")
+    );
+    assert_eq!(text_of(correlated, "clock").as_deref(), Some("api-server"));
+    assert_eq!(int_of(correlated, "apart_ms"), Some(2000));
+    for forbidden in [
+        "cause",
+        "caused_by",
+        "because",
+        "root_cause",
+        "explanation",
+        "effect",
+        "impact",
+    ] {
+        assert!(
+            correlated.get(forbidden).is_none(),
+            "`{forbidden}` is a field a reader would take for a cause, and §40's ladder has no \
+             rung for one"
+        );
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_carry_the_ceiling_of_the_answer_on_every_finding() {
+    // §40.5 and the "no summation" rule. `strongest_claim` is the maximum of the ladder, on every
+    // record, so a reader who filters down to one finding still sees how far the whole answer
+    // reached. Three weak findings never add up to a strong one.
+    let plugin = loaded_with_observations().await;
+    let records = completed(&plugin, "k8s-why", WHY_SCHEMA, &about_a_pod()).await;
+    let asserted = records
+        .iter()
+        .find(|record| text_of(record, "claim").as_deref() == Some("ASSERTED_BY_KUBERNETES"))
+        .expect("the Pod states an owner reference, which the API server asserts");
+    assert_eq!(
+        text_of(asserted, "support_class").as_deref(),
+        Some("assertion")
+    );
+    assert!(
+        text_of(asserted, "claim_means")
+            .unwrap_or_default()
+            .contains("management responsibility"),
+        "§40.4: ownership is not the origin of every state change"
+    );
+    for record in &records {
+        assert_eq!(
+            text_of(record, "strongest_claim").as_deref(),
+            Some("ASSERTED_BY_KUBERNETES"),
+            "the ceiling of the answer is on every record, not on a summary"
+        );
+        assert_eq!(bool_of(record, "insufficient_evidence"), Some(false));
+    }
+    // A refusal is a record too: an answer with the empty findings dropped looks like one where
+    // nobody looked (§4 invariant 13).
+    assert!(
+        records
+            .iter()
+            .any(|record| text_of(record, "not_proven").is_some()),
+        "the findings that established nothing keep their reason"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_answer_insufficient_evidence_where_nothing_rose_above_the_bottom_rung() {
+    // §40.5, verbatim: where the evidence is insufficient, say so. The specification calls that
+    // preferable to a plausible invented explanation, and it has to be *reachable* — an answer
+    // that could only be produced by a bug would not be a policy.
+    let plugin = loaded_with_observations().await;
+    let records = completed(
+        &plugin,
+        "k8s-why",
+        WHY_SCHEMA,
+        &[("kind", json!("ConfigMap")), ("name", json!("api-config"))],
+    )
+    .await;
+    assert_eq!(records.len(), 1);
+    let nothing = &records[0];
+    assert_eq!(
+        text_of(nothing, "claim").as_deref(),
+        Some("CAUSALITY_NOT_PROVEN")
+    );
+    assert_eq!(
+        text_of(nothing, "support_class").as_deref(),
+        Some("nothing")
+    );
+    assert_eq!(
+        text_of(nothing, "not_proven").as_deref(),
+        Some("nothing was gathered"),
+        "a refusal that names its reason is actionable where a bare unknown is not"
+    );
+    assert_eq!(bool_of(nothing, "insufficient_evidence"), Some(true));
+    assert_eq!(
+        text_of(nothing, "strongest_claim").as_deref(),
+        Some("CAUSALITY_NOT_PROVEN")
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_state_a_condition_without_ever_meaning_that_the_object_is_healthy() {
+    // §37.3, which is the half of §37 that is easiest to lose at a boundary. This Deployment's
+    // controller *has* seen the current generation — `observedGeneration` equals `generation` —
+    // and `Available` is `True`. Neither of those is convergence, and one replica of three is
+    // updated. The derived state says so, names the rule that says it, and cites the fields.
+    let plugin = loaded_with_observations().await;
+    let records = completed(
+        &plugin,
+        "k8s-condition",
+        CONDITION_SCHEMA,
+        &[("kind", json!("Deployment")), ("name", json!("checkout"))],
+    )
+    .await;
+    assert_eq!(
+        records.len(),
+        2,
+        "one record per condition, never one status word"
+    );
+    let available = records
+        .iter()
+        .find(|record| text_of(record, "condition_type").as_deref() == Some("Available"))
+        .expect("the Deployment states an Available condition");
+    assert_eq!(text_of(available, "status").as_deref(), Some("True"));
+    assert_eq!(int_of(available, "observed_generation"), Some(4));
+    assert_eq!(
+        int_of(available, "generation"),
+        Some(4),
+        "the controller has seen the current spec, which is all that says"
+    );
+    let Some(Value::Map(reconciliation)) = available.get("reconciliation") else {
+        panic!("the derived state arrives as a map with its rule (§37.5)");
+    };
+    assert_eq!(
+        reconciliation.get("verified_convergence"),
+        Some(&Value::Bool(false)),
+        "§37.3: a matching observedGeneration is never on its own a claim of health"
+    );
+    assert_eq!(
+        reconciliation.get("state"),
+        Some(&Value::String(
+            "controller observed; convergence pending".into()
+        ))
+    );
+    assert_eq!(
+        reconciliation.get("rule"),
+        Some(&Value::String("deployment-generation-and-replicas".into())),
+        "the rule is named so a reader can look it up and disagree with it"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_a_condition_status_as_the_word_the_api_wrote() {
+    // §37.1 and §37.2. `Unknown` is a controller saying it does not know, which is a third state
+    // and not a `False` with a nicer name — and a boolean has two. The reason and the message come
+    // with it, because reducing the three to a green word throws away the only parts an operator
+    // can act on (§4 invariant 9).
+    let plugin = loaded_with_observations().await;
+    let records = completed(&plugin, "k8s-condition", CONDITION_SCHEMA, &about_a_pod()).await;
+    let ready = records
+        .iter()
+        .find(|record| text_of(record, "condition_type").as_deref() == Some("Ready"))
+        .expect("the Pod states a Ready condition");
+    assert_eq!(
+        ready.get("status"),
+        Some(&Value::String("Unknown".into())),
+        "the string the API carries, never a bool"
+    );
+    assert_eq!(
+        text_of(ready, "reason").as_deref(),
+        Some("ContainersNotReady")
+    );
+    assert_eq!(
+        text_of(ready, "message").as_deref(),
+        Some("containers with unready status: [api]")
+    );
+    assert_eq!(
+        text_of(ready, "last_transition_time").as_deref(),
+        Some("2026-09-01T09:04:00Z"),
+        "as the string the server sent"
+    );
+    assert_eq!(
+        text_of(ready, "clock").as_deref(),
+        Some("unattributed"),
+        "`status.conditions` does not say which controller wrote the entry, so two conditions on \
+         one object must not be ordered against each other (§37.1)"
+    );
+    // A Pod has no `metadata.generation`, so there is no generation evidence and the derived
+    // state says exactly that rather than inventing a rule for symmetry (§37.2, §37.5).
+    let Some(Value::Map(reconciliation)) = ready.get("reconciliation") else {
+        panic!("`reconciliation` is a map");
+    };
+    assert_eq!(
+        reconciliation.get("state"),
+        Some(&Value::String(
+            "unknown due to insufficient evidence".into()
+        ))
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_a_question_about_an_object_the_query_did_not_name() {
+    // §35.1 and §4 invariant 22: a target word plus options is the grammar, and every one of these
+    // six is a question *about* one object. Asking it of a whole collection would read every
+    // object in it to answer a question about none of them, so it is refused with the spelling
+    // that would work.
+    let plugin = loaded_with_observations().await;
+    for (target, example) in [
+        ("k8s-event", "--kind Pod --name"),
+        ("k8s-evidence", "--name node-a"),
+        ("k8s-log", "--name"),
+        ("k8s-timeline", "--kind Pod --name"),
+        ("k8s-why", "--kind Pod --name"),
+        ("k8s-condition", "--kind Deployment --name"),
+    ] {
+        let (records, result) = asked(&plugin, target, &[]).await;
+        assert!(records.is_empty(), "`{target}` answered without a subject");
+        assert_eq!(result.status, InvokeStatus::Failed, "`{target}`");
+        let said = refusal(&result);
+        assert!(
+            said.contains("named no `name`"),
+            "`{target}` says which option is missing: {said}"
+        );
+        assert!(
+            said.contains(example),
+            "`{target}` shows the spelling that works: {said}"
+        );
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_answer_every_question_asked_about_an_object_from_the_cluster_s_own_discovery() {
+    // The six targets end to end, over the protocol, against one recorded cluster: every declared
+    // word answers records of the schema it declared, and the host validates each one against the
+    // contributed schema before it reaches this test. ADR-0005's rule — a declared schema is a
+    // promise — applied to the last of the unreachable work.
+    let plugin = loaded_with_observations().await;
+    for (target, schema, extra) in [
+        ("k8s-event", EVENT_SCHEMA, about_a_pod()),
+        (
+            "k8s-evidence",
+            EVIDENCE_SCHEMA,
+            vec![("name", json!("node-a"))],
+        ),
+        (
+            "k8s-log",
+            LOG_SCHEMA,
+            vec![("name", json!("api-7d9f-abc")), ("container", json!("api"))],
+        ),
+        ("k8s-timeline", TIMELINE_SCHEMA, about_a_pod()),
+        ("k8s-why", WHY_SCHEMA, about_a_pod()),
+        ("k8s-condition", CONDITION_SCHEMA, about_a_pod()),
+    ] {
+        let records = completed(&plugin, target, schema, &extra).await;
+        assert!(!records.is_empty(), "`{target}` answered nothing");
+        for record in &records {
+            assert_eq!(
+                record.provenance().provider(),
+                format!("plugin:{PACKAGE}"),
+                "provenance is the host's stamp; a package cannot claim another source (§31.80)"
+            );
+        }
+    }
     plugin.shutdown(ShutdownReason::Unload).await;
 }

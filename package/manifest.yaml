@@ -38,6 +38,19 @@ capabilities:
     # endpoint comes from whichever kubeconfig context the operator chose, so the scope is
     # granted per instance by the operator rather than declared here (§27.2 of the generic
     # provider contract allows a broader but still bounded grant for dynamic endpoints).
+    #
+    # **This is also the capability the two mutating commands declare, and it is the only honest
+    # one available.** Everything `set k8s-resource` and `remove k8s-resource` do to a cluster
+    # travels as bytes through this grant, and its scope — the host and the port of the API
+    # server — is the operator's decision about which cluster this package may reach at all
+    # (§51.2). KUANG/11 has no capability family for "change state in the external system a
+    # provider fronts": the twenty-nine of spec §31.16 gate *host* services, and a package
+    # carrying its own protocol over a brokered byte connection is invisible to the broker
+    # between a `GET` and a `PATCH`. The two families whose names come closest belong to other
+    # domains — `service.mutate` is scoped to service-manager units, `remote.mutate` to Ono
+    # links — and claiming either would put a scope on an operator's grant that nothing checks,
+    # which §31.16 forbids in as many words. Inventing one is not open either: an unknown
+    # capability id makes the whole manifest `package.invalid`. ADR-0024 records the finding.
     - network.connect
     # kubeconfig, read from the conventional path and nothing else. §27.3 forbids blanket
     # filesystem access merely to read provider configuration.
@@ -53,5 +66,11 @@ network:
   outbound: brokered
 
 contributions:
+  # A target is read; a command may write. The split is not cosmetic: a target contribution
+  # carries a name, a schema, a summary and an identity note and has nowhere to state a risk or a
+  # capability, while a command contribution states both and the host checks the capability at
+  # every invocation (spec §31.22, §31.75). So the two words that change a cluster are commands.
+  # ADR-0024.
+  commands: [contributions/commands.yaml]
   targets: [contributions/targets.yaml]
   schemas: [contributions/schemas.yaml]

@@ -20,12 +20,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ono_provider_kubernetes::condition;
+use ono_provider_kubernetes::causal::{Finding, Support, Why};
+use ono_provider_kubernetes::condition::{self, Condition};
 use ono_provider_kubernetes::discovery::Resource;
+use ono_provider_kubernetes::events::Event;
+use ono_provider_kubernetes::evidence::{IdentityEvidence, NodeEvidence, Unobserved, key};
+use ono_provider_kubernetes::logs::{LineText, LogLine, Retrieved};
 use ono_provider_kubernetes::object::{Object, OwnerReference};
 use ono_provider_kubernetes::place::Place;
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::relationship::{Edge, Relation};
+use ono_provider_kubernetes::temporal::{ClockSource, Observation, Timeline};
 use ono_provider_kubernetes::transport::{EndpointCategory, Freshness, Origin};
 use ono_provider_kubernetes::workload::{Endpoint as WorkloadEndpoint, Workload};
 use ono_value::{ErrorValue, MapValue, Provenance, RecordValue, Schema, Value, builtin_schemas};
@@ -282,6 +287,476 @@ pub fn change_record(
         builder = builder.set(field.name, value)?;
     }
     Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// Builds one record of one Kubernetes Event (§38).
+///
+/// The Event's own metadata goes through the projection every other schema uses, because an Event
+/// *is* an object (ADR-0013). What this adds is what §38 asks to survive: which representation it
+/// was read from, who reported it, what it regards, and the *count* — as a count, on one record,
+/// with `aggregate` saying that one record stands for more than one occurrence. There is no route
+/// from here that turns 47 into 47 records.
+///
+/// Every time on the record is a string beside a `clock`. A timestamp field would be sortable,
+/// and a set of Events sorted by time reads as a history it is not (§38.1, §39.2).
+///
+/// # Errors
+///
+/// [`ErrorValue`] when a field name is not one the schema declares — a drift between this crate's
+/// table and the schema built from it, never something a cluster can cause.
+pub fn event_record(
+    target: &Target,
+    schema: &Arc<Schema>,
+    guarded: &Guarded,
+    event: &Event,
+    regarding: Option<&Place>,
+    freshness: &Freshness,
+) -> Result<Value, ErrorValue> {
+    let occurrences = event.occurrences();
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    for field in target.fields {
+        let value = match field.name {
+            "representation" => Value::String(event.representation().as_str().into()),
+
+            // --- what the reporter said, as evidence and never as machine semantics (§38.5) ---
+            "level" => Value::String(event.level().as_str().into()),
+            "reason" => text(event.reason()),
+            "note" => text(event.note()),
+            "action" => text(event.action()),
+
+            // --- what it is about (§38.3) ---
+            "regarding" => regarding.map_or(Value::Null, |place| {
+                Value::String(place.uri().to_string().into())
+            }),
+            "regarding_kind" => text(
+                event
+                    .regarding()
+                    .map(ono_provider_kubernetes::relationship::Target::kind),
+            ),
+            "regarding_name" => text(
+                event
+                    .regarding()
+                    .map(ono_provider_kubernetes::relationship::Target::name),
+            ),
+            "regarding_namespace" => text(
+                event
+                    .regarding()
+                    .and_then(ono_provider_kubernetes::relationship::Target::namespace),
+            ),
+            "regarding_uid" => text(
+                event
+                    .regarding()
+                    .and_then(ono_provider_kubernetes::relationship::Target::uid),
+            ),
+            "related" => text(
+                event
+                    .related()
+                    .map(|target| format!("{}/{}", target.kind(), target.name()))
+                    .as_deref(),
+            ),
+
+            // --- who said it, and from where (§38.3) ---
+            "reporting_controller" => text(event.reporter().controller()),
+            "reporting_instance" => text(event.reporter().instance()),
+
+            // --- when, on whose clock (§39.1) ---
+            "event_time" => text(event.event_time()),
+            "clock" => Value::String(event_clock(event).to_string().into()),
+
+            // --- how often, as a count (§38.4) ---
+            "aggregate" => Value::Bool(occurrences.is_aggregate()),
+            "recorded_count" => count(occurrences.recorded_count()),
+            "series_count" => count(occurrences.series_count()),
+            "series_last_observed" => text(occurrences.series_last_observed()),
+            "first_seen" => text(occurrences.first_seen()),
+            "last_seen" => text(occurrences.last_seen()),
+
+            name => field_value(name, guarded),
+        };
+        builder = builder.set(field.name, value)?;
+    }
+    Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// Which machine's clock wrote an Event's `eventTime` (§38.3, §39.1).
+///
+/// The reporting controller where the Event names one, and [`ClockSource::Unattributed`] where it
+/// does not — never this provider's clock, which never saw the occurrence.
+fn event_clock(event: &Event) -> ClockSource {
+    event
+        .reporter()
+        .controller()
+        .map_or(ClockSource::Unattributed, |controller| {
+            ClockSource::Reporter(controller.to_owned())
+        })
+}
+
+/// One row of a Node's exported evidence: a value that was read, or a key that was not (§47).
+pub enum Exported<'a> {
+    /// A value the Node states, with where it was read and how far it goes.
+    Observed(&'a IdentityEvidence),
+    /// A key that could not be read, and whether that is about the cluster or about the read.
+    Unobserved(&'a Unobserved),
+}
+
+/// Builds one record of one exported identity fact (§28.3–§28.5, §47, ADR-0016).
+///
+/// **Nothing built here presents a match.** The record carries what the API server stated, the
+/// pointer it stated it at, the evidence class and the strength — and there is no field for a
+/// foreign resource, because this provider has read Kubernetes and nothing else (§47.1). §28.4's
+/// whole permitted decomposition is `uri_scheme` and `uri_path`; no segment is labelled, because
+/// labelling one is the vendor policy §28.4 forbids arriving one match arm at a time.
+///
+/// # Errors
+///
+/// [`ErrorValue`] when a field name is not one the schema declares — a drift between this crate's
+/// table and the schema built from it, never something a cluster can cause.
+pub fn evidence_record(
+    target: &Target,
+    schema: &Arc<Schema>,
+    here: &Place,
+    node: &Guarded,
+    evidence: &NodeEvidence,
+    exported: &Exported<'_>,
+    freshness: &Freshness,
+) -> Result<Value, ErrorValue> {
+    let item = match exported {
+        Exported::Observed(item) => Some(*item),
+        Exported::Unobserved(_) => None,
+    };
+    // §28.4's decomposition belongs to the one key that is a URI-shaped identifier, and to no
+    // other. An address decomposed as a URI would be a shape nobody stated.
+    let shape = item
+        .filter(|item| item.key() == key::PROVIDER_ID)
+        .and_then(|_| evidence.provider_id())
+        .and_then(ono_provider_kubernetes::evidence::ProviderId::shape);
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    for field in target.fields {
+        let value = match field.name {
+            "subject" => Value::String(here.uri().to_string().into()),
+
+            // --- what kind of fact, and what it held ---
+            "key" => Value::String(
+                match exported {
+                    Exported::Observed(item) => item.key(),
+                    Exported::Unobserved(gap) => gap.key(),
+                }
+                .into(),
+            ),
+            "qualifier" => text(item.and_then(IdentityEvidence::qualifier)),
+            "value" => text(item.map(IdentityEvidence::value)),
+            "source" => text(item.map(IdentityEvidence::source)),
+
+            // --- how far it goes (§47.2) ---
+            "strength" => item.map_or(Value::Null, |item| {
+                Value::String(item.strength().as_str().into())
+            }),
+            "evidence_class" => item.map_or(Value::Null, |item| {
+                Value::String(item.evidence().class().into())
+            }),
+            "evidence" => item.map_or(Value::Null, |item| {
+                Value::String(item.evidence().describe().into())
+            }),
+            "asserted" => item.map_or(Value::Null, |item| {
+                Value::Bool(item.evidence().is_asserted_by_provider())
+            }),
+            "lookup_key" => item.map_or(Value::Null, |item| Value::Bool(item.is_lookup_key())),
+
+            // --- §28.4, as far as it goes and no further ---
+            "uri_scheme" => text(shape.map(ono_provider_kubernetes::evidence::UriShape::scheme)),
+            "uri_path" => text(shape.map(ono_provider_kubernetes::evidence::UriShape::path)),
+
+            // --- or a key nobody read, which is not a machine with nothing to say (§4 inv. 13) ---
+            "observed" => Value::Bool(item.is_some()),
+            "outcome" => match exported {
+                Exported::Observed(_) => Value::Null,
+                Exported::Unobserved(gap) => Value::String(gap.outcome().as_str().into()),
+            },
+
+            name => field_value(name, node),
+        };
+        builder = builder.set(field.name, value)?;
+    }
+    Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// One line of a retrieved log, with what the retrieval as a whole was (§42.1).
+pub struct Line<'a> {
+    /// The Pod the log was read from, for the metadata every record here shares.
+    pub pod: &'a Guarded,
+    /// What was read, what from, and everything that was cut off first.
+    pub retrieved: &'a Retrieved,
+    /// This line.
+    pub line: &'a LogLine,
+    /// Which line of this retrieval it is, counting from one.
+    pub ordinal: usize,
+    /// The clock that wrote the line's timestamp prefix, where the server wrote one.
+    pub clock: &'a ClockSource,
+}
+
+/// Builds one record of one log line (§42.1, §42.2).
+///
+/// **`bounds` is on every record and is never empty.** The container runtime rotated and
+/// truncated this log before anybody asked, so the answer is short of the container's output
+/// whatever the request said — and a record that omitted the bounds would imply completeness by
+/// saying nothing, which is the reading §42.1 exists to prevent.
+///
+/// # Errors
+///
+/// [`ErrorValue`] when a field name is not one the schema declares — a drift between this crate's
+/// table and the schema built from it, never something a cluster can cause.
+pub fn log_record(
+    target: &Target,
+    schema: &Arc<Schema>,
+    line: &Line<'_>,
+    freshness: &Freshness,
+) -> Result<Value, ErrorValue> {
+    let retrieved = line.retrieved;
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    for field in target.fields {
+        let value = match field.name {
+            "container" => text(retrieved.target().container()),
+            "instance" => Value::String(retrieved.instance().as_str().into()),
+
+            // --- the line, as bytes first and as text only where it is text ---
+            "line" => integer(i64::try_from(line.ordinal).unwrap_or(i64::MAX)),
+            "text" => match line.line.text() {
+                LineText::Utf8(text) => Value::String(text.into()),
+                LineText::NotUtf8 { .. } => Value::Null,
+            },
+            "bytes" => integer(i64::try_from(line.line.bytes().len()).unwrap_or(i64::MAX)),
+            "not_utf8_after" => match line.line.text() {
+                LineText::Utf8(_) => Value::Null,
+                LineText::NotUtf8 { valid_up_to } => {
+                    integer(i64::try_from(valid_up_to).unwrap_or(i64::MAX))
+                }
+            },
+            // A string beside its clock, never an instant: the prefix is the container runtime's
+            // time on the node, and parsing it would make it sortable against this provider's own
+            // observations (§39.2).
+            "stamp" => text(line.line.stamp()),
+            "clock" => Value::String(line.clock.to_string().into()),
+            "terminated" => Value::Bool(line.line.is_terminated()),
+
+            // --- and what this is not (§42.1) ---
+            "bounds" => Value::List(
+                retrieved
+                    .bounds()
+                    .iter()
+                    .map(|bound| Value::String(bound.describe().into()))
+                    .collect(),
+            ),
+            "ending" => Value::String(retrieved.ending().describe().into()),
+            "may_contain_secrets" => Value::Bool(retrieved.may_contain_secrets()),
+
+            name => field_value(name, line.pod),
+        };
+        builder = builder.set(field.name, value)?;
+    }
+    Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// Builds one record of one temporal observation, with the window it was made in (§39).
+///
+/// **The window and the gaps are on every record.** A stream of observations with the window on a
+/// summary somebody may not read is a stream a reader takes for a complete history, and §39.3 is
+/// precisely about the periods that are missing from one.
+///
+/// **`stamp` is a string and `clock` is beside it.** The two together are §39.2 as a record shape:
+/// there is no field a shell can sort into a cross-clock timeline, because the raw string of one
+/// clock and the raw string of another are not comparable and nothing here pretends they are.
+///
+/// # Errors
+///
+/// [`ErrorValue`] when a field name is not one the schema declares — a drift between this crate's
+/// table and the schema built from it, never something a cluster can cause.
+pub fn observation_record(
+    target: &Target,
+    schema: &Arc<Schema>,
+    subject: &Guarded,
+    observation: &Observation,
+    timeline: &Timeline,
+    freshness: &Freshness,
+) -> Result<Value, ErrorValue> {
+    let window = timeline.window();
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    for field in target.fields {
+        let value = match field.name {
+            // --- what kind of observation, and whose clock (§39.1, §39.2) ---
+            "basis" => Value::String(observation.basis().as_str().into()),
+            "source" => Value::String(observation.source().as_str().into()),
+            "clock" => Value::String(observation.stamp().source().to_string().into()),
+            "stamp" => Value::String(observation.stamp().raw().into()),
+            "placeable" => Value::Bool(observation.stamp().is_placeable()),
+            "detail" => Value::String(observation.detail().into()),
+
+            // --- the period it belongs to, and both kinds of hole in it (§19.4, §39.3, §21.4) ---
+            "window_opened" => instant(window.opened_at().unix_millis()),
+            "window_latest" => instant(window.latest_at().unix_millis()),
+            "continuous" => Value::Bool(timeline.is_continuous()),
+            "gaps" => Value::List(
+                timeline
+                    .gaps()
+                    .iter()
+                    .map(|gap| Value::String(gap.describe().into()))
+                    .collect(),
+            ),
+            "not_observed" => Value::List(
+                timeline
+                    .coverage()
+                    .gaps()
+                    .iter()
+                    .map(|gap| Value::String(gap.describe().into()))
+                    .collect(),
+            ),
+
+            name => field_value(name, subject),
+        };
+        builder = builder.set(field.name, value)?;
+    }
+    Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// Builds one record of one causal finding, and of the rung it stops at (§40).
+///
+/// **There is no field for a cause.** `claim` is one of five words, none of which says that one
+/// thing brought about another, and `claim_means` carries where the word stops — because a token
+/// on its own is read as strongly as its reader needs it to be. `strongest_claim` is the ceiling
+/// of the whole answer on every record, so a reader who sees one finding still sees the limit.
+///
+/// # Errors
+///
+/// [`ErrorValue`] when a field name is not one the schema declares — a drift between this crate's
+/// table and the schema built from it, never something a cluster can cause.
+pub fn finding_record(
+    target: &Target,
+    schema: &Arc<Schema>,
+    subject: &Guarded,
+    finding: &Finding,
+    why: &Why,
+    freshness: &Freshness,
+) -> Result<Value, ErrorValue> {
+    let support = finding.support();
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    for field in target.fields {
+        let value = match field.name {
+            "claim" => Value::String(finding.claim().as_str().into()),
+            "claim_means" => Value::String(finding.claim().means().into()),
+
+            "support_class" => Value::String(support_class(support).into()),
+            "support" => Value::String(support.describe().into()),
+            "not_proven" => match support {
+                Support::Nothing(unproven) => Value::String(unproven.as_str().into()),
+                Support::Sequence { .. } | Support::Path(_) | Support::Assertion { .. } => {
+                    Value::Null
+                }
+            },
+            // A distance exists only where one clock wrote both, which is why the two travel
+            // together and why both are null for everything else (§39.2).
+            "clock" => match support {
+                Support::Sequence { clock, .. } => Value::String(clock.to_string().into()),
+                _ => Value::Null,
+            },
+            "apart_ms" => match support {
+                Support::Sequence { apart_millis, .. } => {
+                    integer(i64::try_from(*apart_millis).unwrap_or(i64::MAX))
+                }
+                _ => Value::Null,
+            },
+            "evidence_class" => match support {
+                Support::Assertion { evidence, .. } => Value::String(evidence.class().into()),
+                _ => Value::Null,
+            },
+            "evidence_path" => match support {
+                Support::Assertion { evidence, .. } => text(evidence.path()),
+                _ => Value::Null,
+            },
+
+            // --- the ceiling, and what the search could not reach (§40.5, §21.4) ---
+            "strongest_claim" => Value::String(why.strongest_claim().as_str().into()),
+            "insufficient_evidence" => Value::Bool(why.is_insufficient()),
+            "not_observed" => Value::List(
+                why.coverage()
+                    .gaps()
+                    .iter()
+                    .map(|gap| Value::String(gap.describe().into()))
+                    .collect(),
+            ),
+
+            name => field_value(name, subject),
+        };
+        builder = builder.set(field.name, value)?;
+    }
+    Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// Which of the four shapes of support a finding rests on.
+///
+/// A word of its own rather than something a reader infers from which fields are null, because
+/// "no support" and "support this build did not render" would otherwise look the same.
+fn support_class(support: &Support) -> &'static str {
+    match support {
+        Support::Sequence { .. } => "sequence",
+        Support::Path(_) => "path",
+        Support::Assertion { .. } => "assertion",
+        Support::Nothing(_) => "nothing",
+    }
+}
+
+/// Builds one record of one condition (§37.1).
+///
+/// **`observedGeneration` arrives as a number and never as a verdict.** The only derived state on
+/// the record is the `reconciliation` map, which carries the rule that produced it and the fields
+/// that rule read, and whose `verified_convergence` key is true for exactly one of five states —
+/// never for `generation-observed-only`, which is what a matching `observedGeneration` on its own
+/// establishes (§37.3, §37.5).
+///
+/// # Errors
+///
+/// [`ErrorValue`] when a field name is not one the schema declares — a drift between this crate's
+/// table and the schema built from it, never something a cluster can cause.
+pub fn condition_record(
+    target: &Target,
+    schema: &Arc<Schema>,
+    subject: &Guarded,
+    condition: &Condition,
+    freshness: &Freshness,
+) -> Result<Value, ErrorValue> {
+    let object = subject.object();
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    for field in target.fields {
+        let value = match field.name {
+            "condition_type" => Value::String(condition.type_name().into()),
+            // The string the API carries. `True`, `False` and `Unknown` are three states, a
+            // controller may write a fourth, and a boolean has two (§37.2).
+            "status" => Value::String(condition.status().as_str().into()),
+            "reason" => text(condition.reason()),
+            "message" => text(condition.message()),
+            "observed_generation" => count_i64(condition.observed_generation()),
+            "generation" => count_i64(object.generation()),
+            "last_transition_time" => text(condition.last_transition_time()),
+            // `status.conditions` does not say which controller wrote the entry, so the clock is
+            // nobody's in particular and two conditions must not be ordered against each other.
+            "clock" => Value::String(ClockSource::Unattributed.to_string().into()),
+            "reconciliation" => reconciliation(object),
+
+            name => field_value(name, subject),
+        };
+        builder = builder.set(field.name, value)?;
+    }
+    Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// An unsigned count the object stated, or null where it stated none.
+fn count(value: Option<u64>) -> Value {
+    value.map_or(Value::Null, |count| {
+        integer(i64::try_from(count).unwrap_or(i64::MAX))
+    })
+}
+
+/// A signed count the object stated, or null where it stated none.
+fn count_i64(value: Option<i64>) -> Value {
+    value.map_or(Value::Null, integer)
 }
 
 /// The record's provenance, carrying what §17.1 requires a read to state about itself.

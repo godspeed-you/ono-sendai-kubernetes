@@ -1,0 +1,92 @@
+# The two words this package contributes that change a cluster (spec §31.22, §31.68).
+#
+# Read before any of this package's code runs, so that `set k8s-resource`, its help page, its
+# risk level and the capability it needs are answerable on a shell that has never loaded the
+# package — and so that the operator's decision about the grant can be made before the first
+# invocation rather than during it.
+#
+# **Why these are commands and everything else is a target.** A target contribution carries a
+# name, a schema, a summary and an identity note. It has nowhere to state a risk and nowhere to
+# state a capability, because everything a target answers is a read. A command contribution
+# carries both, and the host checks the capability at every invocation before the package's code
+# is reached at all. A mutation spelled as a target would therefore be a write with no declared
+# risk, reachable through `get` — which is §21.2 of the generic provider contract lost at the one
+# place it matters. ADR-0024.
+#
+# **The verbs are core's** (`docs/contracts/verbs.yaml`). §31.22 asks a package to reuse an
+# existing verb wherever the semantics allow, and both do: `set` is "modify properties or
+# configuration" and `remove` is "delete a resource or a membership", which are exactly §43.3's
+# bounded field change and its deletion. A `k8s-apply` would have been the first word of the
+# Kubernetes mini-shell §4 invariant 22 forbids.
+#
+# **The noun is the one `get k8s-resource` already reads.** One word for a kind, read by one verb
+# and written by another. Nothing is reachable here that `get` could not already show, and a
+# curated noun — `k8s-deployment` and the rest — is still the better *read* of the same object.
+#
+# **`network.connect` is the capability, and the manifest says why it is the only honest one.**
+# The KUANG/11 families gate host services; there is none for "change state in the external
+# system a provider fronts", and the near misses carry scope keys that belong to other domains.
+#
+# **Every invocation asks for a server dry run unless it is told otherwise.** `dry_run` defaults
+# to true (§44.5), so the shortest sentence a user can write predicts rather than writes, and
+# what comes back is labelled a provider-native dry run rather than an observation (§21.4 of the
+# generic provider contract).
+#
+# **Options, which a command contribution has nowhere to declare either.** As for the targets,
+# the wire shape is closed, so they are documented here and in each summary:
+#
+#   context, kubeconfig, host, port   which cluster, exactly as every target takes them
+#   namespace                         the namespace the object is in (§7.5)
+#   kind, group, version, resource    which resource, resolved against discovery (ADR-0010)
+#   name                              the object. Required: a change is aimed at one object
+#                                     resolved to a stable identity before it is made (§21.3 of
+#                                     the generic provider contract)
+#   dry_run                           default true. `false` writes
+#   set                               `set k8s-resource` only: a mapping from a JSON pointer to
+#                                     the value the field should hold
+#   unset                             `set k8s-resource` only: a pointer, or a list of them,
+#                                     whose fields the apply gives up rather than sets (§44.1)
+#   field_manager                     `set k8s-resource` only: the name ownership is recorded
+#                                     under, default `ono-sendai` (§44.2)
+#   force_because                     `set k8s-resource` only: the reason ownership is taken from
+#                                     a conflicting manager. There is deliberately no `force`
+#                                     flag — forcing is a sentence somebody wrote, and a
+#                                     conflict without one is an answer rather than a retry
+#                                     (§44.3, §44.4)
+#   propagation                       `remove k8s-resource` only: `Foreground`, `Background` or
+#                                     `Orphan`, default `Background` (§45.2)
+#
+# There is deliberately **no `resource_version` and no `uid` option**. §56's preconditions come
+# from the object that was read, and an option by which a caller could type one would let a
+# change be aimed at an object nobody looked at — which is the failure the preconditions exist to
+# prevent (ADR-0019).
+
+commands:
+  - id: io.github.godspeed-you.kubernetes.command.set-k8s-resource
+    verb: set
+    target: k8s-resource
+    summary: "Apply a bounded field change to one Kubernetes object, as a server dry run unless `dry_run false` is given (specification sections 43.3, 44)."
+    output: stream<io.github.godspeed-you.kubernetes.mutation/1>
+    capabilities: [network.connect]
+    argument_mode: words
+    risk: mutate
+    examples:
+      - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/replicas\": 2}'"
+      - "set k8s-resource --context prod --kind Deployment --name api --set '{\"/spec/replicas\": 2}' --dry-run false"
+
+  # `destructive` rather than `mutate`: §45.1 and §45.5 are a list of the ways a deletion reaches
+  # things this provider cannot get back, and `risk_levels` in core's `capabilities.yaml` defines
+  # `destructive` as exactly "may cause irreversible loss". The host applies its own confirmation
+  # policy to that descriptor (§21.5 of the generic provider contract); this package prompts for
+  # nothing of its own.
+  - id: io.github.godspeed-you.kubernetes.command.remove-k8s-resource
+    verb: remove
+    target: k8s-resource
+    summary: "Delete one Kubernetes object, as a server dry run unless `dry_run false` is given (specification section 45)."
+    output: stream<io.github.godspeed-you.kubernetes.mutation/1>
+    capabilities: [network.connect]
+    argument_mode: words
+    risk: destructive
+    examples:
+      - "remove k8s-resource --context prod --kind ConfigMap --name stale"
+      - "remove k8s-resource --context prod --kind ConfigMap --name stale --dry-run false"

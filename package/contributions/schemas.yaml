@@ -2639,6 +2639,868 @@ schemas:
     default_view:
       columns: [change, segment, continuous, kind, name, resource_version, gap_reason]
 
+  - id: io.github.godspeed-you.kubernetes.event/1
+    name: KubernetesEvent
+    summary: >-
+      One Kubernetes Event: what a component reported, about what, and how many times the server
+      recorded it.
+    identity: [uid]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` of the *Event object* (§16.1). An Event is a resource like any other, and
+          this is its own lifetime identity rather than that of whatever it is about — which is
+          `regarding_uid`, one field down.
+      name:
+        type: string
+        required: true
+        doc: >-
+          `metadata.name` of the Event object, which the API server generates. A locator, never an
+          identity (§16.2).
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace`. Null only for an object the server sent without one (§9.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion`.'
+      kind:
+        type: string
+        required: true
+        doc: '`kind`.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: '`metadata.resourceVersion`, opaque (§14.3).'
+      created:
+        type: timestamp
+        nullable: true
+        doc: >-
+          `metadata.creationTimestamp` of the Event object — when the API server accepted the
+          record, not when the reporter observed what it describes. That is `event_time`, on a
+          different clock (§39.1).
+      labels:
+        type: map
+        nullable: true
+        doc: '`metadata.labels`, whole — what a Service selector matches on.'
+      annotations:
+        type: map
+        nullable: true
+        doc: >-
+          `metadata.annotations`, whole and structured (§14.5). Null when the object carries
+          none. Never flattened into one string: an annotation is read one key at a time, and a
+          rendered blob is a different thing from a map with a key in it.
+      terminating:
+        type: bool
+        required: true
+        doc: >-
+          Whether deletion of the Event object was accepted and has not completed. Ordinary object
+          metadata: an Event is a resource, and it is garbage-collected like one when its
+          retention runs out (§38.1).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          `metadata.finalizers` (§14.6) — what is holding a deletion open. An object that is
+          `terminating` and lists finalizers is held by something namable rather than being
+          slow, which is the half of Gate H a user could not see before. Null when the object
+          states none.
+      owner_references:
+        type: list<map>
+        nullable: true
+        doc: >-
+          `metadata.ownerReferences`, each whole: `api_version`, `kind`, `name`, `uid`,
+          `controller` and `block_owner_deletion` (§14.6). A list of names would drop the two
+          flags that make a reference more than a name. The same fact `k8s-relation` emits as
+          `owned-by` and `controlled-by` edges, here as metadata of the object itself.
+      field_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The distinct managers named in `metadata.managedFields`, sorted — §14.7's summary
+          rather than the record itself, which is large and rarely what anyone wants. The
+          structure stays reachable through `k8s-resource`, which projects the whole object.
+      representation:
+        type: enum
+        values: [events.k8s.io, core]
+        required: true
+        doc: >-
+          Which of §38.2's two representations this Event was read from — `events.k8s.io`, which
+          §38.2 prefers, or the core group's, which a cluster inside the support window of §5.1
+          may be the only thing serving. The newer group renamed almost every field, so a provider
+          that knew one spelling would report a blank Event from half the clusters it can talk to.
+      level:
+        type: string
+        required: true
+        doc: >-
+          The Event's `type`, as the API wrote it. `Normal` and `Warning` are documented upstream;
+          anything else is preserved rather than folded into the routine one, and an Event with no
+          `type` at all reads `unstated` — which is not the same as routine (§12.5).
+      reason:
+        type: string
+        nullable: true
+        doc: >-
+          The machine-readable `reason`, carried as evidence and never as machine semantics.
+          Upstream warns that reasons and messages evolve, so code that branches on one is an
+          unversioned dependency that stops matching without failing — the branch simply stops
+          being taken (§38.5). A curated adapter is where a stable meaning may be attached to one
+          (§33.8).
+      note:
+        type: string
+        nullable: true
+        doc: >-
+          The human-readable note — `note` in the newer representation, `message` in the core one.
+          Evidence for a reader, on the same terms as `reason` (§38.5).
+      action:
+        type: string
+        nullable: true
+        doc: >-
+          The action the reporter took or attempted, where it stated one.
+      regarding:
+        type: string
+        nullable: true
+        doc: >-
+          What the Event is about, as a place address in the grammar `k8s-relation` uses (§35.4,
+          ADR-0008). Null where the reference does not name something completely enough to look
+          up: such an Event is still an observation and is still kept, because dropping it for
+          being unattachable would delete evidence for tidiness (§38.3).
+      regarding_kind:
+        type: string
+        nullable: true
+        doc: >-
+          The kind the Event's `regarding` — or the core representation's `involvedObject` —
+          names. Half of a GVK, never a GVR (§13.1).
+      regarding_name:
+        type: string
+        nullable: true
+        doc: >-
+          The name that reference carries. A locator, never an identity (§16.2).
+      regarding_namespace:
+        type: string
+        nullable: true
+        doc: >-
+          The namespace that reference carries, and null for a cluster-scoped object, which has no
+          namespace rather than an empty one (§9.2).
+      regarding_uid:
+        type: string
+        nullable: true
+        doc: >-
+          The `metadata.uid` that reference carries, where the reporter wrote one. This is what
+          attaches the Event to a *lifetime*: a Pod deleted and recreated under one name is two
+          Pods, and the old one's Events are about decisions the new one never saw (§4 invariants
+          4–5).
+      related:
+        type: string
+        nullable: true
+        doc: >-
+          The secondary object the newer representation mentions, as `Kind/name`. Null in the core
+          representation, which has no such field.
+      reporting_controller:
+        type: string
+        nullable: true
+        doc: >-
+          The controller that reported it (§38.3). "The kubelet said it" and "the scheduler said
+          it" are different claims about the same object, and an Event stripped of its reporter is
+          an anonymous assertion.
+      reporting_instance:
+        type: string
+        nullable: true
+        doc: >-
+          Which instance of that controller reported it. Beside the controller rather than folded
+          into it, because one controller runs in several places and only one of them saw this.
+      event_time:
+        type: string
+        nullable: true
+        doc: >-
+          When the reporter observed *this* occurrence, as the string the API carries.
+          Deliberately not a timestamp: a timestamp field is one a shell sorts, and these come
+          from the clocks of the components that reported them. An ordering assembled over them
+          would read as a causal history while being an artefact of three unrelated accidents —
+          those clocks, unordered delivery, and retention that has already discarded part of what
+          happened (§38.1, §39.2).
+      clock:
+        type: string
+        required: true
+        doc: >-
+          Which machine's clock wrote `event_time`: `reported-by/<controller>` where the Event
+          names its reporter, and `unattributed` where it does not. Never this provider's clock,
+          which never saw the occurrence. Two records whose clocks differ are not in any order at
+          all (§39.2).
+      aggregate:
+        type: bool
+        required: true
+        doc: >-
+          Whether this one record stands for more than one occurrence. True where the server
+          recorded a count above one or a series. It is a flag rather than an invitation: there is
+          no expansion here and none in the library, because Kubernetes aggregates precisely so
+          that the individual occurrences need not be stored (§38.4).
+      recorded_count:
+        type: int
+        nullable: true
+        doc: >-
+          How many occurrences the server recorded, from whichever of its two mechanisms recorded
+          it. **One record carries this number; the occurrences are never expanded into records.**
+          Forty-six of forty-seven aggregated failures were never observed individually, and
+          manufacturing them would produce records a reader could not tell from observed ones
+          (§38.4). Null where the server recorded no count.
+      series_count:
+        type: int
+        nullable: true
+        doc: >-
+          The count of an ongoing series, where the Event is one. Held apart from `recorded_count`
+          because the two upstream mechanisms mean different things — a total that has stopped
+          moving, against a series still running — and collapsing them would lose which of the two
+          this is (§38.4).
+      series_last_observed:
+        type: string
+        nullable: true
+        doc: >-
+          When the series was last observed continuing, as the string the API carries. A string
+          for the same reason `event_time` is one.
+      first_seen:
+        type: string
+        nullable: true
+        doc: >-
+          The first occurrence the server timestamped, where it timestamped one. Never filled in
+          from `eventTime`: that is when the reporter saw *this* occurrence, and copying it here
+          to complete a rendering would state a beginning nobody recorded (§38.4).
+      last_seen:
+        type: string
+        nullable: true
+        doc: >-
+          The last occurrence the server timestamped, where it timestamped one.
+    default_view:
+      columns: [level, reason, regarding_kind, regarding_name, recorded_count, reporting_controller, note]
+  - id: io.github.godspeed-you.kubernetes.evidence/1
+    name: KubernetesIdentityEvidence
+    summary: >-
+      One value a Node states about the machine underneath it, with where it was read and how far
+      it goes — never a link to another system.
+    identity: [uid, key, source]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` of the Node this is evidence about (§16.1). The evidence attaches to a
+          *lifetime*: a Node rebuilt under the same name is a different machine, and evidence that
+          outlived the rebuild would point a resolver at hardware that is gone (§4 invariants
+          4–5).
+      name:
+        type: string
+        required: true
+        doc: >-
+          `metadata.name` of the Node. A locator, never an identity (§16.2).
+      api_version:
+        type: string
+        required: true
+        doc: >-
+          `apiVersion` of the Node.
+      kind:
+        type: string
+        required: true
+        doc: >-
+          `kind` of the Node, as the server spells it.
+      subject:
+        type: string
+        required: true
+        doc: >-
+          The Node as a place address, in the grammar every other address in this document uses
+          (§35.4, ADR-0008).
+      key:
+        type: string
+        required: true
+        doc: >-
+          What kind of fact this is, under the key Appendix C.3 fixes — `kubernetes.node.provider-
+          id`, `kubernetes.node.address`, `kubernetes.node.system-uuid`, `kubernetes.node.machine-
+          id`, and the placement keys of §28.3. A spelling a resolver written against the document
+          can look for.
+      qualifier:
+        type: string
+        nullable: true
+        doc: >-
+          What narrows the key: the address type for an address (§28.5). Carried beside the value
+          rather than folded into it, because a resolver matching an internal address against a
+          public inventory is precisely the mistake the type information prevents. Null where the
+          key already says everything.
+      value:
+        type: string
+        nullable: true
+        doc: >-
+          The value, exactly as the field held it. Null for a key that was not read, where
+          `observed` is false and `outcome` says why.
+      source:
+        type: string
+        nullable: true
+        doc: >-
+          The JSON pointer this was read from, resolvable against the Node it came from — a
+          citation a reader can check rather than a field name they have to trust (§47.7). Null
+          for a key that was not read.
+      strength:
+        type: enum
+        values: [distinguishing, correlating, placement]
+        nullable: true
+        doc: >-
+          How far this value narrows the subject down, in §47.2's ranking. `distinguishing` is a
+          field whose purpose is to name one thing in the system that assigned it; `correlating`
+          is a value equal across unrelated things, reassigned while the thing lives, or copied
+          when a machine is cloned; `placement` is a property of where the subject sits rather
+          than of which thing it is, and a thousand machines share a zone (§28.3, §28.5). Null for
+          a key that was not read: strength is how far a *value* goes, and there is no value.
+      evidence_class:
+        type: enum
+        values: [native-field, owner-reference, selector, convention, adapter-derivation, inference]
+        nullable: true
+        doc: >-
+          What class of thing this rests on, in the vocabulary §23 already defines rather than a
+          second one — a field the server states, or a naming convention somebody with write
+          access can change. Deliberately never `inference`: an inference wearing this provider's
+          authority is what §4 invariant 20 forbids.
+      evidence:
+        type: string
+        nullable: true
+        doc: >-
+          What was read and what it held, in the same rendering an edge's evidence carries
+          (ADR-0013).
+      asserted:
+        type: bool
+        nullable: true
+        doc: >-
+          Whether the API server states this or a convention supplies it (§23.3). A well-known
+          label is written by a controller and anyone with write access can change it, which is
+          weaker than a field the server owns and must render as weaker.
+      lookup_key:
+        type: bool
+        nullable: true
+        doc: >-
+          Whether a resolver that has read another system may key a lookup on this value **alone**
+          (§47.2). False for every address and every copied host identifier: private ranges repeat
+          between clusters, a public address outlives the machine that held it, a hostname is
+          assigned rather than owned, and an identifier baked into a disk image is shared by every
+          machine built from it (§28.5). Note what neither answer says — that a match *is* a
+          verified link. Matching happens against a system this provider has not read, and there
+          is no field on this record for the result (§47.1).
+      uri_scheme:
+        type: string
+        nullable: true
+        doc: >-
+          The scheme of a URI-shaped identifier, where the identifier is one. This and `uri_path`
+          are the whole decomposition §28.4 permits: this provider knows that `://` separates a
+          scheme from a path and that `/` separates path segments, and it labels no segment. A
+          resolver that has read the other system knows what the segments mean, and that is where
+          the knowledge belongs (§47.1, Gate K).
+      uri_path:
+        type: string
+        nullable: true
+        doc: >-
+          The path under the scheme, undivided and unlabelled. Null for every key that is not a
+          URI-shaped identifier.
+      observed:
+        type: bool
+        required: true
+        doc: >-
+          Whether this record is a value the Node stated or a key that could not be read. False
+          makes `value`, `source`, `strength` and the rest null and fills `outcome` — because a
+          rendering that dropped the unread keys would read as "this Node has no cross-system
+          identity" when it means "nobody asked" (§4 invariant 13, §47.7).
+      outcome:
+        type: string
+        nullable: true
+        doc: >-
+          Why the key is not here, in §21.4's vocabulary: `absent` where the stanza came back
+          without the field, `not queried` where nobody projected the stanza at all. Null where
+          the value was observed.
+    default_view:
+      columns: [name, key, qualifier, value, strength, lookup_key, source, observed, outcome]
+  - id: io.github.godspeed-you.kubernetes.log/1
+    name: KubernetesLogLine
+    summary: >-
+      One line of a container's log, with everything that kept the read short of what the
+      container wrote.
+    identity: [uid, container, instance, line]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` of the Pod the log was read from (§16.1). A Pod deleted and recreated
+          under one name is two containers, and their outputs are not one log (§4 invariants 4–5).
+      name:
+        type: string
+        required: true
+        doc: >-
+          `metadata.name` of the Pod. A locator, never an identity (§16.2).
+      namespace:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.namespace` of the Pod. A Pod name is unique within a namespace of one cluster
+          and nowhere else, and a line attributed to the identically named Pod elsewhere is the
+          most expensive kind of wrong (§42.1).
+      api_version:
+        type: string
+        required: true
+        doc: >-
+          `apiVersion` of the Pod.
+      kind:
+        type: string
+        required: true
+        doc: >-
+          `kind` of the Pod, as the server spells it.
+      container:
+        type: string
+        nullable: true
+        doc: >-
+          Which container, where the query named one. Null where it did not and the API server
+          chose — a Pod with one container, in practice (§42.1).
+      instance:
+        type: enum
+        values: [current, previous]
+        required: true
+        doc: >-
+          Which run of the container this is: the one running now, or the one prior run the
+          kubelet still retains. Two values and no third, because `previous` reaches exactly that
+          one run and an ordinal selector would name runs the cluster cannot produce (§42.1).
+      line:
+        type: int
+        required: true
+        doc: >-
+          Which line of *this read* it is, counting from one. Not a line number in the container's
+          output: what came before the first line here was cut off by `bounds`, and numbering from
+          the container's own beginning would claim a beginning nobody read.
+      text:
+        type: string
+        nullable: true
+        doc: >-
+          The line as text, where its bytes are UTF-8. Null where they are not, and
+          `not_utf8_after` then says how far decoding got. Never a lossy conversion: substituting
+          U+FFFD hands back something that reads like the container's output and is not it, with
+          nothing downstream able to tell that a substitution happened (§12.5).
+      bytes:
+        type: int
+        required: true
+        doc: >-
+          How many bytes the container wrote on this line, without the newline and without any
+          timestamp prefix. Known whether or not the bytes are text.
+      not_utf8_after:
+        type: int
+        nullable: true
+        doc: >-
+          How many leading bytes of the line were valid UTF-8, where the line is not text. Null
+          where it is.
+      stamp:
+        type: string
+        nullable: true
+        doc: >-
+          The timestamp the API server prefixed, where `timestamps` was asked for. Kept as the
+          string it arrived as and deliberately not parsed: it is the container runtime's clock,
+          on the node, and comparing it with this provider's observations or with another node's
+          would be the cross-clock timeline §39.2 forbids.
+      clock:
+        type: string
+        required: true
+        doc: >-
+          Which machine's clock wrote `stamp`: `node/<name>` where the Pod states the node it runs
+          on, `unattributed` where it does not. The prefix is written on the node rather than by
+          the API server, and a reader who does not know that will compare it with something it is
+          not comparable with (§39.1, §42.1).
+      terminated:
+        type: bool
+        required: true
+        doc: >-
+          Whether the server sent the newline that ends this line. False for the remainder of a
+          body that stopped mid-line — presenting that remainder as a line would show half a
+          message as one the container finished writing.
+      bounds:
+        type: list<string>
+        required: true
+        doc: >-
+          Everything that kept this read short of what the container wrote. **Never empty.** `the
+          container runtime rotated and truncated this log before it was read` is in every list,
+          because rotation and truncation happened in the runtime before anybody asked;
+          `tailLines`, `sinceSeconds` and `limitBytes` each add their own entry where the query
+          set one. A log is not the container's complete output, and a record that omitted this
+          would imply completeness by saying nothing (§42.1).
+      ending:
+        type: string
+        required: true
+        doc: >-
+          Why the lines stopped: the response body ended, the read was cancelled, or the stream
+          failed. A body that ended is a statement about the response and not about the container.
+      may_contain_secrets:
+        type: bool
+        required: true
+        doc: >-
+          Whether the shell must treat these bytes as possibly secret. Always true, and not a scan
+          of the content: whether a log carries a credential is not decidable from the log — the
+          secret may be base64, a fragment across two lines, or a URL with a token in its query —
+          and a field that sometimes answered false would be a filter that is wrong exactly when
+          it matters (§42.2).
+    default_view:
+      columns: [line, stamp, text, container, instance, bounds]
+  - id: io.github.godspeed-you.kubernetes.timeline/1
+    name: KubernetesObservation
+    summary: >-
+      One thing known to have a time attached, the clock that wrote it, and the window this
+      provider was observing in.
+    identity: [uid, source, clock, stamp, detail]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` of the object the observation is about (§16.1).
+      name:
+        type: string
+        required: true
+        doc: >-
+          `metadata.name` of that object. A locator, never an identity (§16.2).
+      namespace:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.namespace` of that object, and null for a cluster-scoped one (§9.2).
+      api_version:
+        type: string
+        required: true
+        doc: >-
+          `apiVersion` of that object.
+      kind:
+        type: string
+        required: true
+        doc: >-
+          `kind` of that object, as the server spells it.
+      basis:
+        type: enum
+        values: [observed, reported]
+        required: true
+        doc: >-
+          Whether this provider *saw* the change happen or *read* a timestamp off state (§39.2).
+          Only a watch event within an unbroken observation period is `observed`; everything a
+          read produces is `reported`. This is the distinction that stops a provider manufacturing
+          history: a Pod created at 08:00 and first read at 14:00 is a reported creation timestamp
+          and not six hours of observation.
+      source:
+        type: enum
+        values: [watch-event, resource-snapshot, event-record, object-metadata, condition-transition, managed-field]
+        required: true
+        doc: >-
+          Where the observation came from, in §39.1's list: a watch event, a list or get that
+          captured state at a moment, a Kubernetes Event, object metadata, a condition transition,
+          or a `managedFields` entry. `watch-event` is the only one whose basis is `observed`.
+      clock:
+        type: string
+        required: true
+        doc: >-
+          Which machine's clock wrote `stamp`: `provider` for this machine's own acquisition time,
+          `api-server`, `reported-by/<controller>`, `node/<name>`, or `unattributed` where the
+          object does not say. Two stamps are comparable only when the same clock wrote both, and
+          `unattributed` is not comparable even with itself — some controller wrote it and the
+          object does not record which (§37.1, §39.2).
+      stamp:
+        type: string
+        required: true
+        doc: >-
+          The time, as the string the clock wrote it in. Deliberately not a timestamp: a timestamp
+          field is one a shell sorts into a single column, and parsing five machines' clocks into
+          one produces something that reads as a history of the cluster while being a picture of
+          the skew between those machines (§39.2). The only ordering this provider offers is per
+          clock, and it is reached by naming one.
+      placeable:
+        type: bool
+        required: true
+        doc: >-
+          Whether `stamp` reads as an instant on its clock at all. False where the value did not
+          parse, which is an answer — the observation still happened, and its time is unusable. An
+          unplaceable stamp is kept rather than dropped for tidiness, because discarding it would
+          lose both facts.
+      detail:
+        type: string
+        required: true
+        doc: >-
+          What was observed, in words: `created`, `deletion accepted`, a condition and its status,
+          the manager that applied a field set, or the Event's own one-line rendering.
+      window_opened:
+        type: timestamp
+        required: true
+        doc: >-
+          When this provider started observing, on its own clock — the only clock this machine
+          owns. A window opens when observation starts and never earlier, so an object created
+          last year and first read a moment ago has a window a moment wide (§39.2).
+      window_latest:
+        type: timestamp
+        required: true
+        doc: >-
+          The latest moment observation is known to have reached, on the same clock. Monotonic: a
+          clock that answers an earlier instant does not shorten a window whose observations were
+          still made.
+      continuous:
+        type: bool
+        required: true
+        doc: >-
+          Whether one unbroken stretch covers the window. False as soon as anything could not be
+          observed, and the reason is in `gaps`.
+      gaps:
+        type: list<string>
+        required: true
+        doc: >-
+          The stretches of time this provider could not observe, each naming the continuity token
+          it starts after, why observation stopped, and what is known about its length (§19.4,
+          §39.3). A duration comes from the provider's clock at both ends or from nowhere:
+          subtracting two `resourceVersion`s would be arithmetic on opaque strings (§14.3, §4
+          invariant 6). Empty where nothing broke — which is a statement, not a gap.
+      not_observed:
+        type: list<string>
+        required: true
+        doc: >-
+          The other kind of hole: scopes that were never readable, each naming a scope and one of
+          §21.4's outcomes. A namespace whose Events are denied is not a namespace in which
+          nothing was reported, and a continuous window over a denied scope is not a complete
+          answer. Empty where everything asked about answered.
+    default_view:
+      columns: [basis, source, clock, stamp, detail, continuous, gaps]
+  - id: io.github.godspeed-you.kubernetes.why/1
+    name: KubernetesFinding
+    summary: >-
+      One thing this provider is prepared to say about the state an object is in, and the rung
+      above which it will not climb.
+    identity: [uid, claim, support]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` of the object the finding is about (§16.1).
+      name:
+        type: string
+        required: true
+        doc: >-
+          `metadata.name` of that object. A locator, never an identity (§16.2).
+      namespace:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.namespace` of that object, and null for a cluster-scoped one (§9.2).
+      api_version:
+        type: string
+        required: true
+        doc: >-
+          `apiVersion` of that object.
+      kind:
+        type: string
+        required: true
+        doc: >-
+          `kind` of that object, as the server spells it.
+      claim:
+        type: enum
+        values: [CAUSALITY_NOT_PROVEN, CORRELATED_WITH, PRECEDED_BY, DEPENDENCY_PATH_EXISTS, ASSERTED_BY_KUBERNETES]
+        required: true
+        doc: >-
+          The strongest thing this provider is prepared to say about this link, in the five words
+          of §40's ladder and §11.3 of the Cloud-Native Vision. `CAUSALITY_NOT_PROVEN` — nothing
+          sufficient was found. `CORRELATED_WITH` — two observations on one clock, close together.
+          `PRECEDED_BY` — two observations on one clock, in an order. `DEPENDENCY_PATH_EXISTS` — a
+          relationship path connects them, so influence was possible. `ASSERTED_BY_KUBERNETES` —
+          the API server states the link itself (§23.4). **There is no sixth**, and its absence is
+          what makes every refusal here structural rather than a matter of who reviews the change.
+      claim_means:
+        type: string
+        required: true
+        doc: >-
+          What the claim licenses a reader to conclude, and where it stops — written into the
+          vocabulary rather than left to a renderer, because a token on its own is read as
+          strongly as its reader needs it to be. `CORRELATED_WITH` arrives with "one clock saw
+          both, close together; proximity is not a causal link".
+      support_class:
+        type: enum
+        values: [sequence, path, assertion, nothing]
+        required: true
+        doc: >-
+          Which of the four shapes the support takes: two observations one clock put a distance
+          between, a path of relationship edges, something the API server states, or nothing. A
+          word of its own rather than something a reader infers from which fields are null,
+          because "no support" and "support this build did not render" would otherwise look the
+          same.
+      support:
+        type: string
+        required: true
+        doc: >-
+          What was actually read to make the claim. A claim without its support is an opinion, and
+          Gate D's rule for relationships applies here for the same reason: an answer a user
+          cannot check is one they have to trust.
+      not_proven:
+        type: string
+        nullable: true
+        doc: >-
+          Why a finding established nothing, where it established nothing: different clocks wrote
+          the two timestamps, a timestamp could not be read, the two are further apart than the
+          window asked about, they are not in that order, no relationship path connects them,
+          Kubernetes states no such link, or nothing was gathered. A refusal that names its reason
+          is actionable where a bare "unknown" sends the reader back to guessing (§40.5). Null
+          where the finding established something.
+      clock:
+        type: string
+        nullable: true
+        doc: >-
+          The clock that wrote both timestamps, where the support is a distance. A distance needs
+          one clock, so this is never two: a `creationTimestamp` against this machine's
+          acquisition time yields `different clocks wrote the two timestamps` rather than a number
+          (§39.2). Null for every other kind of support.
+      apart_ms:
+        type: int
+        nullable: true
+        doc: >-
+          How far apart that one clock put the two observations, in milliseconds. Null for every
+          other kind of support, and null wherever no distance exists.
+      evidence_class:
+        type: enum
+        values: [native-field, owner-reference, selector, convention, adapter-derivation, inference]
+        nullable: true
+        doc: >-
+          The evidence class of what Kubernetes states, where the support is an assertion — the
+          same six-way vocabulary every relationship edge carries (§23, ADR-0013). Null for every
+          other kind of support.
+      evidence_path:
+        type: string
+        nullable: true
+        doc: >-
+          The JSON pointer the assertion rests on, where its class cites one. Null otherwise.
+      strongest_claim:
+        type: enum
+        values: [CAUSALITY_NOT_PROVEN, CORRELATED_WITH, PRECEDED_BY, DEPENDENCY_PATH_EXISTS, ASSERTED_BY_KUBERNETES]
+        required: true
+        doc: >-
+          The strongest claim any finding in this answer makes, carried on **every** record rather
+          than on a summary somebody may not read. It is the maximum of the ladder and never a
+          summation: three weak findings do not add up to a strong one, and a scoring function is
+          how they would.
+      insufficient_evidence:
+        type: bool
+        required: true
+        doc: >-
+          Whether §40.5's required conclusion is the honest one — true where nothing rose above
+          `CAUSALITY_NOT_PROVEN`. The specification calls this preferable to a plausible invented
+          explanation, and it is cheap to reach on purpose.
+      not_observed:
+        type: list<string>
+        required: true
+        doc: >-
+          What the search could not reach, each entry naming a scope and one of §21.4's outcomes.
+          "Nothing was found" over a denied namespace and "nothing was found" over a complete read
+          are different answers. Empty where everything asked about answered.
+    default_view:
+      columns: [claim, support, not_proven, strongest_claim, insufficient_evidence]
+  - id: io.github.godspeed-you.kubernetes.condition/1
+    name: KubernetesCondition
+    summary: >-
+      One condition a controller wrote about an object, kept structured rather than reduced to a
+      status word.
+    identity: [uid, condition_type]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` of the object the condition is about (§16.1).
+      name:
+        type: string
+        required: true
+        doc: >-
+          `metadata.name` of that object. A locator, never an identity (§16.2).
+      namespace:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.namespace` of that object, and null for a cluster-scoped one (§9.2).
+      api_version:
+        type: string
+        required: true
+        doc: >-
+          `apiVersion` of that object.
+      kind:
+        type: string
+        required: true
+        doc: >-
+          `kind` of that object, as the server spells it.
+      condition_type:
+        type: string
+        required: true
+        doc: >-
+          The condition's `type`, which is the kind's own vocabulary (§37.2). Spelled
+          `condition_type` rather than `type` because `kind` and `api_version` on this record
+          already mean the Kubernetes type, and one field name means one thing across this
+          document (ADR-0013).
+      status:
+        type: string
+        required: true
+        doc: >-
+          The condition's `status`, as the string the API carries. `True`, `False` and `Unknown`
+          are three states and a boolean has two — and a controller may write a fourth word this
+          provider has never seen, which §37.2 requires to survive rather than be coerced into
+          `false`. `Unknown` is a controller saying it does not know, which is not the same as
+          `False` (§37.1).
+      reason:
+        type: string
+        nullable: true
+        doc: >-
+          The machine-readable `reason`, where the controller gave one.
+      message:
+        type: string
+        nullable: true
+        doc: >-
+          The human-readable `message`, where the controller gave one. Both are kept because
+          reducing a condition to a green word throws away the only parts an operator can act on
+          (§4 invariant 9).
+      observed_generation:
+        type: int
+        nullable: true
+        doc: >-
+          The generation this observation was written about (§37.3). Absent rather than zero when
+          the controller wrote none: a defaulted `0` would read as "observed generation 0", a
+          claim the object never made. **On its own this is never a claim of health.** It is
+          evidence that a controller saw a desired state and nothing more; what convergence would
+          mean is in `reconciliation`, with the rule that derived it.
+      generation:
+        type: int
+        nullable: true
+        doc: >-
+          `metadata.generation` of the object, beside `observed_generation` so that the distance
+          between what was asked and what a controller has seen is readable without a second
+          query. `generation` moved because the API server accepted a write; `observedGeneration`
+          moved because a controller read it; neither says the workload runs (§20.4).
+      last_transition_time:
+        type: string
+        nullable: true
+        doc: >-
+          When the status last changed, as the string the server sent. Deliberately not a
+          timestamp: `status.conditions` does not say which controller wrote the entry, so two
+          conditions on one object may be two machines' idea of the time and must not be sorted
+          against each other (§37.1, §39.2).
+      clock:
+        type: string
+        required: true
+        doc: >-
+          Which machine's clock wrote `last_transition_time`. Always `unattributed`, because the
+          API does not record which controller wrote a condition — and an unattributed clock is
+          not comparable even with itself.
+      reconciliation:
+        type: map
+        required: true
+        doc: >-
+          Where the object stands between what was asked of it and what has been observed (§37.5).
+          A map rather than a word: `state` in §37.5's own phrasing, `rule` naming the derivation
+          so a reader can look it up and disagree with it, `evidence` listing the fields that rule
+          read and what they held, `stage` as far up §20.4's ladder as the evidence reaches, and
+          `verified_convergence` — which is true for exactly one of the five states and never for
+          `generation-observed-only`. That last key is §37.3 held literally: a matching
+          `observedGeneration` is not health, and a renderer that wants one green word has to ask
+          this question rather than treating "not failed" as success.
+    default_view:
+      columns: [name, condition_type, status, reason, observed_generation, generation, message]
+
   - id: io.github.godspeed-you.kubernetes.cluster/1
     name: KubernetesCluster
     summary: >-
@@ -2770,3 +3632,355 @@ schemas:
         doc: 'How long each request above took, in milliseconds (§34.3).'
     default_view:
       columns: [name, server, reachable, server_version, effective_identity, tls]
+
+  # --- what a change would do, and what one attempt at it produced (§43 to §46, §56) ---------
+  #
+  # Two schemas that share their first nine fields, because a plan and an attempt at that plan
+  # are aimed at the same thing in the same words: the object's identity, the two preconditions
+  # of §56, the action and the fields it touches.
+  #
+  # **Identity is the four components ADR-0024 argues for**, not `uid` alone. A plan is not an
+  # object: one object may have several prospective changes aimed at it, and keying them on the
+  # object would collapse a scale-down and an image change into one record. The
+  # `resource_version` in the key is the *precondition* — the point in the object's continuity
+  # the change is aimed at — and never what came back.
+  - id: io.github.godspeed-you.kubernetes.plan/1
+    name: KubernetesChangePlan
+    summary: >-
+      A change described before it is made: its target, its preconditions, its effects and what
+      could be verified afterwards.
+    identity: [uid, resource_version, action, changes]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` of the object the change is aimed at, which is also the UID precondition
+          the mutation will assert (§16.1, §56.3). Null where the object carries none, in which
+          case a deletion is refused rather than planned.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name` of that object. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace` of that object, and null for a cluster-scoped one (§9.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion` of that object.'
+      kind:
+        type: string
+        required: true
+        doc: '`kind` of that object, as the server spells it.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          The `resourceVersion` the plan was built at, which is the optimistic-concurrency
+          precondition the mutation will assert (§56.1). An opaque continuity token and never a
+          clock (§14.3). Null where the object carried none, in which case an apply is refused
+          rather than planned.
+      action:
+        type: string
+        required: true
+        doc: >-
+          `apply` or `delete` — the two shapes every candidate action of §43.3 reduces to.
+      changes:
+        type: list<string>
+        required: true
+        doc: >-
+          Each field the change touches, with what it holds now and what it would hold (§46.2).
+          Empty for a deletion, which touches the whole object.
+      preconditions:
+        type: map
+        required: true
+        doc: >-
+          What the mutation will assert about its target before the server carries it out (§56):
+          the `resource_version`, the `uid`, and whether each of them actually guards anything —
+          `guards_lost_update` and `guards_recreation`. A mutation with neither can land on an
+          object recreated under the same name since the plan was made.
+      precondition_guarded:
+        type: bool
+        required: true
+        doc: >-
+          Whether a precondition stands between this change and the wrong object. False only for
+          the expert path of §43.4, which takes a reason and carries it as a caveat for the rest
+          of the plan's life.
+      propagation:
+        type: string
+        nullable: true
+        doc: >-
+          The propagation policy a deletion was planned with — `Foreground`, `Background` or
+          `Orphan` (§45.2). Null for an apply, which removes nothing.
+      effects:
+        type: list<map>
+        required: true
+        doc: >-
+          What the change is expected to do beyond the fields it names, each with its *own*
+          `reversibility` (§46.2, §46.5). Prospective by construction: these are the effects a
+          change of this shape has, not effects anybody observed.
+      reversibility:
+        type: string
+        required: true
+        doc: >-
+          The weakest reversibility among the effects, never the commonest and never a boolean.
+          §46.5 separates reapplying a previous spec from getting back what the change consumed,
+          so a change with one irreversible effect is an irreversible change.
+      recovery:
+        type: map
+        required: true
+        doc: >-
+          Two lists and a sentence: what reapplying the previous values would restore, what it
+          would not, and why the first list is not a rollback (§46.5). "Recoverable" as one word
+          is the claim that section forbids.
+      dependents:
+        type: list<map>
+        required: true
+        doc: >-
+          The objects that name this one as an owner, on owner-reference evidence and nothing
+          weaker (§24.1, §45.4). A preview assembled from label conventions would present a guess
+          with the weight of a provider-proven edge (§23).
+      dependent_coverage:
+        type: string
+        required: true
+        doc: >-
+          What the dependent preview covered and what it could not (§45.4, §21.4). It starts at
+          "not queried", which is a different answer from "there are none".
+      preflight:
+        type: string
+        required: true
+        doc: >-
+          Whether anybody asked the API server if this is allowed (§46.2). "not checked" is the
+          default and is not a permission; the API server remains the authority either way
+          (§21.1).
+      verification:
+        type: string
+        required: true
+        doc: >-
+          How the outcome of this action could be verified afterwards, chosen from the action's
+          semantics *before* the change rather than after it (§46.3). One of the answers is that
+          this provider has no rule, which is a visible value rather than silent optimism.
+      verification_stage:
+        type: string
+        nullable: true
+        doc: >-
+          The furthest rung of §20.4's ladder a confirmed verification of that rule would reach.
+          Never "workload externally healthy": no API read establishes that (§37.5, Gate G).
+      caveats:
+        type: list<string>
+        required: true
+        doc: >-
+          Everything true of this plan that the field list does not show: finalizers that must be
+          removed, a dependent preview that saw nothing, admission effects nobody previewed,
+          other field managers already on the object, a permission nobody verified.
+      prediction:
+        type: string
+        required: true
+        doc: >-
+          Where this prediction comes from, which §21.4 of the generic provider contract requires
+          a provider to label. A plan is *static provider metadata*: it is derived from the
+          object as it was read and from this provider's own rules, and no server dry run was
+          made — which is a much weaker claim than a dry run's, and saying so is the point.
+      statement:
+        type: string
+        required: true
+        doc: >-
+          The whole plan as it would be shown to somebody deciding whether to say yes, ending
+          with the sentence the rest of it exists for: none of this is evidence that anything
+          happened (§4 invariant 18, §46.1).
+    default_view:
+      columns: [kind, name, action, changes, reversibility, verification]
+
+  # What one attempt at a change produced. There is deliberately no `succeeded` field and no
+  # `rolled_out` field: `acceptance` says what the API server did with the request, `stage` says
+  # how far up §20.4's ladder that reaches — one rung for a write and none for a dry run — and
+  # everything above it belongs to `verdict`, which has four values because §46.4 insists on the
+  # fourth. Gate G is the absence of a field, and Gate H is `deletion_state` being a state rather
+  # than a boolean.
+  - id: io.github.godspeed-you.kubernetes.mutation/1
+    name: KubernetesMutation
+    summary: >-
+      What one attempt at a change asked for, what the API server did with it, and the one rung
+      of the ladder that establishes.
+    identity: [uid, resource_version, action, changes]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: '`metadata.uid` of the object the change was aimed at (§16.1, §56.3).'
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name` of that object. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: '`metadata.namespace` of that object, and null for a cluster-scoped one (§9.2).'
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion` of that object.'
+      kind:
+        type: string
+        required: true
+        doc: '`kind` of that object, as the server spells it.'
+      resource_version:
+        type: string
+        nullable: true
+        doc: >-
+          The `resourceVersion` the attempt asserted as its precondition — what the object was at
+          when it was read, never what came back (§56.1, §14.3).
+      action:
+        type: string
+        required: true
+        doc: '`apply` or `delete` (§43.3).'
+      changes:
+        type: list<string>
+        required: true
+        doc: >-
+          Each field the attempt asked to change, with what it held and what it would hold.
+      preconditions:
+        type: map
+        required: true
+        doc: >-
+          What the request asserted about its target, and whether each precondition actually
+          guards anything (§56).
+      acceptance:
+        type: string
+        required: true
+        doc: >-
+          What the API server did with the request: `persisted`, `dry run`, `conflict`,
+          `precondition failed` or `refused`. None of the five is a word about what became of the
+          cluster (§4 invariant 18).
+      dry_run:
+        type: bool
+        required: true
+        doc: >-
+          Whether the server was asked to run admission and defaulting and write nothing (§44.5).
+          True unless the invocation said otherwise, because a preview that needs no argument is
+          the only kind that is actually the easy path.
+      prediction:
+        type: string
+        nullable: true
+        doc: >-
+          Where the prediction came from, for a dry run: a provider-native dry run, which
+          predicts API acceptance semantics and not what controllers do afterwards (§44.5, §21.4
+          of the generic provider contract). Null for a write, which is an observation of what
+          the server did rather than a prediction of anything.
+      code:
+        type: int
+        required: true
+        doc: 'The HTTP status the API server answered with.'
+      stage:
+        type: string
+        nullable: true
+        doc: >-
+          The furthest rung of §20.4's ladder this answer establishes: "API accepted
+          desired-state change" for a write, and null for everything else including a successful
+          dry run, which persisted nothing. Gate G lives in this field being the only one that
+          could carry such a claim and in it never carrying a higher one.
+      field_manager:
+        type: string
+        required: true
+        doc: >-
+          The name server-side apply recorded field ownership under (§44.2), so a cluster
+          administrator reading `managedFields` can tell Ono's changes from a controller's.
+      forced:
+        type: bool
+        required: true
+        doc: >-
+          Whether ownership was taken from a conflicting manager (§44.4). True only where a
+          reason was given: there is no `force` flag anywhere in this package.
+      forced_because:
+        type: string
+        nullable: true
+        doc: >-
+          The reason forcing was chosen, kept whole because it is what a reviewer reads when
+          asking why one apply was allowed to take another manager's field (§44.4).
+      conflict_fields:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The fields an apply could not take, as the API server named them (§44.3). Null where
+          there was no conflict.
+      conflict_managers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The managers that own them. This is the ownership evidence §44.3 requires a conflict to
+          be surfaced with, and it is the reason a conflict reaches a person rather than a retry.
+      resolution:
+        type: string
+        nullable: true
+        doc: >-
+          What resolving the conflict requires: an explicit choice between leaving the field to
+          its owner and taking ownership with a stated reason. There is exactly one value,
+          because a resolution vocabulary that offered "force" would put the forbidden answer one
+          match arm away from being taken automatically (§44.3).
+      admission_differences:
+        type: list<string>
+        nullable: true
+        doc: >-
+          What admission and defaulting did to the document on the way in — a mutating webhook
+          rewriting an image registry, a default injected into a field nobody set (§44.6). The
+          returned object crosses the redaction boundary before it is compared, so a rewritten
+          Secret payload cannot appear here (§22, Gate I).
+      deletion_state:
+        type: string
+        nullable: true
+        doc: >-
+          Where a deletion stands, in the words §45.1 keeps apart: accepted with nothing known
+          about the object, terminating with deletion pending, or absent from the API. There is
+          no value meaning "deleted", and only a read that established absence produces the third
+          (Gate H).
+      finalizers:
+        type: list<string>
+        nullable: true
+        doc: >-
+          The finalizers still holding a terminating object. §45.3 requires deletion completion
+          to be stated as depending on their removal, and this is what it depends on.
+      propagation:
+        type: string
+        nullable: true
+        doc: 'The propagation policy the delete was sent with (§45.2). Null for an apply.'
+      verification:
+        type: string
+        required: true
+        doc: >-
+          The rule the outcome would be verified by, taken from the plan rather than chosen
+          afterwards: a rule picked to make a verification pass is not a verification (§46.3).
+      verdict:
+        type: string
+        nullable: true
+        doc: >-
+          What one look at the target immediately afterwards established: `confirmed`, `refuted`,
+          `pending` or `inconclusive`. Null where nothing was written, so there was nothing to
+          verify. `inconclusive` is neither success nor failure, and it is the honest answer when
+          a single immediate observation found nothing decisive (§46.4).
+      verification_detail:
+        type: string
+        nullable: true
+        doc: >-
+          The evidence the verdict rests on, and — for an inconclusive one — the sentence §46.4
+          requires: this is not evidence that the change failed, and not evidence that it
+          succeeded.
+      reconciliation:
+        type: map
+        nullable: true
+        doc: >-
+          Where the object stands between what was asked of it and what has been observed, with
+          the rule that derived it and the fields that rule read (§37.5). `verified_convergence`
+          is true for exactly one of the five states, because a matching `observedGeneration` is
+          not a claim of health (§37.3).
+      statement:
+        type: string
+        required: true
+        doc: >-
+          Everything the attempt amounts to, assembled from the sentences the domain layer wrote
+          for it. For a write it says that acceptance is not evidence that the intended outcome
+          occurred; for a deletion it says that effects outside the API server are unknown either
+          way.
+    default_view:
+      columns: [kind, name, action, acceptance, stage, verdict]

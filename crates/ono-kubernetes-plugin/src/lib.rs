@@ -12,11 +12,19 @@
 //! changes         one live watch: acquire, observe until the operator stops it, and say which
 //!                 periods were not observed
 //! sessions        what a provider instance keeps between two invocations, and keyed on what
+//! planning        one prospective change, built from the object it is aimed at and shown
+//! mutations       one bounded write: the plan, the request, the answer, and what it is not
 //! query           one `provider.query`: discovery, list, redact, emit
 //! cluster         the diagnostic: which cluster, reachable, as whom, and what is unknown
 //! dynamic         a resource nobody compiled in: resolving it, and typing it from the cluster
 //! records         one Kubernetes object, as a record of the target's schema
 //! relations       one object's relationships, as a record per edge with its evidence
+//! events          the Events regarding one object, and the refusal to read none as none
+//! evidence        what a Node states about the machine under it, exported rather than resolved
+//! logs            one container's log, as lines that carry the bounds of the read
+//! timeline        what is known to have happened to one object, and by whose clock
+//! why             what may be said about the state an object is in, and where that stops
+//! conditions      the structured observations an object's controllers wrote about it
 //! ```
 //!
 //! **`main.rs` is four lines on purpose.** Everything above lives in the library so that the
@@ -25,12 +33,20 @@
 pub mod broker;
 pub mod changes;
 pub mod cluster;
+pub mod conditions;
 pub mod contributions;
 pub mod dynamic;
+pub mod events;
+pub mod evidence;
+pub mod logs;
+pub mod mutations;
+pub mod planning;
 pub mod query;
 pub mod records;
 pub mod relations;
 pub mod sessions;
+pub mod timeline;
+pub mod why;
 
 use std::rc::Rc;
 
@@ -77,9 +93,34 @@ pub fn plugin() -> Plugin {
                 contributions::Reads::Instance => cluster::answer(target, &sessions, ctx),
                 contributions::Reads::Relations => relations::answer(target, &sessions, ctx),
                 contributions::Reads::Changes => changes::answer(target, &sessions, ctx),
+                contributions::Reads::Plan => planning::answer(target, &sessions, ctx),
+                contributions::Reads::Events => events::answer(target, &sessions, ctx),
+                contributions::Reads::Evidence => evidence::answer(target, &sessions, ctx),
+                contributions::Reads::Logs => logs::answer(target, &sessions, ctx),
+                contributions::Reads::Timeline => timeline::answer(target, &sessions, ctx),
+                contributions::Reads::Why => why::answer(target, &sessions, ctx),
+                contributions::Reads::Conditions => conditions::answer(target, &sessions, ctx),
                 contributions::Reads::Kind { .. } | contributions::Reads::Discovered => {
                     query::answer(target, &sessions, ctx)
                 }
+            });
+    }
+    // The schemas a *command* answers with, which no target names. A mutation's answer is what
+    // one attempt produced; there is no collection of attempts to enumerate, so there is no noun
+    // to hang it on (§31.23).
+    for schema in contributions::COMMAND_SCHEMAS {
+        plugin = plugin.contribute_schema(schema.contribution());
+    }
+    // The two words that write. They are commands rather than targets because a contributed
+    // command declares a `risk` and a set of capabilities and a contributed target declares
+    // neither — and the host checks the capability at every invocation, before any of this
+    // package's code runs (§31.22, §31.75). ADR-0024.
+    for declared in contributions::COMMANDS {
+        let sessions = Rc::clone(&sessions);
+        plugin = plugin
+            .contribute_command(declared.contribution())
+            .command(&declared.id(), move |ctx| {
+                mutations::answer(declared, &sessions, ctx)
             });
     }
     plugin

@@ -19,7 +19,9 @@
 //! package runs cannot name a kind invented after it, so the noun names the *shape* of the
 //! question instead of the answer — ADR-0010.
 
-use ono_kuang_sdk::protocol::{SchemaContribution, SchemaFieldContribution, TargetContribution};
+use ono_kuang_sdk::protocol::{
+    CommandContribution, SchemaContribution, SchemaFieldContribution, TargetContribution,
+};
 
 /// One field of a contributed schema, as the table spells it.
 ///
@@ -100,6 +102,47 @@ pub enum Reads {
     /// answer, resolved against discovery exactly as [`Self::Discovered`] resolves one, so a CRD
     /// invented after this table was written is watchable without recompiling anything.
     Changes,
+    /// The Events regarding one object, rather than the object (§38).
+    ///
+    /// Not a collection of the query's kind either: the query names the object an Event is
+    /// *about*, and the Events themselves are read from whichever of §38.2's two representations
+    /// the cluster serves. Which object is the query's answer, resolved against discovery exactly
+    /// as [`Self::Discovered`] resolves one, so a custom resource's Events are reachable without
+    /// recompiling anything.
+    Events,
+    /// What one Node states about the machine underneath it, as evidence (§28.3–§28.5, §47).
+    ///
+    /// A Node and nothing else: the pointers and the published keys of `evidence.rs` are a
+    /// Node's, and reading a Pod through them would answer an empty evidence set that renders as
+    /// a machine with nothing to say rather than as the wrong question. The kind is therefore
+    /// named here — this *is* a curated read — and it is a separate variant from
+    /// [`Self::Kind`] because the records are not the Node.
+    Evidence,
+    /// One container's log, as lines (§42.1).
+    ///
+    /// A subresource rather than a collection: `pods/log` is reached through one Pod's own REST
+    /// endpoint, it is served only where discovery says the subresource is served, and its answer
+    /// is bytes rather than objects.
+    Logs,
+    /// What was observed about one object, when, and by whose clock (§39).
+    ///
+    /// Not a collection: a timeline is assembled from one object's metadata, its conditions, its
+    /// field managers and the Events regarding it, over the window this provider was looking in.
+    Timeline,
+    /// What may be said about the state one object is in, and the rung above which it may not
+    /// climb (§40).
+    Why,
+    /// The structured observations one object's controllers wrote about it (§37.1).
+    Conditions,
+    /// What a change *would* do, described before anybody is asked to agree to it (§46).
+    ///
+    /// Not a collection, and not the object: a plan is a value about a change that has not
+    /// happened. It is a target rather than a command because building one is read-only — one
+    /// `GET` of the object the change is aimed at, and this provider's own rules — and because
+    /// §46.1 puts understanding a change before making it. Which object is the query's answer,
+    /// resolved against discovery exactly as [`Self::Discovered`] resolves one, so a change to a
+    /// custom resource is as plannable as a change to a Deployment (§33.1).
+    Plan,
 }
 
 impl Reads {
@@ -108,7 +151,17 @@ impl Reads {
     pub const fn group(self) -> Option<&'static str> {
         match self {
             Self::Kind { group, .. } => Some(group),
-            Self::Discovered | Self::Instance | Self::Relations | Self::Changes => None,
+            Self::Evidence => Some(""),
+            Self::Discovered
+            | Self::Instance
+            | Self::Relations
+            | Self::Changes
+            | Self::Events
+            | Self::Logs
+            | Self::Timeline
+            | Self::Why
+            | Self::Conditions
+            | Self::Plan => None,
         }
     }
 
@@ -117,7 +170,19 @@ impl Reads {
     pub const fn kind(self) -> Option<&'static str> {
         match self {
             Self::Kind { kind, .. } => Some(kind),
-            Self::Discovered | Self::Instance | Self::Relations | Self::Changes => None,
+            // The one read below `Kind` that still names a kind: a Node, whose evidence is not
+            // the Node (§47.1).
+            Self::Evidence => Some("Node"),
+            Self::Discovered
+            | Self::Instance
+            | Self::Relations
+            | Self::Changes
+            | Self::Events
+            | Self::Logs
+            | Self::Timeline
+            | Self::Why
+            | Self::Conditions
+            | Self::Plan => None,
         }
     }
 }
@@ -180,7 +245,17 @@ impl Target {
         match self.reads {
             Reads::Relations => EDGE_IDENTITY,
             Reads::Changes => CHANGE_IDENTITY,
-            Reads::Kind { .. } | Reads::Discovered | Reads::Instance => OBJECT_IDENTITY,
+            Reads::Evidence => EVIDENCE_IDENTITY,
+            Reads::Logs => LOG_IDENTITY,
+            Reads::Timeline => OBSERVATION_IDENTITY,
+            Reads::Why => FINDING_IDENTITY,
+            Reads::Conditions => CONDITION_IDENTITY,
+            Reads::Plan => PLAN_IDENTITY,
+            // An Event *is* a Kubernetes object with a `metadata.uid` of its own, so it is keyed
+            // the way every other object here is. What it is about is a field of it.
+            Reads::Kind { .. } | Reads::Discovered | Reads::Instance | Reads::Events => {
+                OBJECT_IDENTITY
+            }
         }
     }
 
@@ -652,6 +727,331 @@ const RELATION_FIELDS: &[Field] = &[
 ///   object the server sent without one.
 const CHANGE_IDENTITY: &[&str] = &["resource", "segment", "change", "uid", "resource_version"];
 
+/// What makes two exported facts about a machine the same fact (§47, ADR-0016).
+///
+/// Three components, and the third is the one that is easy to leave out. A Node commonly reports
+/// an internal address, a public address and a hostname, and all three are published under
+/// [`key::ADDRESS`](ono_provider_kubernetes::evidence::key::ADDRESS) — so a key without the
+/// pointer they were read from would merge three separate pieces of evidence into one. The
+/// pointer is null for a key that could not be read at all, where the key alone separates them.
+const EVIDENCE_IDENTITY: &[&str] = &["uid", "key", "source"];
+
+/// What makes two log lines the same line (§42.1).
+///
+/// The Pod's lifetime identity rather than its name, because a Pod deleted and recreated under
+/// one name is two containers and their outputs are not one log (§4 invariants 4–5). The run is
+/// in the key because `previous` reaches a different container from the one running now, and the
+/// ordinal is in it because a log line is not unique in its own text — a process that prints one
+/// message twice printed it twice.
+const LOG_IDENTITY: &[&str] = &["uid", "container", "instance", "line"];
+
+/// What makes two temporal observations the same observation (§39.1, §39.2).
+///
+/// The clock is part of the key and not a decoration: the same instant written by the API server
+/// and by a reporting controller are two observations of two machines' idea of the time, and a
+/// key without the clock would merge them into the single history §39.2 forbids. `stamp` is the
+/// raw string the clock wrote, never a parsed instant, for the same reason.
+const OBSERVATION_IDENTITY: &[&str] = &["uid", "source", "clock", "stamp", "detail"];
+
+/// What makes two findings the same finding (§40).
+///
+/// The claim is in the key because the same two facts may support a weak claim and a stronger
+/// one, and collapsing them would let a reader see only one rung of the ladder.
+const FINDING_IDENTITY: &[&str] = &["uid", "claim", "support"];
+
+/// What makes two conditions the same condition (§37.1).
+///
+/// The `type` within one object's lifetime, which is the uniqueness the API's own convention
+/// gives conditions. Not the status: a condition that flipped is the same condition.
+const CONDITION_IDENTITY: &[&str] = &["uid", "condition_type"];
+
+/// What makes two prospective changes, or two attempts at one, the same thing (§46, §56).
+///
+/// Four components, and the argument for the second is the interesting one. A plan is about one
+/// object *lifetime* (`uid`, §16.3), aimed at one point in that lifetime's continuity
+/// (`resource_version`, §56.1), doing one thing (`action`) to a named set of fields (`changes`).
+/// Two records agreeing on all four describe the same change, and a mutation record is keyed the
+/// same way because a `resourceVersion` precondition is *consumed* by the write that satisfies
+/// it: an accepted apply moves the object on, so a second attempt asserting the same token is
+/// refused rather than being a second write of the same key. Dropping any component merges
+/// things that are not the same — two field sets against one object, an apply with a delete, or
+/// a plan built before a concurrent write with one built after it.
+const PLAN_IDENTITY: &[&str] = &["uid", "resource_version", "action", "changes"];
+
+/// One Kubernetes Event, and everything §38 says it is not (§38, Gate F's neighbour).
+///
+/// **An aggregated Event is one record.** `recorded_count` carries the number the server
+/// recorded and `aggregate` says that the record stands for more than one occurrence — and there
+/// is no field, and no route through this package, by which 47 aggregated failures become 47
+/// records. Kubernetes aggregates precisely so that the individual occurrences need not be
+/// stored, so 46 of them were never observed and manufacturing them would produce records a
+/// reader could not tell from observed ones (§38.4).
+///
+/// **Nothing here is a history.** `event_time`, `first_seen`, `last_seen` and
+/// `series_last_observed` are strings rather than timestamps, and `clock` names the machine that
+/// wrote `event_time` beside it. A timestamp field would be sortable, and a set of Events sorted
+/// by time reads as a sequence of what happened while being an artefact of three unrelated
+/// accidents: the reporters' clocks, unordered delivery, and retention that has already discarded
+/// part of it (§38.1, §39.2).
+///
+/// **`reason` is evidence, not machine semantics.** It is carried so a reader sees it and never
+/// so anything branches on it: upstream warns that reasons evolve, and a consumer switching on
+/// one is an unversioned dependency that stops matching without failing (§38.5).
+///
+/// The shared metadata is §14's, spelled as every other schema here spells it: an Event *is* a
+/// Kubernetes object, with a `metadata.uid` of its own, and the object it regards is a field of
+/// it rather than its identity (ADR-0013).
+const EVENT_FIELDS: [Field; 34] = with_metadata(
+    true,
+    &[
+        // --- which of §38.2's two representations this was read from ---
+        Field::required("representation", "enum<events.k8s.io|core>"),
+        // --- what the reporter said ---
+        Field::required("level", "string"),
+        Field::nullable("reason", "string"),
+        Field::nullable("note", "string"),
+        Field::nullable("action", "string"),
+        // --- what it is about (§38.3) ---
+        Field::nullable("regarding", "string"),
+        Field::nullable("regarding_kind", "string"),
+        Field::nullable("regarding_name", "string"),
+        Field::nullable("regarding_namespace", "string"),
+        Field::nullable("regarding_uid", "string"),
+        Field::nullable("related", "string"),
+        // --- who said it (§38.3) ---
+        Field::nullable("reporting_controller", "string"),
+        Field::nullable("reporting_instance", "string"),
+        // --- when, and on whose clock (§39.1) ---
+        Field::nullable("event_time", "string"),
+        Field::required("clock", "string"),
+        // --- how often, as a count and never as a list (§38.4) ---
+        Field::required("aggregate", "bool"),
+        Field::nullable("recorded_count", "int"),
+        Field::nullable("series_count", "int"),
+        Field::nullable("series_last_observed", "string"),
+        Field::nullable("first_seen", "string"),
+        Field::nullable("last_seen", "string"),
+    ],
+);
+
+/// One fact a Node states about the machine underneath it, exported rather than resolved (§47).
+///
+/// **Nothing here presents a match.** There is no target, no link, no foreign identifier and no
+/// resolution: this provider has read Kubernetes and nothing else, so the strongest honest claim
+/// it can make is "here is what the API server stated, here is where it stated it, and here is
+/// how far that value narrows anything down" (§47.1, ADR-0016). Which foreign resource a value
+/// matches is a finding of a resolver that has read both sides, and this schema deliberately has
+/// nowhere to put one.
+///
+/// **Distinguishing evidence stays distinguishable from correlating evidence.** `strength` is
+/// §47.2's ranking as a field rather than something a consumer rebuilds from key names — which
+/// would be the vendor knowledge §47.1 keeps out of here in a different disguise. A private
+/// address repeats between clusters and a public one outlives the machine that held it, so
+/// `lookup_key` is false for every address however exact the value looks.
+///
+/// **A key that could not be read is a record too.** `observed` is false for it, `value` and
+/// `source` are null, and `outcome` names one of §21.4's eight states — so a Node whose spec
+/// carries no provider identifier reads differently from one whose spec nobody projected.
+const EVIDENCE_FIELDS: &[Field] = &[
+    // --- whose evidence this is, bound to a lifetime rather than to a name (§4 invariants 4–5) ---
+    Field::nullable("uid", "string"),
+    Field::required("name", "string"),
+    Field::required("api_version", "string"),
+    Field::required("kind", "string"),
+    Field::required("subject", "string"),
+    // --- what kind of fact, and what it held ---
+    Field::required("key", "string"),
+    Field::nullable("qualifier", "string"),
+    Field::nullable("value", "string"),
+    // --- where it was read, and how far it goes ---
+    Field::nullable("source", "string"),
+    // Null for a key that was not read: strength is how far a *value* narrows the subject down,
+    // and there is no value. Never defaulted to the weakest, which would be a claim about a
+    // machine nobody looked at.
+    Field::nullable("strength", "enum<distinguishing|correlating|placement>"),
+    Field::nullable(
+        "evidence_class",
+        "enum<native-field|owner-reference|selector|convention|adapter-derivation|inference>",
+    ),
+    Field::nullable("evidence", "string"),
+    Field::nullable("asserted", "bool"),
+    Field::nullable("lookup_key", "bool"),
+    // --- §28.4's whole permitted decomposition of a URI-shaped identifier, and no more ---
+    Field::nullable("uri_scheme", "string"),
+    Field::nullable("uri_path", "string"),
+    // --- or a key that was not read, which is not a machine with nothing to say ---
+    Field::required("observed", "bool"),
+    Field::nullable("outcome", "string"),
+];
+
+/// One line of a container's log, and everything that is not in it (§42.1, §42.2).
+///
+/// **`bounds` is never empty, on any record.** The container runtime rotated and truncated this
+/// log before anybody asked, so even an unbounded request carries `the container runtime rotated
+/// and truncated this log before it was read`, and a `tailLines`, `sinceSeconds` or `limitBytes`
+/// adds its own entry. A record without it would imply completeness by omission, which is the one
+/// thing §42.1 will not have: a log is not the container's output.
+///
+/// **A line is bytes.** `text` is null where the bytes are not UTF-8 and `not_utf8_after` says
+/// how far decoding got, because substituting U+FFFD hands a reader something that looks like the
+/// container's output and is not it. `bytes` is the length either way.
+///
+/// **`stamp` is a string beside its `clock`.** The prefix the API server writes comes from the
+/// container runtime on the node, and parsing it into an instant would make it sortable against
+/// this provider's own observations — the cross-clock timeline §39.2 forbids.
+///
+/// `may_contain_secrets` is true on every record and is not a scan of the content: whether a log
+/// carries a credential is not decidable from the log, and a field that sometimes answered false
+/// would be a filter that is wrong exactly when it matters (§42.2).
+const LOG_FIELDS: &[Field] = &[
+    // --- what was read, bound to the Pod's lifetime and never to its name ---
+    Field::nullable("uid", "string"),
+    Field::required("name", "string"),
+    Field::nullable("namespace", "string"),
+    Field::required("api_version", "string"),
+    Field::required("kind", "string"),
+    Field::nullable("container", "string"),
+    Field::required("instance", "enum<current|previous>"),
+    // --- the line ---
+    Field::required("line", "int"),
+    Field::nullable("text", "string"),
+    Field::required("bytes", "int"),
+    Field::nullable("not_utf8_after", "int"),
+    Field::nullable("stamp", "string"),
+    Field::required("clock", "string"),
+    Field::required("terminated", "bool"),
+    // --- and what this is not ---
+    Field::required("bounds", "list<string>"),
+    Field::required("ending", "string"),
+    Field::required("may_contain_secrets", "bool"),
+];
+
+/// One thing known to have a time attached, with the clock that wrote it (§39).
+///
+/// **`stamp` is the string the clock wrote.** Not a timestamp: a timestamp field is one a shell
+/// sorts, and five of Kubernetes' timestamps are written by five machines. Sorting them produces
+/// something that reads as a history of the cluster and is a picture of the skew between those
+/// machines (§39.2). `clock` travels beside it, and two records whose clocks differ are not in
+/// any order at all.
+///
+/// **`basis` is the distinction the whole section exists for.** `observed` means this provider
+/// saw the change while it was watching; `reported` means a timestamp was read off state. A Pod
+/// created at 08:00 and first read at 14:00 is a *reported* object-metadata observation, and
+/// filing it as six hours of history is precisely what §39.2 forbids.
+///
+/// **Every record carries the window and the gaps.** `window_opened` and `window_latest` are this
+/// provider's own clock, which is the only clock it owns, and `gaps` names each stretch that
+/// could not be observed. A record that carried observations without them would let a reader take
+/// a sequence for a complete one — and `not_observed` is the other kind of hole, a scope that was
+/// never readable, because a continuous window over a denied namespace is not a complete answer.
+const TIMELINE_FIELDS: &[Field] = &[
+    // --- what the observation is about ---
+    Field::nullable("uid", "string"),
+    Field::required("name", "string"),
+    Field::nullable("namespace", "string"),
+    Field::required("api_version", "string"),
+    Field::required("kind", "string"),
+    // --- what kind of observation it is (§39.1, §39.2) ---
+    Field::required("basis", "enum<observed|reported>"),
+    Field::required(
+        "source",
+        "enum<watch-event|resource-snapshot|event-record|object-metadata|condition-transition|managed-field>",
+    ),
+    Field::required("clock", "string"),
+    Field::required("stamp", "string"),
+    Field::required("placeable", "bool"),
+    Field::required("detail", "string"),
+    // --- the period it belongs to, and the holes in that period (§39.3) ---
+    Field::required("window_opened", "timestamp"),
+    Field::required("window_latest", "timestamp"),
+    Field::required("continuous", "bool"),
+    Field::required("gaps", "list<string>"),
+    Field::required("not_observed", "list<string>"),
+];
+
+/// One thing this provider is prepared to say about why an object is as it is (§40).
+///
+/// **There is no field for a cause, and that is the schema's content.** The strongest thing a
+/// record here carries is a `claim`, there are five of them, and none says that one thing brought
+/// about another. `claim_means` travels with it because a token on its own is read as strongly as
+/// its reader needs it to be — `CORRELATED_WITH` arrives with "one clock saw both, close
+/// together; proximity is not a causal link" attached to it.
+///
+/// **`strongest_claim` is on every record rather than on a summary somebody may not read.** It is
+/// the maximum of the ladder and never a sum: three weak findings do not add up to a strong one.
+/// `insufficient_evidence` is §40.5's required conclusion, which the specification calls
+/// preferable to a plausible invented explanation.
+///
+/// **A refusal is a record.** A finding that established nothing keeps its `not_proven` reason —
+/// different clocks, an unreadable timestamp, a window that was too narrow, no path, nothing
+/// asserted — because an answer with the empty findings dropped looks like one where nobody
+/// looked (§4 invariant 13).
+const WHY_FIELDS: &[Field] = &[
+    // --- what the answer is about ---
+    Field::nullable("uid", "string"),
+    Field::required("name", "string"),
+    Field::nullable("namespace", "string"),
+    Field::required("api_version", "string"),
+    Field::required("kind", "string"),
+    // --- the rung, verbatim, and where it stops ---
+    Field::required(
+        "claim",
+        "enum<CAUSALITY_NOT_PROVEN|CORRELATED_WITH|PRECEDED_BY|DEPENDENCY_PATH_EXISTS|ASSERTED_BY_KUBERNETES>",
+    ),
+    Field::required("claim_means", "string"),
+    // --- what was read to say it ---
+    Field::required("support_class", "enum<sequence|path|assertion|nothing>"),
+    Field::required("support", "string"),
+    Field::nullable("not_proven", "string"),
+    Field::nullable("clock", "string"),
+    Field::nullable("apart_ms", "int"),
+    Field::nullable(
+        "evidence_class",
+        "enum<native-field|owner-reference|selector|convention|adapter-derivation|inference>",
+    ),
+    Field::nullable("evidence_path", "string"),
+    // --- the ceiling of the whole answer, and what the search could not reach ---
+    Field::required(
+        "strongest_claim",
+        "enum<CAUSALITY_NOT_PROVEN|CORRELATED_WITH|PRECEDED_BY|DEPENDENCY_PATH_EXISTS|ASSERTED_BY_KUBERNETES>",
+    ),
+    Field::required("insufficient_evidence", "bool"),
+    Field::required("not_observed", "list<string>"),
+];
+
+/// One structured observation a controller wrote about an object (§37.1).
+///
+/// **`status` is the string the API carries.** `True`, `False` and `Unknown` are three states and
+/// a boolean has two, and a controller may write a fourth word this provider has never seen —
+/// which §37.2 requires to survive rather than be coerced into `false`.
+///
+/// **`observedGeneration` is never on its own a claim of health.** `observed_generation` and
+/// `generation` are two plain numbers here, and the only derived state is the `reconciliation`
+/// map — which arrives with the rule that produced it and the fields that rule read (§37.5), and
+/// whose `verified_convergence` key is true for exactly one of five states and never for
+/// `generation-observed-only` (§37.3). There is deliberately no `healthy`, no `ready` and no
+/// green word anywhere on this record.
+///
+/// `last_transition_time` is a string beside `clock`, and the clock is `unattributed`:
+/// `status.conditions` does not say which controller wrote an entry, so two conditions on one
+/// object may be two machines' idea of the time and must not be ordered against each other.
+const CONDITION_FIELDS: &[Field] = &[
+    Field::nullable("uid", "string"),
+    Field::required("name", "string"),
+    Field::nullable("namespace", "string"),
+    Field::required("api_version", "string"),
+    Field::required("kind", "string"),
+    Field::required("condition_type", "string"),
+    Field::required("status", "string"),
+    Field::nullable("reason", "string"),
+    Field::nullable("message", "string"),
+    Field::nullable("observed_generation", "int"),
+    Field::nullable("generation", "int"),
+    Field::nullable("last_transition_time", "string"),
+    Field::required("clock", "string"),
+    RECONCILIATION,
+];
+
 /// One observed change, and the continuity it belongs to (§19, §39.3, §41.4, Gate F).
 ///
 /// **A record per observation, and a record for the periods with no observations in them.** The
@@ -1082,6 +1482,91 @@ pub static TARGETS: &[Target] = &[
         fields: CHANGE_FIELDS,
     },
     Target {
+        name: "k8s-event",
+        schema: "io.github.godspeed-you.kubernetes.event/1",
+        schema_name: "KubernetesEvent",
+        schema_summary: "One Kubernetes Event: what a component reported, about what, and how \
+                         many times the server recorded it.",
+        summary: "The Events a cluster reported about an object — best-effort, briefly retained, \
+                  and never a history (specification section 38).",
+        identity_doc: "Two observations are the same Event when their `metadata.uid` matches. An \
+                       Event is an object of its own; what it regards is a field of it. An \
+                       aggregated Event is one Event however many occurrences it counts.",
+        reads: Reads::Events,
+        fields: &EVENT_FIELDS,
+    },
+    Target {
+        name: "k8s-evidence",
+        schema: "io.github.godspeed-you.kubernetes.evidence/1",
+        schema_name: "KubernetesIdentityEvidence",
+        schema_summary: "One value a Node states about the machine underneath it, with where it \
+                         was read and how far it goes — never a link to another system.",
+        summary: "What a Node states about the machine underneath it, as inspectable evidence \
+                  for a resolver that has read the other system (specification section 47).",
+        identity_doc: "Two observations are the same evidence when the Node's `metadata.uid`, \
+                       the published key and the field pointer all match. A Node rebuilt under \
+                       the same name is a different machine.",
+        reads: Reads::Evidence,
+        fields: EVIDENCE_FIELDS,
+    },
+    Target {
+        name: "k8s-log",
+        schema: "io.github.godspeed-you.kubernetes.log/1",
+        schema_name: "KubernetesLogLine",
+        schema_summary: "One line of a container's log, with everything that kept the read short \
+                         of what the container wrote.",
+        summary: "A container's log, as lines that state their bounds — never the container's \
+                  complete output (specification section 42.1).",
+        identity_doc: "Two observations are the same line when the Pod's `metadata.uid`, the \
+                       container, the run and the ordinal within the read all match. A line has \
+                       no identity of its own; a process that printed one message twice printed \
+                       it twice.",
+        reads: Reads::Logs,
+        fields: LOG_FIELDS,
+    },
+    Target {
+        name: "k8s-timeline",
+        schema: "io.github.godspeed-you.kubernetes.timeline/1",
+        schema_name: "KubernetesObservation",
+        schema_summary: "One thing known to have a time attached, the clock that wrote it, and \
+                         the window this provider was observing in.",
+        summary: "What is known to have happened to an object, with the clock behind every time \
+                  and the periods nobody observed (specification section 39).",
+        identity_doc: "Two observations are the same observation when the object, the source, \
+                       the clock, the raw timestamp and what was observed all match. Two \
+                       observations on two clocks are never in an order.",
+        reads: Reads::Timeline,
+        fields: TIMELINE_FIELDS,
+    },
+    Target {
+        name: "k8s-why",
+        schema: "io.github.godspeed-you.kubernetes.why/1",
+        schema_name: "KubernetesFinding",
+        schema_summary: "One thing this provider is prepared to say about the state an object is \
+                         in, and the rung above which it will not climb.",
+        summary: "What can be said about the state an object is in — correlation, order, a \
+                  dependency path or something Kubernetes asserts, and never a cause \
+                  (specification section 40).",
+        identity_doc: "Two observations are the same finding when the object, the claim and what \
+                       the claim rests on all match. A finding has no `metadata.uid` of its own.",
+        reads: Reads::Why,
+        fields: WHY_FIELDS,
+    },
+    Target {
+        name: "k8s-condition",
+        schema: "io.github.godspeed-you.kubernetes.condition/1",
+        schema_name: "KubernetesCondition",
+        schema_summary: "One condition a controller wrote about an object, kept structured \
+                         rather than reduced to a status word.",
+        summary: "The conditions an object's controllers wrote about it, each with the \
+                  generation it was written about (specification section 37).",
+        identity_doc: "Two observations are the same condition when the object's `metadata.uid` \
+                       and the condition `type` match. A condition that flipped is the same \
+                       condition.",
+        reads: Reads::Conditions,
+        fields: CONDITION_FIELDS,
+    },
+    Target {
         name: "k8s-cluster",
         schema: "io.github.godspeed-you.kubernetes.cluster/1",
         schema_name: "KubernetesCluster",
@@ -1095,10 +1580,336 @@ pub static TARGETS: &[Target] = &[
         reads: Reads::Instance,
         fields: CLUSTER_FIELDS,
     },
+    Target {
+        name: "k8s-plan",
+        schema: "io.github.godspeed-you.kubernetes.plan/1",
+        schema_name: "KubernetesChangePlan",
+        schema_summary: "A change described before it is made: its target, its preconditions, \
+                         its effects and what could be verified afterwards.",
+        summary: "What a change would do, before anything is changed (specification section 46).",
+        identity_doc: "Two records describe the same prospective change when the object \
+                       lifetime, the `resourceVersion` the plan is aimed at, the action and the \
+                       fields it touches all match. A plan has no `metadata.uid` of its own; the \
+                       uid on the record is the target object's.",
+        reads: Reads::Plan,
+        fields: &PLAN_FIELDS,
+    },
 ];
 
 /// The target of that name, where this package answers for one.
 #[must_use]
 pub fn target(name: &str) -> Option<&'static Target> {
     TARGETS.iter().find(|target| target.name == name)
+}
+
+// --- what a change says about itself, and what an attempt at one came back with -------------------
+
+/// The target every plan and every mutation record names, in the words every other schema here
+/// uses (ADR-0013).
+///
+/// Not the object's metadata projection: a plan is not the object, and a reader who saw
+/// `terminating` or `labels` on one would be reading facts that belong to a record of the object
+/// itself. What is here is exactly what identifies the change's target and what guards it —
+/// which is §16.1's identity plus §56's two preconditions.
+const CHANGE_TARGET: &[Field] = &[
+    Field::nullable("uid", "string"),
+    Field::required("name", "string"),
+    Field::nullable("namespace", "string"),
+    Field::required("api_version", "string"),
+    Field::required("kind", "string"),
+    Field::nullable("resource_version", "string"),
+    Field::required("action", "string"),
+    Field::required("changes", "list<string>"),
+    Field::required("preconditions", "map"),
+];
+
+/// A change described before it is made (§46.2), and the two things §46.2's list does not name.
+///
+/// **`prediction` is required and it is not decoration.** §21.4 of the generic provider contract
+/// makes a provider label where a prediction came from — a provider-native dry run, static
+/// provider metadata, Ono's own impact analysis or a heuristic — and a plan built from one read
+/// and this package's rules is the second of those. A plan that did not say so would be
+/// indistinguishable from a server dry run's answer, which is a much stronger claim.
+///
+/// **`reversibility` is the weakest of the effects and never a boolean.** §46.5 separates
+/// reapplying a previous spec from getting back what the change consumed, so every entry of
+/// `effects` carries its own answer and `recovery` states in two lists what reapplying would and
+/// would not restore. A `reversible: bool` here is exactly the claim §46.5 forbids.
+///
+/// **`verification` is a plan field rather than a verification field.** "How would we know this
+/// worked" is answered before the change (§46.3), and one of the answers is that this provider
+/// has no rule — which is a visible value here rather than silent optimism.
+const PLAN_FIELDS: [Field; 22] = with_target(&[
+    Field::required("precondition_guarded", "bool"),
+    Field::nullable("propagation", "string"),
+    Field::required("effects", "list<map>"),
+    Field::required("reversibility", "string"),
+    Field::required("recovery", "map"),
+    Field::required("dependents", "list<map>"),
+    Field::required("dependent_coverage", "string"),
+    Field::required("preflight", "string"),
+    Field::required("verification", "string"),
+    Field::nullable("verification_stage", "string"),
+    Field::required("caveats", "list<string>"),
+    Field::required("prediction", "string"),
+    Field::required("statement", "string"),
+]);
+
+/// What one attempt at a change came back with — and, deliberately, no field that could carry
+/// the sentence Gate G forbids.
+///
+/// **There is no `succeeded` and no `rolled_out`.** `acceptance` says what the API server did
+/// with the request and `stage` says how far up §20.4's ladder that reaches, which for a write
+/// is one rung and for a dry run is none at all (§44.5, §4 invariant 18). Everything above that
+/// rung is `verdict`'s, and `verdict` has four values because §46.4 insists on the fourth: a
+/// verification that did not become decisive is not a failure and not a success.
+///
+/// **`deletion_state` is a state and not a boolean.** §45.1 lists six distinctions a boolean
+/// collapses, and Gate H turns on the one in the middle: an accepted delete with a finalizer on
+/// the object is *terminating*. `finalizers` is beside it because §45.3 requires what deletion
+/// is waiting for to be visible.
+///
+/// **`forced` never appears without `forced_because`.** §44.4 makes forcing a separate explicit
+/// choice, so the record keeps the sentence somebody wrote rather than a flag somebody flipped.
+const MUTATION_FIELDS: [Field; 29] = with_target(&[
+    Field::required("acceptance", "string"),
+    Field::required("dry_run", "bool"),
+    Field::nullable("prediction", "string"),
+    Field::required("code", "int"),
+    Field::nullable("stage", "string"),
+    Field::required("field_manager", "string"),
+    Field::required("forced", "bool"),
+    Field::nullable("forced_because", "string"),
+    Field::nullable("conflict_fields", "list<string>"),
+    Field::nullable("conflict_managers", "list<string>"),
+    Field::nullable("resolution", "string"),
+    Field::nullable("admission_differences", "list<string>"),
+    Field::nullable("deletion_state", "string"),
+    Field::nullable("finalizers", "list<string>"),
+    Field::nullable("propagation", "string"),
+    Field::required("verification", "string"),
+    Field::nullable("verdict", "string"),
+    Field::nullable("verification_detail", "string"),
+    Field::nullable("reconciliation", "map"),
+    Field::required("statement", "string"),
+]);
+
+/// Concatenates [`CHANGE_TARGET`] with a schema's own fields, at compile time.
+///
+/// The same shape as [`with_metadata`], and for the same reason: the field order a schema
+/// declares is the order a record stores its fields in, so it is visible in the table rather
+/// than assembled by a macro.
+const fn with_target<const N: usize>(own: &'static [Field]) -> [Field; N] {
+    let mut fields = [Field::required("", ""); N];
+    let mut at = 0;
+    while at < CHANGE_TARGET.len() {
+        fields[at] = CHANGE_TARGET[at];
+        at += 1;
+    }
+    let mut own_at = 0;
+    while own_at < own.len() {
+        fields[at] = own[own_at];
+        at += 1;
+        own_at += 1;
+    }
+    fields
+}
+
+/// One schema this package contributes that no target answers for.
+///
+/// Every other schema here belongs to a noun somebody can `get`. A mutation's answer belongs to
+/// a *command*: it is what one attempt produced, and there is no collection of attempts to
+/// enumerate. So the schema is declared on its own and the commands name it as their output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaDef {
+    /// The schema id, as records of it carry it.
+    pub id: &'static str,
+    /// The schema's display name.
+    pub name: &'static str,
+    /// One line: what a record of this schema is.
+    pub summary: &'static str,
+    /// What makes two records of it the same thing.
+    pub identity: &'static [&'static str],
+    /// The fields, in declaration order.
+    pub fields: &'static [Field],
+}
+
+impl SchemaDef {
+    /// The schema as the handshake carries it.
+    #[must_use]
+    pub fn contribution(&self) -> SchemaContribution {
+        SchemaContribution {
+            id: self.id.to_owned(),
+            name: self.name.to_owned(),
+            summary: self.summary.to_owned(),
+            identity: self
+                .identity
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect(),
+            fields: self
+                .fields
+                .iter()
+                .map(|field| SchemaFieldContribution {
+                    name: field.name.to_owned(),
+                    field_type: field.field_type.to_owned(),
+                    required: field.required,
+                    nullable: !field.required,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The schemas that belong to a command rather than to a target.
+pub static COMMAND_SCHEMAS: &[SchemaDef] = &[SchemaDef {
+    id: "io.github.godspeed-you.kubernetes.mutation/1",
+    name: "KubernetesMutation",
+    summary: "What one attempt at a change asked for, what the API server did with it, and the \
+              one rung of the ladder that establishes.",
+    identity: PLAN_IDENTITY,
+    fields: &MUTATION_FIELDS,
+}];
+
+/// What a contributed command changes, which decides which handler answers it.
+///
+/// Two members, because §43.3's candidate actions all reduce to two shapes: a bounded field
+/// change and a deletion. A third member would be a third kind of write, and this package has
+/// none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writes {
+    /// A bounded set of field changes, applied with field ownership tracked (§43.3, §44.1).
+    Fields,
+    /// The object, with the propagation policy the invocation chose (§45.2).
+    Object,
+}
+
+/// One command this package contributes: a word that changes a cluster.
+///
+/// A command rather than a target, and the difference is not cosmetic. A `TargetContribution`
+/// carries a name, a schema, a summary and an identity note, and that is all it can carry — it
+/// has nowhere to declare a risk and nowhere to declare a capability, because everything a
+/// target answers is a read. A `CommandContribution` carries both, and the host checks the
+/// capability at every invocation before this package's code is reached at all. That is why a
+/// mutation is a command here: not because `get` would be inconvenient, but because `get` cannot
+/// say what a write has to say about itself (§31.22, §31.75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Command {
+    /// The kebab name after `<package.id>.command.`.
+    pub name: &'static str,
+    /// An existing verb from core's `docs/contracts/verbs.yaml` — never one invented here.
+    pub verb: &'static str,
+    /// The noun the verb acts on, which is a target this package already contributes.
+    pub target: &'static str,
+    /// One line, for `help` and completion.
+    pub summary: &'static str,
+    /// The schema of the records the command emits.
+    pub schema: &'static str,
+    /// The risk level, from `risk_levels` in core's `docs/contracts/capabilities.yaml` (§31.75).
+    pub risk: &'static str,
+    /// The KUANG/11 capabilities the command needs, checked by the host at each invocation.
+    pub capabilities: &'static [&'static str],
+    /// What the command changes.
+    pub writes: Writes,
+    /// Documented examples.
+    pub examples: &'static [&'static str],
+}
+
+impl Command {
+    /// The full contributed id, `<package.id>.command.<kebab-name>` (§31.5).
+    #[must_use]
+    pub fn id(&self) -> String {
+        format!("{}.command.{}", crate::PACKAGE, self.name)
+    }
+
+    /// The command as the handshake carries it.
+    #[must_use]
+    pub fn contribution(&self) -> CommandContribution {
+        CommandContribution {
+            id: self.id(),
+            verb: self.verb.to_owned(),
+            target: self.target.to_owned(),
+            summary: self.summary.to_owned(),
+            // A mutation is aimed at one object this package resolves for itself (§21.3 of the
+            // generic contract), so nothing flows into it.
+            input: None,
+            output: format!("stream<{}>", self.schema),
+            capabilities: self
+                .capabilities
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+            argument_mode: "words".to_owned(),
+            risk: Some(self.risk.to_owned()),
+            examples: self
+                .examples
+                .iter()
+                .map(|example| (*example).to_owned())
+                .collect(),
+        }
+    }
+}
+
+/// The two words that change a cluster, and nothing else.
+///
+/// **The verbs are core's.** §31.22 asks a package to reuse an existing verb wherever the
+/// semantics allow, and both do: `set` is "modify properties or configuration" and `remove` is
+/// "delete a resource or a membership", which is exactly §43.3's bounded field change and
+/// exactly its deletion. Neither needed a verb of its own, and a `k8s-apply` would have been a
+/// Kubernetes mini-shell growing its first word (§4 invariant 22, §35.1).
+///
+/// **The noun is the one `get k8s-resource` already reads.** One word for a kind, read by one
+/// verb and written by another, is the whole point of a verb-noun shell: nothing here is
+/// reachable that `get` could not already show.
+///
+/// **`network.connect` is the capability, and it is the only honest one available.** Everything
+/// these commands do to a cluster travels as bytes through the host's network broker, and the
+/// broker's scope — the host and the port of the API server — is the operator's decision about
+/// which cluster this package may reach at all (§27.2 of the generic contract, §51.2). The
+/// capability model has no family for "change state in the external system a provider fronts":
+/// `service.mutate` is scoped to service-manager units and `remote.mutate` to Ono links, and
+/// claiming either would put a scope on an operator's grant that nothing checks — which §31.16
+/// forbids in as many words. See ADR-0024.
+pub static COMMANDS: &[Command] = &[
+    Command {
+        name: "set-k8s-resource",
+        verb: "set",
+        target: "k8s-resource",
+        summary: "Apply a bounded field change to one Kubernetes object, as a server dry run \
+                  unless `dry_run false` is given (specification sections 43.3, 44).",
+        schema: "io.github.godspeed-you.kubernetes.mutation/1",
+        risk: "mutate",
+        capabilities: &["network.connect"],
+        writes: Writes::Fields,
+        examples: &[
+            "set k8s-resource --context prod --kind Deployment --name api --set \
+             '{\"/spec/replicas\": 2}'",
+            "set k8s-resource --context prod --kind Deployment --name api --set \
+             '{\"/spec/replicas\": 2}' --dry-run false",
+        ],
+    },
+    Command {
+        name: "remove-k8s-resource",
+        verb: "remove",
+        target: "k8s-resource",
+        summary: "Delete one Kubernetes object, as a server dry run unless `dry_run false` is \
+                  given (specification section 45).",
+        schema: "io.github.godspeed-you.kubernetes.mutation/1",
+        // `destructive` rather than `mutate`: §45.1 and §45.5 are a list of the ways a deletion
+        // reaches things this provider cannot get back, and `risk_levels` in core's
+        // `capabilities.yaml` defines `destructive` as exactly "may cause irreversible loss".
+        risk: "destructive",
+        capabilities: &["network.connect"],
+        writes: Writes::Object,
+        examples: &[
+            "remove k8s-resource --context prod --kind ConfigMap --name stale",
+            "remove k8s-resource --context prod --kind ConfigMap --name stale --dry-run false",
+        ],
+    },
+];
+
+/// The command of that kebab name, where this package contributes one.
+#[must_use]
+pub fn command(name: &str) -> Option<&'static Command> {
+    COMMANDS.iter().find(|command| command.name == name)
 }

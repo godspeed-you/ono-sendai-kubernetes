@@ -148,6 +148,98 @@ targets:
     summary: "What changed in a collection while this provider was watching it, and every period it could not observe (specification section 19)."
     identity_doc: "Two observations are the same change when the collection, the observation period, the word, the object's UID and its resourceVersion all match. A change has no `metadata.uid` of its own; the UID on the record is the object's."
 
+  # The Events a cluster reported about one object (§38). Not a collection of the query's kind: the
+  # query names the object the Events are *about*, and the Events themselves come from whichever of
+  # §38.2's two representations the cluster serves. Options: `kind`/`group`/`version`/`resource` and
+  # `name` name the object, exactly as `k8s-relation` names one.
+  #
+  # An aggregated Event is **one** record carrying its count, and a search that matched nothing ends
+  # the invocation stating §38.6 rather than completing with an empty stream — an empty stream is
+  # read as absence, and the absence of an Event never proves that nothing happened. ADR-0025.
+  - name: k8s-event
+    schema: io.github.godspeed-you.kubernetes.event/1
+    summary: >-
+      The Events a cluster reported about an object — best-effort, briefly retained, and never a
+      history (specification section 38).
+    identity_doc: >-
+      Two observations are the same Event when their `metadata.uid` matches. An Event is an object
+      of its own; what it regards is a field of it. An aggregated Event is one Event however many
+      occurrences it counts.
+
+  # What a Node states about the machine underneath it, exported for someone else to resolve (§28.3
+  # to §28.5, §47). The kind is fixed — the pointers and the published keys are a Node's — so the
+  # only option beyond the endpoint ones is `name`. Nothing here presents a match: each record
+  # carries the value, the pointer it was read at, its evidence class and its strength, and there is
+  # no field for a foreign resource. A key that could not be read is a record too, with `observed`
+  # false and an outcome from §21.4's vocabulary. ADR-0016.
+  - name: k8s-evidence
+    schema: io.github.godspeed-you.kubernetes.evidence/1
+    summary: >-
+      What a Node states about the machine underneath it, as inspectable evidence for a resolver
+      that has read the other system (specification section 47).
+    identity_doc: >-
+      Two observations are the same evidence when the Node's `metadata.uid`, the published key and
+      the field pointer all match. A Node rebuilt under the same name is a different machine.
+
+  # One container's log, as lines (§42.1). Options: `name` is the Pod, `container` names one where
+  # the Pod has several, `previous` reads the one prior run the kubelet retains, `timestamps` asks
+  # the server to prefix each line, and `tail_lines`, `since_seconds` and `limit_bytes` bound the
+  # answer — each of them adding an entry to every record's `bounds`. `bounds` is never empty, and
+  # that is the point: a retrieved log is not the container's output. There is deliberately no
+  # `follow`, which is a live stream and would need `k8s-change`'s machinery to answer honestly.
+  - name: k8s-log
+    schema: io.github.godspeed-you.kubernetes.log/1
+    summary: >-
+      A container's log, as lines that state their bounds — never the container's complete output
+      (specification section 42.1).
+    identity_doc: >-
+      Two observations are the same line when the Pod's `metadata.uid`, the container, the run and
+      the ordinal within the read all match. A line has no identity of its own; a process that
+      printed one message twice printed it twice.
+
+  # What is known to have happened to one object, and by whose clock (§39). Options are the object's:
+  # `kind`/`group`/`version`/`resource` and `name`. Every record carries the window this provider
+  # observed in, on its own clock, and both kinds of hole in it — the stretches nobody observed and
+  # the scopes nobody could read. Every observation this route produces is `reported` rather than
+  # `observed`, because nothing here opens a watch and only a watch witnesses a change (§39.2).
+  - name: k8s-timeline
+    schema: io.github.godspeed-you.kubernetes.timeline/1
+    summary: >-
+      What is known to have happened to an object, with the clock behind every time and the
+      periods nobody observed (specification section 39).
+    identity_doc: >-
+      Two observations are the same observation when the object, the source, the clock, the raw
+      timestamp and what was observed all match. Two observations on two clocks are never in an
+      order.
+
+  # What may be said about the state one object is in (§40). Options are the object's, plus
+  # `within_ms` — how far apart two observations on one clock may be and still be reported as
+  # correlated. The strongest thing a record carries is one of five claims, none of which says that
+  # one thing brought about another, and `strongest_claim` travels on every record so that a reader
+  # who sees one finding still sees the ceiling. §40.5's `insufficient evidence` is an answer.
+  - name: k8s-why
+    schema: io.github.godspeed-you.kubernetes.why/1
+    summary: >-
+      What can be said about the state an object is in — correlation, order, a dependency path or
+      something Kubernetes asserts, and never a cause (specification section 40).
+    identity_doc: >-
+      Two observations are the same finding when the object, the claim and what the claim rests on
+      all match. A finding has no `metadata.uid` of its own.
+
+  # The structured observations an object's controllers wrote about it (§37.1). Options are the
+  # object's. One record per condition, because a Deployment can be `Available=True` on its old
+  # replicas while `Progressing=False` because the new ones never came up. `observedGeneration`
+  # arrives as a number; the only derived state is the `reconciliation` map, whose
+  # `verified_convergence` key is false for a matching generation alone (§37.3, §37.5).
+  - name: k8s-condition
+    schema: io.github.godspeed-you.kubernetes.condition/1
+    summary: >-
+      The conditions an object's controllers wrote about it, each with the generation it was
+      written about (specification section 37).
+    identity_doc: >-
+      Two observations are the same condition when the object's `metadata.uid` and the condition
+      `type` match. A condition that flipped is the same condition.
+
   # The provider instance itself rather than anything in the cluster: which cluster this is,
   # whether it answers, and who you are to it (§8.5, §8.6, §10, §34.3). It is the one target here
   # that is useful when the cluster is *not* reachable, which is why an unreachable API server
@@ -156,3 +248,16 @@ targets:
     schema: io.github.godspeed-you.kubernetes.cluster/1
     summary: "Which cluster this is, whether it can be reached, and who you are to it."
     identity_doc: "Two observations are the same provider instance when their `uid` — `kubernetes:<context>` — matches. Two instances that reach one cluster share a fingerprint and are never one instance (specification section 10.3)."
+
+  # What a change *would* do, before anything is changed (§46). A target rather than a command
+  # because building a plan is read-only: one `GET` of the object the change is aimed at, plus
+  # discovery, and this provider's own rules. Deliberately no server dry run on this path — a
+  # dry-run `PATCH` is a write-shaped request that runs admission webhooks, and a word a user may
+  # point at anything must not do that. The plan says so in its caveats instead, and the dry run
+  # lives on `set k8s-resource`, where the risk is declared. Options: `kind`/`group`/`version`/
+  # `resource` and `name` name the object exactly as `k8s-resource` does; `set` and `unset` state
+  # the field change; `action delete` plans a deletion instead, with `propagation`. ADR-0024.
+  - name: k8s-plan
+    schema: io.github.godspeed-you.kubernetes.plan/1
+    summary: "What a change would do, before anything is changed (specification section 46)."
+    identity_doc: "Two records describe the same prospective change when the object lifetime, the `resourceVersion` the plan is aimed at, the action and the fields it touches all match. A plan has no `metadata.uid` of its own; the uid on the record is the target object's."

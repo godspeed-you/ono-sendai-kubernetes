@@ -864,23 +864,10 @@ impl MutationOutcome {
     /// registry, a default injected into a field the caller left alone.
     #[must_use]
     pub fn admission_differences(&self, requested: &Json) -> Vec<FieldChange> {
-        let Some(returned) = &self.returned else {
-            return Vec::new();
-        };
-        let mut differences = Vec::new();
-        let mut paths = Vec::new();
-        leaves(requested, String::new(), &mut paths);
-        for (path, sent) in paths {
-            if SERVER_OWNED_METADATA.contains(&path.as_str()) {
-                continue;
-            }
-            match returned.field(&path) {
-                Some(got) if got == &sent => {}
-                Some(got) => differences.push(FieldChange::change(path, sent, got.clone())),
-                None => differences.push(FieldChange::remove(path, sent)),
-            }
-        }
-        differences
+        self.returned
+            .as_ref()
+            .map(|returned| admission_differences_of(requested, returned))
+            .unwrap_or_default()
     }
 
     /// The answer, and the sentence that stops it being read as an outcome.
@@ -909,6 +896,33 @@ impl MutationOutcome {
             }
         }
     }
+}
+
+/// The same comparison as [`MutationOutcome::admission_differences`], against an object the
+/// caller supplies (§44.6).
+///
+/// It exists for one caller: a boundary that may not hold a Secret's payload. §22 requires the
+/// payload to be destroyed on the way in rather than filtered on the way out, so a caller that
+/// has taken the returned object through `redaction::Guarded` passes the guarded object here and
+/// gets the same answer for every field that is not one. Comparing against
+/// [`MutationOutcome::returned`] instead would report an admission-rewritten payload value
+/// verbatim, which is the one way a mutation could disclose what a read may not (Gate I).
+#[must_use]
+pub fn admission_differences_of(requested: &Json, returned: &Object) -> Vec<FieldChange> {
+    let mut differences = Vec::new();
+    let mut paths = Vec::new();
+    leaves(requested, String::new(), &mut paths);
+    for (path, sent) in paths {
+        if SERVER_OWNED_METADATA.contains(&path.as_str()) {
+            continue;
+        }
+        match returned.field(&path) {
+            Some(got) if got == &sent => {}
+            Some(got) => differences.push(FieldChange::change(path, sent, got.clone())),
+            None => differences.push(FieldChange::remove(path, sent)),
+        }
+    }
+    differences
 }
 
 /// The object a response body carries, where it carries one.

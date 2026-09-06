@@ -55,7 +55,7 @@ use ono_provider_kubernetes::tls::{Anchors, ClientIdentity, TlsError, TlsSetting
 use ono_provider_kubernetes::transport::{
     ApiError, ByteStream, Client, Freshness, ListOptions, Listing, Operation, Request,
 };
-use ono_value::Schema;
+use ono_value::{Schema, Value};
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use crate::broker::{BrokeredStream, Lease, ReadPolicy, decode_hex};
@@ -482,6 +482,26 @@ fn read<S: ByteStream>(
                  and then watches it from the version that listing returned.",
             ));
         }
+        // Nor is any of the six questions that are *about* one object rather than about a
+        // collection of anything. Each is routed by its own handler long before a collection is
+        // chosen, and each arm is written out rather than folded into a catch-all so that a
+        // seventh reading cannot silently fall through to a wrong one.
+        Reads::Events
+        | Reads::Evidence
+        | Reads::Logs
+        | Reads::Timeline
+        | Reads::Why
+        | Reads::Conditions => {
+            return Err(failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                "this question is asked about one named object rather than about a collection"
+                    .to_owned(),
+                "Pass `kind` and `name` — for example `get k8s-event --kind Pod --name \
+                 api-7d9f-abc` — so that the answer is about one lifetime rather than about a \
+                 name several objects have had.",
+            ));
+        }
         // Nor is a relationship: it has no collection of its own, and `relations::answer` routes
         // it long before a collection is chosen.
         Reads::Relations => {
@@ -491,6 +511,19 @@ fn read<S: ByteStream>(
                 "a relationship is derived from one object rather than fetched from a collection"
                     .to_owned(),
                 "Ask for the object's relationships with `get k8s-relation --kind ... --name ...`.",
+            ));
+        }
+        // Nor is a prospective change: `planning::answer` reads the one object the change is
+        // aimed at and builds a plan from it, and a listing of plans would be a listing of
+        // changes nobody has asked for.
+        Reads::Plan => {
+            return Err(failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                "a plan describes a change to one object rather than a collection of objects"
+                    .to_owned(),
+                "Ask what a change would do with `get k8s-plan --kind ... --name ... --set ...`, \
+                 which reads that one object and describes the change against what it holds.",
             ));
         }
         Reads::Discovered => {
@@ -604,8 +637,177 @@ pub(crate) fn fetch<S: ByteStream>(
     }
 }
 
+/// The whole preferred discovery surface, as one snapshot (§4 invariants 1–2, §5.2).
+///
+/// Two documents rather than a compile-time table, and read through the session so that the
+/// second question of one session is free (§50.2). Every handler that resolves a kind the query
+/// named starts here.
+///
+/// # Errors
+///
+/// A wire failure, or an endpoint that answered but not as a Kubernetes API server.
+pub(crate) fn served<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+) -> Result<Discovery, WireError> {
+    let core = document(session, client, endpoint, "/api")?;
+    let groups = document(session, client, endpoint, "/apis")?;
+    Ok(Discovery::builder()
+        .core_versions(&core)
+        .and_then(|builder| builder.groups(&groups))
+        .map_err(|error| {
+            failure(
+                UNAVAILABLE_CODE,
+                UNAVAILABLE,
+                format!("the API server's discovery documents did not read: {error}"),
+                "The endpoint answered, but not as a Kubernetes API server.",
+            )
+        })?
+        .build())
+}
+
+/// One object a question is *about*, read at its own endpoint (§17.1).
+///
+/// Four targets ask a question whose subject is one named object — its Events, its conditions,
+/// what is known to have happened to it, and what may be said about the state it is in — and all
+/// four need exactly this: the resource discovery resolved, the scope it lives in, the object
+/// across the redaction boundary, and the freshness of the read. Assembling it once is what stops
+/// four handlers disagreeing about which of them is the object's namespace.
+pub(crate) struct Subject {
+    /// What discovery said serves the kind the query named.
+    pub(crate) resource: Resource,
+    /// The scope the object was read in — the query's namespace, or cluster scope (§9.2).
+    pub(crate) scope: Scope,
+    /// The object, past the one door into the emission path (§22, Gate I).
+    pub(crate) guarded: Guarded,
+    /// What §17.1 requires the read to state about itself.
+    pub(crate) freshness: Freshness,
+}
+
+/// Reads the object a question is about, or [`None`] where it is not there.
+///
+/// [`None`] is §21.4's `absent` and nothing else: a `404` on one object's own endpoint is the one
+/// outcome that is evidence of absence rather than a statement about what could not be seen. A
+/// denial, an unserved API and a failed request are refusals, and every one of them comes back as
+/// an error (ADR-0012).
+///
+/// # Errors
+///
+/// Whatever kept the object from being read, in the vocabulary of core's `errors.yaml`.
+pub(crate) fn subject<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    selector: &Selector,
+    name: &str,
+) -> Result<Option<Subject>, WireError> {
+    let catalogue = served(session, client, endpoint)?;
+    let resource = resolve_in(session, client, endpoint, &catalogue, selector, Verb::Get)?;
+    let scope = scope_for(endpoint, &resource);
+    let (object, freshness) = match fetch(client, &resource, &scope, name)? {
+        Answer::Absent => return Ok(None),
+        Answer::Fetched(read) => *read,
+        // `fetch` is a get, and a get answers with one object or with nothing.
+        Answer::Listed(_) => {
+            return Err(failure(
+                UNAVAILABLE_CODE,
+                UNAVAILABLE,
+                "a direct read answered with a collection".to_owned(),
+                "This is a defect in the Kubernetes provider, not in the cluster.",
+            ));
+        }
+    };
+    Ok(Some(Subject {
+        resource,
+        scope,
+        guarded: hold(object)?,
+        freshness,
+    }))
+}
+
+/// The scope a resource of this shape is read in (§9.2).
+///
+/// A cluster-scoped resource has no namespace, and inventing one for it would be a request the
+/// server rejects for a reason that has nothing to do with what was asked.
+pub(crate) fn scope_for(endpoint: &Endpoint, resource: &Resource) -> Scope {
+    match resource.scope() {
+        discovery::Scope::Cluster => Scope::cluster(),
+        discovery::Scope::Namespaced => endpoint.scope.clone(),
+    }
+}
+
+/// Takes one object across the redaction boundary (§22, Gate I).
+///
+/// # Errors
+///
+/// A defect in this provider rather than anything a cluster can cause, reported as one.
+pub(crate) fn hold(object: Object) -> Result<Guarded, WireError> {
+    Guarded::hold(object).map_err(|error| {
+        failure(
+            UNAVAILABLE_CODE,
+            UNAVAILABLE,
+            format!("an object could not be taken across the redaction boundary: {error}"),
+            "This is a defect in the Kubernetes provider, not in the cluster.",
+        )
+    })
+}
+
+/// Hands one record to the host, or says why the invocation is over.
+///
+/// [`Err`] carries the outcome the caller returns unchanged: a cancelled stream and a refused
+/// record end an invocation in different ways, and neither is something a handler continues past.
+pub(crate) fn deliver(ctx: &mut Ctx<'_>, value: &Value) -> Result<(), Outcome> {
+    match ctx.emit(value) {
+        Ok(()) => Ok(()),
+        Err(EmitError::Cancelled) => Err(Outcome::Cancelled),
+        Err(error) => Err(Outcome::Failed(failure(
+            UNAVAILABLE_CODE,
+            UNAVAILABLE,
+            format!("the host refused a record: {error}"),
+            "The stream ended before the query did.",
+        ))),
+    }
+}
+
+/// Builds one record, or says why the table and the schema have drifted apart.
+///
+/// # Errors
+///
+/// [`Outcome::Failed`], because a record that does not fit its own declared schema is a defect in
+/// this crate's table and never something a cluster can cause.
+pub(crate) fn built(
+    target: &'static Target,
+    value: Result<Value, ono_value::ErrorValue>,
+) -> Result<Value, Outcome> {
+    value.map_err(|error| {
+        Outcome::Failed(failure(
+            UNAVAILABLE_CODE,
+            UNAVAILABLE,
+            format!(
+                "a record of `{}` could not be built: {error}",
+                target.schema
+            ),
+            "This is a defect in the Kubernetes provider's schema table.",
+        ))
+    })
+}
+
+/// A question about one object that did not say which object.
+pub(crate) fn unnamed(what: &str, example: &str) -> WireError {
+    failure(
+        AMBIGUOUS_CODE,
+        AMBIGUOUS,
+        format!("the query named no `name`, so it did not say which object {what}"),
+        &format!(
+            "Pass `kind` and `name` — for example `{example}` — and `namespace` where the kind is \
+             namespaced."
+        ),
+    )
+}
+
 /// The resource serving a kind this package named at build time (§15.2).
-fn curated<S: ByteStream>(
+pub(crate) fn curated<S: ByteStream>(
     session: &mut Session,
     client: &mut Client<S>,
     endpoint: &Endpoint,
