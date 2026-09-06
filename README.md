@@ -75,12 +75,17 @@ Every flag above is declared and reaches the registry, so `help get k8s-pod` and
 `help set k8s-resource` list them with their types and defaults — including `--dry_run`, which is
 the argument that decides whether a cluster changes.
 
-**What you cannot type.** An `ExecCredential` plugin is not run, so a kubeconfig that authenticates
-through one — which is how EKS, GKE and AKS are usually configured — is refused by name rather than
-connected as somebody else (§8.2). `exec`, `attach` and `port-forward` are refusals that say what is
-missing rather than sessions (§42.3–§42.5). `up` refuses, because the space above a namespace is an
+**What you cannot type.** `exec`, `attach` and `port-forward` are refusals that say what is missing
+rather than sessions (§42.3–§42.5). `up` refuses, because the space above a namespace is an
 aggregate no single package can declare. A `KUBECONFIG` naming several files reads the first and
 says so. Each is named with its reason in [`docs/coverage.md`](docs/coverage.md).
+
+**What needs one more grant.** A kubeconfig authenticating through an `exec` credential plugin —
+which is how EKS, GKE and AKS are usually configured — runs that plugin under `process.exec`, and
+under nothing less: §8.2 requires an explicit process-execution capability, so without the grant
+the context is refused by name and nothing is run. Scope it to the one program your cloud installs
+— `--grant process.exec` with `programs` naming it — and the helper gets the environment your
+kubeconfig declares and nothing inherited.
 
 ## What the provider is for
 

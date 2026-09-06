@@ -232,11 +232,13 @@ against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`.
 Four things, none of them a `MUST` that is unmet, and each with a reason rather than a backlog
 position. They are the gap list in [`coverage.md`](coverage.md), in the same order.
 
-1. **Exec credential plugins (§8.2, §8.3).** The largest thing between this provider and most real
-   clusters: an EKS, GKE or AKS kubeconfig authenticates through an `ExecCredential` plugin and
-   this package runs none, so it refuses by name rather than connecting as somebody else. It needs
-   a process-execution capability this package does not declare and the three interaction modes
-   §8.3 names. §51.6's fourth audit record waits behind it. **This is the next task.**
+1. **Credential refresh (§8.3).** §8.2 and §8.3 are met — a managed cloud's kubeconfig connects,
+   under a `process.exec` grant the operator makes deliberately (ADR-0054) — except that a
+   credential is fetched once per endpoint resolution. One that expires mid-invocation produces the
+   API server's `401` rather than a second run of the helper, which §8.3 makes a `SHOULD`. Doing it
+   properly means a credential outliving the resolution that fetched it, and the session is keyed
+   on what the operator configured (ADR-0021): a cached credential is the first thing that would
+   want to be keyed on something else. **This is the next task.**
 2. **No relationship index and no query plan (§50.4, §17.6).** Both are `SHOULD`s or `MAY`s whose
    `MUST`s hold vacuously. Server-side selectors now exist but no *derivation* uses one, because a
    rule's selector is not the caller's.
@@ -921,8 +923,8 @@ claim. A sibling pins the core revision CI builds the shell from against *every*
 bump that touched only the workspace left two revisions of `ono-kuang-protocol` in one graph.
 
 Counts, so the next re-derivation has something to disagree with: 933 tests (662 domain, 271
-package), 47 targets, 2 commands, 48 schemas, 24 of 24 domain modules imported, 22 declared skips,
-53 ADRs, 34 sections implemented and 32 partial, 22 of 22 invariants, **14 of 14 gates**.
+package), 47 targets, 2 commands, 48 schemas, 22 declared skips, 31 sections implemented and 35
+partial, 22 of 22 invariants, **14 of 14 gates**.
 
 Next: exec credential plugins (§8.2, §8.3), which is what stands between this provider and most
 managed clusters.
