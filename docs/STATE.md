@@ -1031,3 +1031,71 @@ of §4's 22 invariants hold and the twenty-second is aggregated-API failure isol
 gates end to end.
 
 Next: two invocations at once, then a Kubernetes object that is somewhere.
+
+### 2026-09-07 — the gaps closed, and two defects only running could find
+
+This record covers `76125cd`..`96ebabb` and a re-derivation of [`coverage.md`](coverage.md). The
+headline is that **all fourteen acceptance gates of §62 are met**, proven against real `kind`
+clusters at all three declared versions, and that the last two were closed by finding bugs rather
+than by writing features.
+
+**The gaps the previous coverage map named are closed.** §11.3's discovery snapshot carries its
+five fields and `k8s-cluster` publishes them, because a provider fact nothing can read is not one
+([ADR-0048](adr/ADR-0048-a-served-surface-that-cannot-say-when-it-was-observed-is-a-lookup-table.md)).
+§17.3–§17.5's selectors are pushed to the API server *verbatim*, which is what keeps all three of
+the section's prohibitions: there is no translation, so nothing for a translation to change
+([ADR-0049](adr/ADR-0049-the-way-to-keep-a-selector-translation-from-changing-meaning-is-to-have-no-translation.md)).
+§23.6 dates a derived edge by the oldest read that went into it and publishes Appendix C.2's
+`observed_resource_versions`
+([ADR-0050](adr/ADR-0050-a-conclusion-is-as-old-as-the-oldest-fact-it-rests-on.md)). §47.5 exports
+a CSI handle and its driver as two items rather than one, because joining them would be a decision
+about whose namespace the handle lives in
+([ADR-0051](adr/ADR-0051-a-volume-handle-is-a-name-the-storage-system-gave-and-this-provider-does-not-know-whose.md)).
+And §15.3's seventeen Tier 2 kinds are curated, proven against a recorded server and against a
+live cluster, because a fixture written from the same table as the code cannot disagree with it
+([ADR-0052](adr/ADR-0052-a-curated-noun-earns-its-place-by-its-projection.md)).
+
+**§33.8's registry is a decision rather than code**, and the guard that came with it found a real
+defect. §55.2's Namespace deletion analysis read `resource.kind() == "Namespace"` with no group
+beside it, so a custom resource called `Namespace` in another group would have had a cluster's
+namespaced inventory counted as its contents and attached to its deletion plan. §13.5 is the rule
+it broke. The registry itself is declined with reasons in
+[ADR-0053](adr/ADR-0053-there-is-no-curated-crd-knowledge-to-register-and-inventing-some-would-be-worse.md):
+it governs curated *CRD* knowledge, this provider curates none, and inventing an ecosystem's
+semantics would be a claim about what somebody else's controller means by its fields.
+
+**The part worth keeping is the two defects, because neither could have been found by a test in
+this repository.**
+
+- **`get k8s-log` had never once worked against a real API server.** The request asked for
+  `Accept: text/plain` — what a log body *is*, and not a media type Kubernetes' content
+  negotiation offers — so every real cluster answered `406 Not Acceptable`. The recorded fixture
+  answered whatever it was asked and never looked at the header. A fixture written from the same
+  belief as the code cannot disagree with it, and a hundred green tests proved only that the
+  fixture was agreeable. It now answers `406` to a media type the API server would refuse, which
+  turns eight tests red on the old spelling, and a live test reads CoreDNS's startup lines.
+
+- **The host was converting every refusal from an unbounded target into a clean empty answer.**
+  `plugin_provider::stream_of` in core returned on the end of the output stream without reading
+  the invocation result, so a handler that refused before emitting anything looked exactly like
+  one that finished with nothing to say. That is §21.4 of the provider contract violated *by the
+  host* — invisible to every test a provider can write, and it is what had been hiding the log
+  defect through every layer of green beneath it. Fixed as `ADR-0590 (core)` with acceptance case
+  `129-kuang-unbounded-target`, and this package now pins the revision that carries it.
+
+Both were found by running `scripts/demo.sh` and reading its output. Nothing else in this session
+was.
+
+**Gate N is tested rather than asserted.** §5.1 asks for "a tested compatibility matrix, not a
+parser guard", and the window lived in four places that could drift apart — the specification, the
+workflow's three legs, the README's compatibility row and `scripts/cluster.sh`'s default.
+`should_test_the_support_matrix_the_specification_declares_and_the_readme_claims` makes them one
+claim. A sibling pins the core revision CI builds the shell from against *every* manifest, after a
+bump that touched only the workspace left two revisions of `ono-kuang-protocol` in one graph.
+
+Counts, so the next re-derivation has something to disagree with: 933 tests (662 domain, 271
+package), 47 targets, 3 commands, 48 schemas, 24 of 24 domain modules imported, 22 declared skips,
+53 ADRs, 34 sections implemented and 32 partial, 22 of 22 invariants, **14 of 14 gates**.
+
+Next: exec credential plugins (§8.2, §8.3), which is what stands between this provider and most
+managed clusters.
