@@ -2516,6 +2516,19 @@ schemas:
           that read a custom resource (§33.8), the owner-reference reversal behind an `owns` edge.
           None of it would make the edge exist and all of it changes what the edge means. Empty
           rather than null where there is none.
+      observed_resource_versions:
+        type: map
+        required: true
+        doc: >-
+          What each source of this edge was at when it was read, keyed by kind — Appendix C.2's
+          field of the same name. The subject is always here, because every edge rests on the
+          subject's read; a collection is here only for an edge this provider *concluded*, since
+          an owner reference is a field of the subject and nothing else was read to find it.
+          It is what makes §23.6 checkable rather than merely asserted: a `selects` edge is this
+          provider's conclusion from two objects read at two instants, the record's `observed_at`
+          is already bounded by the older of them, and this says which two reads they were. A
+          source whose read carried no `resourceVersion` is left out rather than entered empty,
+          because a key with nothing behind it is a check nobody can make (§21.4).
     default_view:
       columns: [name, relation, target_name, evidence_class, evidence, asserted]
 

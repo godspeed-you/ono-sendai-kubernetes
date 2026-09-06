@@ -1199,6 +1199,7 @@ const RELATION_FIELDS: &[Field] = &[
     Field::nullable("evidence_path", "string"),
     Field::required("asserted", "bool"),
     Field::required("supporting", "list<string>"),
+    Field::required("observed_resource_versions", "map"),
 ];
 
 /// What makes two observations the same observed change (§19.3, §39.3).

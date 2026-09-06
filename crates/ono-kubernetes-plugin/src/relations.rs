@@ -192,6 +192,7 @@ impl Conversation for Related<'_> {
             coverage: ono_provider_kubernetes::coverage::Coverage::complete(scope.clone()),
             source: guarded,
             freshness,
+            sources: Vec::new(),
         };
         // §34.2's second sentence: the failed group/version is reported separately, beside the
         // gaps the derivations record for themselves.
@@ -223,6 +224,51 @@ struct Derived {
     coverage: ono_provider_kubernetes::coverage::Coverage,
     source: Guarded,
     freshness: Freshness,
+    /// Every *second* read a derivation drew on, in the order it was made (§23.6).
+    ///
+    /// The subject's own read is [`Self::freshness`] and is not in here. What is in here is the
+    /// collection a rule listed to evaluate a selector against — the second half of a conclusion
+    /// neither object states — and it is kept because §23.6 bounds a derived edge's freshness by
+    /// *every* source fact, and because Appendix C.2 shows each source's `resourceVersion` on the
+    /// edge it produced.
+    sources: Vec<SourceRead>,
+}
+
+/// One collection a derivation read, and what it was worth.
+///
+/// The role is the kind, lower-cased, because that is what Appendix C.2's example keys on
+/// (`service:`, `pod:`) and because a reader checking an edge against the cluster asks "which
+/// Pod list was this?" rather than "which of the three reads was this?".
+struct SourceRead {
+    role: String,
+    freshness: Freshness,
+}
+
+/// Appendix C.2's `observed_resource_versions`: what each source of this edge was at.
+///
+/// The subject is always in it, under its own kind, because every edge rests on the subject's
+/// read. The collections are in it only for an edge this provider *concluded* — an owner
+/// reference is a field of the subject and nothing else was read to find it, so listing a Pod
+/// collection beside it would name a source that had no part in the conclusion, which is the
+/// same class of mistake as citing evidence that does not exist.
+///
+/// A source whose read carried no `resourceVersion` is left out rather than entered as empty
+/// text: the point of the map is that a reader can check an edge against the cluster, and a key
+/// with nothing behind it is a check that cannot be made (§21.4).
+fn observed_resource_versions(derived: &Derived, edge: &Edge) -> Vec<(String, String)> {
+    let mut versions = Vec::new();
+    let subject = derived.source.object();
+    if let Some(version) = subject.resource_version() {
+        versions.push((subject.gvk().kind().to_lowercase(), version.to_owned()));
+    }
+    if !edge.evidence().is_asserted_by_provider() {
+        for read in &derived.sources {
+            if let Some(version) = read.freshness.resource_version() {
+                versions.push((read.role.clone(), version.to_owned()));
+            }
+        }
+    }
+    versions
 }
 
 /// Every edge the object states about itself: no second object, so no derived class (§23.1–§23.2).
@@ -437,6 +483,13 @@ fn collection<S: ByteStream>(
         options = options.max_pages(pages);
     }
     let listing = client.list(resource.gvr(), &scope, &options);
+    // §23.6, recorded at the one moment it is knowable: this listing is the second source of every
+    // edge the rule about to run derives, and once the objects are unwrapped the read that
+    // produced them is gone.
+    derived.sources.push(SourceRead {
+        role: kind.to_lowercase(),
+        freshness: listing.freshness().clone(),
+    });
     let complete = listing.coverage().is_complete() && listing.continuity().is_intact();
     for gap in listing.coverage().gaps() {
         derived.coverage.record(gap.clone());
@@ -670,6 +723,18 @@ fn emit(
                 ));
             }
         };
+        // §23.6: an edge this provider concluded from two objects is only as fresh as the older
+        // of them, and an edge the API server states about the object is as fresh as that
+        // object's read. The difference is `is_asserted_by_provider` — the same fact the record
+        // already publishes as `asserted`, so the rule a reader is told about and the rule the
+        // code applies are one thing rather than two that can drift.
+        let bounded = if edge.evidence().is_asserted_by_provider() {
+            derived.freshness.clone()
+        } else {
+            derived
+                .freshness
+                .bounded_by(derived.sources.iter().map(|read| &read.freshness))
+        };
         let value = match edge_record(
             target,
             schema,
@@ -677,7 +742,8 @@ fn emit(
             &there,
             &derived.source,
             edge,
-            &derived.freshness,
+            &bounded,
+            &observed_resource_versions(&derived, edge),
         ) {
             Ok(value) => value,
             Err(error) => {

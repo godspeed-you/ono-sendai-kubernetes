@@ -1461,3 +1461,107 @@ fn should_keep_the_scopes_that_answered_when_one_api_group_is_not_served() {
     assert!(!coverage.is_complete());
     assert_eq!(coverage.describe(), "all-namespaces: not served");
 }
+
+// --- §23.6: a derived edge is only as fresh as its oldest source ---------------------------------
+
+#[test]
+fn should_date_a_conclusion_by_the_oldest_fact_that_went_into_it() {
+    // §23.6: "a derived edge's freshness is bounded by the freshness of every source fact used to
+    // derive it." A `selects` edge is not a fact either object states — it is this provider's
+    // conclusion from a Service read at one instant and a Pod collection read at another — and
+    // dating it by the subject's read would stamp a conclusion with the freshest thing that went
+    // into it. That is the arithmetic that makes a stale answer look current, and it is the whole
+    // reason the section exists.
+    let subject = Freshness::direct_read(
+        ObservedAt::from_unix_millis(9_000),
+        Some("18010".to_owned()),
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        EndpointCategory::Core,
+    );
+    let older = Freshness::direct_read(
+        ObservedAt::from_unix_millis(4_000),
+        Some("17000".to_owned()),
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        EndpointCategory::Core,
+    );
+
+    let bounded = subject.bounded_by([&older]);
+    assert_eq!(
+        bounded.observed_at().unix_millis(),
+        4_000,
+        "the conclusion is as old as the older half of it, not as young as the newer"
+    );
+
+    // And the token is dropped rather than reconciled. A `resourceVersion` names a point in *one*
+    // object's continuity (§4 invariant 8); there is no such point for a conclusion drawn from
+    // two, and offering one of the sources' tokens would hand a reader a continuity they cannot
+    // resume the edge from.
+    assert_eq!(
+        bounded.resource_version(),
+        None,
+        "a conclusion has no `resourceVersion` of its own, and borrowing one would be a lie \
+         about what could be resumed"
+    );
+    assert_eq!(bounded.provider_instance(), INSTANCE);
+}
+
+#[test]
+fn should_keep_a_conclusion_that_rests_on_a_cached_fact_from_claiming_a_direct_read() {
+    // The other half of the bound, and the one that is easy to miss because the instant already
+    // looks handled. §20.2 keeps a cache hit apart from a direct read; a conclusion drawn partly
+    // from a cache hit is not a direct observation either, whatever the other half of it was.
+    let subject = Freshness::direct_read(
+        ObservedAt::from_unix_millis(9_000),
+        Some("18010".to_owned()),
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        EndpointCategory::Core,
+    );
+    let cached = Freshness::cached(
+        ObservedAt::from_unix_millis(12_000),
+        Some("17000".to_owned()),
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        EndpointCategory::Core,
+        false,
+    );
+
+    let bounded = subject.bounded_by([&cached]);
+    assert_eq!(
+        bounded.origin(),
+        Origin::Cache,
+        "one cached source makes the conclusion a cached observation (§20.2)"
+    );
+    assert!(!bounded.is_direct_read());
+    assert_eq!(
+        bounded.watch_synced(),
+        Some(false),
+        "a watch that had not caught up when it supplied the fact qualifies everything derived \
+         from it (§20.3)"
+    );
+    // The cache hit is *newer* here, so the bound is the subject's own instant: this bounds, it
+    // does not simply take the last source it was handed.
+    assert_eq!(bounded.observed_at().unix_millis(), 9_000);
+}
+
+#[test]
+fn should_leave_a_read_with_no_second_source_exactly_as_it_was_except_for_the_token() {
+    // The degenerate case, asserted because it is the one every stated edge takes. An owner
+    // reference is a field of the subject: nothing else was read to find it, so there is nothing
+    // to bound it by, and a bound that quietly aged it would make §23.6 cost accuracy rather than
+    // buy it.
+    let subject = Freshness::direct_read(
+        ObservedAt::from_unix_millis(9_000),
+        Some("18010".to_owned()),
+        INSTANCE,
+        Scope::in_namespace("shop"),
+        EndpointCategory::Core,
+    );
+
+    let bounded = subject.bounded_by(std::iter::empty());
+    assert_eq!(bounded.observed_at(), subject.observed_at());
+    assert_eq!(bounded.origin(), subject.origin());
+    assert_eq!(bounded.provider_instance(), subject.provider_instance());
+}

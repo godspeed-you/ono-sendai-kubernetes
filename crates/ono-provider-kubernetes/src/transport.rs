@@ -1588,6 +1588,44 @@ impl Freshness {
         }
     }
 
+    /// This read, no fresher than the oldest of the reads a derivation also used (§23.6).
+    ///
+    /// "A derived edge's freshness is bounded by the freshness of every source fact used to
+    /// derive it." A `selects` edge is not a fact either object states: it is this provider's
+    /// conclusion from a Service read at one instant and a Pod collection read at another, and it
+    /// is only as current as the older of the two. Reporting it with the subject's `observed_at`
+    /// would date a conclusion by the freshest thing that went into it, which is exactly the
+    /// arithmetic that makes a stale answer look current.
+    ///
+    /// The `resource_version` is dropped rather than reconciled. A `resourceVersion` names a
+    /// point in *one* object's continuity (§4 invariant 8); there is no such point for a
+    /// conclusion drawn from two, and picking one of the sources' tokens would offer a reader a
+    /// continuity they cannot resume from. What each source was at is carried separately, as
+    /// Appendix C.2's `observed_resource_versions`.
+    ///
+    /// An [`Origin::Cache`] or [`Origin::WatchEvent`] among the sources wins over a direct read
+    /// for the same reason the instant does: a conclusion that rests on a cached fact is not a
+    /// direct observation, whatever the other half of it was.
+    #[must_use]
+    pub fn bounded_by<'a>(&self, sources: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut bounded = self.clone();
+        bounded.resource_version = None;
+        for source in sources {
+            if source.observed_at < bounded.observed_at {
+                bounded.observed_at = source.observed_at;
+            }
+            if source.origin != Origin::DirectRead && bounded.origin == Origin::DirectRead {
+                bounded.origin = source.origin;
+            }
+            // A watch that had not caught up when it supplied a fact is a qualification on
+            // everything derived from that fact (§20.3).
+            if source.watch_synced == Some(false) {
+                bounded.watch_synced = Some(false);
+            }
+        }
+        bounded
+    }
+
     /// What a cache serves (§20.2).
     ///
     /// A constructor of its own rather than a direct read corrected afterwards. The two differ in

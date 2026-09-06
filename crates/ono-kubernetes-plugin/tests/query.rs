@@ -1483,6 +1483,9 @@ fn related_service() -> Json {
             "namespace": "default",
             "uid": "a4a4a4a4-0000-0000-0000-000000000001",
             "creationTimestamp": "2026-08-20T08:00:00Z",
+            // Every object a real API server returns carries one, and §23.6's check depends on
+            // it: `observed_resource_versions` names what each source of a derived edge was at.
+            "resourceVersion": "5100",
         },
         "spec": {
             "type": "LoadBalancer",
@@ -8234,4 +8237,62 @@ fn percent_decode(encoded: &str) -> String {
         index += 1;
     }
     String::from_utf8(out).expect("a decoded selector is text")
+}
+
+#[tokio::test]
+async fn should_name_every_read_a_derived_edge_rests_on_and_no_read_it_did_not_use() {
+    // §23.6 and Appendix C.2. A `selects` edge is this provider's conclusion from two objects
+    // read at two instants, and §23.6 bounds its freshness by both — which is only checkable if
+    // the record says which two reads they were. Appendix C.2 spells the field:
+    // `observed_resource_versions: {service: "…", pod: "…"}`.
+    //
+    // The negative half is the sharper one. An owner reference is a field of the subject; nothing
+    // else was read to find it. Listing the Pod collection beside it would name a source that had
+    // no part in the conclusion, which is the same class of mistake as claiming evidence that
+    // does not exist — and it is the mistake a single shared map of "everything this invocation
+    // read" would make automatically.
+    let plugin = loaded_with_relations().await;
+    let records = edges(
+        &plugin,
+        &[("kind", json!("Service")), ("name", json!("api"))],
+    )
+    .await;
+
+    let selected = edge(&records, "selects", "api-7d9f-abc");
+    let versions = map_of(selected, "observed_resource_versions");
+    let roles: Vec<String> = versions.iter().map(|(role, _)| role.to_string()).collect();
+    assert!(
+        roles.iter().any(|role| role == "service"),
+        "the subject's own read is a source of every edge: {roles:?}"
+    );
+    assert!(
+        roles.iter().any(|role| role == "pod"),
+        "and the collection the selector was evaluated against is the second one: {roles:?}"
+    );
+    assert!(
+        versions
+            .iter()
+            .all(|(_, version)| matches!(version, Value::String(text) if !text.is_empty())),
+        "a source with no `resourceVersion` is left out rather than entered empty, because a key \
+         with nothing behind it is a check nobody can make: {versions:?}"
+    );
+
+    // And an edge the object states about itself names only itself.
+    let stated = records
+        .iter()
+        .find(|record| {
+            text_of(record, "evidence_class").as_deref() == Some("native-field")
+                || text_of(record, "evidence_class").as_deref() == Some("owner-reference")
+        })
+        .expect("the Service states at least one edge as a field of its own");
+    let stated_roles: Vec<String> = map_of(stated, "observed_resource_versions")
+        .iter()
+        .map(|(role, _)| role.to_string())
+        .collect();
+    assert_eq!(
+        stated_roles,
+        vec!["service".to_owned()],
+        "nothing was read to find a field of the subject, so nothing else is a source of it"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
 }

@@ -95,6 +95,7 @@ pub fn edge_record(
     source: &Guarded,
     edge: &Edge,
     freshness: &Freshness,
+    observed_resource_versions: &[(String, String)],
 ) -> Result<Value, ErrorValue> {
     let evidence = edge.evidence();
     let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
@@ -126,6 +127,20 @@ pub fn edge_record(
             ),
 
             // --- why it exists: Gate D, in three fields that cannot be dropped ---
+            // Appendix C.2 and §23.6: what each source of this edge was at, so a reader can check
+            // the conclusion against the cluster rather than take it on trust. The record's own
+            // `observed_at` is already bounded by the oldest of these; this says which they were.
+            "observed_resource_versions" => Value::Map(Arc::new(
+                observed_resource_versions
+                    .iter()
+                    .map(|(role, version)| {
+                        (
+                            Arc::from(role.as_str()),
+                            Value::String(version.as_str().into()),
+                        )
+                    })
+                    .collect::<MapValue>(),
+            )),
             "evidence_class" => Value::String(evidence.class().into()),
             "evidence" => Value::String(evidence.describe().into()),
             // Only the classes that rest on one field cite a pointer. Reporting one for a
