@@ -204,7 +204,21 @@ fn pointers(options: &JsonMap<String, Json>) -> Result<Vec<(String, Json)>, Wire
     let Some(set) = options.get("set") else {
         return Ok(Vec::new());
     };
-    let Some(fields) = set.as_object() else {
+    // Two spellings, because a shell has two ways to hand over a mapping and the documented one
+    // is the quoted document. An Ono record literal arrives as a record because `set` is declared
+    // `record`; a quoted JSON document arrives as text, because a written word is only coerced to
+    // a type it parses as and `'{"/spec/replicas": 2}'` is a string until somebody reads it. The
+    // example in `package/contributions/commands.yaml` is the second, so the second has to work.
+    let parsed;
+    let fields = match set {
+        Json::Object(fields) => Some(fields),
+        Json::String(document) => {
+            parsed = serde_json::from_str::<Json>(document).ok();
+            parsed.as_ref().and_then(Json::as_object)
+        }
+        _ => None,
+    };
+    let Some(fields) = fields else {
         return Err(failure(
             UNSUPPORTED_CODE,
             UNSUPPORTED,
@@ -800,4 +814,58 @@ fn dependent(dependent: &Dependent) -> Value {
         Value::Bool(dependent.blocks_owner_deletion()),
     );
     Value::Map(Arc::new(map))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::panic,
+        reason = "a test states its preconditions directly (AGENTS.md section 16)"
+    )]
+
+    use super::*;
+    use serde_json::json;
+
+    fn options(set: Json) -> JsonMap<String, Json> {
+        let mut options = JsonMap::new();
+        options.insert("set".to_owned(), set);
+        options
+    }
+
+    #[test]
+    fn should_read_a_quoted_json_document_as_the_mapping_it_spells() {
+        // §43.3 and the example `package/contributions/commands.yaml` documents:
+        // `--set '{"/spec/replicas": 2}'`. A shell hands that over as *text*, because a written
+        // word is coerced only to a type it parses as, and a quoted document parses as a string.
+        // The example was refused for exactly that reason until a demonstration ran it.
+        let read = pointers(&options(json!(r#"{"/spec/replicas": 2}"#)))
+            .expect("the documented spelling is the one that has to work");
+
+        assert_eq!(read, vec![("/spec/replicas".to_owned(), json!(2))]);
+    }
+
+    #[test]
+    fn should_read_a_record_the_shell_evaluated_as_the_same_mapping() {
+        // The other spelling, which is what an Ono record literal becomes once the host coerces
+        // it against the declared `record` type. Both reach the same plan, so which one a user
+        // writes is a matter of taste rather than of capability.
+        let read = pointers(&options(json!({"/spec/replicas": 2})))
+            .expect("a record arrives as a mapping");
+
+        assert_eq!(read, vec![("/spec/replicas".to_owned(), json!(2))]);
+    }
+
+    #[test]
+    fn should_refuse_text_that_is_not_a_mapping_rather_than_guessing_at_it() {
+        // A string that is not a document, and a document that is not a mapping, are both
+        // refusals rather than an empty change: `set k8s-resource` with nothing to set would be
+        // a write that reports success for having done nothing.
+        for wrong in [json!("/spec/replicas"), json!("[1, 2]"), json!(3)] {
+            assert!(
+                pointers(&options(wrong.clone())).is_err(),
+                "`{wrong}` is not a mapping from a pointer to a value"
+            );
+        }
+    }
 }
