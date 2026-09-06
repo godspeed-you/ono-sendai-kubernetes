@@ -28,7 +28,11 @@
 #                collection (§17.1). A different request with different permissions, and its
 #                `404` means the object is absent where a collection's means the API is not
 #                served — ADR-0012
-#   max_pages    a page budget (§18.4)
+#   max_pages    a page budget: a decision to stop consuming, which §18.4 says is not
+#                incompleteness — the records say more exists upstream and the answer completes
+#   max_requests, max_scopes, budget_ms   what one query may spend (§49.5), over the conservative
+#                defaults of §50.1. Passing one of these is the *provider* stopping short, which
+#                is a coverage gap and not a decision
 #   kind, group, version, resource   for the nouns that take their kind from the query rather
 #                than from the table: which resource to read (ADR-0010)
 #
@@ -82,6 +86,15 @@ targets:
       - name: max_pages
         type: int
         doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
+      - name: max_requests
+        type: int
+        doc: "How many requests this query may send to the API server before it stops and says so. Default 64, which is what an interactive question costs (specification section 49.5)."
+      - name: max_scopes
+        type: int
+        doc: "How many distinct scopes — namespaces, API group-versions — the query may reach into. Checked against the estimated breadth before the first request rather than halfway through (specification section 17.6). Default 32."
+      - name: budget_ms
+        type: int
+        doc: "How long the query may take before it stops with what it has. Default 10000: an interactive answer is one somebody is waiting for (specification section 50.1)."
   - name: k8s-node
     schema: io.github.godspeed-you.kubernetes.node/1
     summary: "Nodes, and the cloud instances underneath them."
@@ -215,6 +228,15 @@ targets:
       - name: max_pages
         type: int
         doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
+      - name: max_requests
+        type: int
+        doc: "How many requests this query may send to the API server before it stops and says so. Default 64, which is what an interactive question costs (specification section 49.5)."
+      - name: max_scopes
+        type: int
+        doc: "How many distinct scopes — namespaces, API group-versions — the query may reach into. Checked against the estimated breadth before the first request rather than halfway through (specification section 17.6). Default 32."
+      - name: budget_ms
+        type: int
+        doc: "How long the query may take before it stops with what it has. Default 10000: an interactive answer is one somebody is waiting for (specification section 50.1)."
   # What one object is related to. Not a resource: an edge has no `metadata.uid` and no collection
   # to be fetched from, so this noun names an object with `kind` and `name` and answers one record
   # per edge — with the evidence class and the fields that decided it, which is Gate D (§62.4).
@@ -261,6 +283,15 @@ targets:
       - name: max_pages
         type: int
         doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
+      - name: max_requests
+        type: int
+        doc: "How many requests this query may send to the API server before it stops and says so. Default 64, which is what an interactive question costs (specification section 49.5)."
+      - name: max_scopes
+        type: int
+        doc: "How many distinct scopes — namespaces, API group-versions — the query may reach into. Checked against the estimated breadth before the first request rather than halfway through (specification section 17.6). Default 32."
+      - name: budget_ms
+        type: int
+        doc: "How long the query may take before it stops with what it has. Default 10000: an interactive answer is one somebody is waiting for (specification section 50.1)."
       - name: relation
         type: string
         doc: "One relationship word, e.g. `owned-by` or `selects`, instead of every edge this object states."
@@ -313,6 +344,15 @@ targets:
       - name: max_pages
         type: int
         doc: "How many pages of a listing to read before stopping. The stop is coverage, never a silently short answer (specification section 18.4)."
+      - name: max_requests
+        type: int
+        doc: "How many requests this query may send to the API server before it stops and says so. Default 64, which is what an interactive question costs (specification section 49.5)."
+      - name: max_scopes
+        type: int
+        doc: "How many distinct scopes — namespaces, API group-versions — the query may reach into. Checked against the estimated breadth before the first request rather than halfway through (specification section 17.6). Default 32."
+      - name: budget_ms
+        type: int
+        doc: "How long the query may take before it stops with what it has. Default 10000: an interactive answer is one somebody is waiting for (specification section 50.1)."
       - name: max_changes
         type: int
         doc: "Stop after this many changes. Absent is unbounded, which is what a watch is: the operator ends it."

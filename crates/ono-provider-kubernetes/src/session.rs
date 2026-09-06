@@ -928,6 +928,32 @@ impl<C: Clock> Session<C> {
         self.watches.remove(&(gvr.clone(), scope.clone())).is_some()
     }
 
+    /// Closes a live view, releasing its watch when nothing else is served by it (§19.7).
+    ///
+    /// The rule §19.7 states has a qualifier, and the qualifier is the whole of it: a closing view
+    /// releases the watches that "no longer serve **another active consumer**". This session has
+    /// exactly one other consumer of a watch, and it is not a second stream — it is [`Self::lookup`].
+    /// §20.2 makes `origin=cache` a first-class answer a later read may be given, and §20.3 lets a
+    /// synchronised stream report an absence *as* an absence. A stream that can still do either is
+    /// serving a consumer; one that cannot is holding a checkpoint the API server has already
+    /// discarded and a set of objects nothing is keeping true.
+    ///
+    /// So the question this asks is the same question [`Self::lookup`] asks, and asking it here
+    /// rather than in the caller is what keeps the two from drifting: a view that released a cache
+    /// still entitled to answer would make §20.2's cache origin unreachable in practice, and one
+    /// that released nothing would be `release_watch` never being called at all.
+    ///
+    /// Returns whether the watch was released.
+    pub fn close_view(&mut self, gvr: &Gvr, scope: &Scope) -> bool {
+        let Some(watched) = self.watches.get(&(gvr.clone(), scope.clone())) else {
+            return false;
+        };
+        if watched.stream.absence_is_conclusive() {
+            return false;
+        }
+        self.release_watch(gvr, scope)
+    }
+
     /// Seeds or re-acquires a watched cache from a completed listing (§19.1, §20.3).
     ///
     /// # Errors

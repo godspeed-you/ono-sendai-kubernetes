@@ -40,7 +40,7 @@ use std::time::Duration;
 use ono_kuang_sdk::protocol::WireError;
 use ono_kuang_sdk::{Ctx, EmitError, Outcome};
 use ono_provider_kubernetes::coverage::Scope;
-use ono_provider_kubernetes::discovery::{self, Discovery, Gvr, Resource, Verb};
+use ono_provider_kubernetes::discovery::{self, Gvr, Resource, Verb};
 use ono_provider_kubernetes::live::{LiveView, ViewState};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
@@ -205,6 +205,38 @@ fn observe(
     let (resource, listing) = acquired;
     let gvr = resource.gvr().clone();
     let scope = scope_of(watched.endpoint, &resource);
+    let outcome = live(
+        lease,
+        session,
+        emitter,
+        watched,
+        gvr.clone(),
+        scope.clone(),
+        listing,
+    );
+    // §19.7: the view is closing, so the watch behind it is released unless the session's own
+    // object cache is still entitled to answer from it — which is the "another active consumer"
+    // §19.7 names, and the only one this provider has. `Session::close_view` asks that question,
+    // so a watch quarantined by a `410` stops costing a checkpoint the server has already
+    // discarded, and a healthy one stays where §20.2's `origin=cache` can still reach it.
+    session.close_view(&gvr, &scope);
+    outcome
+}
+
+/// Watches one collection until the operator, a bound or the cluster ends the observation.
+///
+/// Split from [`observe`] so that every way out of the loop — cancelled, exhausted, denied,
+/// refused — passes through the one place §19.7's release is written, instead of each `return`
+/// having to remember it.
+fn live(
+    lease: &Lease<'_, '_>,
+    session: &mut Session,
+    emitter: &mut Emitter,
+    watched: &Watched<'_>,
+    gvr: Gvr,
+    scope: Scope,
+    listing: Listing,
+) -> Outcome {
     let mut freshness = listing.freshness().clone();
 
     // §19.1 and §20.3: the listing becomes the cache the watch keeps true, or it becomes nothing.
@@ -582,20 +614,9 @@ impl Conversation for Acquire<'_> {
 
     fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
         let session = self.session;
-        let core = query::document(session, client, self.endpoint, "/api")?;
-        let groups = query::document(session, client, self.endpoint, "/apis")?;
-        let served = Discovery::builder()
-            .core_versions(&core)
-            .and_then(|builder| builder.groups(&groups))
-            .map_err(|error| {
-                failure(
-                    UNAVAILABLE_CODE,
-                    UNAVAILABLE,
-                    format!("the API server's discovery documents did not read: {error}"),
-                    "The endpoint answered, but not as a Kubernetes API server.",
-                )
-            })?
-            .build();
+        // §11.2 through the one reader that negotiates it, so a watch pays the same discovery
+        // cost a query does and never a second, older one.
+        let served = query::served(session, client, self.endpoint)?;
         let resource = query::resolve_in(
             session,
             client,

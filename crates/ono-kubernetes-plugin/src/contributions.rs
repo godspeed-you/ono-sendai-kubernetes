@@ -220,6 +220,39 @@ const MAX_PAGES: Parameter = Parameter::new(
      silently short answer (specification section 18.4).",
 );
 
+/// What one invocation may spend against the API server (§49.5, §50.1).
+///
+/// §49.5 asks the provider to "expose configurable query concurrency/QPS/burst policy with
+/// conservative defaults aligned with interactive use". These three are that policy, and they are
+/// three rather than six on purpose — see `query::budget_of` for why concurrency and the
+/// transferred-byte bound stay where they are. The defaults are `Budget::interactive`'s, so a
+/// query that names none of them is still bounded on every dimension.
+///
+/// Different in kind from `max_pages` beside them, and the difference is §18.4's: a page budget
+/// is a *decision* to stop consuming, which is not incompleteness, while passing one of these is
+/// the provider stopping short — a gap, stated as one.
+const BUDGET: &[Parameter] = &[
+    Parameter::new(
+        "max_requests",
+        "int",
+        "How many requests this query may send to the API server before it stops and says so. \
+         Default 64, which is what an interactive question costs (specification section 49.5).",
+    ),
+    Parameter::new(
+        "max_scopes",
+        "int",
+        "How many distinct scopes — namespaces, API group-versions — the query may reach into. \
+         Checked against the estimated breadth before the first request rather than halfway \
+         through (specification section 17.6). Default 32.",
+    ),
+    Parameter::new(
+        "budget_ms",
+        "int",
+        "How long the query may take before it stops with what it has. Default 10000: an \
+         interactive answer is one somebody is waiting for (specification section 50.1).",
+    ),
+];
+
 /// One field of a contributed schema, as the table spells it.
 ///
 /// `required` is the only flag because ADR-0012 §8 makes the two mutually exclusive: a field is
@@ -529,6 +562,7 @@ impl Target {
                 options.extend_from_slice(SCOPE);
                 options.push(NAMED);
                 options.push(MAX_PAGES);
+                options.extend_from_slice(BUDGET);
             }
             // The floor of ADR-0010: the kind comes from the query.
             Reads::Discovered => {
@@ -536,12 +570,14 @@ impl Target {
                 options.extend_from_slice(RESOURCE);
                 options.push(NAMED);
                 options.push(MAX_PAGES);
+                options.extend_from_slice(BUDGET);
             }
             Reads::Relations => {
                 options.extend_from_slice(SCOPE);
                 options.extend_from_slice(RESOURCE);
                 options.push(NAMED);
                 options.push(MAX_PAGES);
+                options.extend_from_slice(BUDGET);
                 options.push(Parameter::new(
                     "relation",
                     "string",
@@ -553,6 +589,7 @@ impl Target {
                 options.extend_from_slice(SCOPE);
                 options.extend_from_slice(RESOURCE);
                 options.push(MAX_PAGES);
+                options.extend_from_slice(BUDGET);
                 options.push(Parameter::new(
                     "max_changes",
                     "int",
@@ -580,6 +617,7 @@ impl Target {
                 options.extend_from_slice(RESOURCE);
                 options.push(NAMED);
                 options.push(MAX_PAGES);
+                options.extend_from_slice(BUDGET);
             }
             // §47.2's Node is cluster-scoped; §47.3's Pod and §47.4's Service and Ingress are
             // not, so a namespace is nameable — and `all_namespaces` is not, because this is a
@@ -2086,7 +2124,14 @@ const CHANGE_TARGET: &[Field] = &[
 /// **`verification` is a plan field rather than a verification field.** "How would we know this
 /// worked" is answered before the change (§46.3), and one of the answers is that this provider
 /// has no rule — which is a visible value here rather than silent optimism.
-const PLAN_FIELDS: [Field; 22] = with_target(&[
+///
+/// **`competing_writers` carries its coverage and `contained` is nullable.** §54.1 asks for known
+/// competing desired-state writers from five sources, and a list with no coverage beside it reads
+/// as complete — an empty list from a group that would not answer is not an absence of
+/// autoscalers (§21.4). `contained` is §55.2's inventory of what a Namespace holds, and it is
+/// null rather than empty for every change that is not a Namespace deletion, because a count of
+/// zero for a question nobody asked is the one number this schema must not be able to print.
+const PLAN_FIELDS: [Field; 26] = with_target(&[
     Field::required("precondition_guarded", "bool"),
     Field::nullable("propagation", "string"),
     Field::required("effects", "list<map>"),
@@ -2097,6 +2142,10 @@ const PLAN_FIELDS: [Field; 22] = with_target(&[
     Field::required("preflight", "string"),
     Field::required("verification", "string"),
     Field::nullable("verification_stage", "string"),
+    Field::required("competing_writers", "list<map>"),
+    Field::required("competing_writer_coverage", "string"),
+    Field::nullable("contained", "list<map>"),
+    Field::nullable("contained_coverage", "string"),
     Field::required("caveats", "list<string>"),
     Field::required("prediction", "string"),
     Field::required("statement", "string"),
@@ -2118,7 +2167,7 @@ const PLAN_FIELDS: [Field; 22] = with_target(&[
 ///
 /// **`forced` never appears without `forced_because`.** §44.4 makes forcing a separate explicit
 /// choice, so the record keeps the sentence somebody wrote rather than a flag somebody flipped.
-const MUTATION_FIELDS: [Field; 29] = with_target(&[
+const MUTATION_FIELDS: [Field; 34] = with_target(&[
     Field::required("acceptance", "string"),
     Field::required("dry_run", "bool"),
     Field::nullable("prediction", "string"),
@@ -2138,6 +2187,11 @@ const MUTATION_FIELDS: [Field; 29] = with_target(&[
     Field::nullable("verdict", "string"),
     Field::nullable("verification_detail", "string"),
     Field::nullable("reconciliation", "map"),
+    Field::required("caveats", "list<string>"),
+    Field::required("competing_writers", "list<map>"),
+    Field::required("competing_writer_coverage", "string"),
+    Field::nullable("contained", "list<map>"),
+    Field::nullable("contained_coverage", "string"),
     Field::required("statement", "string"),
 ]);
 
@@ -2338,17 +2392,60 @@ impl Command {
 
 /// What `set k8s-resource` names beyond the object (§44.1, §44.2, §44.4).
 const APPLY_OPTIONS: &[Parameter] = &[
+    // --- section 43.3's curated transitions, in the order that section lists them ---
+    Parameter::new(
+        "replicas",
+        "int",
+        "Scale: how many replicas the workload should ask for. The curated form of \
+         `/spec/replicas` (specification section 43.3).",
+    ),
+    Parameter::repeatable(
+        "image",
+        "list<string>",
+        "Set image: `<container>=<image>`, naming the container rather than its position in the \
+         list. Write it more than once for more than one container (specification section 43.3).",
+    ),
+    Parameter::new(
+        "restart_rollout",
+        "bool",
+        "Restart the rollout by marking the pod template as changed, which is what makes a \
+         controller roll its pods. Nothing is deleted (specification section 43.3).",
+    ),
+    Parameter::new(
+        "schedulable",
+        "bool",
+        "Cordon or uncordon a Node: `false` stops the scheduler placing new pods on it, `true` \
+         lets it again. Pods already running are neither stopped nor moved (specification \
+         section 43.3).",
+    ),
+    Parameter::repeatable(
+        "label",
+        "list<string>",
+        "Label: `<key>=<value>`, or `<key>=` to remove the label. Write it more than once for \
+         more than one (specification sections 43.3, 14.5).",
+    ),
+    Parameter::repeatable(
+        "annotation",
+        "list<string>",
+        "Annotate: `<key>=<value>`, or `<key>=` to remove the annotation. Write it more than \
+         once for more than one (specification sections 43.3, 14.5).",
+    ),
+    // --- section 43.4's escape hatch, and it says so ---
     Parameter::new(
         "set",
         "record",
-        "A mapping from a JSON pointer to the value the field should hold, e.g. \
-         `{\"/spec/replicas\": 2}`.",
+        "LOW-LEVEL EXPERT PATH (specification section 43.4): a mapping from a raw JSON pointer \
+         to the value the field should hold, e.g. `{\"/spec/replicas\": 2}`. It names fields \
+         against a schema you are expected to know and no curated action vouches for what they \
+         mean together. Prefer `--replicas`, `--image`, `--restart_rollout`, `--schedulable`, \
+         `--label` or `--annotation`, which each carry their own effects and verification rule.",
     ),
     Parameter::repeatable(
         "unset",
         "list<string>",
-        "A pointer whose field this apply gives up rather than sets. Write it more than once for \
-         more than one (specification section 44.1).",
+        "LOW-LEVEL EXPERT PATH (specification section 43.4): a pointer whose field this apply \
+         gives up rather than sets. Write it more than once for more than one (specification \
+         section 44.1).",
     ),
     Parameter::defaulting(
         "field_manager",
@@ -2398,18 +2495,27 @@ pub static COMMANDS: &[Command] = &[
         name: "set-k8s-resource",
         verb: "set",
         target: "k8s-resource",
-        summary: "Apply a bounded field change to one Kubernetes object, as a server dry run \
-                  unless `dry_run false` is given (specification sections 43.3, 44).",
+        summary: "Change one Kubernetes object through a curated action — `--replicas` to \
+                  scale, `--image` to set an image, `--restart_rollout`, `--schedulable` to \
+                  cordon or uncordon a Node, `--label`, `--annotation` — or through the \
+                  low-level `--set`/`--unset` JSON-pointer escape hatch. A server dry run unless \
+                  `dry_run false` is given (specification sections 43.3, 43.4, 44).",
         schema: "io.github.godspeed-you.kubernetes.mutation/1",
         risk: "mutate",
         capabilities: &["network.connect"],
         writes: Writes::Fields,
         extra: APPLY_OPTIONS,
         examples: &[
+            "set k8s-resource --context prod --kind Deployment --name api --replicas 2",
+            "set k8s-resource --context prod --kind Deployment --name api --replicas 2 \
+             --dry_run false",
+            "set k8s-resource --context prod --kind Deployment --name api --image \
+             web=registry.example/web:1.4.0",
+            "set k8s-resource --context prod --kind Deployment --name api --restart_rollout true",
+            "set k8s-resource --context prod --kind Node --name node-7 --schedulable false",
+            "set k8s-resource --context prod --kind Deployment --name api --label tier=edge",
             "set k8s-resource --context prod --kind Deployment --name api --set \
-             '{\"/spec/replicas\": 2}'",
-            "set k8s-resource --context prod --kind Deployment --name api --set \
-             '{\"/spec/replicas\": 2}' --dry_run false",
+             '{\"/spec/minReadySeconds\": 10}'",
         ],
     },
     Command {

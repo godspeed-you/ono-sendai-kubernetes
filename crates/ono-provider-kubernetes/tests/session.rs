@@ -744,6 +744,60 @@ fn should_release_a_watch_that_no_longer_serves_a_consumer() {
     );
 }
 
+#[test]
+fn should_release_a_closed_view_s_watch_only_when_its_cache_can_no_longer_answer() {
+    // §19.7's qualifier, which is the whole of the rule: a closing live view releases the watches
+    // that "no longer serve another active consumer". In this provider the other consumer is the
+    // session's own object cache — §20.2 makes `origin=cache` a first-class answer and §20.3 lets
+    // a synchronised stream report an absence as an absence — so a stream a later read may still
+    // be answered from is serving one, and a stream past a `410` is serving nobody while holding
+    // a checkpoint the API server has already discarded.
+    //
+    // Releasing both, or neither, is what this prevents. Releasing both makes §20.2's cache
+    // origin unreachable in practice; releasing neither is `release_watch` never being called,
+    // which is a session that only ever grows.
+    let mut live = session("dev");
+    live.synchronise(&pods(), &shop(), one_pod_listing())
+        .expect("a complete listing seeds the cache");
+
+    assert!(
+        !live.close_view(&pods(), &shop()),
+        "a synchronised cache still answers reads, so the watch behind it still serves a consumer"
+    );
+    assert_eq!(live.watched().len(), 1);
+    assert!(matches!(
+        live.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::Cached(_)
+    ));
+
+    let mut broken = session("dev");
+    broken
+        .synchronise(&pods(), &shop(), one_pod_listing())
+        .expect("a complete listing seeds the cache");
+    let expiry = frame(
+        "ERROR",
+        r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 18010 (18700)","reason":"Expired","code":410}"#,
+    );
+    broken
+        .feed_watch(&pods(), &shop(), expiry.as_bytes())
+        .expect("the ERROR frame decodes");
+
+    assert!(
+        broken.close_view(&pods(), &shop()),
+        "a stream past a gap answers no read and holds a checkpoint the server has discarded"
+    );
+    assert!(broken.watched().is_empty());
+    assert_eq!(
+        broken.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::NotWatched,
+        "and what it left behind reads as unwatched rather than as a cluster with nothing in it"
+    );
+    assert!(
+        !broken.close_view(&pods(), &shop()),
+        "closing a view over a watch nobody holds is neither an error nor an achievement"
+    );
+}
+
 // --- §6.5 and §6.3's last line -------------------------------------------------------------------
 
 #[test]

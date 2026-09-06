@@ -3810,13 +3810,47 @@ schemas:
         doc: >-
           The furthest rung of §20.4's ladder a confirmed verification of that rule would reach.
           Never "workload externally healthy": no API read establishes that (§37.5, Gate G).
+      competing_writers:
+        type: list<map>
+        required: true
+        doc: >-
+          What else writes this object's desired state, as far as anybody looked (§54.1). Each
+          entry names the source that produced it — `managedFields`, an HPA's `scaleTargetRef`,
+          an owner reference, a GitOps annotation — because the sources are not equally strong: a
+          field manager is a record of a write that already happened and an autoscaler target is
+          a controller that is going to write.
+      competing_writer_coverage:
+        type: string
+        required: true
+        doc: >-
+          What the search for those writers covered and what it did not (§54.1, §21.4). It exists
+          because an empty list from a group that would not answer is not an absence of
+          autoscalers, and a list with no coverage beside it reads as complete.
+      contained:
+        type: list<map>
+        nullable: true
+        doc: >-
+          What a Namespace deletion would take with it, counted by GVR (§55.2's first bullet).
+          Each entry says whether its number is a total or a floor, because a page that did not
+          end has counted the page rather than the namespace. Null — never empty — for every
+          change that is not a Namespace deletion: a count of zero for a question nobody asked is
+          the one number this schema must not be able to print.
+      contained_coverage:
+        type: string
+        nullable: true
+        doc: >-
+          Which of that namespace's types could not be listed, and why (§55.2's second bullet,
+          §55.4, §45.4). What could not be listed is reported as not listed, never as absent.
       caveats:
         type: list<string>
         required: true
         doc: >-
           Everything true of this plan that the field list does not show: finalizers that must be
           removed, a dependent preview that saw nothing, admission effects nobody previewed,
-          other field managers already on the object, a permission nobody verified.
+          other field managers already on the object, a permission nobody verified, an autoscaler
+          that would reconcile the replica count back (§54.2), and — for the raw JSON-pointer
+          apply — that this is §43.4's low-level escape hatch rather than one of §43.3's curated
+          transitions.
       prediction:
         type: string
         required: true
@@ -4016,6 +4050,44 @@ schemas:
           the rule that derived it and the fields that rule read (§37.5). `verified_convergence`
           is true for exactly one of the five states, because a matching `observedGeneration` is
           not a claim of health (§37.3).
+      caveats:
+        type: list<string>
+        required: true
+        doc: >-
+          The plan's caveats, on the record of the attempt as well as on the record of the plan
+          (§46.1). A §54.2 autoscaler warning or a §43.4 low-level label that only `get k8s-plan`
+          showed would be one the shortest sentence a user writes never printed.
+      competing_writers:
+        type: list<map>
+        required: true
+        doc: >-
+          What else writes this object's desired state, as far as anybody looked (§54.1). Each
+          entry names the source that produced it — `managedFields`, an HPA's `scaleTargetRef`,
+          an owner reference, a GitOps annotation — because the sources are not equally strong: a
+          field manager is a record of a write that already happened and an autoscaler target is
+          a controller that is going to write.
+      competing_writer_coverage:
+        type: string
+        required: true
+        doc: >-
+          What the search for those writers covered and what it did not (§54.1, §21.4). It exists
+          because an empty list from a group that would not answer is not an absence of
+          autoscalers, and a list with no coverage beside it reads as complete.
+      contained:
+        type: list<map>
+        nullable: true
+        doc: >-
+          What a Namespace deletion would take with it, counted by GVR (§55.2's first bullet).
+          Each entry says whether its number is a total or a floor, because a page that did not
+          end has counted the page rather than the namespace. Null — never empty — for every
+          change that is not a Namespace deletion: a count of zero for a question nobody asked is
+          the one number this schema must not be able to print.
+      contained_coverage:
+        type: string
+        nullable: true
+        doc: >-
+          Which of that namespace's types could not be listed, and why (§55.2's second bullet,
+          §55.4, §45.4). What could not be listed is reported as not listed, never as absent.
       statement:
         type: string
         required: true

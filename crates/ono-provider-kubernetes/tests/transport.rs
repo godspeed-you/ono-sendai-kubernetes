@@ -18,13 +18,15 @@
 
 use std::time::Duration;
 
+use ono_provider_kubernetes::budget::{Budget, Limit, Overrun};
 use ono_provider_kubernetes::coverage::{Coverage, Gap, Outcome, Scope};
 use ono_provider_kubernetes::discovery::Gvr;
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::transport::{
     ApiError, BreakReason, Client, Continuity, EndpointCategory, ErrorKind, FixedClock,
     FixtureStream, Freshness, HttpConnection, ListOptions, Method, ObservedAt, Operation, Origin,
-    Read, Request, Retryability, Status, create_request, get_request, list_request, watch_request,
+    Page, Read, Reader, Request, Retryability, Status, Walk, create_request, get_request,
+    list_request, watch_request,
 };
 
 // --- fixtures ---------------------------------------------------------------------------------
@@ -699,6 +701,177 @@ fn should_not_call_a_deliberately_limited_listing_incomplete() {
     assert!(listing.coverage().may_have_more());
     assert_eq!(listing.continuity(), &Continuity::Intact);
     assert_eq!(request_lines(client.stream()).len(), 1);
+}
+
+// --- §18.5: pages into the pipeline rather than into a buffer ------------------------------------
+
+/// A reader that takes one page and stops, recording what it was handed.
+struct FirstPage {
+    handed: Vec<usize>,
+}
+
+impl Reader for FirstPage {
+    fn page(&mut self, page: Page) -> Walk {
+        self.handed.push(page.objects().len());
+        Walk::Stop
+    }
+}
+
+#[test]
+fn should_hand_a_page_to_its_reader_before_asking_the_server_for_the_next_one() {
+    // §18.5: "The provider SHOULD stream pages into the Ono pipeline rather than buffering entire
+    // large clusters unless an operation explicitly requires a complete set." A walk that
+    // accumulated every page and handed them over at the end would be `list` under another name,
+    // and no assertion about the *result* could tell the two apart.
+    //
+    // So the assertion is on the one thing only a streaming walk can do: a reader that stops
+    // after the first page leaves the second request unsent. That is only possible if the first
+    // page was in its hands while the sequence was still open.
+    let mut client = client(&[
+        json_response(
+            "200 OK",
+            &pod_list("1000", Some("tok-2"), &[pod("a", "u-a", "1")]),
+        ),
+        json_response("200 OK", &pod_list("1000", None, &[pod("b", "u-b", "2")])),
+    ]);
+    let mut reader = FirstPage { handed: Vec::new() };
+
+    let listing = client.walk(
+        &pods(),
+        &Scope::in_namespace("shop"),
+        &ListOptions::new().limit(1),
+        &mut reader,
+    );
+
+    assert_eq!(reader.handed, vec![1]);
+    assert_eq!(
+        request_lines(client.stream()).len(),
+        1,
+        "the second page was never asked for, so the first one had already crossed"
+    );
+    assert!(
+        listing.objects().is_empty(),
+        "a streamed listing buffers nothing: the reader took the objects"
+    );
+    assert!(
+        listing.coverage().is_complete(),
+        "§18.4: a consumer that stops asking is not provider incompleteness"
+    );
+    assert!(
+        listing.coverage().may_have_more(),
+        "and the stream still knows that more exists upstream"
+    );
+}
+
+/// A reader that asks for one repetition of a failed page, then gives up.
+struct RetryOnce {
+    retries: u32,
+    objects: usize,
+}
+
+impl Reader for RetryOnce {
+    fn page(&mut self, page: Page) -> Walk {
+        self.objects += page.objects().len();
+        Walk::Continue
+    }
+
+    fn failed(&mut self, _error: &ApiError) -> Walk {
+        if self.retries == 0 {
+            self.retries += 1;
+            return Walk::Continue;
+        }
+        Walk::Stop
+    }
+}
+
+#[test]
+fn should_send_the_same_page_request_again_when_its_reader_answers_a_failure_with_continue() {
+    // §49.2 and §49.3: a rate-limited read is a read the server asked to have repeated, and a
+    // safe idempotent read MAY be retried. The walk cannot decide that for itself — the delay,
+    // the attempt allowance and the cancellation check belong to whoever owns the scheduler — so
+    // it asks, and a `Continue` re-sends *the same request*. Re-listing from the start instead
+    // would mix two snapshots, which §18.2 forbids without a continuity break.
+    let mut client = client(&[
+        json_response(
+            "200 OK",
+            &pod_list("1000", Some("tok-2"), &[pod("a", "u-a", "1")]),
+        ),
+        json_response(
+            "429 Too Many Requests",
+            &status(429, "TooManyRequests", "please try again later"),
+        ),
+        json_response("200 OK", &pod_list("1000", None, &[pod("b", "u-b", "2")])),
+    ]);
+    let mut reader = RetryOnce {
+        retries: 0,
+        objects: 0,
+    };
+
+    let listing = client.walk(
+        &pods(),
+        &Scope::in_namespace("shop"),
+        &ListOptions::new().limit(1),
+        &mut reader,
+    );
+
+    assert_eq!(reader.objects, 2, "the repetition completed the collection");
+    assert!(listing.coverage().is_complete());
+    assert!(listing.error().is_none());
+    let lines = request_lines(client.stream());
+    assert_eq!(lines.len(), 3, "one request per attempt: {lines:?}");
+    assert!(
+        lines[1].contains("continue=tok-2") && lines[2].contains("continue=tok-2"),
+        "the repetition carries the same token, so the snapshot is never restarted: {lines:?}"
+    );
+}
+
+#[test]
+fn should_stop_a_listing_at_its_budget_and_record_the_stop_rather_than_shortening_the_answer() {
+    // §49.1 ("Ono is an interactive shell, not a load generator") and §50.1, with §18.3's rule
+    // about what a short answer has to say for itself. A budget that returned two pages of a
+    // ten-page collection and called it complete would be the one failure this whole module is
+    // arranged around: a shorter answer that reads as a whole one.
+    //
+    // The gap is `not queried` because that is literally what became of the rest — nobody asked.
+    // It is not a failure: the cluster answered every request it was sent.
+    let page = |token: Option<&str>, name: &str, uid: &str| {
+        json_response("200 OK", &pod_list("1000", token, &[pod(name, uid, "1")]))
+    };
+    let mut client = client(&[
+        page(Some("tok-2"), "a", "u-a"),
+        page(Some("tok-3"), "b", "u-b"),
+        page(None, "c", "u-c"),
+    ]);
+    client.spend(Budget::unlimited().with_pages(2));
+
+    let listing = client.list(
+        &pods(),
+        &Scope::in_namespace("shop"),
+        &ListOptions::new().limit(1),
+    );
+
+    assert_eq!(
+        listing.objects().len(),
+        2,
+        "the pages that were paid for stand"
+    );
+    assert_eq!(
+        request_lines(client.stream()).len(),
+        2,
+        "and the third page is never asked for"
+    );
+    assert!(
+        !listing.coverage().is_complete(),
+        "a provider that stopped short is incomplete, unlike a consumer that stopped asking"
+    );
+    assert_eq!(listing.coverage().gaps()[0].outcome(), Outcome::NotQueried);
+    assert!(listing.coverage().may_have_more());
+    assert_eq!(listing.overrun().map(Overrun::limit), Some(Limit::Pages));
+    assert_eq!(listing.overrun().map(Overrun::allowed), Some(2));
+    assert!(
+        listing.error().is_none(),
+        "nothing failed: the cluster answered every request it was sent"
+    );
 }
 
 // --- structured errors -------------------------------------------------------------------------

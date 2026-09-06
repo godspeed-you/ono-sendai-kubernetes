@@ -10,7 +10,7 @@
 //! `deployments/scale` — so they are different types here, and no code can pass one where the
 //! other belongs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::Deserialize;
@@ -24,6 +24,8 @@ pub enum DiscoveryError {
     GroupList(String),
     /// The core version list did not read.
     CoreVersions(String),
+    /// An aggregated discovery document did not read (§11.2).
+    Aggregated(String),
 }
 
 impl fmt::Display for DiscoveryError {
@@ -35,6 +37,12 @@ impl fmt::Display for DiscoveryError {
             Self::GroupList(detail) => write!(f, "the API group list does not read: {detail}"),
             Self::CoreVersions(detail) => {
                 write!(f, "the core API version list does not read: {detail}")
+            }
+            Self::Aggregated(detail) => {
+                write!(
+                    f,
+                    "the aggregated discovery document does not read: {detail}"
+                )
             }
         }
     }
@@ -293,6 +301,12 @@ pub struct Discovery {
     resources: BTreeMap<String, BTreeMap<String, Resource>>,
     versions: BTreeMap<String, Vec<String>>,
     preferred: BTreeMap<String, String>,
+    /// The group-versions aggregated discovery marked `Stale` (§11.2, §34.2).
+    ///
+    /// Only ever written by [`Builder::aggregated`], because only the aggregated document has a
+    /// word for it. The legacy path learns the same fact from a `503` on the group's own resource
+    /// list, which is a coverage outcome rather than a property of the snapshot.
+    stale: BTreeSet<String>,
 }
 
 impl Discovery {
@@ -352,6 +366,22 @@ impl Discovery {
     #[must_use]
     pub fn serves_group_version(&self, group_version: &str) -> bool {
         self.resources.contains_key(group_version)
+    }
+
+    /// Whether aggregated discovery reported this group-version as `Stale` (§11.2, §34.2).
+    ///
+    /// The aggregation layer's own word for "the API server behind this group did not answer, so
+    /// what I am telling you about it is what I remembered". An empty resource list under that
+    /// mark is nobody having been able to ask, and reading it as a group that serves nothing is
+    /// §4 invariant 13's collapse reached through content negotiation.
+    #[must_use]
+    pub fn is_stale(&self, group_version: &str) -> bool {
+        self.stale.contains(group_version)
+    }
+
+    /// Every group-version the snapshot holds an inventory for.
+    pub fn group_versions(&self) -> impl Iterator<Item = &str> {
+        self.resources.keys().map(String::as_str)
     }
 
     /// Every API group the server serves, the core group's empty name included (§13.3).
@@ -510,6 +540,153 @@ impl Builder {
         Ok(())
     }
 
+    /// Reads one aggregated discovery document, from `/api` or `/apis` (§11.2).
+    ///
+    /// **One document instead of one per group-version, and nothing is inferred to get there.**
+    /// `APIGroupDiscoveryList` states every field §11.1 requires — groups, versions, resources,
+    /// scope, verbs, kind identity and subresources — so this reads them all rather than taking
+    /// the groups and asking each one again, which would negotiate a capability and keep paying
+    /// the cost it exists to remove.
+    ///
+    /// **The version order is the preference order.** The aggregated document has no
+    /// `preferredVersion` field: it lists a group's versions in priority order instead, so the
+    /// first is what §13.4 calls preferred. Anything else here would be this crate inventing a
+    /// preference the server did not state.
+    ///
+    /// **`freshness` is kept rather than flattened.** A group-version the aggregation layer could
+    /// not refresh arrives marked `Stale`, usually with an empty resource list. That is §34.2's
+    /// failure with the server's own word on it, and dropping the word would turn "nobody could
+    /// ask" into "this group serves nothing".
+    ///
+    /// # Errors
+    ///
+    /// [`DiscoveryError::Aggregated`] when the document does not read as an
+    /// `APIGroupDiscoveryList`. It must be an error rather than an empty snapshot: the fallback
+    /// §11.2 and §5.3 both require is only reachable if a server that ignored the negotiation is
+    /// distinguishable from a cluster that serves nothing.
+    pub fn aggregated(mut self, json: &str) -> Result<Self, DiscoveryError> {
+        self.add_aggregated(json)?;
+        Ok(self)
+    }
+
+    /// Reads one aggregated discovery document into the snapshot being built (§11.2).
+    ///
+    /// # Errors
+    ///
+    /// [`DiscoveryError::Aggregated`] as [`Self::aggregated`]. The builder is unchanged: the
+    /// document is parsed before anything is inserted.
+    pub fn add_aggregated(&mut self, json: &str) -> Result<(), DiscoveryError> {
+        let parsed: RawAggregatedList = serde_json::from_str(json)
+            .map_err(|error| DiscoveryError::Aggregated(error.to_string()))?;
+        if parsed.kind.as_deref() != Some("APIGroupDiscoveryList") {
+            return Err(DiscoveryError::Aggregated(format!(
+                "the document is a `{}`, not an `APIGroupDiscoveryList`",
+                parsed.kind.as_deref().unwrap_or("document with no kind")
+            )));
+        }
+        for group in parsed.items {
+            let name = group.metadata.name;
+            for (at, version) in group.versions.iter().enumerate() {
+                let group_version = if name.is_empty() {
+                    version.version.clone()
+                } else {
+                    format!("{name}/{}", version.version)
+                };
+                self.discovery
+                    .versions
+                    .entry(name.clone())
+                    .or_default()
+                    .push(version.version.clone());
+                // The order the server listed them in is the priority order it means.
+                if at == 0 {
+                    self.discovery
+                        .preferred
+                        .insert(name.clone(), version.version.clone());
+                }
+                if version.freshness.as_deref() == Some("Stale") {
+                    self.discovery.stale.insert(group_version.clone());
+                }
+                let entry = self.discovery.resources.entry(group_version).or_default();
+                for raw in &version.resources {
+                    let mut verbs = Vec::new();
+                    let mut other = Vec::new();
+                    for word in &raw.verbs {
+                        match Verb::from_word(word) {
+                            Some(verb) => verbs.push(verb),
+                            None => other.push(word.clone()),
+                        }
+                    }
+                    verbs.sort_unstable();
+                    verbs.dedup();
+                    let mut short_names = raw.short_names.clone();
+                    short_names.sort();
+                    let mut subresources: Vec<String> = raw
+                        .subresources
+                        .iter()
+                        .map(|sub| sub.subresource.clone())
+                        .collect();
+                    subresources.sort();
+                    subresources.dedup();
+                    // §13.1 again: the kind comes from `responseKind` and the collection name
+                    // from `resource`, and the group and version of the *identity* are the ones
+                    // the server wrote beside the kind rather than the ones the envelope implies.
+                    entry.insert(
+                        raw.resource.clone(),
+                        Resource {
+                            gvk: Gvk::new(
+                                raw.response_kind.group.clone(),
+                                if raw.response_kind.version.is_empty() {
+                                    version.version.clone()
+                                } else {
+                                    raw.response_kind.version.clone()
+                                },
+                                &raw.response_kind.kind,
+                            ),
+                            gvr: Gvr::new(&name, &version.version, &raw.resource),
+                            scope: if raw.scope == "Cluster" {
+                                Scope::Cluster
+                            } else {
+                                Scope::Namespaced
+                            },
+                            verbs,
+                            other_verbs: other,
+                            short_names,
+                            subresources,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies one group-version's inventory out of a snapshot that already holds it (§11.2).
+    ///
+    /// What makes an aggregated snapshot worth negotiating: a search over the group-versions it
+    /// already answered for makes no further request at all. Nothing is merged — a group-version
+    /// this builder already holds keeps what it has, so a legacy read of the same group cannot be
+    /// silently overwritten by a stale aggregated one.
+    pub fn adopt(&mut self, snapshot: &Discovery, group_version: &str) {
+        let Some(resources) = snapshot.resources.get(group_version) else {
+            return;
+        };
+        self.discovery
+            .resources
+            .entry(group_version.to_owned())
+            .or_insert_with(|| resources.clone());
+        let (group, version) = split_group_version(group_version);
+        let versions = self.discovery.versions.entry(group.to_owned()).or_default();
+        if !versions.iter().any(|held| held == version) {
+            versions.push(version.to_owned());
+        }
+        if let Some(preferred) = snapshot.preferred.get(group) {
+            self.discovery
+                .preferred
+                .entry(group.to_owned())
+                .or_insert_with(|| preferred.clone());
+        }
+    }
+
     /// The snapshot.
     #[must_use]
     pub fn build(self) -> Discovery {
@@ -556,6 +733,69 @@ struct RawResourceList {
     group_version: String,
     #[serde(default)]
     resources: Vec<RawResource>,
+}
+
+/// `APIGroupDiscoveryList`, as an API server offering aggregated discovery writes it (§11.2).
+#[derive(Debug, Deserialize)]
+struct RawAggregatedList {
+    kind: Option<String>,
+    #[serde(default)]
+    items: Vec<RawAggregatedGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAggregatedGroup {
+    #[serde(default)]
+    metadata: RawAggregatedMetadata,
+    #[serde(default)]
+    versions: Vec<RawAggregatedVersion>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAggregatedMetadata {
+    /// Empty for the core group, which is a group and not a gap (§13.3).
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAggregatedVersion {
+    version: String,
+    #[serde(default)]
+    resources: Vec<RawAggregatedResource>,
+    /// `Current` or `Stale`; absent on a server that publishes neither.
+    #[serde(default)]
+    freshness: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAggregatedResource {
+    resource: String,
+    #[serde(rename = "responseKind", default)]
+    response_kind: RawResponseKind,
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    verbs: Vec<String>,
+    #[serde(rename = "shortNames", default)]
+    short_names: Vec<String>,
+    #[serde(default)]
+    subresources: Vec<RawSubresource>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawResponseKind {
+    #[serde(default)]
+    group: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSubresource {
+    subresource: String,
 }
 
 #[derive(Debug, Deserialize)]

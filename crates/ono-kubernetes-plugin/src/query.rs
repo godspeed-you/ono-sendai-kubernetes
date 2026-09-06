@@ -25,11 +25,31 @@
 //! configuration for automation and test hosts. Naming neither is refused: an endpoint this
 //! package invented would be a cluster the operator never chose.
 //!
+//! **A collection is streamed, page by page** (§18.5). Each page's records cross before the next
+//! page is asked for, so a ten-thousand-Pod namespace never exists in this process at once and a
+//! consumer that wanted the first twenty rows does not wait for the last. That is possible for
+//! the same reason a live watch is: the brokered connection borrows the invocation context for
+//! the length of one read rather than for the length of the connection (ADR-0023). The credit
+//! `Ctx::emit` blocks on is the backpressure, so a query that produces faster than its reader
+//! stops reading the socket instead of growing a queue.
+//!
 //! **An incomplete answer never renders as a whole one.** A `403`, an expired continue token and
-//! a page budget are three different reasons for a short list, and none of them is "there are no
-//! more" (§4 invariant 13, §21.4). The values already read are emitted — they are true — and the
-//! invocation then *fails* with what was missing, because the value stream of a contributed
-//! target carries records of one schema and has nowhere to put a coverage report.
+//! an exhausted budget are three different reasons for a short list, and none of them is "there
+//! are no more" (§4 invariant 13, §21.4). The values already read are emitted — they are true,
+//! and once they have crossed they cannot be unsent — and the invocation then *fails* with what
+//! was missing, because the value stream of a contributed target carries records of one schema
+//! and has nowhere to put a coverage report (§18.3, ADR-0004).
+//!
+//! **A page budget is the one short list that is not incomplete.** §18.4 says a limit the
+//! pipeline asked for is a decision rather than a hole, so the invocation completes — and every
+//! record it delivered says `upstream=more-available` on its own provenance, because a decision
+//! that leaves the consumer thinking it has seen the cluster is a decision nobody made.
+//!
+//! **A query declares what it may cost** (§49.1, §49.5). `max_requests`, `max_scopes` and
+//! `budget_ms` bound one invocation over `Budget::interactive`'s conservative defaults, the
+//! breadth of a fan-out is estimated before the first request rather than discovered on the four
+//! hundredth (§17.6), and a `429` is waited out for as long as the API server asked — in slices,
+//! so that a cancelled query still stops promptly (§49.2, §49.3, §62.12).
 //!
 //! **`name` asks a different question of the cluster.** A query naming one takes §17.1's direct
 //! lookup against the object's own REST endpoint rather than the collection's, and the two are
@@ -42,18 +62,23 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ono_kuang_sdk::protocol::{WireError, method};
 use ono_kuang_sdk::{Ctx, EmitError, Outcome};
+use ono_provider_kubernetes::budget::{
+    Budget, Cancellation, Decision, Estimate, Idempotent, Jitter, Overrun, RetryPolicy, StopReason,
+};
 use ono_provider_kubernetes::coverage::{Gap, Outcome as Coverage, Scope};
 use ono_provider_kubernetes::discovery::{self, Discovery, Resource, Verb};
 use ono_provider_kubernetes::kubeconfig::{Credential, Kubeconfig, Secret, Trust};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
-use ono_provider_kubernetes::session::{Lookup, Session};
+use ono_provider_kubernetes::session::{Capability, Lookup, Session};
 use ono_provider_kubernetes::tls::{Anchors, ClientIdentity, TlsError, TlsSettings, TlsStream};
 use ono_provider_kubernetes::transport::{
-    ApiError, ByteStream, Client, Freshness, ListOptions, Listing, Operation, Request,
+    ApiError, ByteStream, Client, Freshness, ListOptions, Listing, Operation, Page, Reader,
+    Request, Walk,
 };
 use ono_value::{Schema, Value};
 use serde_json::{Map as JsonMap, Value as Json, json};
@@ -61,7 +86,7 @@ use serde_json::{Map as JsonMap, Value as Json, json};
 use crate::broker::{BrokeredStream, Lease, ReadPolicy, decode_hex};
 use crate::contributions::{Reads, Target};
 use crate::dynamic::{self, Selector, Typing, Unresolved};
-use crate::records::{dynamic_record, record};
+use crate::records::{Upstream, dynamic_record, record};
 use crate::sessions::{Key, Sessions};
 
 /// `provider.unavailable`, as core's `docs/contracts/errors.yaml` publishes it.
@@ -112,12 +137,63 @@ const DEFAULT_PORT: u16 = 8001;
 /// How many objects one page asks the API server for.
 const PAGE_SIZE: u32 = 500;
 
+/// What a client asks for when it wants the aggregated Discovery API (§11.2).
+///
+/// Content negotiation rather than a second endpoint: `/api` and `/apis` answer either form, and
+/// which one arrives is decided by this header. The stable `v2` comes first because §11.2 asks
+/// for the *stable* aggregated API, the beta follows it for the servers that offer only that, and
+/// plain `application/json` closes the list so that a server which understands none of it answers
+/// the legacy document instead of a `406` — which is §11.2's "MUST have a compatible fallback"
+/// and §5.3's "MUST be negotiated or detected and MUST have a safe fallback" in one line.
+const AGGREGATED_ACCEPT: &str = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,\
+application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList,application/json";
+
+/// The `as=` parameter an aggregated answer carries in its own `Content-Type`.
+///
+/// The detection half of §5.3. A server that ignored [`AGGREGATED_ACCEPT`] answers `200` with the
+/// legacy document and a plain content type, so the *request* proves nothing and only the reply
+/// does. Reading the body to find out would work for a well-formed document and turn a truncated
+/// one into a cluster that serves nothing.
+const AGGREGATED_MEDIA: &str = "APIGroupDiscoveryList";
+
+/// How a root discovery document read under [`AGGREGATED_ACCEPT`] is remembered (§50.2).
+///
+/// A key of its own rather than the path, because the two forms of `/apis` are different
+/// documents and a cache that let one answer for the other would hand an `APIGroupDiscoveryList`
+/// to a reader expecting an `APIGroupList` — where `serde` would find no `groups` field and
+/// report a cluster with no API groups at all.
+const AGGREGATED_KEY: &str = "#aggregated";
+
 /// Where a kubeconfig lives unless the query names another file.
 const DEFAULT_KUBECONFIG: &str = "~/.kube/config";
 
 /// How many bytes one `filesystem.read` asks for. The host caps a single call at 64 KiB, so a
 /// larger file is read in several calls rather than silently truncated.
 const READ_CHUNK: u64 = 64 * 1024;
+
+/// The shortest and longest a retried read waits before the same request is sent again (§49.3).
+///
+/// A floor because a retry that returns instantly is not a retry, and a ceiling because §49.4's
+/// "bounded" applies here for the same reason it applies to a watch: an unbounded doubling either
+/// hammers a struggling API server or overflows into no delay at all. Both are shorter than a
+/// watch's reconnect window, because a person is waiting for this one (§50.1).
+const RETRY_FLOOR: Duration = Duration::from_millis(100);
+const RETRY_CEILING: Duration = Duration::from_secs(2);
+
+/// How many times one page of a listing may be asked for again (§49.3, §20.2 of the generic
+/// contract).
+///
+/// Three, and bounded rather than "until it works": a `429` that does not clear in three
+/// increasing waits is a cluster under real pressure, and the honest answer is the partial result
+/// §18.3 describes rather than a fourth request.
+const RETRY_ALLOWANCE: u32 = 3;
+
+/// How long a backoff sleeps before it looks at the cancellation again (§50.1, Gate L).
+///
+/// The whole reason the wait is sliced. A retry that finished its backoff before noticing that
+/// the operator had stopped the query would have made the shell unresponsive for exactly as long
+/// as it was being polite to the API server.
+const CANCELLATION_WINDOW: Duration = Duration::from_millis(25);
 
 /// How large a kubeconfig may be before this package stops reading it.
 ///
@@ -162,51 +238,55 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
     // The session is entered around the whole conversation rather than consulted before it: what
     // discovery costs and what it produced are the same question, and asking them at two moments
     // is how a snapshot comes to be fetched twice for one query.
-    let answer = sessions.with(
+    sessions.with(
         &endpoint.session_key(),
         || endpoint.start_session(),
         |session| {
-            converse(
-                ctx,
+            // From here the context is lent rather than held (ADR-0023). §18.5 is why this query
+            // needs that as much as a watch does: a page is read, the context is given back, the
+            // records that page carried are emitted, and only then is the next page asked for —
+            // so a ten-thousand-Pod collection never exists in this process at once.
+            let lease = Lease::new(ctx);
+            match converse_on(
+                &lease,
                 &endpoint,
                 Listed {
+                    lease: &lease,
                     target,
+                    schema: &schema,
                     endpoint: &endpoint,
                     selector: &selector,
                     lookup: lookup.as_deref(),
                     session,
                 },
-            )
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => Outcome::Failed(error),
+            }
         },
-    );
-    let (answer, shape, unread) = match answer {
-        Ok(answer) => answer,
-        Err(error) => return Outcome::Failed(error),
-    };
-    emit(ctx, target, &schema, &shape, answer, &unread)
+    )
 }
 
-/// The listing conversation, as one value [`converse`] can run over either kind of stream.
-struct Listed<'a> {
+/// The listing conversation, as one value [`converse_on`] can run over either kind of stream.
+struct Listed<'a, 'ctx, 'io> {
+    lease: &'a Lease<'ctx, 'io>,
     target: &'static Target,
+    schema: &'a Arc<Schema>,
     endpoint: &'a Endpoint,
     selector: &'a Selector,
     lookup: Option<&'a str>,
     session: &'a mut Session,
 }
 
-impl Conversation for Listed<'_> {
-    type Answer = (Answer, Shape, Vec<Gap>);
+impl Conversation for Listed<'_, '_, '_> {
+    /// The whole answer, because the records have already crossed by the time this comes back.
+    ///
+    /// The invocation's outcome rather than its values: a streamed listing emits as it walks, so
+    /// there is nothing left to hand upwards but what became of it (§18.5).
+    type Answer = Outcome;
 
     fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
-        read(
-            self.session,
-            client,
-            self.target,
-            self.endpoint,
-            self.selector,
-            self.lookup,
-        )
+        read(self, client)
     }
 }
 
@@ -331,6 +411,18 @@ pub(crate) enum Answer {
     /// its coverage, its continuity and its freshness beside its objects, and an enum sized to
     /// its largest variant would make the answer that carries nothing as expensive as the one
     /// that carries everything.
+    ///
+    /// **Nothing constructs it any more, and the variant stays.** Since §18.5's listing became a
+    /// stream, a collection never arrives as one value: [`Streamed`] emits each page and the
+    /// [`Listing`] that comes back carries only what the sequence was. What is left of this
+    /// variant is the arm every caller of [`fetch`] writes to say that a direct read answering
+    /// with a collection is a defect — and deleting it would delete that check from six handlers
+    /// at once, which is the wrong trade for a warning.
+    #[expect(
+        dead_code,
+        reason = "the arm is what makes `fetch`'s callers say a get cannot answer with a \
+                  collection; removing the variant removes the check"
+    )]
     Listed(Box<Listing>),
     /// One object, read at its own endpoint (§17.1).
     Fetched(Box<(Object, Freshness)>),
@@ -342,127 +434,229 @@ pub(crate) enum Answer {
     Absent,
 }
 
-/// Streams whatever the cluster answered, then reports whatever it could not see.
-fn emit(
-    ctx: &mut Ctx<'_>,
+/// Emits the pages of one listing as they arrive, and keeps what §18.3 has to say afterwards.
+///
+/// **A partial listing means something different once a record has crossed.** ADR-0004 records
+/// the rule for a buffered answer: values that are true are emitted and the *invocation* then
+/// fails with what was missing, because a contributed target's value stream carries records of
+/// one schema and has nowhere to put a coverage report. Streaming does not weaken that rule; it
+/// removes the choice. Page one is already in the consumer's hands when page two is refused, and
+/// there is no version of this in which the answer is withheld until it is known to be whole.
+///
+/// So the contract a streamed listing keeps is exactly §18.3's: every record that crossed is
+/// true, and the invocation ends `Failed` naming the gap. What changes is that the failure is now
+/// the *only* place the incompleteness can live, which is why it names the scope, the outcome and
+/// the bound rather than saying "partial".
+struct Streamed<'a, 'ctx, 'io> {
+    lease: &'a Lease<'ctx, 'io>,
     target: &'static Target,
-    schema: &Arc<Schema>,
-    shape: &Shape,
-    answer: Answer,
-    unread: &[Gap],
-) -> Outcome {
-    // §60.5 and §21.4 in the shape of a control flow: a named object that is not there is a
-    // complete answer with nothing in it, and it is reached without emitting anything, so
-    // nothing downstream has to distinguish it from a failure that emitted first.
-    let (objects, freshness, listed) = match answer {
-        // Unless the search that chose the collection skipped a group. An object absent from the
-        // resource one group serves is not an object the cluster does not have, and `absent` is
-        // the one word in §21.4's vocabulary that is evidence about the cluster (§34.2, §35.8).
-        Answer::Absent if !unread.is_empty() => return Outcome::Failed(absence_unproven(unread)),
-        Answer::Absent => return Outcome::Completed,
-        Answer::Fetched(read) => {
-            let (object, freshness) = *read;
-            (vec![object], freshness, None)
-        }
-        Answer::Listed(listing) => {
-            let listing = *listing;
-            let coverage = listing.coverage().describe();
-            let complete = listing.coverage().is_complete() && listing.continuity().is_intact();
-            let broken = !listing.continuity().is_intact();
-            let freshness = listing.freshness().clone();
-            (
-                listing.into_objects(),
+    schema: &'a Arc<Schema>,
+    shape: &'a Shape,
+    /// §49.3's bounded retry of one safe read. Built from [`Idempotent::list`], which is the only
+    /// way to build one at all: a mutation has no constructor here (§49.3's `MUST`).
+    retries: RetryPolicy,
+    /// The page budget the *query* named, which is §18.4's user limit and not a bound.
+    page_budget: Option<usize>,
+    pages: usize,
+    /// Why the stream stopped, where it stopped for a reason of its own rather than the cluster's.
+    stopped: Option<Outcome>,
+}
+
+impl Streamed<'_, '_, '_> {
+    /// Takes one object across the redaction boundary and hands the record to the host.
+    ///
+    /// # Errors
+    ///
+    /// The outcome the invocation ends with: a cancelled stream and a refused record end it in
+    /// different ways, and neither is something the walk continues past.
+    fn deliver(
+        &self,
+        object: Object,
+        freshness: &Freshness,
+        upstream: Upstream,
+    ) -> Result<(), Outcome> {
+        // §22 and Gate I: there is one door into the emission path and streaming does not open a
+        // second one.
+        let guarded = Guarded::hold(object).map_err(|error| {
+            Outcome::Failed(failure(
+                UNAVAILABLE_CODE,
+                UNAVAILABLE,
+                format!("an object could not be taken across the redaction boundary: {error}"),
+                "This is a defect in the Kubernetes provider, not in the cluster.",
+            ))
+        })?;
+        let built = match self.shape {
+            Shape::Curated => record(self.target, self.schema, &guarded, freshness, upstream),
+            Shape::Discovered { resource, typing } => dynamic_record(
+                self.target,
+                self.schema,
+                resource,
+                typing,
+                &guarded,
                 freshness,
-                Some((complete, broken, coverage)),
-            )
-        }
-    };
-    for object in objects {
-        // §62.12: a cancelled query stops promptly, and the cheapest place to notice is between
-        // two objects.
-        if ctx.cancelled() {
-            return Outcome::Cancelled;
-        }
-        let guarded = match Guarded::hold(object) {
-            Ok(guarded) => guarded,
-            Err(error) => {
-                return Outcome::Failed(failure(
-                    UNAVAILABLE_CODE,
-                    UNAVAILABLE,
-                    format!("an object could not be taken across the redaction boundary: {error}"),
-                    "This is a defect in the Kubernetes provider, not in the cluster.",
-                ));
-            }
+                upstream,
+            ),
         };
-        let built = match shape {
-            Shape::Curated => record(target, schema, &guarded, &freshness),
-            Shape::Discovered { resource, typing } => {
-                dynamic_record(target, schema, resource, typing, &guarded, &freshness)
-            }
-        };
-        let value = match built {
-            Ok(value) => value,
-            Err(error) => {
-                return Outcome::Failed(failure(
-                    UNAVAILABLE_CODE,
-                    UNAVAILABLE,
-                    format!(
-                        "a record of `{}` could not be built: {error}",
-                        target.schema
-                    ),
-                    "This is a defect in the Kubernetes provider's schema table.",
-                ));
-            }
-        };
-        match ctx.emit(&value) {
-            Ok(()) => {}
-            Err(EmitError::Cancelled) => return Outcome::Cancelled,
-            Err(error) => {
-                return Outcome::Failed(failure(
-                    UNAVAILABLE_CODE,
-                    UNAVAILABLE,
-                    format!("the host refused a record: {error}"),
-                    "The stream ended before the query did.",
-                ));
-            }
+        let value = built.map_err(|error| {
+            Outcome::Failed(failure(
+                UNAVAILABLE_CODE,
+                UNAVAILABLE,
+                format!(
+                    "a record of `{}` could not be built: {error}",
+                    self.target.schema
+                ),
+                "This is a defect in the Kubernetes provider's schema table.",
+            ))
+        })?;
+        // The credit is the backpressure: this blocks until the consumer has taken enough for the
+        // host to have more to give, and nothing is queued here while it does. That is what makes
+        // §18.5 a memory bound rather than a shape.
+        match self.lease.with(|ctx| ctx.emit(&value)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(EmitError::Cancelled)) => Err(Outcome::Cancelled),
+            Ok(Err(error)) => Err(Outcome::Failed(failure(
+                UNAVAILABLE_CODE,
+                UNAVAILABLE,
+                format!("the host refused a record: {error}"),
+                "The stream ended before the query did.",
+            ))),
+            Err(overlap) => Err(Outcome::Failed(overlap)),
         }
     }
-    let Some((complete, broken, coverage)) = listed else {
-        // A get answered, so there is no collection whose coverage could be partial: one object
-        // was asked for and one object arrived. What may still be partial is the *search* that
-        // decided which collection that was (§34.2, §35.8).
-        if unread.is_empty() {
+
+    /// What became of the whole listing, once the walk is over (§18.3, §34.2, §48.6).
+    fn finish(self, listing: &Listing, unread: &[Gap]) -> Outcome {
+        if let Some(outcome) = self.stopped {
+            return outcome;
+        }
+        let complete = listing.coverage().is_complete() && listing.continuity().is_intact();
+        let broken = !listing.continuity().is_intact();
+        // §48.6: the resources that answered stay visible, with explicit incomplete coverage. The
+        // group-versions the search could not read join the listing's own gaps rather than
+        // replacing them — a denied namespace and an unavailable API group are two different
+        // holes in one answer, and Appendix D.3's report names both.
+        let mut coverage = listing.coverage().describe();
+        if !unread.is_empty() {
+            let groups = describe(unread);
+            coverage = if coverage.is_empty() {
+                groups
+            } else {
+                format!("{coverage}; {groups}")
+            };
+        }
+        // §49.1's bound, as the reason rather than as another gap. The gap is already in the
+        // coverage above; this is the sentence that says a policy stopped the query and the
+        // cluster did nothing wrong.
+        if let Some(over) = listing.overrun() {
+            coverage = format!("{coverage} ({})", over.describe());
+        }
+        // §18.4's other half, in the one place a failed answer can still say it. The records that
+        // crossed carry the marker themselves; this is for the operator reading the refusal, who
+        // needs to know that narrowing the question is not the only thing left to try.
+        if listing.coverage().may_have_more() {
+            coverage = format!("{coverage}; more remains upstream than was consumed");
+        }
+        if complete && unread.is_empty() {
             return Outcome::Completed;
         }
-        return Outcome::Failed(read_over_incomplete_search(unread));
-    };
-    // §48.6: the resources that answered stay visible, with explicit incomplete coverage. The
-    // group-versions the search could not read join the listing's own gaps rather than replacing
-    // them — a denied namespace and an unavailable API group are two different holes in one
-    // answer, and Appendix D.3's report names both.
-    let coverage = match (coverage.is_empty(), unread.is_empty()) {
-        (_, true) => coverage,
-        (true, false) => describe(unread),
-        (false, false) => format!("{coverage}; {}", describe(unread)),
-    };
-    if complete && unread.is_empty() {
-        return Outcome::Completed;
+        Outcome::Failed(failure(
+            UNAVAILABLE_CODE,
+            UNAVAILABLE,
+            if broken {
+                format!(
+                    "the listing lost continuity and the records already delivered are one \
+                     observation with a gap in it: {coverage}"
+                )
+            } else {
+                format!("the query did not see everything it asked about: {coverage}")
+            },
+            "The records that did arrive are true. What is missing is named above — a denial, an \
+             unserved API, an API group whose own server did not answer and an exhausted budget \
+             are different things, and none of them means the cluster is empty.",
+        ))
     }
-    Outcome::Failed(failure(
-        UNAVAILABLE_CODE,
-        UNAVAILABLE,
-        if broken {
-            format!(
-                "the listing lost continuity and the records already delivered are one \
-                 observation with a gap in it: {coverage}"
-            )
+}
+
+impl Reader for Streamed<'_, '_, '_> {
+    fn page(&mut self, page: Page) -> Walk {
+        self.pages += 1;
+        let freshness = page.freshness().clone();
+        // §18.4. The page carries the server's own answer to "is there more", and the query
+        // carries its own limit — so at this moment the stream knows whether it is about to stop
+        // with results still upstream. Nothing later can say it: the records are about to cross.
+        let upstream = if page.continue_token().is_some()
+            && self.page_budget.is_some_and(|budget| self.pages >= budget)
+        {
+            Upstream::MoreAvailable
         } else {
-            format!("the query did not see everything it asked about: {coverage}")
-        },
-        "The records that did arrive are true. What is missing is named above — a denial, an \
-         unserved API, an API group whose own server did not answer and an exhausted page budget \
-         are different things, and none of them means the cluster is empty.",
-    ))
+            Upstream::Consumed
+        };
+        for object in page.into_objects() {
+            // §62.12: a cancelled query stops promptly, and the cheapest place to notice is
+            // between two objects.
+            if self.lease.cancelled() {
+                self.stopped = Some(Outcome::Cancelled);
+                return Walk::Stop;
+            }
+            if let Err(outcome) = self.deliver(object, &freshness, upstream) {
+                self.stopped = Some(outcome);
+                return Walk::Stop;
+            }
+        }
+        // A page that arrived is evidence the sequence is healthy, so the next failure starts its
+        // backoff from the floor rather than from where an hour-old hiccup left it.
+        self.retries.reset();
+        Walk::Continue
+    }
+
+    fn failed(&mut self, error: &ApiError) -> Walk {
+        let cancellation = if self.lease.cancelled() {
+            Cancellation::Cancelled
+        } else {
+            Cancellation::Live
+        };
+        match self.retries.plan(error, cancellation) {
+            // §49.2: the delay already has the server's `Retry-After` as its floor — a client
+            // that backed off for less than the API server asked for would be deciding it knows
+            // better than the API server how loaded the API server is. The *sleeping* is here
+            // because `budget.rs` owns no thread on purpose: it computes delays and the caller,
+            // which is the only thing holding the invocation, does the waiting.
+            Decision::Wait(delay) => {
+                if nap(self.lease, delay) {
+                    Walk::Continue
+                } else {
+                    self.stopped = Some(Outcome::Cancelled);
+                    Walk::Stop
+                }
+            }
+            Decision::Stop(StopReason::Cancelled) => {
+                self.stopped = Some(Outcome::Cancelled);
+                Walk::Stop
+            }
+            // Not retryable, or the allowance is spent. Both leave the listing to §18.3: what
+            // arrived stands, and the invocation says what is missing.
+            Decision::Stop(StopReason::NotRetryable | StopReason::AttemptsExhausted) => Walk::Stop,
+        }
+    }
+}
+
+/// Waits `delay`, looking up often enough that a cancelled query still stops promptly (§62.12).
+///
+/// A retry that finishes its backoff before it notices has made the shell unresponsive for
+/// exactly as long as it was being polite, which is the failure §50.1 and Gate L are about. So
+/// the wait is a sequence of short sleeps with a cancellation check between them rather than one
+/// long one. Answers whether the wait ran to its end.
+fn nap(lease: &Lease<'_, '_>, delay: Duration) -> bool {
+    let mut left = delay;
+    while !left.is_zero() {
+        if lease.cancelled() {
+            return false;
+        }
+        let slice = left.min(CANCELLATION_WINDOW);
+        std::thread::sleep(slice);
+        left = left.saturating_sub(slice);
+    }
+    !lease.cancelled()
 }
 
 /// A read that answered over a search which could not cover every group (§34.2, §35.8).
@@ -498,31 +692,30 @@ fn absence_unproven(unread: &[Gap]) -> WireError {
 }
 
 /// Discovers what serves the target's kind, then reads it — one object, or the collection.
+///
+/// The listing half is streamed rather than assembled: each page's records cross before the next
+/// page is asked for (§18.5, ADR-0023). See [`Streamed`] for what that costs and what it does not
+/// change about §18.3.
 fn read<S: ByteStream>(
-    session: &mut Session,
+    asked: Listed<'_, '_, '_>,
     client: &mut Client<S>,
-    target: &'static Target,
-    endpoint: &Endpoint,
-    selector: &Selector,
-    lookup: Option<&str>,
-) -> Result<(Answer, Shape, Vec<Gap>), WireError> {
-    let core = document(session, client, endpoint, "/api")?;
-    let groups = document(session, client, endpoint, "/apis")?;
-    // Two passes over the same two documents rather than two round trips: the preferred version
-    // has to be known before the resource list can be asked for, and `Builder` answers only once
-    // it is built.
-    let served = Discovery::builder()
-        .core_versions(&core)
-        .and_then(|builder| builder.groups(&groups))
-        .map_err(|error| {
-            failure(
-                UNAVAILABLE_CODE,
-                UNAVAILABLE,
-                format!("the API server's discovery documents did not read: {error}"),
-                "The endpoint answered, but not as a Kubernetes API server.",
-            )
-        })?
-        .build();
+) -> Result<Outcome, WireError> {
+    let Listed {
+        lease,
+        target,
+        schema,
+        endpoint,
+        selector,
+        lookup,
+        session,
+    } = asked;
+    // §49.1 and §49.5: everything from here — discovery, the search fan-out and the listing — is
+    // spent against one budget the query declared, with conservative defaults for the query that
+    // declared nothing. It is set here rather than on the client because a bound belongs to a
+    // question: the same connection carries a watch, which is something an operator holds open.
+    client.spend(endpoint.budget);
+
+    let served = served(session, client, endpoint)?;
 
     // §34.2's report, carried from the search all the way to the outcome. Empty for every
     // target that names its own group: a curated kind is one group-version's business, and
@@ -627,6 +820,26 @@ fn read<S: ByteStream>(
         discovery::Scope::Namespaced => endpoint.scope.clone(),
     };
 
+    let mut streamed = Streamed {
+        lease,
+        target,
+        schema,
+        shape: &shape,
+        // §49.3's `MUST`, made a property of the type: a retry policy is built *from* an
+        // `Idempotent`, which has three constructors named after the three read verbs and no way
+        // in for a mutation. A blind replay is not a mistake this file can make.
+        retries: RetryPolicy::new(
+            Idempotent::list(),
+            RETRY_FLOOR,
+            RETRY_CEILING,
+            RETRY_ALLOWANCE,
+        )
+        .with_jitter(Jitter::for_instance(&endpoint.instance)),
+        page_budget: endpoint.max_pages,
+        pages: 0,
+        stopped: None,
+    };
+
     if let Some(name) = lookup {
         // §20.2's other origin. A session that is watching this collection has already been told
         // what is in it, and answering from that cache is the only way a record's provenance
@@ -634,19 +847,20 @@ fn read<S: ByteStream>(
         // `Option` for exactly this call site: a cache that is still synchronising, or one whose
         // continuity broke, must fall through to the wire rather than report an absence it is
         // not entitled to (§20.3, §4 invariant 13).
-        match session.lookup(resource.gvr(), &scope, scope.namespace(), name) {
+        let answer = match session.lookup(resource.gvr(), &scope, scope.namespace(), name) {
             Lookup::Cached(read) => {
                 let (object, freshness) = read.into_parts();
-                return Ok((
-                    Answer::Fetched(Box::new((object, freshness))),
-                    shape,
-                    unread,
-                ));
+                Answer::Fetched(Box::new((object, freshness)))
             }
-            Lookup::ConfirmedAbsent => return Ok((Answer::Absent, shape, unread)),
-            Lookup::NotWatched | Lookup::NotSynced(_) => {}
-        }
-        return Ok((fetch(client, &resource, &scope, name)?, shape, unread));
+            Lookup::ConfirmedAbsent => Answer::Absent,
+            Lookup::NotWatched | Lookup::NotSynced(_) => {
+                afford(client)?;
+                let fetched = fetch(client, &resource, &scope, name);
+                client.ledger().end_request();
+                fetched?
+            }
+        };
+        return Ok(one(&streamed, answer, &unread));
     }
 
     if !resource.supports(Verb::List) {
@@ -665,11 +879,45 @@ fn read<S: ByteStream>(
     if let Some(pages) = endpoint.max_pages {
         options = options.max_pages(pages);
     }
-    Ok((
-        Answer::Listed(Box::new(client.list(resource.gvr(), &scope, &options))),
-        shape,
-        unread,
-    ))
+    // §17.6 and §9.4: the namespace, or every namespace, counted as the breadth it is.
+    client.ledger().enter_scope(&scope).map_err(over_budget)?;
+    let listing = client.walk(resource.gvr(), &scope, &options, &mut streamed);
+    Ok(streamed.finish(&listing, &unread))
+}
+
+/// The answer to a query that named one object: nothing to stream, and one thing to say.
+fn one(streamed: &Streamed<'_, '_, '_>, answer: Answer, unread: &[Gap]) -> Outcome {
+    match answer {
+        // §60.5 and §21.4 in the shape of a control flow: a named object that is not there is a
+        // complete answer with nothing in it, reached without emitting anything.
+        //
+        // Unless the search that chose the collection skipped a group. An object absent from the
+        // resource one group serves is not an object the cluster does not have, and `absent` is
+        // the one word in §21.4's vocabulary that is evidence about the cluster (§34.2, §35.8).
+        Answer::Absent if !unread.is_empty() => Outcome::Failed(absence_unproven(unread)),
+        Answer::Absent => Outcome::Completed,
+        Answer::Fetched(read) => {
+            let (object, freshness) = *read;
+            // §18.4 has nothing to say here: one object was asked for and one arrived, so there
+            // is no collection whose consumption could have been stopped short.
+            if let Err(outcome) = streamed.deliver(object, &freshness, Upstream::Consumed) {
+                return outcome;
+            }
+            // What may still be partial is the *search* that decided which collection this was.
+            if unread.is_empty() {
+                Outcome::Completed
+            } else {
+                Outcome::Failed(read_over_incomplete_search(unread))
+            }
+        }
+        // `fetch` is a get, and a get answers with one object or with nothing.
+        Answer::Listed(_) => Outcome::Failed(failure(
+            UNAVAILABLE_CODE,
+            UNAVAILABLE,
+            "a direct read answered with a collection".to_owned(),
+            "This is a defect in the Kubernetes provider, not in the cluster.",
+        )),
+    }
 }
 
 /// One object, at the canonical endpoint discovery resolved for it (§17.1).
@@ -737,20 +985,115 @@ pub(crate) fn served<S: ByteStream>(
     client: &mut Client<S>,
     endpoint: &Endpoint,
 ) -> Result<Discovery, WireError> {
-    let core = document(session, client, endpoint, "/api")?;
-    let groups = document(session, client, endpoint, "/apis")?;
-    Ok(Discovery::builder()
-        .core_versions(&core)
-        .and_then(|builder| builder.groups(&groups))
-        .map_err(|error| {
-            failure(
-                UNAVAILABLE_CODE,
-                UNAVAILABLE,
-                format!("the API server's discovery documents did not read: {error}"),
-                "The endpoint answered, but not as a Kubernetes API server.",
-            )
-        })?
-        .build())
+    let core = root_document(session, client, endpoint, "/api")?;
+    let groups = root_document(session, client, endpoint, "/apis")?;
+    assemble(core, groups)
+}
+
+/// Which form of a root discovery document arrived (§11.2, §5.3).
+///
+/// Two variants rather than a string and a flag, so that nothing downstream can hand an
+/// aggregated body to the legacy reader. The two documents answer the same question at two
+/// different costs and they are not interchangeable text.
+pub(crate) enum RootDocument {
+    /// `APIGroupDiscoveryList`: groups, versions **and** every resource, in one round trip.
+    Aggregated(String),
+    /// `APIVersions` or `APIGroupList`: the versions only, with a request per group-version still
+    /// to come.
+    Legacy(String),
+}
+
+/// Reads `/api` or `/apis`, taking the aggregated form where the server offers it (§11.2).
+///
+/// The negotiation costs nothing: the aggregated document lives at the same two paths, so this is
+/// the request the provider was going to make either way with a longer `Accept` on it. What it
+/// saves is the rest — a cluster serving forty group-versions answers the whole inventory here
+/// instead of in forty-one exchanges (§50.2).
+///
+/// # Errors
+///
+/// A wire failure, or an endpoint that answered but not as a Kubernetes API server.
+pub(crate) fn root_document<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    path: &str,
+) -> Result<RootDocument, WireError> {
+    let aggregated_key = format!("{path}{AGGREGATED_KEY}");
+    if let Some(held) = session.discovery_document(&aggregated_key) {
+        return Ok(RootDocument::Aggregated(held.to_owned()));
+    }
+    if let Some(held) = session.discovery_document(path) {
+        return Ok(RootDocument::Legacy(held.to_owned()));
+    }
+    let request = endpoint.authorise(Request::get(path).header("Accept", AGGREGATED_ACCEPT));
+    afford(client)?;
+    let sent = client.connection().send(&request);
+    client.ledger().end_request();
+    let response = sent.map_err(|error| transport_failure(path, &error))?;
+    if response.status() != 200 {
+        return Err(discovery_refused(
+            path,
+            response.status(),
+            response.reason(),
+        ));
+    }
+    let aggregated = response
+        .header("Content-Type")
+        .is_some_and(|kind| kind.contains(AGGREGATED_MEDIA));
+    let text = String::from_utf8(response.body().to_vec()).map_err(|error| {
+        failure(
+            UNAVAILABLE_CODE,
+            UNAVAILABLE,
+            format!("the API server's answer to `{path}` is not text: {error}"),
+            "A discovery document is JSON.",
+        )
+    })?;
+    if aggregated {
+        // §6.3's negotiated capability, earned from the answer rather than assumed from the ask.
+        session.negotiate(Capability::AggregatedDiscovery);
+        session.cache_discovery_document(aggregated_key, text.clone());
+        return Ok(RootDocument::Aggregated(text));
+    }
+    session.cache_discovery_document(path, text.clone());
+    Ok(RootDocument::Legacy(text))
+}
+
+/// The served surface, from whichever pair of root documents arrived (§11.2's fallback).
+fn assemble(core: RootDocument, groups: RootDocument) -> Result<Discovery, WireError> {
+    let mut builder = Discovery::builder();
+    let unreadable = |error: ono_provider_kubernetes::discovery::DiscoveryError| {
+        failure(
+            UNAVAILABLE_CODE,
+            UNAVAILABLE,
+            format!("the API server's discovery documents did not read: {error}"),
+            "The endpoint answered, but not as a Kubernetes API server.",
+        )
+    };
+    match core {
+        RootDocument::Aggregated(text) => builder.add_aggregated(&text).map_err(unreadable)?,
+        RootDocument::Legacy(text) => {
+            builder = builder.core_versions(&text).map_err(unreadable)?;
+        }
+    }
+    match groups {
+        RootDocument::Aggregated(text) => builder.add_aggregated(&text).map_err(unreadable)?,
+        RootDocument::Legacy(text) => {
+            builder = builder.groups(&text).map_err(unreadable)?;
+        }
+    }
+    Ok(builder.build())
+}
+
+/// A cluster that will not say what it serves, which is a cluster that cannot be read (§11.1).
+fn discovery_refused(path: &str, status: u16, reason: &str) -> WireError {
+    failure(
+        UNAVAILABLE_CODE,
+        UNAVAILABLE,
+        format!("the API server answered `{path}` with {status} {reason}"),
+        "Discovery is the first thing this provider asks for; a cluster that refuses it \
+         cannot be read at all.",
+    )
 }
 
 /// One object a question is *about*, read at its own endpoint (§17.1).
@@ -913,7 +1256,13 @@ pub(crate) fn curated<S: ByteStream>(
         )
     })?;
     let group_version = group_version_of(group, version);
-    let discovery = resource_list(session, client, endpoint, &group_version)?;
+    // §11.2: where the aggregated document answered, the inventory is already here and the
+    // per-group request is one this provider no longer has to make (§50.2).
+    let discovery = if served.serves_group_version(&group_version) {
+        served.clone()
+    } else {
+        resource_list(session, client, endpoint, &group_version)?
+    };
     discovery
         .by_kind(&group_version, kind)
         .cloned()
@@ -974,9 +1323,43 @@ pub(crate) fn search<S: ByteStream>(
     selector: &Selector,
 ) -> Result<Searched, WireError> {
     let group_versions = search_space(served, selector)?;
+    // §17.6: "before an expensive all-namespace/all-resource query, the provider SHOULD estimate
+    // or expose query breadth when possible." This is the moment it is possible — the search
+    // space is resolved and nothing has been read — and the estimate is exact rather than a
+    // guess: one request and one scope per group-version the search has to cover.
+    let estimate = Estimate::new(group_versions.len() as u64, group_versions.len() as u64);
+    let admitted = client.ledger().budget().admits(&estimate);
+    if let Err(over) = admitted {
+        return Err(too_broad(estimate, over));
+    }
     let mut builder = Discovery::builder();
     let mut unread = Vec::new();
     for group_version in &group_versions {
+        // §11.2's whole point, spent: the aggregated document already stated this group's
+        // resources, so the search makes no request for it at all. A snapshot assembled the
+        // legacy way holds versions and no resources, so this arm is simply never taken there —
+        // which is the fallback staying the only path against a server that offers no aggregate.
+        if served.serves_group_version(group_version) {
+            if served.is_stale(group_version) {
+                // §34.2 in the aggregation layer's own vocabulary. `Stale` means the API server
+                // behind the group did not answer, so an empty inventory under it is nobody
+                // having been able to ask — the same gap a `503` on the group's resource list
+                // records, learned one round trip earlier.
+                unread.push(Gap::new(
+                    Scope::in_group_version(group_version),
+                    Coverage::Unavailable,
+                ));
+                continue;
+            }
+            builder.adopt(served, group_version);
+            continue;
+        }
+        // §9.3 and §17.6: a group-version is a scope, and how many of them a query reaches into
+        // is what its breadth *is*. Counted once however often it is entered.
+        client
+            .ledger()
+            .enter_scope(&Scope::in_group_version(group_version))
+            .map_err(over_budget)?;
         let outcome = match group_document(session, client, endpoint, group_version)? {
             // The group answered, and not as a Kubernetes API server. Still a fact about *that*
             // group rather than about the cluster (§34.3), so it is recorded as a `503` is —
@@ -1062,10 +1445,10 @@ pub(crate) fn group_document<S: ByteStream>(
     }
     let request =
         endpoint.authorise(Request::get(path.clone()).header("Accept", "application/json"));
-    let response = client
-        .connection()
-        .send(&request)
-        .map_err(|error| transport_failure(&path, &error))?;
+    afford(client)?;
+    let sent = client.connection().send(&request);
+    client.ledger().end_request();
+    let response = sent.map_err(|error| transport_failure(&path, &error))?;
     if response.status() != 200 {
         return Ok(GroupRead::Unread(unread_outcome(response.status())));
     }
@@ -1110,6 +1493,56 @@ fn unproven_resolution(selector: &Selector, searched: &Searched) -> WireError {
         "A group whose own API server did not answer is not a group with nothing in it \
          (specification sections 34.2 and 21.4), so one candidate found here is not proof that \
          only one type has this name (section 35.8). Name `group` to ask a group that answers.",
+    )
+}
+
+/// Takes leave to send one request against the query's budget (§49.1, §50.1).
+///
+/// Paired with `client.ledger().end_request()` after the exchange, because concurrency is the one
+/// bound that is not a total: it limits what the *cluster* sees at an instant. The request itself
+/// goes on counting, which is what the request bound is for.
+///
+/// # Errors
+///
+/// A refusal naming the bound that was reached, in the vocabulary of core's `errors.yaml`.
+fn afford<S: ByteStream>(client: &mut Client<S>) -> Result<(), WireError> {
+    client.ledger().begin_request().map_err(over_budget)
+}
+
+/// A query stopped by a bound this provider was configured with (§49.1, §49.5).
+///
+/// Never `timeout` and never `transport_error`: nothing failed. The cluster answered every
+/// request it was sent, and saying otherwise sends an operator to look at a system that is
+/// behaving perfectly.
+fn over_budget(over: Overrun) -> WireError {
+    failure(
+        UNAVAILABLE_CODE,
+        UNAVAILABLE,
+        format!("the query stopped at a bound it was given: {over}"),
+        "This is a budget the query ran under rather than anything the cluster did \
+         (specification sections 49.1 and 49.5). Narrow the question — name a `namespace`, a \
+         `group`, a `kind` — or raise the bound with `max_requests`, `max_scopes` or `budget_ms`.",
+    )
+}
+
+/// A query whose declared breadth is already past its budget (§17.6, §12.6 of the generic
+/// contract).
+///
+/// Asked before the first request rather than discovered on the four hundredth. Refusing halfway
+/// hands an operator a partial answer they never asked for; refusing up front, with the breadth
+/// named, lets them narrow the query or raise the bound.
+fn too_broad(estimate: Estimate, over: Overrun) -> WireError {
+    failure(
+        UNAVAILABLE_CODE,
+        UNAVAILABLE,
+        format!(
+            "this query would be {}, and it is bounded before it starts rather than halfway \
+             through: {over}",
+            estimate.describe()
+        ),
+        "Section 17.6 asks a provider to estimate or expose the breadth of an expensive query \
+         before running it, and nothing was read. Name `group` (and `version`) to search one API \
+         group instead of every one the server lists, or raise `max_scopes` and `max_requests`.",
     )
 }
 
@@ -1406,21 +1839,15 @@ pub(crate) fn document<S: ByteStream>(
         return Ok(held.to_owned());
     }
     let request = endpoint.authorise(Request::get(path).header("Accept", "application/json"));
-    let response = client
-        .connection()
-        .send(&request)
-        .map_err(|error| transport_failure(path, &error))?;
+    afford(client)?;
+    let sent = client.connection().send(&request);
+    client.ledger().end_request();
+    let response = sent.map_err(|error| transport_failure(path, &error))?;
     if response.status() != 200 {
-        return Err(failure(
-            UNAVAILABLE_CODE,
-            UNAVAILABLE,
-            format!(
-                "the API server answered `{path}` with {} {}",
-                response.status(),
-                response.reason()
-            ),
-            "Discovery is the first thing this provider asks for; a cluster that refuses it \
-             cannot be read at all.",
+        return Err(discovery_refused(
+            path,
+            response.status(),
+            response.reason(),
         ));
     }
     let text = String::from_utf8(response.body().to_vec()).map_err(|error| {
@@ -1447,10 +1874,10 @@ fn optional_document<S: ByteStream>(
     path: &str,
 ) -> Result<Option<String>, WireError> {
     let request = endpoint.authorise(Request::get(path).header("Accept", "application/json"));
-    let response = client
-        .connection()
-        .send(&request)
-        .map_err(|error| transport_failure(path, &error))?;
+    afford(client)?;
+    let sent = client.connection().send(&request);
+    client.ledger().end_request();
+    let response = sent.map_err(|error| transport_failure(path, &error))?;
     if response.status() != 200 {
         return Ok(None);
     }
@@ -1472,6 +1899,12 @@ pub(crate) struct Endpoint {
     pub(crate) instance: String,
     pub(crate) scope: Scope,
     pub(crate) max_pages: Option<usize>,
+    /// What one query answered from this endpoint may cost (§49.1, §49.5, §50.1).
+    ///
+    /// Resolved per invocation from the query's own words over conservative defaults, and never
+    /// stored on the session: a bound one invocation chose has no more business surviving into
+    /// the next than the scope it asked about does (§6.5).
+    pub(crate) budget: Budget,
     /// `None` is plain HTTP/1.1, which reaches an API server through `kubectl proxy` and nothing
     /// else. A `https://` server always carries settings.
     pub(crate) tls: Option<TlsSettings>,
@@ -1581,6 +2014,7 @@ impl Endpoint {
             instance,
             scope: scope_of(options, None),
             max_pages: max_pages(options),
+            budget: budget_of(options),
             // Deliberately no TLS on this path, and deliberately no option to ask for it: an
             // explicit host with no kubeconfig behind it has no trust anchors, and a session
             // against the platform store that the operator never chose would be a trust decision
@@ -1717,6 +2151,7 @@ impl Endpoint {
             // query beats it because it is the more recent deliberate choice.
             scope: scope_of(options, connection.namespace()),
             max_pages: max_pages(options),
+            budget: budget_of(options),
             tls,
             authorization,
             credential: connection.credential(),
@@ -1803,6 +2238,53 @@ fn scope_of(options: &JsonMap<String, Json>, context_namespace: Option<&str>) ->
         }
         None => Scope::in_namespace(context_namespace.unwrap_or("default")),
     }
+}
+
+/// What this query may spend, over conservative defaults (§49.5).
+///
+/// **§49.5 asks for a configurable policy, and this is the operator-facing half of it.** The
+/// starting point is `Budget::interactive` — every one of the six quantities §20.4 of the generic
+/// contract names is bounded, because a default that leaves one dimension open is an unbounded
+/// default and the default is what every query nobody configured runs under.
+///
+/// Three of the six are nameable in a query, and they are the three an operator has a reason to
+/// move while working: how wide (`max_scopes`), how much (`max_requests`) and how long
+/// (`budget_ms`). `max_pages` is beside them and older, and it means something different — §18.4's
+/// user limit, which is a decision rather than a bound and therefore not incompleteness.
+///
+/// The other two are deliberately not exposed:
+///
+/// - **concurrency**, because this package holds one brokered connection and sends one request at
+///   a time, so the in-flight count is structurally one. A knob that cannot change what the
+///   cluster sees would be a decoration, and §5.3's discipline about not claiming capabilities
+///   applies to a provider's own surface as much as to an API server's.
+/// - **the transferred-byte bound**, because it is a safety property rather than a preference.
+///   §50.1 says connecting a large cluster must not freeze the shell, and an operator who raised
+///   the byte bound to get an answer would have moved that risk onto the shell rather than
+///   narrowing the question. `max_pages` narrows it honestly and says so in coverage.
+///
+/// A value of zero or less is ignored rather than obeyed: `0` would be the most expensive typo
+/// available here, since it reads as "unbounded" and means "refuse everything".
+fn budget_of(options: &JsonMap<String, Json>) -> Budget {
+    let mut budget = Budget::interactive();
+    if let Some(requests) = bound(options, "max_requests") {
+        budget = budget.with_requests(requests);
+    }
+    if let Some(scopes) = bound(options, "max_scopes") {
+        budget = budget.with_scopes(scopes);
+    }
+    if let Some(millis) = bound(options, "budget_ms") {
+        budget = budget.with_elapsed(Duration::from_millis(millis));
+    }
+    budget
+}
+
+/// One positive integer bound the query named, where it named one.
+fn bound(options: &JsonMap<String, Json>, name: &str) -> Option<u64> {
+    options
+        .get(name)
+        .and_then(Json::as_u64)
+        .filter(|value| *value > 0)
 }
 
 /// A page budget, where the query set one.

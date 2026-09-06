@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value as Json;
 
+use crate::budget::{Budget, Ledger, Overrun};
 use crate::coverage::{Coverage, Gap, Outcome, Scope};
 use crate::discovery::Gvr;
 use crate::object::Object;
@@ -614,6 +615,12 @@ impl<S: ByteStream> HttpConnection<S> {
 
     /// Reads one chunk of a chunked body, or `None` at the terminating zero-length chunk.
     fn next_chunk_bytes(&mut self) -> Result<Option<Vec<u8>>, ApiError> {
+        // The one place a quiet window is worth reporting: between two chunks, with nothing
+        // buffered and no frame begun. Everything below this line is inside a frame and waits
+        // (`fill_waiting`), because a partial chunk is not something a caller can be handed.
+        if self.buffer.is_empty() {
+            self.fill()?;
+        }
         let line = self.read_until(b"\r\n")?;
         let text = String::from_utf8_lossy(&line).into_owned();
         let size_text = text.split(';').next().unwrap_or(&text).trim();
@@ -642,7 +649,7 @@ impl<S: ByteStream> HttpConnection<S> {
                 self.buffer.drain(..needle.len());
                 return Ok(found);
             }
-            if self.fill()? == 0 {
+            if self.fill_waiting()? == 0 {
                 return Err(ApiError::Stream(
                     "the connection closed before the message ended".to_owned(),
                 ));
@@ -653,7 +660,7 @@ impl<S: ByteStream> HttpConnection<S> {
     /// Exactly `length` bytes, or a stream failure. A short body is not a small answer.
     fn take(&mut self, length: usize) -> Result<Vec<u8>, ApiError> {
         while self.buffer.len() < length {
-            if self.fill()? == 0 {
+            if self.fill_waiting()? == 0 {
                 return Err(ApiError::Stream(format!(
                     "the connection closed after {} of {length} body bytes",
                     self.buffer.len()
@@ -665,8 +672,26 @@ impl<S: ByteStream> HttpConnection<S> {
 
     /// Everything until the connection closes.
     fn take_to_end(&mut self) -> Result<Vec<u8>, ApiError> {
-        while self.fill()? != 0 {}
+        // `Framing::ToEnd` has no frame boundary before the connection closes, so there is
+        // nowhere to hand a quiet window back to: waiting is the whole operation.
+        while self.fill_waiting()? != 0 {}
         Ok(std::mem::take(&mut self.buffer))
+    }
+
+    /// [`Self::fill`], waiting through a quiet window rather than reporting it.
+    ///
+    /// **Every caller inside a frame uses this one.** A quiet window is only an outcome anybody
+    /// can act on at a frame *boundary*: halfway through a status line or a chunk body there is
+    /// nothing to hand back but a partial message, and a caller that received one could neither
+    /// use it nor put it back. Reporting it there would turn a slow response head — a watch whose
+    /// server takes longer than one poll window to answer — into a failed watch.
+    fn fill_waiting(&mut self) -> Result<usize, ApiError> {
+        loop {
+            match self.fill() {
+                Err(ApiError::Quiet) => {}
+                other => return other,
+            }
+        }
     }
 
     fn fill(&mut self) -> Result<usize, ApiError> {
@@ -1894,6 +1919,7 @@ pub struct Page {
     continue_token: Option<String>,
     remaining: Option<i64>,
     freshness: Freshness,
+    bytes: u64,
 }
 
 impl Page {
@@ -1931,6 +1957,17 @@ impl Page {
     #[must_use]
     pub fn freshness(&self) -> &Freshness {
         &self.freshness
+    }
+
+    /// How many bytes of response body this page cost (§18.5, §20.4 of the generic contract).
+    ///
+    /// The wire size rather than the size of what was parsed out of it, because the bound §18.5
+    /// asks for is about what crossed the connection and sat in memory at once. A caller with a
+    /// byte budget has no other way to know: an object's own footprint is a different number and
+    /// a later one.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
     }
 
     /// Whether this page is the whole collection.
@@ -1985,6 +2022,7 @@ pub struct Listing {
     error: Option<ApiError>,
     freshness: Freshness,
     pages: usize,
+    overrun: Option<Overrun>,
 }
 
 impl Listing {
@@ -2035,6 +2073,65 @@ impl Listing {
     pub fn pages(&self) -> usize {
         self.pages
     }
+
+    /// The budget bound that stopped the walk, where one did (§49.1, §50.1).
+    ///
+    /// Beside [`Self::error`] rather than folded into it, because nothing failed: the query was
+    /// stopped by a policy this provider was given, and reporting that as a request error sends
+    /// an operator to look at a cluster that is behaving perfectly (`budget::Overrun::kind`).
+    /// The gap it left is already in [`Self::coverage`]; this is the reason, for the sentence a
+    /// person reads.
+    #[must_use]
+    pub fn overrun(&self) -> Option<Overrun> {
+        self.overrun
+    }
+}
+
+/// What a [`Reader`] wants the walk over a collection to do next (§18.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walk {
+    /// Go on: ask for the next page, or send the failed request again.
+    Continue,
+    /// Stop here.
+    Stop,
+}
+
+/// What a caller does with the pages of a collection as they arrive (§18.5).
+///
+/// The seam that lets a listing be *streamed* without moving §18's rules out of this module. The
+/// walk keeps continuity, coverage and the snapshot version, because those are properties of the
+/// sequence; the reader keeps whatever it does with the objects, and it is the only thing that
+/// holds any.
+pub trait Reader {
+    /// One page arrived, whole.
+    ///
+    /// [`Walk::Stop`] ends the sequence without recording a gap: a consumer that stops asking is
+    /// §18.4's user limit rather than provider incompleteness, and the listing says so by
+    /// reporting that more may exist upstream.
+    fn page(&mut self, page: Page) -> Walk;
+
+    /// The request for a page failed.
+    ///
+    /// [`Walk::Continue`] re-sends the same request, which is the only repetition §18.2 and §49.3
+    /// both allow: the same token into the same snapshot, by a caller that has decided the read
+    /// is safe to repeat and has waited however long it means to wait. Stopping is the default,
+    /// because a retry nobody asked for is a retry nobody bounded.
+    fn failed(&mut self, error: &ApiError) -> Walk {
+        let _ = error;
+        Walk::Stop
+    }
+}
+
+/// The reader [`Client::list`] is written in terms of: keep everything.
+struct Collected {
+    objects: Vec<Object>,
+}
+
+impl Reader for Collected {
+    fn page(&mut self, page: Page) -> Walk {
+        self.objects.extend(page.into_objects());
+        Walk::Continue
+    }
 }
 
 // --- the client ------------------------------------------------------------------------------------
@@ -2049,6 +2146,18 @@ pub struct Client<S: ByteStream, C: Clock = SystemClock> {
     provider_instance: String,
     clock: C,
     default_headers: Vec<(String, String)>,
+    /// What the work still to be done over this client may cost (§49.1, §50.1).
+    ///
+    /// [`Budget::unlimited`] until a caller says otherwise, and that is deliberate rather than
+    /// lax: a bound belongs to a *question*, not to a connection. An interactive listing is
+    /// something a person is waiting for; a watch is something a person is holding open, and the
+    /// same elapsed bound would end it after ten seconds for being healthy. So the default is no
+    /// bound and [`Self::spend`] is how the bounded path opts in.
+    ///
+    /// On the wall clock rather than on `C`. §50.1's bound is about how long a person waits, and
+    /// a test that fixes the clock to make freshness assertable is not asking for a query that
+    /// may run forever.
+    ledger: Ledger<SystemClock>,
 }
 
 impl<S: ByteStream> Client<S, SystemClock> {
@@ -2073,7 +2182,26 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
             provider_instance: provider_instance.into(),
             clock,
             default_headers: vec![("Accept".to_owned(), "application/json".to_owned())],
+            ledger: Ledger::new(Budget::unlimited(), SystemClock),
         }
+    }
+
+    /// Puts everything this client does from now on under `budget`, counting from now (§49.1).
+    ///
+    /// Called by the question rather than by the connection, and called once: the elapsed bound
+    /// starts here, so a caller that re-declared its budget between two pages would have a bound
+    /// that never fires.
+    pub fn spend(&mut self, budget: Budget) {
+        self.ledger = Ledger::new(budget, SystemClock);
+    }
+
+    /// What this client has spent, for a caller that spends outside this module.
+    ///
+    /// Discovery is the caller this exists for: `/api`, `/apis` and a resource list per group are
+    /// requests against the same budget as the listing they precede, and §17.6's breadth is
+    /// counted in *scopes*, which only the caller resolving them knows the names of.
+    pub fn ledger(&mut self) -> &mut Ledger<SystemClock> {
+        &mut self.ledger
     }
 
     /// Adds a header sent on every request — an `Authorization`, typically.
@@ -2152,6 +2280,7 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
         let request = self.decorate(list_request(gvr, scope, options));
         let response = classify(self.connection.send(&request)?)?;
         let observed_at = self.clock.now();
+        let bytes = response.body().len() as u64;
         let document: Json = serde_json::from_slice(response.body())
             .map_err(|error| ApiError::Malformed(error.to_string()))?;
         let metadata = document.get("metadata");
@@ -2196,31 +2325,92 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
             continue_token,
             remaining,
             freshness,
+            bytes,
         })
     }
 
-    /// Reads a whole collection, following `continue` tokens (§18).
+    /// Reads a whole collection into memory, following `continue` tokens (§18).
     ///
-    /// Never fails as a whole: a sequence that dies on page N+1 still knows about pages 1..N, and
-    /// §18.3 says those may be returned as long as coverage is partial and the error is attached.
-    /// The sequence is never restarted here — a fresh list mixed into a continued one is exactly
-    /// what §18.2 forbids without a continuity break, so an expired token ends the walk and says
-    /// so.
+    /// The buffering form of [`Self::walk`], for the callers §18.5 exempts: an operation that
+    /// "explicitly requires a complete set" — a listing that seeds a watched cache (§19.1), a
+    /// relationship derivation that has to evaluate a selector over the whole collection (§23.3).
+    /// A caller that only forwards the objects onward wants [`Self::walk`] instead.
     pub fn list(&mut self, gvr: &Gvr, scope: &Scope, options: &ListOptions) -> Listing {
+        let mut collected = Collected {
+            objects: Vec::new(),
+        };
+        let mut listing = self.walk(gvr, scope, options, &mut collected);
+        listing.objects = collected.objects;
+        listing
+    }
+
+    /// Walks a collection page by page, handing each page to `reader` as it arrives (§18.5).
+    ///
+    /// **Nothing is accumulated here.** The [`Listing`] that comes back carries the coverage, the
+    /// continuity, the snapshot version and the error, and no objects: the reader has them, and
+    /// keeping a second copy is the buffering §18.5 asks the provider not to do.
+    ///
+    /// Never fails as a whole: a sequence that dies on page N+1 has already handed over pages
+    /// 1..N, and §18.3 says those may stand as long as coverage is partial and the error is
+    /// attached. That is a stronger obligation for a streaming caller than for a buffering one —
+    /// records it has already emitted cannot be unsent — and it is why the error travels on the
+    /// listing rather than replacing it.
+    ///
+    /// The sequence is never restarted: a fresh list mixed into a continued one is exactly what
+    /// §18.2 forbids without a continuity break, so an expired token ends the walk and says so.
+    /// [`Reader::failed`] answering [`Walk::Continue`] re-sends **the same request**, which is
+    /// §49.3's bounded retry of a safe read and never a second snapshot. Bounding it is the
+    /// reader's business: this loop repeats for as long as it is told to.
+    pub fn walk(
+        &mut self,
+        gvr: &Gvr,
+        scope: &Scope,
+        options: &ListOptions,
+        reader: &mut impl Reader,
+    ) -> Listing {
         let mut coverage = Coverage::complete(scope.clone());
-        let mut objects: Vec<Object> = Vec::new();
         let mut continuity = Continuity::Intact;
         let mut error = None;
+        let mut overrun = None;
         let mut snapshot: Option<String> = None;
         let mut observed_at = self.clock.now();
         let mut pages = 0_usize;
         let mut page_options = options.clone();
+        // Whether this turn of the loop is a new page or a repetition of one that failed. A
+        // repetition is the same page, so it costs a request and never a second page.
+        let mut fresh_page = true;
 
         loop {
-            match self.list_page(gvr, scope, &page_options) {
+            // §49.1 and §50.1, checked before the spending rather than reported after it. An
+            // exceeded budget is a *stated incomplete* result and never a shorter list, so the
+            // stop and the coverage that says so happen in one statement (`Overrun::record`).
+            let taken = if fresh_page {
+                self.ledger
+                    .page()
+                    .and_then(|()| self.ledger.begin_request())
+            } else {
+                self.ledger.begin_request()
+            };
+            if let Err(over) = taken {
+                over.record(&mut coverage, scope.clone());
+                overrun = Some(over);
+                break;
+            }
+            let attempt = self.list_page(gvr, scope, &page_options);
+            self.ledger.end_request();
+            match attempt {
                 Ok(page) => {
                     pages += 1;
+                    fresh_page = true;
                     observed_at = page.freshness().observed_at();
+                    if let Err(over) = self.ledger.transfer(page.bytes()) {
+                        // §18.5's memory bound. The page is refused rather than handed on: a
+                        // byte budget that admits the page it was meant to stop has already
+                        // paid for what it was protecting.
+                        over.record(&mut coverage, scope.clone());
+                        overrun = Some(over);
+                        break;
+                    }
                     match (&snapshot, page.resource_version()) {
                         (None, version) => snapshot = version.map(str::to_owned),
                         (Some(first), Some(version)) if first != version => {
@@ -2229,19 +2419,27 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
                         _ => {}
                     }
                     let token = page.continue_token().map(str::to_owned);
-                    objects.extend(page.into_objects());
                     coverage.observed(scope.clone());
+                    let walk = reader.page(page);
                     let Some(token) = token else {
                         break;
                     };
-                    if options.page_budget().is_some_and(|budget| pages >= budget) {
-                        // §18.4: the pipeline stopped asking. Not a gap, and not silence either.
+                    // §18.4: the consumer stopped asking, or the query named a page budget.
+                    // Neither is a gap — a decision is not a hole — and neither is silence: the
+                    // stream is told that more exists upstream.
+                    if walk == Walk::Stop
+                        || options.page_budget().is_some_and(|budget| pages >= budget)
+                    {
                         coverage.more_available();
                         break;
                     }
                     page_options = page_options.continue_from(token);
                 }
                 Err(failure) => {
+                    if reader.failed(&failure) == Walk::Continue {
+                        fresh_page = false;
+                        continue;
+                    }
                     if failure.is_continuity_expiry() {
                         continuity = Continuity::Broken(BreakReason::TokenExpired);
                     }
@@ -2260,13 +2458,14 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
             EndpointCategory::of(gvr),
         );
         Listing {
-            objects,
+            objects: Vec::new(),
             coverage,
             resource_version: snapshot,
             continuity,
             error,
             freshness,
             pages,
+            overrun,
         }
     }
 

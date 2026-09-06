@@ -208,6 +208,14 @@ struct RecordedCluster {
     /// behind it is down. The core API server answers perfectly throughout, which is the whole
     /// point: the specification forbids one of those failures becoming the other.
     degraded_aggregate: bool,
+    /// How the Pod collection is paginated, and what happens on its second page (§18).
+    paging: Paging,
+    /// Whether the server offers the aggregated Discovery API of §11.2.
+    ///
+    /// Off by default, and that is the fixture that matters most: the fallback is what every
+    /// other test in this file exercises, so a negotiation that silently stopped falling back
+    /// would be caught by all of them rather than by none.
+    aggregated: bool,
     /// Whether the group list itself does not answer.
     ///
     /// The other side of §34.2's boundary. `/api` and `/apis` are not one group among many —
@@ -297,6 +305,30 @@ enum Watching {
     Paced,
     /// An expiry, then — after the re-acquisition — a second stream that stays open (§19.4).
     ExpiryThenLive,
+}
+
+/// How a recorded server paginates the Pod collection, and what its second page does (§18).
+///
+/// One enum rather than four flags, because the four cases are mutually exclusive readings of the
+/// same second request and a fixture that could be both "denied" and "throttled" would be a
+/// server no cluster is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Paging {
+    /// One page, which is what every other test in this file sees.
+    #[default]
+    Whole,
+    /// Two pages, both answered as soon as they are asked for.
+    TwoPages,
+    /// Two pages, the second delivered only when the test releases it.
+    ///
+    /// The gate is what makes "streamed" checkable rather than plausible: the second page does
+    /// not exist on the wire until the test has already taken the record the first one produced,
+    /// so a package that buffered the whole collection could not answer at all.
+    Paced,
+    /// Two pages, and RBAC refuses the second — §18.3 after a record has already crossed.
+    SecondDenied,
+    /// Two pages, and the second is rate-limited once with a `Retry-After` before it answers.
+    SecondThrottled,
 }
 
 /// One Pod as the watch fixtures use it: a name, a lifetime and a version, and nothing else.
@@ -446,6 +478,26 @@ impl RecordedCluster {
         Arc::new(Self {
             pods,
             apps: true,
+            ..Self::default()
+        })
+    }
+
+    /// A server whose Pod collection comes in two pages, and what becomes of the second.
+    fn paginating(paging: Paging) -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            paging,
+            ..Self::default()
+        })
+    }
+
+    /// A server that answers `/api` and `/apis` as `APIGroupDiscoveryList` when asked (§11.2).
+    fn offering_aggregated_discovery() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            aggregated: true,
             ..Self::default()
         })
     }
@@ -1857,6 +1909,156 @@ fn collection(kind: &str, api_version: &str, items: &[Json]) -> Json {
     })
 }
 
+/// The two root documents as a server offering aggregated discovery answers them (§11.2).
+///
+/// Keyed on the `Accept` of the request rather than on the path, because that is where the
+/// negotiation lives: the same two paths answer either form, and a server that was never asked
+/// for the aggregate answers the legacy document. `None` is "this request did not ask", which is
+/// how the fallback stays reachable from the same fixture.
+fn aggregated_reply(head: &str, path: &str, cluster: &RecordedCluster) -> Option<Vec<u8>> {
+    if !cluster.aggregated || !head.contains("as=APIGroupDiscoveryList") {
+        return None;
+    }
+    let body = match path {
+        "/api" => json!({
+            "kind": "APIGroupDiscoveryList",
+            "apiVersion": "apidiscovery.k8s.io/v2",
+            "items": [{
+                "metadata": {"name": ""},
+                "versions": [{
+                    "version": "v1",
+                    "freshness": "Current",
+                    "resources": [
+                        {"resource": "namespaces", "singularResource": "namespace",
+                         "responseKind": {"group": "", "version": "v1", "kind": "Namespace"},
+                         "scope": "Cluster", "verbs": ["get", "list", "watch"],
+                         "shortNames": ["ns"]},
+                        {"resource": "nodes", "singularResource": "node",
+                         "responseKind": {"group": "", "version": "v1", "kind": "Node"},
+                         "scope": "Cluster", "verbs": ["get", "list", "watch"],
+                         "shortNames": ["no"]},
+                        {"resource": "pods", "singularResource": "pod",
+                         "responseKind": {"group": "", "version": "v1", "kind": "Pod"},
+                         "scope": "Namespaced", "verbs": ["get", "list", "watch"],
+                         "shortNames": ["po"],
+                         "subresources": [{"subresource": "log",
+                           "responseKind": {"group": "", "version": "v1", "kind": "Pod"},
+                           "verbs": ["get"]}]},
+                        {"resource": "secrets", "singularResource": "secret",
+                         "responseKind": {"group": "", "version": "v1", "kind": "Secret"},
+                         "scope": "Namespaced", "verbs": ["get", "list", "watch"]},
+                    ],
+                }],
+            }],
+        }),
+        "/apis" => json!({
+            "kind": "APIGroupDiscoveryList",
+            "apiVersion": "apidiscovery.k8s.io/v2",
+            "items": [{
+                "metadata": {"name": "apps"},
+                "versions": [{
+                    "version": "v1",
+                    "freshness": "Current",
+                    "resources": [{
+                        "resource": "deployments", "singularResource": "deployment",
+                        "responseKind": {"group": "apps", "version": "v1", "kind": "Deployment"},
+                        "scope": "Namespaced",
+                        "verbs": ["get", "list", "watch"], "shortNames": ["deploy"],
+                    }],
+                }],
+            }, {
+                // §34.2 as the aggregation layer reports it: registered, listed, and not
+                // answering — so its inventory is what the aggregator last remembered, which is
+                // nothing.
+                "metadata": {"name": "metrics.example"},
+                "versions": [{"version": "v1beta1", "freshness": "Stale", "resources": []}],
+            }],
+        }),
+        _ => return None,
+    }
+    .to_string();
+    Some(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json;g=apidiscovery.k8s.io;v=v2;\
+as=APIGroupDiscoveryList\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes(),
+    )
+}
+
+/// One `429`, as an API server under API Priority and Fairness refuses a request (§49.2).
+///
+/// `Retry-After` in the head rather than only `retryAfterSeconds` in the body, because that is
+/// the field §49.2 names and the one an intermediary would have rewritten on the way back.
+fn throttled(path: &str) -> Vec<u8> {
+    let body = json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "message": format!("too many requests for {path}"),
+        "reason": "TooManyRequests",
+        "code": 429,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\n\
+Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// The Pod collection in two pages, for the servers that paginate it (§18.1).
+fn paged_pods(path: &str, cluster: &RecordedCluster) -> Option<Vec<u8>> {
+    if cluster.paging == Paging::Whole {
+        return None;
+    }
+    let (base, query) = match path.split_once('?') {
+        Some((base, query)) => (base, query),
+        None => (path, ""),
+    };
+    if base != "/api/v1/namespaces/default/pods" {
+        return None;
+    }
+    if !query.contains("continue=page-2") {
+        return Some(response(
+            &json!({
+                "kind": "PodList",
+                "apiVersion": "v1",
+                "metadata": {
+                    "resourceVersion": "9002",
+                    "continue": "page-2",
+                    "remainingItemCount": 1,
+                },
+                "items": [pod(0)],
+            })
+            .to_string(),
+        ));
+    }
+    let second = response(
+        &json!({
+            "kind": "PodList",
+            "apiVersion": "v1",
+            "metadata": {"resourceVersion": "9002"},
+            "items": [pod(1)],
+        })
+        .to_string(),
+    );
+    match cluster.paging {
+        Paging::SecondDenied => Some(denied(base, "list")),
+        Paging::SecondThrottled
+            if cluster
+                .lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0 =>
+        {
+            Some(throttled(base))
+        }
+        _ => Some(second),
+    }
+}
+
 fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let pods = cluster.pods;
     // Read before the query string is dropped, because `watch=true` is the whole difference
@@ -1871,6 +2073,11 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
         && let Some(bytes) = log_response(path)
     {
         return bytes;
+    }
+    // §18: which page of the collection this is lives in the query string, exactly as `watch=true`
+    // does, so it is answered before the query is dropped.
+    if let Some(page) = paged_pods(path, cluster) {
+        return page;
     }
     let path = path.split('?').next().unwrap_or(path);
     if cluster.watch != Watching::NotOffered && path == "/api/v1/namespaces/default/pods" {
@@ -2115,9 +2322,17 @@ impl HostServices for RecordedCluster {
                     buffered.drain(..at + 4);
                     let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
                     if let Ok(mut heads) = cluster.heads.lock() {
-                        heads.push(head);
+                        heads.push(head.clone());
                     }
-                    replies.push(document(&path, &cluster));
+                    // §18.5's gate: the second page does not go on the wire until the test
+                    // has taken the record the first one produced.
+                    if cluster.paging == Paging::Paced && path.contains("continue=") {
+                        cluster.release.notified().await;
+                    }
+                    replies.push(
+                        aggregated_reply(&head, path.split('?').next().unwrap_or(&path), &cluster)
+                            .unwrap_or_else(|| document(&path, &cluster)),
+                    );
                     // A paced watch answers with its head here and with its frames later, each
                     // one when the test releases it. The sender is cloned rather than moved,
                     // because the connection goes on carrying nothing until it is closed.
@@ -5223,6 +5438,407 @@ fn asked_for(cluster: &RecordedCluster, path: &str) -> usize {
                 .is_some_and(|target| target.split('?').next() == Some(path))
         })
         .count()
+}
+
+// --- §17.6, §18.3, §18.4, §18.5, §49: what a listing costs and what it says when it stops -------
+
+#[tokio::test]
+async fn should_emit_a_record_from_the_first_page_before_it_asks_for_the_second() {
+    // §18.5: "The provider SHOULD stream pages into the Ono pipeline rather than buffering entire
+    // large clusters unless an operation explicitly requires a complete set." A provider that
+    // walked every page and emitted afterwards holds the whole collection in memory at once, and
+    // a consumer that only wanted the first twenty rows still waits for the ten-thousandth.
+    //
+    // The recorded server here does not answer the second page until this test says so, so a
+    // buffering implementation cannot produce a record at all and this times out. That is the
+    // same shape as `should_emit_a_record_as_each_change_arrives...` and
+    // `should_emit_a_log_line_as_it_arrives...`, and it is the only way to tell streaming from a
+    // fast buffer.
+    let cluster = RecordedCluster::paginating(Paging::Paced);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let mut invocation = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the query starts");
+
+    let first = next_record(&mut invocation, "the first page's record").await;
+    assert_eq!(text_of(&first, "name").as_deref(), Some("api-7d9f-abc"));
+    // The record above arrived while the second page was still behind the gate, which is the
+    // whole assertion: a package that had to walk the collection before it could emit would have
+    // blocked on a page this test has not released, and `next_record` would have timed out.
+    assert!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods") < 2,
+        "the second page has not been answered, so the first one was not being held for it"
+    );
+
+    cluster.release.notify_one();
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let names: Vec<Option<String>> = std::iter::once(Some("api-7d9f-abc".to_owned()))
+        .chain(
+            records(&events)
+                .iter()
+                .map(|record| text_of(record, "name")),
+        )
+        .collect();
+    assert_eq!(names.len(), 2, "both pages arrive: {names:?}");
+    assert_eq!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods"),
+        2,
+        "and the second page was asked for once the first had crossed"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_the_records_of_a_page_that_crossed_when_a_later_page_is_refused() {
+    // §18.3: "If pages 1..N succeed and page N+1 fails, the provider MAY return the already
+    // received values, but coverage MUST be `partial` and the error MUST be attached to the
+    // collection result. A default table MUST NOT look identical to a complete result."
+    //
+    // Streaming does not weaken that rule; it removes the choice about *when*. Page one is
+    // already in the consumer's hands when page two is refused, and a record cannot be unsent —
+    // so what a partial listing means here is exactly ADR-0004's shape: every record that crossed
+    // is true, and the invocation ends `Failed` naming the scope and the outcome.
+    let cluster = RecordedCluster::paginating(Paging::SecondDenied);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert_eq!(
+        records(&events).len(),
+        1,
+        "the page that arrived is true and it stands"
+    );
+    assert_eq!(
+        result.status,
+        InvokeStatus::Failed,
+        "a listing that lost a page must not look like a whole one"
+    );
+    let said = refusal(&result);
+    assert!(
+        said.contains("list denied") && said.contains("namespace/default"),
+        "the gap names the scope and what became of it, not merely `partial`: {said}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_say_that_more_exists_upstream_when_a_page_budget_stops_a_complete_answer() {
+    // §18.4: "User-provided limits ... are not provider incompleteness if the pipeline
+    // intentionally stops consumption. The value stream SHOULD still know that more upstream
+    // results may exist."
+    //
+    // Both halves, and they pull in opposite directions. Failing the invocation would cry wolf on
+    // a deliberate limit; completing it in silence hands back a page of a ten-page collection
+    // that reads as the whole cluster. So the answer completes and every record it delivered says
+    // on its own provenance that the source was not exhausted.
+    let cluster = RecordedCluster::paginating(Paging::TwoPages);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[("max_pages", json!(1))]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "a limit the pipeline asked for is a decision, not a hole: {:?}",
+        result.error
+    );
+    let held = records(&events);
+    assert_eq!(held.len(), 1);
+    let source = held[0].provenance().source().unwrap_or_default().to_owned();
+    assert!(
+        source.contains("upstream=more-available"),
+        "the value stream still knows there is more upstream (§18.4): {source}"
+    );
+    assert_eq!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods"),
+        1,
+        "and the page nobody asked for was not fetched"
+    );
+
+    // The same collection read without a limit says nothing of the kind, because nothing was left
+    // behind. A marker that were always present would say nothing at all.
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the second query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let whole = records(&events);
+    assert_eq!(whole.len(), 2);
+    assert!(
+        whole.iter().all(|record| !record
+            .provenance()
+            .source()
+            .unwrap_or_default()
+            .contains("upstream=")),
+        "a stream that consumed the source claims nothing about what is left of it"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_wait_as_long_as_a_throttled_server_asked_before_sending_the_page_again() {
+    // §49.2: "Rate-limited responses MUST be represented as rate limiting, not generic network
+    // failure. `Retry-After` or equivalent upstream retry guidance SHOULD be honored." The `429`
+    // was classified correctly long before this test and waited on never, which made the second
+    // sentence a comment rather than a behaviour.
+    //
+    // §49.3 is the other half: this is a `list`, and the retry policy that produced the delay can
+    // only be built from an `Idempotent`, whose three constructors are the three read verbs. A
+    // mutation cannot reach this path because there is no way to name one.
+    //
+    // The server asks for a second and the client's own backoff is a tenth of that, so the
+    // elapsed time is what proves whose advice won: a client that backed off for less than the
+    // API server asked for has decided it knows better than the API server how loaded it is.
+    let cluster = RecordedCluster::paginating(Paging::SecondThrottled);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    let started = std::time::Instant::now();
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    let waited = started.elapsed();
+
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "the repetition completed the collection: {:?}",
+        result.error
+    );
+    assert_eq!(records(&events).len(), 2);
+    assert_eq!(
+        asked_for(&cluster, "/api/v1/namespaces/default/pods"),
+        3,
+        "page one, the refused page two, and page two again"
+    );
+    assert!(
+        waited >= std::time::Duration::from_secs(1),
+        "the server's `Retry-After` is a floor and not a suggestion (§49.2); this waited {waited:?}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_a_query_broader_than_its_budget_before_it_reads_anything() {
+    // §17.6: "Before an expensive all-namespace/all-resource query, the provider SHOULD estimate
+    // or expose query breadth when possible." §49.5 is the other side of it: a configurable
+    // policy with conservative defaults. A bound discovered on the four hundredth request hands
+    // an operator a partial answer they never asked for; a bound checked against the declared
+    // breadth before the first request lets them narrow the query or raise it.
+    //
+    // `k8s-resource` with no `group` searches every API group the server lists, which is the
+    // expensive query §17.6 names. One scope is fewer than that fixture has, so the refusal must
+    // arrive with no group's resource list having been read at all.
+    let cluster = RecordedCluster::with_custom_resources();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    let (events, result) = plugin
+        .query(
+            "k8s-resource",
+            at_cluster(&[("kind", json!("Widget")), ("max_scopes", json!(1))]),
+        )
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert_eq!(result.status, InvokeStatus::Failed);
+    assert!(
+        records(&events).is_empty(),
+        "nothing was read, so nothing crossed"
+    );
+    let said = refusal(&result);
+    assert!(
+        said.contains("scopes") && said.contains("across"),
+        "the refusal states the breadth it estimated and the bound it passed: {said}"
+    );
+    assert_eq!(
+        asked_for(&cluster, "/apis/example.io/v1"),
+        0,
+        "and it was refused before the fan-out, not halfway through it"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_stop_at_the_request_budget_and_report_the_stop_as_the_policy_it_is() {
+    // §49.1: "Ono is an interactive shell, not a load generator. The provider MUST bound
+    // concurrency and SHOULD use efficient list/watch patterns." §49.5 makes the bound the
+    // operator's to move, and this is what moving it down proves: the query stops, and it says
+    // that a budget stopped it rather than blaming the cluster, which answered every request it
+    // was sent.
+    let cluster = RecordedCluster::paginating(Paging::TwoPages);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    // Four requests reach `/api`, `/apis`, the core resource list and the first page — and stop
+    // one short of the second page, which is the interesting place: a record has already crossed.
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[("max_requests", json!(4))]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert_eq!(
+        records(&events).len(),
+        1,
+        "the page that was paid for is true and it stands (§18.3)"
+    );
+    assert_eq!(
+        result.status,
+        InvokeStatus::Failed,
+        "and a provider that stopped short must not answer as though it had not"
+    );
+    let said = refusal(&result);
+    assert!(
+        said.contains("not queried"),
+        "the scope past the bound was not queried — never `absent`, and never a failure the \
+         cluster caused (§4 invariant 13): {said}"
+    );
+    assert!(
+        said.contains("requests budget exceeded"),
+        "the refusal names the bound rather than reporting a cluster that misbehaved: {said}"
+    );
+    assert!(
+        said.contains("more remains upstream"),
+        "and it says that narrowing the question is not the only thing left to try: {said}"
+    );
+
+    // The same query with no bound named runs under `Budget::interactive`'s defaults and answers.
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the second query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records(&events).len(),
+        2,
+        "the conservative default is a bound an ordinary question does not meet"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_learn_the_whole_api_surface_in_one_round_trip_where_the_server_aggregates_it() {
+    // §11.2: "The provider SHOULD use the stable aggregated Discovery API when available because
+    // it provides an efficient cluster-wide resource summary." §5.3 adds the rule that makes it
+    // safe: "optional upstream capabilities MUST be negotiated or detected and MUST have a safe
+    // fallback". Both halves are asserted here and in the test after this one — this one is the
+    // negotiation succeeding, that one is the same query against a server that ignores it.
+    //
+    // What proves the aggregate was *used* rather than merely fetched is a request that no longer
+    // happens: `/api/v1` and `/apis/apps/v1` are the per-group resource lists, and a reader that
+    // took only the groups out of the aggregated document would still ask for both.
+    let cluster = RecordedCluster::offering_aggregated_discovery();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(records(&events).len(), 2, "the objects still arrive");
+
+    assert!(
+        cluster
+            .heads()
+            .iter()
+            .any(|head| head.contains("as=APIGroupDiscoveryList")),
+        "the capability is negotiated on the wire rather than assumed: {:?}",
+        cluster.heads()
+    );
+    assert_eq!(
+        (
+            asked_for(&cluster, "/api/v1"),
+            asked_for(&cluster, "/apis/apps/v1"),
+        ),
+        (0, 0),
+        "the aggregated document already stated every resource, so the per-group resource lists \
+         are requests this provider no longer makes (§50.2)"
+    );
+    assert_eq!(
+        (asked_for(&cluster, "/api"), asked_for(&cluster, "/apis")),
+        (1, 1),
+        "and the aggregate costs no extra request of its own: it is the same two paths with a \
+         longer `Accept` on them"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_still_read_a_cluster_that_answers_the_negotiation_with_the_legacy_documents() {
+    // §11.2's `MUST` and §5.3's: a negotiated capability has to have a compatible fallback, and a
+    // fallback nothing exercises is a fallback nobody has. The recorded cluster of every other
+    // test in this file ignores the aggregated `Accept` entirely — which is exactly what a
+    // supported older server does — so the assertion is that the answer is unchanged and that the
+    // per-group resource list is asked for again.
+    let cluster = RecordedCluster::with_pods(2);
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    let (events, result) = plugin
+        .query("k8s-pod", at_cluster(&[]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(records(&events).len(), 2);
+    assert_eq!(
+        asked_for(&cluster, "/api/v1"),
+        1,
+        "a server that answered the legacy document is read the legacy way, one group at a time"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_not_read_an_aggregated_group_the_layer_could_not_refresh_as_a_group_with_nothing_in_it()
+ {
+    // §34.2 meets §11.2. An aggregated document marks a group-version whose own API server did
+    // not answer as `Stale`, usually with an empty resource list beside it — so a reader that
+    // took the list at face value would report a kind that group serves as one the cluster does
+    // not serve, which is §4 invariant 13's collapse arrived at through content negotiation.
+    //
+    // `Widget` lives nowhere in this fixture, and the only group that could have served it is the
+    // stale one. The refusal therefore has to be the incomplete-search one rather than
+    // `provider.unsupported`.
+    let cluster = RecordedCluster::offering_aggregated_discovery();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+
+    let (_, result) = plugin
+        .query("k8s-resource", at_cluster(&[("kind", json!("Widget"))]))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let said = refusal(&result);
+    assert!(
+        said.contains("metrics.example/v1beta1") && said.contains("unavailable"),
+        "the stale group-version is named as a hole in the search rather than passed over: \
+         {said}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
 }
 
 #[tokio::test]

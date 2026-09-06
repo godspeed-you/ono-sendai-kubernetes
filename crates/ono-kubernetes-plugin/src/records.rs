@@ -60,8 +60,9 @@ pub fn record(
     schema: &Arc<Schema>,
     guarded: &Guarded,
     freshness: &Freshness,
+    upstream: Upstream,
 ) -> Result<Value, ErrorValue> {
-    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    let mut builder = RecordValue::builder(Arc::clone(schema), stated(schema, freshness, upstream));
     for field in target.fields {
         builder = builder.set(field.name, field_value(field.name, guarded))?;
     }
@@ -180,11 +181,12 @@ pub fn dynamic_record(
     typing: &Typing,
     guarded: &Guarded,
     freshness: &Freshness,
+    upstream: Upstream,
 ) -> Result<Value, ErrorValue> {
     let object = guarded.object();
     let projection = typing.project(object);
     let content = dynamic::content(&projection, object.native());
-    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    let mut builder = RecordValue::builder(Arc::clone(schema), stated(schema, freshness, upstream));
     for field in target.fields {
         let value = match field.name {
             // --- what this is: §13.2's canonical host type, which one shared schema would
@@ -776,14 +778,49 @@ fn count_i64(value: Option<i64>) -> Value {
 /// record came from (§31.80 of core's specification). It leaves `observed` and `source` alone,
 /// which is why they are the two this function fills.
 fn provenance(schema: &Arc<Schema>, freshness: &Freshness) -> Provenance {
-    let stated = Provenance::local(crate::PACKAGE, schema.id().clone()).from_source(&format!(
+    stated(schema, freshness, Upstream::Consumed)
+}
+
+/// Whether the source held more than this invocation consumed (§18.4).
+///
+/// **A fact about the observation, not about the object.** §18.4 says a user-requested limit is
+/// not provider incompleteness — `first 20` over a thousand Pods is a pipeline decision and never
+/// a hole — and then adds the sentence that makes it honest: "the value stream SHOULD still know
+/// that more upstream results may exist". A stream that stopped at page one of ten and said
+/// nothing is a complete-looking answer to a question nobody asked completely.
+///
+/// It rides on [`Provenance`] rather than on a schema field, for the reason the function below
+/// already gives about origin and freshness: the record's *fields* are about the Kubernetes
+/// object, and "there is more of this collection upstream" is not a property of a Pod. A field
+/// would also have to be answered on every record of every schema that shares the metadata
+/// projection — a relationship edge, an Event, a log line — where it would be a claim about
+/// something nobody paginated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upstream {
+    /// Nothing was left behind: this stream was not stopped short of the source.
+    Consumed,
+    /// The source held more than crossed into this stream (§18.4).
+    MoreAvailable,
+}
+
+/// Where and when this record was observed, and whether the source outran the stream.
+///
+/// The marker is written only where it is true. A record that said `upstream=consumed` would be
+/// asserting that the collection is exhausted, which a stream still mid-walk does not know — and
+/// §18.4 asks only for the positive claim, that more *may* exist.
+fn stated(schema: &Arc<Schema>, freshness: &Freshness, upstream: Upstream) -> Provenance {
+    let mut source = format!(
         "provider_instance={} origin={} scope={} endpoint={} resource_version={}",
         freshness.provider_instance(),
         origin_word(freshness.origin()),
         freshness.scope(),
         endpoint_word(freshness.endpoint()),
         freshness.resource_version().unwrap_or("unknown"),
-    ));
+    );
+    if upstream == Upstream::MoreAvailable {
+        source.push_str(" upstream=more-available");
+    }
+    let stated = Provenance::local(crate::PACKAGE, schema.id().clone()).from_source(&source);
     match instant(freshness.observed_at().unix_millis()) {
         Value::Timestamp(observed) => stated.observed_at(observed),
         // An instant this shell cannot build is unknown rather than fabricated: a wrong

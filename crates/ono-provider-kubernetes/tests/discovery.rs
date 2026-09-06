@@ -291,3 +291,118 @@ fn should_keep_the_groups_that_read_when_one_group_s_resource_list_does_not() {
         "and the search went on to the group after it"
     );
 }
+
+// --- §11.2: the aggregated Discovery API ---------------------------------------------------------
+
+/// `/apis` as an API server that offers aggregated discovery answers it (§11.2).
+///
+/// One document rather than one per group: the whole point of `APIGroupDiscoveryList` is that a
+/// cluster with sixty group-versions costs one round trip instead of sixty-one. It also carries
+/// two things the legacy pair cannot — a subresource's own verbs, and `freshness`, which is how
+/// the aggregation layer says that a group's own API server did not answer (§34.2).
+const AGGREGATED_GROUPS: &str = r#"{
+  "kind": "APIGroupDiscoveryList",
+  "apiVersion": "apidiscovery.k8s.io/v2",
+  "items": [
+    {"metadata":{"name":"apps"},
+     "versions":[
+       {"version":"v1","freshness":"Current",
+        "resources":[
+          {"resource":"deployments","singularResource":"deployment",
+           "responseKind":{"group":"apps","version":"v1","kind":"Deployment"},
+           "scope":"Namespaced","verbs":["get","list","watch","create","update","patch","delete"],
+           "shortNames":["deploy"],
+           "subresources":[{"subresource":"scale",
+             "responseKind":{"group":"autoscaling","version":"v1","kind":"Scale"},
+             "verbs":["get","patch","update"]}]}
+        ]}
+     ]},
+    {"metadata":{"name":"metrics.example"},
+     "versions":[{"version":"v1","freshness":"Stale","resources":[]}]}
+  ]
+}"#;
+
+/// `/api` in the same form: the core group, whose name is empty and stays a group (§13.3).
+const AGGREGATED_CORE: &str = r#"{
+  "kind": "APIGroupDiscoveryList",
+  "apiVersion": "apidiscovery.k8s.io/v2",
+  "items": [
+    {"metadata":{"name":""},
+     "versions":[
+       {"version":"v1","freshness":"Current",
+        "resources":[
+          {"resource":"pods","singularResource":"pod",
+           "responseKind":{"group":"","version":"v1","kind":"Pod"},
+           "scope":"Namespaced","verbs":["get","list","watch"],"shortNames":["po"],
+           "subresources":[{"subresource":"log",
+             "responseKind":{"group":"","version":"v1","kind":"Pod"},"verbs":["get"]}]},
+          {"resource":"nodes","singularResource":"node",
+           "responseKind":{"group":"","version":"v1","kind":"Node"},
+           "scope":"Cluster","verbs":["get","list","watch"],"shortNames":["no"]}
+        ]}
+     ]}
+  ]
+}"#;
+
+#[test]
+fn should_read_the_whole_served_inventory_from_one_aggregated_discovery_document() {
+    // §11.2: "The provider SHOULD use the stable aggregated Discovery API when available because
+    // it provides an efficient cluster-wide resource summary." Efficient means one document says
+    // everything the legacy pair needs one request per group-version to say — groups, versions,
+    // resources, scope, verbs, kind identity and subresources (§11.1's list). A reader that took
+    // only the groups out of it and then asked each group again would have negotiated a
+    // capability and kept paying the price it exists to remove.
+    let discovery = Discovery::builder()
+        .aggregated(AGGREGATED_CORE)
+        .and_then(|builder| builder.aggregated(AGGREGATED_GROUPS))
+        .expect("the aggregated documents read")
+        .build();
+
+    let pods = discovery
+        .resource("v1", "pods")
+        .expect("the core group is a group");
+    assert_eq!(
+        pods.kind(),
+        "Pod",
+        "§13.1: the kind is the response kind, never the plural"
+    );
+    assert_eq!(pods.gvr().resource(), "pods");
+    assert_eq!(pods.scope(), Scope::Namespaced);
+    assert!(pods.supports(Verb::List));
+    assert_eq!(pods.short_names(), ["po"]);
+    assert_eq!(pods.subresources(), ["log"]);
+
+    let nodes = discovery.resource("v1", "nodes").expect("nodes are served");
+    assert_eq!(
+        nodes.scope(),
+        Scope::Cluster,
+        "a cluster-scoped resource has no namespace (§9.2)"
+    );
+
+    let deployments = discovery
+        .resource("apps/v1", "deployments")
+        .expect("a named group's resources arrive in the same document");
+    assert_eq!(deployments.kind(), "Deployment");
+    assert_eq!(deployments.subresources(), ["scale"]);
+    assert_eq!(discovery.preferred_version("apps"), Some("v1"));
+    assert_eq!(discovery.preferred_version(""), Some("v1"));
+
+    // §34.2, as the aggregation layer itself reports it: a group-version whose own API server did
+    // not answer is marked `Stale`, and an empty resource list under that mark is "nobody could
+    // ask" rather than "this group serves nothing" (§4 invariant 13).
+    assert!(
+        discovery.is_stale("metrics.example/v1"),
+        "a stale group-version is not a group-version with nothing in it"
+    );
+    assert!(!discovery.is_stale("apps/v1"));
+}
+
+#[test]
+fn should_refuse_an_aggregated_document_that_does_not_read_rather_than_build_an_empty_inventory() {
+    // The fallback §11.2 and §5.3 both require has to be reachable, and it is only reachable if a
+    // document that is not an `APIGroupDiscoveryList` is an error. A permissive parse over
+    // `{"kind":"APIGroupList",...}` yields no items and therefore a cluster that serves nothing —
+    // which is the collapse §4 invariant 13 forbids, arrived at through content negotiation.
+    assert!(Discovery::builder().aggregated(GROUPS).is_err());
+    assert!(Discovery::builder().aggregated("not json at all").is_err());
+}
