@@ -15,10 +15,11 @@ use std::time::Duration;
 
 use ono_provider_kubernetes::coverage::Outcome;
 use ono_provider_kubernetes::diagnostics::{
-    Alias, ClusterDiagnostic, Fingerprint, Health, Identity, Impersonation, Known, Probe,
-    ProbeStatus, ServerVersion, Signal, Subject, TlsPosture, normalised_origin,
-    public_key_fingerprint,
+    Alias, Availability, CapabilityReport, CapabilityStatement, ClusterDiagnostic, Fingerprint,
+    Grant, Health, Identity, Impersonation, Known, Probe, ProbeStatus, ProviderCapability,
+    ServerVersion, Signal, Subject, Support, TlsPosture, normalised_origin, public_key_fingerprint,
 };
+use ono_provider_kubernetes::discovery::{Discovery, Verb};
 
 /// A certificate for `name`, as DER, generated so that nothing here expires on a date nobody
 /// chose.
@@ -439,5 +440,215 @@ fn should_state_an_insecure_session_rather_than_leaving_it_to_be_inferred() {
             .as_str(),
         "none: plain HTTP/1.1",
         "no TLS at all is a third state, not a kind of verified"
+    );
+}
+
+// --- capability reporting (§57, §57.1) ---------------------------------------------------------
+
+/// A resource list as an API server writes it, read into the snapshot discovery answers from.
+fn served(json: &str) -> Discovery {
+    Discovery::builder()
+        .resources(json)
+        .expect("the resource list reads")
+        .build()
+}
+
+/// A core group that offers everything this provider asks a resource for.
+fn full_core() -> Discovery {
+    served(
+        r#"{"kind": "APIResourceList", "groupVersion": "v1", "resources": [
+            {"name": "pods", "kind": "Pod", "namespaced": true,
+             "verbs": ["get", "list", "watch", "patch", "delete"]},
+            {"name": "pods/log", "kind": "Pod", "namespaced": true, "verbs": ["get"]}
+        ]}"#,
+    )
+}
+
+/// A core group an operator can only read.
+fn read_only_core() -> Discovery {
+    served(
+        r#"{"kind": "APIResourceList", "groupVersion": "v1", "resources": [
+            {"name": "pods", "kind": "Pod", "namespaced": true, "verbs": ["get", "list"]}
+        ]}"#,
+    )
+}
+
+#[test]
+fn should_state_what_the_provider_supports_beside_what_this_session_found() {
+    // §57.1: runtime diagnostics MUST distinguish manifest-declared potential capability from
+    // session-effective capability. One word for both halves makes "this build cannot exec" and
+    // "this cluster serves no watch" the same answer, and they have different fixes.
+    let report = CapabilityReport::unknown().with(
+        ProviderCapability::Watch,
+        Availability::offered_verb(&full_core(), &[Verb::Watch]),
+    );
+
+    let watch = report.statement(ProviderCapability::Watch);
+    assert_eq!(watch.support(), Support::ByProvider);
+    assert_eq!(watch.availability(), Availability::AvailableOnResource);
+    assert_eq!(
+        watch.describe(),
+        "supported by provider, available on resource",
+        "§57.1's own first line, both halves in one sentence"
+    );
+}
+
+#[test]
+fn should_read_an_offered_verb_as_a_statement_about_the_resource_and_never_about_the_identity() {
+    // §21.2: discovery says the resource *offers* `patch`; whether this identity may use it is
+    // the API server's answer, and per object, which is `plan::Preflight`'s question. So this
+    // vocabulary carries no word for permission — a reader cannot take one out of it.
+    let offered = Availability::offered_verb(&full_core(), &[Verb::Patch, Verb::Delete]);
+    assert_eq!(offered, Availability::AvailableOnResource);
+
+    for capability in ProviderCapability::all() {
+        for availability in [
+            Availability::AvailableOnResource,
+            Availability::GrantedByLocalPolicy,
+            Availability::BlockedByLocalPolicy,
+            Availability::DeniedForCurrentUser,
+            Availability::NotServedByCluster,
+            Availability::NotDetermined(Outcome::NotQueried),
+            Availability::UnavailableInAnySession,
+        ] {
+            let sentence = CapabilityStatement::new(capability, availability).describe();
+            for claim in ["allowed", "authorized", "authorised", "permitted", "may "] {
+                assert!(
+                    !sentence.contains(claim),
+                    "`{sentence}` claims authorization, which only the API server can answer \
+                     (§21.1, §21.2)"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn should_distinguish_a_capability_nothing_asked_about_from_one_the_cluster_does_not_serve() {
+    // §4 invariant 13 and §21.4: `not queried` is not `not served`, and neither is a denial. A
+    // report that folded them would say "no watch here" about a cluster nobody has asked yet.
+    let unasked = CapabilityReport::unknown();
+    assert_eq!(
+        unasked.availability(ProviderCapability::Watch),
+        Availability::NotDetermined(Outcome::NotQueried),
+        "nothing has been gathered, and that is an answer of its own"
+    );
+
+    let asked = CapabilityReport::unknown().with(
+        ProviderCapability::Watch,
+        Availability::offered_verb(&read_only_core(), &[Verb::Watch]),
+    );
+    assert_eq!(
+        asked.availability(ProviderCapability::Watch),
+        Availability::NotServedByCluster,
+        "the resource list read and offers no watch, which is a fact about the cluster"
+    );
+
+    let unreachable = CapabilityReport::undetermined(Outcome::Disconnected);
+    assert_eq!(
+        unreachable.availability(ProviderCapability::Watch),
+        Availability::NotDetermined(Outcome::Disconnected),
+        "and a cluster that never answered is a third state again"
+    );
+    assert_ne!(
+        unreachable.availability(ProviderCapability::Watch),
+        Availability::DeniedForCurrentUser
+    );
+}
+
+#[test]
+fn should_never_report_a_capability_this_provider_refuses_by_construction_as_available() {
+    // §42.3 to §42.5 and ADR-0018: exec, attach and port forward are refusals this build makes,
+    // not permissions a cluster grants. Reporting one as available because a resource offers the
+    // subresource would send an operator to look for a bug in their RBAC.
+    for capability in [
+        ProviderCapability::RemoteExec,
+        ProviderCapability::Attach,
+        ProviderCapability::PortForward,
+    ] {
+        let claimed = CapabilityReport::unknown()
+            .with(capability, Availability::AvailableOnResource)
+            .with(capability, Availability::GrantedByLocalPolicy);
+        assert_eq!(
+            claimed.statement(capability).support(),
+            Support::NotByProvider
+        );
+        assert_eq!(
+            claimed.availability(capability),
+            Availability::UnavailableInAnySession,
+            "no evidence makes a capability this provider does not implement available"
+        );
+        assert_eq!(
+            claimed.statement(capability).describe(),
+            "not supported by provider, unavailable in any session"
+        );
+    }
+}
+
+#[test]
+fn should_report_a_missing_local_grant_as_a_block_rather_than_as_a_cluster_answer() {
+    // §57.1's third line, and §26.4 of the inherited contract: a capability the package supports
+    // and the host withholds is "blocked by local KUANG policy", never "unsupported" and never
+    // an answer the cluster gave. `relation.write` is the case that exists — without it this
+    // package contributes no edge, so `near` answers nothing and nobody says why.
+    let blocked = CapabilityReport::unknown().with(
+        ProviderCapability::Relationships,
+        Availability::from_grant(Grant::Withheld),
+    );
+    assert_eq!(
+        blocked
+            .statement(ProviderCapability::Relationships)
+            .describe(),
+        "supported by provider, blocked by local KUANG policy"
+    );
+
+    let held = CapabilityReport::unknown().with(
+        ProviderCapability::Relationships,
+        Availability::from_grant(Grant::Held),
+    );
+    assert_eq!(
+        held.availability(ProviderCapability::Relationships),
+        Availability::GrantedByLocalPolicy
+    );
+
+    let cannot_say = CapabilityReport::unknown().with(
+        ProviderCapability::Relationships,
+        Availability::from_grant(Grant::Undetermined),
+    );
+    assert_eq!(
+        cannot_say.availability(ProviderCapability::Relationships),
+        Availability::NotDetermined(Outcome::NotQueried),
+        "a host that cannot say has not denied anything (§4 invariant 13)"
+    );
+}
+
+#[test]
+fn should_carry_the_capability_report_on_the_diagnostic_the_session_answers_with() {
+    // §26.1 of the inherited contract: the two layers are the host's to distinguish, so they
+    // travel with the rest of what one provider instance says about itself rather than beside it.
+    let diagnostic = ClusterDiagnostic::for_instance("kubernetes:prod", TlsPosture::Verified);
+    assert_eq!(
+        diagnostic
+            .capabilities()
+            .availability(ProviderCapability::Watch),
+        Availability::NotDetermined(Outcome::NotQueried),
+        "a diagnostic that has observed nothing claims nothing"
+    );
+    assert_eq!(
+        diagnostic.capabilities().statements().len(),
+        ProviderCapability::all().len(),
+        "every capability is reported, including the ones this provider refuses (§57)"
+    );
+
+    let observed = diagnostic.with_capabilities(CapabilityReport::unknown().with(
+        ProviderCapability::RemoteLogs,
+        Availability::offered_subresource(&full_core(), "v1", "pods", "log"),
+    ));
+    assert_eq!(
+        observed
+            .capabilities()
+            .availability(ProviderCapability::RemoteLogs),
+        Availability::AvailableOnResource,
+        "§42.1's logs are available when `pods/log` is served, and not because this build has code"
     );
 }

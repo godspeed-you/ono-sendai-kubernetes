@@ -30,6 +30,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::coverage::Outcome;
+use crate::discovery::{Discovery, Verb};
 
 // --- the signals a cluster can be recognised by --------------------------------------------------
 
@@ -886,6 +887,359 @@ impl TlsPosture {
     }
 }
 
+// --- what this provider can do, and what this session found (§57, §57.1) -----------------------
+
+/// One capability this provider reports on, in the words §57's manifest sketch lists it under.
+///
+/// A closed set, and every member of it is reported every time. §57 sketches a manifest that
+/// declares `watch`, `relationships`, `mutations`, `remote_logs`, `remote_exec` and
+/// `port_forward`; an operator who asks "can this thing exec" is owed the answer *no* rather than
+/// silence, so the three this provider refuses by construction are in the list beside the ones it
+/// implements (§42.3 to §42.5, ADR-0018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProviderCapability {
+    /// Observing a collection as it changes (§19).
+    Watch,
+    /// Contributing the spatial edges `near` and `follow` travel along (§35.5, §35.6).
+    Relationships,
+    /// Changing an object through the API server (§43).
+    Mutations,
+    /// Reading container logs (§42.1).
+    RemoteLogs,
+    /// Asking the API server whether this identity may perform an action (§21.2).
+    SubjectAccessReview,
+    /// Running a command inside a container (§42.3).
+    RemoteExec,
+    /// Attaching to a running container's streams (§42.4).
+    Attach,
+    /// Forwarding a local port into the cluster (§42.5).
+    PortForward,
+}
+
+impl ProviderCapability {
+    /// The word this capability is reported under.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Watch => "watch",
+            Self::Relationships => "relationships",
+            Self::Mutations => "mutations",
+            Self::RemoteLogs => "remote logs",
+            Self::SubjectAccessReview => "subject access review",
+            Self::RemoteExec => "remote exec",
+            Self::Attach => "attach",
+            Self::PortForward => "port forward",
+        }
+    }
+
+    /// Whether the *package* implements this at all — §26.1's first layer of the inherited
+    /// contract, and the half §57's manifest declares.
+    ///
+    /// A constant of this build rather than an observation. §42.6 forbids reaching a cluster
+    /// through a `kubectl` subprocess and this package speaks HTTP/1.1 of its own, so the three
+    /// stream protocols upstream carries over SPDY or WebSocket are refusals in the type system
+    /// (ADR-0018) — and no cluster, grant or permission can turn one of them into a capability.
+    #[must_use]
+    pub fn support(self) -> Support {
+        match self {
+            Self::Watch
+            | Self::Relationships
+            | Self::Mutations
+            | Self::RemoteLogs
+            | Self::SubjectAccessReview => Support::ByProvider,
+            Self::RemoteExec | Self::Attach | Self::PortForward => Support::NotByProvider,
+        }
+    }
+
+    /// Every capability this provider reports on, in one fixed order.
+    #[must_use]
+    pub fn all() -> [Self; 8] {
+        [
+            Self::Watch,
+            Self::Relationships,
+            Self::Mutations,
+            Self::RemoteLogs,
+            Self::SubjectAccessReview,
+            Self::RemoteExec,
+            Self::Attach,
+            Self::PortForward,
+        ]
+    }
+}
+
+impl fmt::Display for ProviderCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether the package implements a capability, independently of any session (§26.1, §57).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Support {
+    /// The package implements it. Whether *this* session has it is the other half.
+    ByProvider,
+    /// The package does not implement it, so no cluster and no grant can supply it (§26.3).
+    NotByProvider,
+}
+
+impl Support {
+    /// The words this half is reported in — §57.1's own.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ByProvider => "supported by provider",
+            Self::NotByProvider => "not supported by provider",
+        }
+    }
+}
+
+impl fmt::Display for Support {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What the host answered when asked whether a grant is in place (§51.1).
+///
+/// Three states because the host has three answers and asking never prompts: a capability the
+/// operator has not decided about is withheld *now* and is not a refusal, and a host that cannot
+/// say has denied nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grant {
+    /// The grant is in place.
+    Held,
+    /// It is not. Either the operator denied it, or nothing has granted it and a prompt would be
+    /// needed — which is not a grant.
+    Withheld,
+    /// The host could not say.
+    Undetermined,
+}
+
+/// What *this session* found for one capability — §26.1's second layer.
+///
+/// Every variant names the evidence it was earned from, and there is no variant meaning "this
+/// identity is authorized". Authorization is per object and the API server's to answer (§21.1,
+/// §21.2); the strongest thing discovery supports is that a resource *offers* a verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Availability {
+    /// A resource this cluster serves offers the verb or subresource the capability needs.
+    ///
+    /// §57.1's own words, and they are a statement about the resource. `patch` appearing in a
+    /// resource's verb list does not mean the current identity may send one.
+    AvailableOnResource,
+    /// The host holds the grant this capability needs.
+    GrantedByLocalPolicy,
+    /// The host withholds it. §57.1's third line, and §26.4 of the inherited contract: a package
+    /// that supports something the host blocks is not an unsupported package.
+    BlockedByLocalPolicy,
+    /// The API server refused this identity the evidence the capability rests on (§21.4).
+    DeniedForCurrentUser,
+    /// The evidence was read, and nothing this cluster serves offers it (§11.5).
+    NotServedByCluster,
+    /// No evidence was gathered, with §21.4's word for why. `not queried` is the ordinary one,
+    /// and it is a different answer from a denial and from an absence (§4 invariant 13).
+    NotDetermined(Outcome),
+    /// The provider does not implement it, so no session has it (§26.3).
+    UnavailableInAnySession,
+}
+
+impl Availability {
+    /// What a resource list says about a verb any resource might offer (§11.1).
+    ///
+    /// Available when one served resource offers one of `verbs`. The snapshot is discovery's
+    /// answer rather than this build's assumption, so a cluster that serves no writable resource
+    /// reports that rather than a capability that fails on first use.
+    #[must_use]
+    pub fn offered_verb(served: &Discovery, verbs: &[Verb]) -> Self {
+        let offered = served
+            .all()
+            .any(|resource| verbs.iter().any(|verb| resource.supports(*verb)));
+        if offered {
+            Self::AvailableOnResource
+        } else {
+            Self::NotServedByCluster
+        }
+    }
+
+    /// What a resource list says about one kind and one verb (§11.1).
+    #[must_use]
+    pub fn offered_on(served: &Discovery, group_version: &str, kind: &str, verb: Verb) -> Self {
+        match served.by_kind(group_version, kind) {
+            Some(resource) if resource.supports(verb) => Self::AvailableOnResource,
+            Some(_) | None => Self::NotServedByCluster,
+        }
+    }
+
+    /// What a resource list says about a subresource — `pods/log` for §42.1's logs.
+    #[must_use]
+    pub fn offered_subresource(
+        served: &Discovery,
+        group_version: &str,
+        plural: &str,
+        subresource: &str,
+    ) -> Self {
+        match served.resource(group_version, plural) {
+            Some(resource) if resource.subresources().iter().any(|sub| sub == subresource) => {
+                Self::AvailableOnResource
+            }
+            Some(_) | None => Self::NotServedByCluster,
+        }
+    }
+
+    /// What the host's answer about a grant says (§51.1, §57.1).
+    #[must_use]
+    pub fn from_grant(grant: Grant) -> Self {
+        match grant {
+            Grant::Held => Self::GrantedByLocalPolicy,
+            Grant::Withheld => Self::BlockedByLocalPolicy,
+            // A host that cannot say has denied nothing, and reading its silence as a refusal is
+            // the collapse §4 invariant 13 forbids.
+            Grant::Undetermined => Self::NotDetermined(Outcome::NotQueried),
+        }
+    }
+
+    /// The words this half is reported in.
+    #[must_use]
+    pub fn describe(self) -> String {
+        match self {
+            Self::AvailableOnResource => "available on resource".to_owned(),
+            Self::GrantedByLocalPolicy => "granted by local KUANG policy".to_owned(),
+            Self::BlockedByLocalPolicy => "blocked by local KUANG policy".to_owned(),
+            Self::DeniedForCurrentUser => "denied for current user".to_owned(),
+            Self::NotServedByCluster => "not served by cluster".to_owned(),
+            Self::NotDetermined(outcome) => format!("not determined: {}", outcome.as_str()),
+            Self::UnavailableInAnySession => "unavailable in any session".to_owned(),
+        }
+    }
+}
+
+/// One capability, what the provider supports, and what this session found (§57.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityStatement {
+    capability: ProviderCapability,
+    availability: Availability,
+}
+
+impl CapabilityStatement {
+    /// One capability's two halves.
+    ///
+    /// The session half of a capability the provider does not implement is
+    /// [`Availability::UnavailableInAnySession`] whatever the caller passes, so no accumulation
+    /// of cluster evidence can report an `exec` this build refuses as something an operator
+    /// might get by fixing their RBAC (§26.3, ADR-0018).
+    #[must_use]
+    pub fn new(capability: ProviderCapability, availability: Availability) -> Self {
+        let availability = match capability.support() {
+            Support::ByProvider => availability,
+            Support::NotByProvider => Availability::UnavailableInAnySession,
+        };
+        Self {
+            capability,
+            availability,
+        }
+    }
+
+    /// Which capability this is about.
+    #[must_use]
+    pub fn capability(&self) -> ProviderCapability {
+        self.capability
+    }
+
+    /// What the package implements.
+    #[must_use]
+    pub fn support(&self) -> Support {
+        self.capability.support()
+    }
+
+    /// What this session found.
+    #[must_use]
+    pub fn availability(&self) -> Availability {
+        self.availability
+    }
+
+    /// Both halves, in §57.1's shape.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "{}, {}",
+            self.support().as_str(),
+            self.availability.describe()
+        )
+    }
+}
+
+/// Every capability, with both halves of each (§57.1).
+///
+/// Built by starting from what nothing has determined and recording each piece of evidence as it
+/// arrives, so a capability whose evidence was never gathered says `not queried` rather than
+/// inheriting a neighbour's answer or defaulting to available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityReport {
+    statements: Vec<CapabilityStatement>,
+}
+
+impl CapabilityReport {
+    /// Every capability, with nothing gathered about any of them.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::undetermined(Outcome::NotQueried)
+    }
+
+    /// Every capability, with one reason why nothing about it could be gathered — `disconnected`
+    /// for a cluster that never answered.
+    #[must_use]
+    pub fn undetermined(outcome: Outcome) -> Self {
+        Self {
+            statements: ProviderCapability::all()
+                .into_iter()
+                .map(|capability| {
+                    CapabilityStatement::new(capability, Availability::NotDetermined(outcome))
+                })
+                .collect(),
+        }
+    }
+
+    /// Records what one capability's evidence proved.
+    #[must_use]
+    pub fn with(mut self, capability: ProviderCapability, availability: Availability) -> Self {
+        let statement = CapabilityStatement::new(capability, availability);
+        for existing in &mut self.statements {
+            if existing.capability() == capability {
+                *existing = statement;
+                return self;
+            }
+        }
+        self.statements.push(statement);
+        self
+    }
+
+    /// Every statement, in [`ProviderCapability::all`]'s order.
+    #[must_use]
+    pub fn statements(&self) -> &[CapabilityStatement] {
+        &self.statements
+    }
+
+    /// One capability's statement.
+    ///
+    /// # Panics
+    ///
+    /// Never: a report holds a statement for every member of the closed set, and `with` replaces
+    /// rather than appends.
+    #[must_use]
+    pub fn statement(&self, capability: ProviderCapability) -> &CapabilityStatement {
+        self.statements
+            .iter()
+            .find(|statement| statement.capability() == capability)
+            .unwrap_or_else(|| unreachable!("every capability is reported"))
+    }
+
+    /// What this session found for one capability.
+    #[must_use]
+    pub fn availability(&self, capability: ProviderCapability) -> Availability {
+        self.statement(capability).availability()
+    }
+}
+
 // --- the whole answer ----------------------------------------------------------------------------
 
 /// One thing the provider could not determine, and why.
@@ -936,6 +1290,7 @@ pub struct ClusterDiagnostic {
     identity: Identity,
     health: Health,
     tls: TlsPosture,
+    capabilities: CapabilityReport,
 }
 
 impl ClusterDiagnostic {
@@ -952,6 +1307,7 @@ impl ClusterDiagnostic {
             identity: Identity::unknown(),
             health: Health::unknown(),
             tls,
+            capabilities: CapabilityReport::unknown(),
         }
     }
 
@@ -973,6 +1329,13 @@ impl ClusterDiagnostic {
     #[must_use]
     pub fn with_health(mut self, health: Health) -> Self {
         self.health = health;
+        self
+    }
+
+    /// Records what the provider supports and what this session found (§57.1).
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: CapabilityReport) -> Self {
+        self.capabilities = capabilities;
         self
     }
 
@@ -1004,6 +1367,16 @@ impl ClusterDiagnostic {
     #[must_use]
     pub fn tls(&self) -> TlsPosture {
         self.tls
+    }
+
+    /// What the provider supports, beside what this session found (§57.1).
+    ///
+    /// Two halves per capability, and neither is derived from the other. A diagnostic that has
+    /// observed nothing reports `not queried` for every capability the provider implements —
+    /// which is the answer, not a placeholder for one (§4 invariant 13, §21.4).
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilityReport {
+        &self.capabilities
     }
 
     /// Everything this diagnostic could not determine, each with the reason.

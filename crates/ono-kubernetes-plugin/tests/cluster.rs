@@ -39,6 +39,18 @@ enum Review {
     Unserved,
 }
 
+/// How the recorded API server serves `authorization.k8s.io` — the evidence §21.2's access
+/// review rests on, and §57.1's `subject access review` capability with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AccessReview {
+    /// The group is not served at all.
+    Absent,
+    /// It is served, and `selfsubjectaccessreviews` accepts `create`.
+    Serves,
+    /// The group is listed and RBAC refuses the resource list behind it.
+    Forbids,
+}
+
 fn options(pairs: &[(&str, Json)]) -> JsonMap<String, Json> {
     pairs
         .iter()
@@ -81,6 +93,28 @@ fn list_of(record: &RecordValue, field: &str) -> Vec<String> {
     }
 }
 
+fn map_of(record: &RecordValue, field: &str) -> Vec<(String, String)> {
+    match record.get(field) {
+        Some(Value::Map(entries)) => entries
+            .iter()
+            .map(|(key, value)| match value {
+                Value::String(text) => (key.to_string(), text.to_string()),
+                other => panic!("a map entry is text, and it is {other:?}"),
+            })
+            .collect(),
+        other => panic!("`{field}` is a map, and it is {other:?}"),
+    }
+}
+
+/// One capability's two-part statement, by the word it is reported under.
+fn capability_of(record: &RecordValue, capability: &str) -> String {
+    map_of(record, "capabilities")
+        .into_iter()
+        .find(|(word, _)| word == capability)
+        .unwrap_or_else(|| panic!("`{capability}` is reported"))
+        .1
+}
+
 // --- the recorded cluster ----------------------------------------------------------------------
 
 /// An API server that answers the diagnostic's questions from recorded documents.
@@ -91,6 +125,8 @@ struct RecordedCluster {
     kube_system_uid: &'static str,
     /// How it answers `SelfSubjectReview`.
     review: Review,
+    /// How it serves the access review of §21.2.
+    access_review: AccessReview,
     /// Whether it may be reached at all.
     reachable: bool,
 }
@@ -100,6 +136,17 @@ impl RecordedCluster {
         Arc::new(Self {
             kube_system_uid,
             review,
+            access_review: AccessReview::Absent,
+            reachable: true,
+        })
+    }
+
+    /// A cluster that answers everything, serving `authorization.k8s.io` in the stated way.
+    fn reviewing(kube_system_uid: &'static str, access_review: AccessReview) -> Arc<Self> {
+        Arc::new(Self {
+            kube_system_uid,
+            review: Review::Answers,
+            access_review,
             reachable: true,
         })
     }
@@ -108,6 +155,7 @@ impl RecordedCluster {
         Arc::new(Self {
             kube_system_uid: "unreachable",
             review: Review::Unserved,
+            access_review: AccessReview::Absent,
             reachable: false,
         })
     }
@@ -142,6 +190,15 @@ fn status(code: u16, reason: &str, message: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// One entry of an `APIGroupList`, at `v1`.
+fn group(name: &str) -> Json {
+    json!({
+        "name": name,
+        "versions": [{"groupVersion": format!("{name}/v1"), "version": "v1"}],
+        "preferredVersion": {"groupVersion": format!("{name}/v1"), "version": "v1"},
+    })
+}
+
 /// One answer, chosen by method and path.
 fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let path = path.split('?').next().unwrap_or(path);
@@ -151,19 +208,16 @@ fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
             "platform": "linux/amd64",
         }),
         ("GET", "/api") => json!({"kind": "APIVersions", "versions": ["v1"]}),
-        ("GET", "/apis") if cluster.review == Review::Unserved => {
-            json!({"kind": "APIGroupList", "groups": []})
+        ("GET", "/apis") => {
+            let mut groups = Vec::new();
+            if cluster.review != Review::Unserved {
+                groups.push(group("authentication.k8s.io"));
+            }
+            if cluster.access_review != AccessReview::Absent {
+                groups.push(group("authorization.k8s.io"));
+            }
+            json!({"kind": "APIGroupList", "groups": groups})
         }
-        ("GET", "/apis") => json!({
-            "kind": "APIGroupList",
-            "groups": [{
-                "name": "authentication.k8s.io",
-                "versions": [{"groupVersion": "authentication.k8s.io/v1", "version": "v1"}],
-                "preferredVersion": {
-                    "groupVersion": "authentication.k8s.io/v1", "version": "v1",
-                },
-            }],
-        }),
         ("GET", "/api/v1") => json!({
             "kind": "APIResourceList",
             "groupVersion": "v1",
@@ -171,7 +225,8 @@ fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
                 {"name": "namespaces", "kind": "Namespace", "namespaced": false,
                  "verbs": ["get", "list", "watch"]},
                 {"name": "pods", "kind": "Pod", "namespaced": true,
-                 "verbs": ["get", "list", "watch"]},
+                 "verbs": ["get", "list", "watch", "patch", "delete"]},
+                {"name": "pods/log", "kind": "Pod", "namespaced": true, "verbs": ["get"]},
             ],
         }),
         ("GET", "/apis/authentication.k8s.io/v1") => json!({
@@ -182,6 +237,23 @@ fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
                  "namespaced": false, "verbs": ["create"]},
             ],
         }),
+        ("GET", "/apis/authorization.k8s.io/v1") => {
+            if cluster.access_review == AccessReview::Forbids {
+                return status(
+                    403,
+                    "Forbidden",
+                    "the resource list of authorization.k8s.io is forbidden",
+                );
+            }
+            json!({
+                "kind": "APIResourceList",
+                "groupVersion": "authorization.k8s.io/v1",
+                "resources": [
+                    {"name": "selfsubjectaccessreviews", "kind": "SelfSubjectAccessReview",
+                     "namespaced": false, "verbs": ["create"]},
+                ],
+            })
+        }
         ("GET", "/api/v1/namespaces/kube-system") => json!({
             "kind": "Namespace",
             "apiVersion": "v1",
@@ -377,14 +449,24 @@ impl HostServices for RecordedCluster {
     }
 }
 
-/// A loaded package pointed at `cluster`.
-async fn loaded(cluster: Arc<RecordedCluster>) -> ono_kuang_supervisor::LoadedPlugin {
-    TestHost::new(PLUGIN, MANIFEST)
-        .grant(Capability::NetworkConnect)
-        .host(cluster as Arc<dyn HostServices>)
-        .load()
+/// A loaded package pointed at `cluster`, holding the grants an operator gave it.
+async fn loaded_with(
+    cluster: Arc<RecordedCluster>,
+    grants: &[Capability],
+) -> ono_kuang_supervisor::LoadedPlugin {
+    let mut host = TestHost::new(PLUGIN, MANIFEST).host(cluster as Arc<dyn HostServices>);
+    for grant in grants {
+        host = host.grant(*grant);
+    }
+    host.load()
         .await
         .expect("the package loads under its own manifest")
+}
+
+/// A loaded package with the one grant every read needs, and nothing else — which is what an
+/// operator who ran `load plugin` without naming a capability has (spec §31.19).
+async fn loaded(cluster: Arc<RecordedCluster>) -> ono_kuang_supervisor::LoadedPlugin {
+    loaded_with(cluster, &[Capability::NetworkConnect]).await
 }
 
 /// The options that point a query at a recorded cluster under a named context.
@@ -664,6 +746,151 @@ async fn should_answer_that_a_cluster_cannot_be_reached_rather_than_failing_the_
             .iter()
             .any(|unknown| unknown.ends_with("disconnected")),
         "and everything the cluster would have said is `disconnected`: {unknowns:?}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- what this provider supports, and what this session found (§57, §57.1) ---------------------
+
+#[tokio::test]
+async fn should_report_what_the_provider_supports_beside_what_this_session_found() {
+    // §57.1: runtime diagnostics MUST distinguish manifest-declared potential capability from
+    // session-effective capability. Without the two halves, "this build cannot exec", "this
+    // cluster serves no watch" and "you did not grant the edges" arrive as one shrug, and they
+    // have three different fixes — a different provider, a different cluster, a different grant.
+    let plugin = loaded(RecordedCluster::new(
+        "11111111-1111-1111-1111-111111111111",
+        Review::Answers,
+    ))
+    .await;
+    let record = diagnostic(&plugin, "prod.test", "prod").await;
+
+    // Discovery: the resource list this cluster answered with, and nothing assumed.
+    assert_eq!(
+        capability_of(&record, "watch"),
+        "supported by provider, available on resource",
+        "§57.1's own first line: `pods` lists the `watch` verb (§11.1)"
+    );
+    assert_eq!(
+        capability_of(&record, "mutations"),
+        "supported by provider, available on resource",
+        "the resource offers `patch` and `delete` — which is not a claim about this identity"
+    );
+    assert_eq!(
+        capability_of(&record, "remote logs"),
+        "supported by provider, available on resource",
+        "`pods/log` is served, so §42.1's logs have somewhere to come from"
+    );
+    assert_eq!(
+        capability_of(&record, "subject access review"),
+        "supported by provider, not served by cluster",
+        "this cluster serves no `authorization.k8s.io`, which is not a denial (§21.4)"
+    );
+
+    // The host's grant: never granted by default, so `near` has no edges and this says why.
+    assert_eq!(
+        capability_of(&record, "relationships"),
+        "supported by provider, blocked by local KUANG policy",
+        "§57.1's third line, verbatim: the package contributes the shapes and the host drops them"
+    );
+
+    // What this provider does not do at all (§42.3 to §42.5, ADR-0018).
+    for refused in ["remote exec", "attach", "port forward"] {
+        assert_eq!(
+            capability_of(&record, refused),
+            "not supported by provider, unavailable in any session",
+            "an operator asking whether this thing can `{refused}` is owed the answer"
+        );
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_report_a_granted_capability_as_the_host_s_answer_and_never_as_the_cluster_s() {
+    // §26.4 of the inherited contract: a package may support what the current session cannot do,
+    // and the two are different sentences. The same package against the same cluster reports the
+    // spatial half differently for two operators, because the grant is what differs.
+    let plugin = loaded_with(
+        RecordedCluster::new("11111111-1111-1111-1111-111111111111", Review::Answers),
+        &[Capability::NetworkConnect, Capability::RelationWrite],
+    )
+    .await;
+    let record = diagnostic(&plugin, "prod.test", "prod").await;
+
+    assert_eq!(
+        capability_of(&record, "relationships"),
+        "supported by provider, granted by local KUANG policy",
+        "the grant is in place, and the answer names where it came from"
+    );
+    assert_eq!(
+        capability_of(&record, "watch"),
+        "supported by provider, available on resource",
+        "and a grant decides nothing about what the cluster serves"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_separate_an_access_review_the_cluster_serves_from_one_it_refuses() {
+    // §21.4 and §4 invariant 13: `403` on the evidence is `denied for current user`, an unserved
+    // group is `not served by cluster`, and neither is the other. §57.1's second line is only
+    // honest when a denial is earned from an answer the API server actually gave.
+    let serving = loaded(RecordedCluster::reviewing(
+        "44444444-4444-4444-4444-444444444444",
+        AccessReview::Serves,
+    ))
+    .await;
+    let open = diagnostic(&serving, "open.test", "open").await;
+    assert_eq!(
+        capability_of(&open, "subject access review"),
+        "supported by provider, available on resource",
+        "`selfsubjectaccessreviews` accepts `create`, so §21.2's check has somewhere to go"
+    );
+    serving.shutdown(ShutdownReason::Unload).await;
+
+    let refusing = loaded(RecordedCluster::reviewing(
+        "55555555-5555-5555-5555-555555555555",
+        AccessReview::Forbids,
+    ))
+    .await;
+    let record = diagnostic(&refusing, "locked.test", "locked").await;
+    assert_eq!(
+        capability_of(&record, "subject access review"),
+        "supported by provider, denied for current user",
+        "the API server refused this identity the evidence, which is not an absence"
+    );
+    assert_eq!(
+        record.get("reachable"),
+        Some(&Value::Bool(true)),
+        "and a refusal is still an answer from a cluster that is there"
+    );
+    refusing.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_claim_no_capability_of_a_cluster_it_could_not_reach() {
+    // The distinction §4 invariant 13 exists for. A cluster that never answered has denied
+    // nothing and serves nothing as far as anyone here knows, and a report that said
+    // `not served by cluster` would be a claim about an API surface nobody has seen.
+    let plugin = loaded(RecordedCluster::unreachable()).await;
+    let record = diagnostic(&plugin, "gone.test", "gone").await;
+
+    for capability in ["watch", "mutations", "remote logs", "subject access review"] {
+        assert_eq!(
+            capability_of(&record, capability),
+            "supported by provider, not determined: disconnected",
+            "`{capability}` was never asked about, and the report says so"
+        );
+    }
+    assert_eq!(
+        capability_of(&record, "remote exec"),
+        "not supported by provider, unavailable in any session",
+        "what this build does not implement does not become unknown when a cluster is down"
+    );
+    assert_eq!(
+        capability_of(&record, "relationships"),
+        "supported by provider, blocked by local KUANG policy",
+        "and the host's own answer is available whether or not the cluster is"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

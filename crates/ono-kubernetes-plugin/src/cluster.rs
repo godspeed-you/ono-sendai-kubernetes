@@ -25,12 +25,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use ono_kuang_sdk::protocol::{WireError, method};
+use ono_kuang_sdk::protocol::{CheckAnswer, WireError, method};
 use ono_kuang_sdk::{Ctx, EmitError, Outcome as InvocationOutcome};
 use ono_provider_kubernetes::coverage::{Outcome, Scope};
 use ono_provider_kubernetes::diagnostics::{
-    ClusterDiagnostic, Fingerprint, Health, Identity, Impersonation, Known, Probe, ProbeStatus,
-    ServerVersion, Signal, Subject, TlsPosture, normalised_origin,
+    Availability, CapabilityReport, ClusterDiagnostic, Fingerprint, Grant, Health, Identity,
+    Impersonation, Known, Probe, ProbeStatus, ProviderCapability, ServerVersion, Signal, Subject,
+    TlsPosture, normalised_origin,
 };
 use ono_provider_kubernetes::discovery::{Discovery, Verb};
 use ono_provider_kubernetes::tls::TlsStream;
@@ -44,6 +45,7 @@ use crate::broker::{BrokeredStream, Lease, ReadPolicy};
 use crate::contributions::Target;
 use crate::query::{Endpoint, UNAVAILABLE, UNAVAILABLE_CODE, failure};
 use crate::sessions::Sessions;
+use crate::spatial::RELATION_WRITE;
 
 /// The group that serves `SelfSubjectReview` (§8.6).
 ///
@@ -51,6 +53,12 @@ use crate::sessions::Sessions;
 /// resource under it accepts `create` is asked of discovery every time — an API server that does
 /// not serve it is a stated unknown, never a `404` this build walked into (§11.1).
 const AUTHENTICATION_GROUP: &str = "authentication.k8s.io";
+
+/// The group that serves `SelfSubjectAccessReview` (§21.2).
+///
+/// Asked of discovery for the same reason as the group above: whether a cluster can answer "may
+/// this identity do that" is the cluster's statement about its API surface, never this build's.
+const AUTHORIZATION_GROUP: &str = "authorization.k8s.io";
 
 /// The namespace whose UID §10.2 offers as cluster evidence.
 const KUBE_SYSTEM: &str = "kube-system";
@@ -73,8 +81,13 @@ pub fn answer(
     if ctx.cancelled() {
         return InvocationOutcome::Cancelled;
     }
+    // §57.1's third line, and it is asked *before* the cluster is touched: whether the operator
+    // granted the edges this package contributes is a fact about this host and this load, and it
+    // is the one capability answer that is available even when the API server is not. Asking
+    // never prompts (spec §31.61), so a diagnostic cannot become a permission dialogue.
+    let relations = local_grant(ctx, RELATION_WRITE);
 
-    let diagnostic = match observe(ctx, &endpoint) {
+    let diagnostic = match observe(ctx, &endpoint, relations) {
         Ok(diagnostic) => diagnostic,
         Err(error) => return InvocationOutcome::Failed(error),
     };
@@ -118,18 +131,36 @@ pub fn answer(
     }
 }
 
+/// What the host says about one grant, without prompting for it (spec §31.61).
+///
+/// `Ask` is [`Grant::Withheld`]: a capability that would need a prompt is not held now, and this
+/// diagnostic is not the place a prompt may appear. A host that cannot say is
+/// [`Grant::Undetermined`] rather than a denial, because reading silence as refusal is the
+/// collapse §4 invariant 13 forbids.
+fn local_grant(ctx: &mut Ctx<'_>, capability: &str) -> Grant {
+    match ctx.check_capability(capability) {
+        Ok(CheckAnswer::Granted) => Grant::Held,
+        Ok(CheckAnswer::Denied | CheckAnswer::Ask) => Grant::Withheld,
+        Ok(CheckAnswer::Unknown) | Err(_) => Grant::Undetermined,
+    }
+}
+
 /// Opens the connection and asks the cluster about itself.
 ///
 /// The `Err` is reserved for what is not an observation about a cluster: a capability the
 /// operator did not grant. Everything else — a refused connection, a failed handshake, a server
 /// that answers nothing — becomes a diagnostic that says so, because "it cannot be reached" is
 /// the answer this target exists to give.
-fn observe(ctx: &mut Ctx<'_>, endpoint: &Endpoint) -> Result<ClusterDiagnostic, WireError> {
+fn observe(
+    ctx: &mut Ctx<'_>,
+    endpoint: &Endpoint,
+    relations: Grant,
+) -> Result<ClusterDiagnostic, WireError> {
     let posture = posture(endpoint);
     // The diagnostic emits nothing until the interrogation is over, so the lease is opened and
     // closed here rather than being handed down from the caller.
     let lease = Lease::new(ctx);
-    let (health, fingerprint, identity, handle, open) = {
+    let (observed, handle, open) = {
         let stream = match BrokeredStream::connect(
             &lease,
             &endpoint.host,
@@ -144,6 +175,7 @@ fn observe(ctx: &mut Ctx<'_>, endpoint: &Endpoint) -> Result<ClusterDiagnostic, 
                     posture,
                     format!("connect {}:{}", endpoint.host, endpoint.port),
                     &error.message,
+                    relations,
                 ));
             }
         };
@@ -151,16 +183,16 @@ fn observe(ctx: &mut Ctx<'_>, endpoint: &Endpoint) -> Result<ClusterDiagnostic, 
         match &endpoint.tls {
             None => {
                 let mut client = endpoint.client(stream);
-                let observed = interrogate(&mut client, endpoint);
+                let observed = interrogate(&mut client, endpoint, relations);
                 let open = client.into_stream().is_open();
-                (observed.0, observed.1, observed.2, handle, open)
+                (observed, handle, open)
             }
             Some(settings) => match TlsStream::connect(stream, &endpoint.server_name, settings) {
                 Ok(session) => {
                     let mut client = endpoint.client(session);
-                    let observed = interrogate(&mut client, endpoint);
+                    let observed = interrogate(&mut client, endpoint, relations);
                     let open = client.into_stream().into_inner().is_open();
-                    (observed.0, observed.1, observed.2, handle, open)
+                    (observed, handle, open)
                 }
                 // The same trade `query::answer` records: the handshake consumed the stream, so
                 // whether the host still holds the connection cannot be asked, and closing one it
@@ -171,6 +203,7 @@ fn observe(ctx: &mut Ctx<'_>, endpoint: &Endpoint) -> Result<ClusterDiagnostic, 
                         posture,
                         "TLS handshake".to_owned(),
                         &error.to_string(),
+                        relations,
                     ));
                 }
             },
@@ -182,9 +215,10 @@ fn observe(ctx: &mut Ctx<'_>, endpoint: &Endpoint) -> Result<ClusterDiagnostic, 
     }
     Ok(
         ClusterDiagnostic::for_instance(endpoint.instance.clone(), posture)
-            .with_fingerprint(fingerprint)
-            .with_identity(identity)
-            .with_health(health),
+            .with_fingerprint(observed.fingerprint)
+            .with_identity(observed.identity)
+            .with_health(observed.health)
+            .with_capabilities(observed.capabilities),
     )
 }
 
@@ -198,6 +232,7 @@ fn unreachable(
     posture: TlsPosture,
     source: String,
     detail: &str,
+    relations: Grant,
 ) -> ClusterDiagnostic {
     let mut health = Health::unknown().with_version(Known::Unavailable(Outcome::Disconnected));
     health.record(Probe::new(
@@ -219,6 +254,13 @@ fn unreachable(
                 .with_effective(Known::Unavailable(Outcome::Disconnected)),
         )
         .with_health(health)
+        // Nothing was asked of the cluster, so nothing about what it serves is known — and
+        // `not served by cluster` would be a claim about an API surface nobody has seen (§21.4,
+        // §4 invariant 13). The host's own grant is still an answer, because the host answered.
+        .with_capabilities(CapabilityReport::undetermined(Outcome::Disconnected).with(
+            ProviderCapability::Relationships,
+            Availability::from_grant(relations),
+        ))
 }
 
 /// What protects this session, in the words §8.4 requires a diagnostic to use.
@@ -258,7 +300,8 @@ fn fingerprint_of(endpoint: &Endpoint) -> Fingerprint {
 fn interrogate<S: ByteStream>(
     client: &mut Client<S>,
     endpoint: &Endpoint,
-) -> (Health, Fingerprint, Identity) {
+    relations: Grant,
+) -> Observed {
     let mut health = Health::unknown();
     let mut fingerprint = fingerprint_of(endpoint);
 
@@ -286,7 +329,131 @@ fn interrogate<S: ByteStream>(
         .with_credential(effective.clone())
         .with_effective(effective)
         .with_impersonation(Impersonation::Inactive);
-    (health, fingerprint, identity)
+    let capabilities = capabilities(client, endpoint, &mut health, served.as_ref(), relations);
+    Observed {
+        health,
+        fingerprint,
+        identity,
+        capabilities,
+    }
+}
+
+/// Everything one interrogation learned about a cluster.
+struct Observed {
+    health: Health,
+    fingerprint: Fingerprint,
+    identity: Identity,
+    capabilities: CapabilityReport,
+}
+
+/// What this session found for each capability §57 lists, beside what the provider supports.
+///
+/// Three sources, and each capability is earned from exactly one of them:
+///
+/// - **discovery**, for what the resources this cluster serves offer — a `watch` verb, a
+///   `pods/log` subresource, a writable resource, a `selfsubjectaccessreviews` collection that
+///   accepts `create`. This is §11.1's rule applied to a report: what the API server says it
+///   serves, never what this build was compiled expecting;
+/// - **the host's grant**, for the edges §35.5 gates on `relation.write`;
+/// - **this provider's own construction**, for exec, attach and port forward, which
+///   [`CapabilityStatement`](ono_provider_kubernetes::diagnostics::CapabilityStatement) reports
+///   as unavailable in every session whatever is passed for them (§42.3 to §42.5, ADR-0018).
+///
+/// **`available on resource` is never an authorization answer.** Discovery says a resource offers
+/// `patch`; whether this identity may send one, against one object, is the API server's answer
+/// and lives in the preflight check of `k8s-plan` (§21.1, §21.2). Reporting the two as one
+/// sentence would turn a resource list into an RBAC oracle, which §21.3 forbids even for the
+/// review that *is* an authorization answer.
+fn capabilities<S: ByteStream>(
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    health: &mut Health,
+    served: Option<&Served>,
+    relations: Grant,
+) -> CapabilityReport {
+    let report = CapabilityReport::unknown().with(
+        ProviderCapability::Relationships,
+        Availability::from_grant(relations),
+    );
+    let Some(served) = served else {
+        // The discovery documents did not read, so nothing about what this cluster serves is
+        // known. The probes above say which request failed; this says only that nothing was
+        // determined, which is a different answer from `not served` (§21.4).
+        return report
+            .with(
+                ProviderCapability::Watch,
+                Availability::NotDetermined(Outcome::RequestFailed),
+            )
+            .with(
+                ProviderCapability::Mutations,
+                Availability::NotDetermined(Outcome::RequestFailed),
+            )
+            .with(
+                ProviderCapability::RemoteLogs,
+                Availability::NotDetermined(Outcome::RequestFailed),
+            )
+            .with(
+                ProviderCapability::SubjectAccessReview,
+                Availability::NotDetermined(Outcome::RequestFailed),
+            );
+    };
+    report
+        .with(
+            ProviderCapability::Watch,
+            Availability::offered_verb(&served.core, &[Verb::Watch]),
+        )
+        .with(
+            ProviderCapability::Mutations,
+            Availability::offered_verb(&served.core, &[Verb::Patch, Verb::Delete]),
+        )
+        .with(
+            ProviderCapability::RemoteLogs,
+            Availability::offered_subresource(&served.core, &served.core_version, "pods", "log"),
+        )
+        .with(
+            ProviderCapability::SubjectAccessReview,
+            access_review(client, endpoint, health, served),
+        )
+}
+
+/// Whether this cluster can answer §21.2's "may this identity do that".
+///
+/// A `403` on the group's own resource list is [`Availability::DeniedForCurrentUser`] and a group
+/// the cluster does not serve is [`Availability::NotServedByCluster`]: §57.1's second and fifth
+/// words, and the two are earned from different answers rather than from one absence.
+fn access_review<S: ByteStream>(
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    health: &mut Health,
+    served: &Served,
+) -> Availability {
+    let Some(version) = served.versions.preferred_version(AUTHORIZATION_GROUP) else {
+        return Availability::NotServedByCluster;
+    };
+    let group_version = format!("{AUTHORIZATION_GROUP}/{version}");
+    match ask(
+        client,
+        endpoint,
+        health,
+        Request::get(format!("/apis/{group_version}")),
+    ) {
+        Answer::Body(body) => match String::from_utf8(body)
+            .ok()
+            .and_then(|document| Discovery::builder().resources(&document).ok())
+        {
+            Some(builder) => Availability::offered_on(
+                &builder.build(),
+                &group_version,
+                "SelfSubjectAccessReview",
+                Verb::Create,
+            ),
+            None => Availability::NotDetermined(Outcome::RequestFailed),
+        },
+        Answer::Refused(401 | 403) => Availability::DeniedForCurrentUser,
+        Answer::Refused(404) => Availability::NotServedByCluster,
+        Answer::Refused(_) => Availability::NotDetermined(Outcome::RequestFailed),
+        Answer::Unreachable => Availability::NotDetermined(Outcome::Disconnected),
+    }
 }
 
 /// What the cluster's discovery documents said about itself.
@@ -611,6 +778,21 @@ fn field_value(name: &str, diagnostic: &ClusterDiagnostic) -> Value {
             .impersonation()
             .user()
             .map_or(Value::Null, |user| Value::String(user.into())),
+
+        // --- what it can do here (§57.1) ---
+        "capabilities" => Value::Map(Arc::new(
+            diagnostic
+                .capabilities()
+                .statements()
+                .iter()
+                .map(|statement| {
+                    (
+                        Arc::from(statement.capability().as_str()),
+                        Value::String(statement.describe().into()),
+                    )
+                })
+                .collect::<MapValue>(),
+        )),
 
         // --- what it could not determine ---
         "unknowns" => Value::List(
