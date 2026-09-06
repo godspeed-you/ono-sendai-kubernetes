@@ -125,6 +125,15 @@ targets:
     summary: "Any resource this cluster serves, named by `kind` and `group` (specification section 15.1)."
     identity_doc: "Two observations are the same object when their `metadata.uid` matches, whatever kind they are."
 
+  # What one object is related to. Not a resource: an edge has no `metadata.uid` and no collection
+  # to be fetched from, so this noun names an object with `kind` and `name` and answers one record
+  # per edge — with the evidence class and the fields that decided it, which is Gate D (§62.4).
+  # `relation` narrows to one of §35.7's words. ADR-0014.
+  - name: k8s-relation
+    schema: io.github.godspeed-you.kubernetes.relation/1
+    summary: "What one object is related to, with the evidence class and the fields that decided each edge (specification sections 23 to 32)."
+    identity_doc: "Two observations are the same edge when the object they start at, the relationship word, the far end's address and the field that decided all match. An edge has no `metadata.uid` of its own."
+
   # The provider instance itself rather than anything in the cluster: which cluster this is,
   # whether it answers, and who you are to it (§8.5, §8.6, §10, §34.3). It is the one target here
   # that is useful when the cluster is *not* reachable, which is why an unreachable API server

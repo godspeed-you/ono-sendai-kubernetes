@@ -164,6 +164,15 @@ pub enum Unresolved {
         /// The collection, for an error that says which one.
         gvr: String,
     },
+    /// Exactly one resource matches and the server does not offer `get` on one of them.
+    ///
+    /// Separate from [`Self::NotListable`] because the two are different permissions on
+    /// different endpoints (§11.5, §60.5, ADR-0012), and a caller told the wrong one would look
+    /// for the wrong grant.
+    NotGettable {
+        /// The collection whose objects cannot be read one at a time.
+        gvr: String,
+    },
 }
 
 /// The resources a selector matches, in the snapshot it was matched against.
@@ -177,6 +186,25 @@ pub fn resolve<'snapshot>(
     selector: &Selector,
     discovery: &'snapshot Discovery,
 ) -> Result<&'snapshot Resource, Unresolved> {
+    resolve_for(selector, discovery, Verb::List)
+}
+
+/// As [`resolve`], for a question that needs a verb other than `list`.
+///
+/// §11.5's third state is a resource the server serves and does not let a caller enumerate, and
+/// §60.5's is a namespace whose Pods may be read one at a time and never listed. A relationship
+/// query asks about one named object, so `get` is the verb that decides whether the question can
+/// be answered at all — and refusing it for want of `list` would refuse a resource nothing was
+/// going to list.
+///
+/// # Errors
+///
+/// [`Unresolved`] — see its variants.
+pub fn resolve_for<'snapshot>(
+    selector: &Selector,
+    discovery: &'snapshot Discovery,
+    verb: Verb,
+) -> Result<&'snapshot Resource, Unresolved> {
     if !selector.names_something() {
         return Err(Unresolved::Unasked);
     }
@@ -187,15 +215,15 @@ pub fn resolve<'snapshot>(
     matched.sort_by_key(|resource| (resource.group().to_owned(), resource.kind().to_owned()));
     match matched.as_slice() {
         [] => Err(Unresolved::NotServed),
-        [only] => {
-            if only.supports(Verb::List) {
-                Ok(only)
-            } else {
-                Err(Unresolved::NotListable {
-                    gvr: only.gvr().to_string(),
-                })
-            }
-        }
+        [only] if only.supports(verb) => Ok(only),
+        [only] => Err(match verb {
+            Verb::Get => Unresolved::NotGettable {
+                gvr: only.gvr().to_string(),
+            },
+            _ => Unresolved::NotListable {
+                gvr: only.gvr().to_string(),
+            },
+        }),
         // §35.8 in one place: more than one type shares the name, so the answer is the list of
         // candidates rather than the first of them. A provider that picked here would be
         // inventing a type priority, and the operator would not find out until the records were

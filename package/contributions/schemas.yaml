@@ -1766,6 +1766,159 @@ schemas:
     default_view:
       columns: [name, namespace, kind, api_group, precision, created]
 
+  # One relationship, rather than one object. It is the only schema here whose identity is not a
+  # `metadata.uid`, because an edge has none: it is derived from an object and, for the derived
+  # classes, from a second reading. The four identity components are the object it starts at, the
+  # relationship word, the far end's address and the field that decided — drop any one of them and
+  # two edges that are not the same relationship become one record. ADR-0014.
+  #
+  # **Gate D (§62.4) is what this schema is for.** `evidence_class` is the six-way choice the gate
+  # names, `evidence` is what was read and what it held, `evidence_path` is the pointer where the
+  # class cites one, and `asserted` separates what the API server states from what this provider
+  # derived (§23.3). An edge that lost any of those would be a relationship a user has to trust,
+  # and §4 invariant 20 forbids a guess arriving in the shape of an assertion.
+  - id: io.github.godspeed-you.kubernetes.relation/1
+    name: KubernetesRelation
+    summary: >-
+      One relationship between two Kubernetes objects, and the evidence it rests on.
+    identity: [uid, relation, target, evidence_path]
+    fields:
+      uid:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.uid` of the object the edge starts at (§16.1). The record is a fact *about*
+          that object, so the field means here what it means in every other schema of this
+          document. Two edges of one Pod share it, which is why it is not the whole identity.
+      name:
+        type: string
+        required: true
+        doc: '`metadata.name` of the object the edge starts at. A locator, never an identity (§16.2).'
+      namespace:
+        type: string
+        nullable: true
+        doc: >-
+          `metadata.namespace` of the object the edge starts at. Null for a cluster-scoped object,
+          which has no namespace rather than an empty one (§9.2).
+      api_version:
+        type: string
+        required: true
+        doc: '`apiVersion` of the object the edge starts at.'
+      kind:
+        type: string
+        required: true
+        doc: '`kind` of the object the edge starts at, as the server spells it.'
+      source:
+        type: string
+        required: true
+        doc: >-
+          The near end as a place address (§35.3, §35.4): `k8s://<context>/ns/<namespace>/<kind>/
+          <name>`, or `/cluster/<kind>/<name>` where the kind is cluster-scoped. The kind segment
+          is lower-cased and carries its API group where it has one, because case is not
+          recoverable from an address and the canonical spelling is discovery's answer (§13.2).
+          Built by the place grammar rather than formatted, so a cluster-scoped object has no
+          namespace slot to fill (ADR-0008).
+      relation:
+        type: string
+        required: true
+        doc: >-
+          The relationship, in the word `follow` takes (§35.7) — `owned-by`, `controlled-by`,
+          `scheduled-on`, `selects`, `routes-to`, `bound-to` and the rest. One vocabulary: a
+          curated routing edge and an owner reference are the same kind of thing with different
+          evidence behind them.
+      target:
+        type: string
+        required: true
+        doc: >-
+          The far end as a place address, in the same grammar as `source` and in the same provider
+          instance — relationships do not cross clusters (§9.6). Present even where the target was
+          never read, because §24.1 keeps a dangling edge an edge.
+      target_kind:
+        type: string
+        required: true
+        doc: 'The kind the reference names. Half of a GVK, never a GVR (§13.1).'
+      target_name:
+        type: string
+        required: true
+        doc: 'The name the reference names. A locator, and for an unread target the only one.'
+      target_namespace:
+        type: string
+        nullable: true
+        doc: >-
+          The namespace the far end is looked for in. Null is cluster scope and never "wherever
+          the source lives": a namespace copied onto a cluster-scoped target would name an address
+          that cannot be looked up (§9.2, §24.2).
+      target_uid:
+        type: string
+        nullable: true
+        doc: >-
+          The far end's `metadata.uid` where the evidence carried one — an owner reference does,
+          a `spec.nodeName` does not. This is what makes the far end provable rather than a name
+          match (§16.1), and null is the honest answer where the reference states only a name.
+      target_resolved:
+        type: bool
+        required: true
+        doc: >-
+          Whether the far-end object was actually read. False is not a broken edge: it is a
+          relationship whose other end nobody has looked at, or cannot (§24.1). An identity is
+          bound only where something resolved it, because inventing one would claim a lifetime
+          nobody observed.
+      target_roles:
+        type: list<string>
+        required: true
+        doc: >-
+          The far end's semantic roles (§36.2) — `workload`, `compute-node`, `configuration`,
+          `secret`, `identity`, `storage`, `policy` and the rest. An overlay for cross-provider
+          questions, beside the native kind rather than instead of it (§36.1): a Deployment is not
+          an Auto Scaling Group because both can produce capacity (§36.3). Empty for a kind with
+          no role, which is a statement rather than a gap.
+      evidence_class:
+        type: enum
+        values: [native-field, owner-reference, selector, convention, adapter-derivation, inference]
+        required: true
+        doc: >-
+          Which of §23's classes decided the edge, which is Gate D's first question (§62.4). The
+          five classes above `inference` are produced; `inference` is declared and never emitted,
+          because §23.5 forbids promoting name similarity or address matching to a verified
+          relationship — and a reader must be able to tell one apart from the others by the
+          record rather than by knowing which rule ran.
+      evidence:
+        type: string
+        required: true
+        doc: >-
+          What was read and what it held, in one line: `/spec/nodeName = node-a`,
+          `metadata.ownerReferences with controller: true`, `selector {app=api} matched labels
+          {app=api}`. Gate D's second question, and the reason an edge is checkable rather than
+          trusted.
+      evidence_path:
+        type: string
+        nullable: true
+        doc: >-
+          The JSON pointer the evidence cites, where its class cites one. Null for the classes
+          that rest on no single field — a selector evaluation read two objects, a convention read
+          a label key, a derivation read whatever its rule says — because naming a pointer there
+          would name a field as the proof when the proof is somewhere else.
+      asserted:
+        type: bool
+        required: true
+        doc: >-
+          Whether the API server itself states this relationship, rather than this provider having
+          derived it. True for a native field and an owner reference; false for a selector
+          evaluation, because the server states a selector and it states some labels and it is
+          *this provider* that evaluated one against the other (§23.3). §4 invariant 20 is why the
+          difference is a field and not a footnote.
+      supporting:
+        type: list<string>
+        required: true
+        doc: >-
+          What qualifies the edge without deciding it, each entry naming its own class: the host,
+          path and port §27.1 requires to stay attached to a routing edge, the adapter and version
+          that read a custom resource (§33.8), the owner-reference reversal behind an `owns` edge.
+          None of it would make the edge exist and all of it changes what the edge means. Empty
+          rather than null where there is none.
+    default_view:
+      columns: [name, relation, target_name, evidence_class, evidence, asserted]
+
   - id: io.github.godspeed-you.kubernetes.cluster/1
     name: KubernetesCluster
     summary: >-

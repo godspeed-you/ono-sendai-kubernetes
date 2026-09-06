@@ -18,7 +18,9 @@
 use std::sync::Arc;
 
 use ono_kuang_sdk::protocol::{Capability, InvokeStatus, ShutdownReason};
-use ono_kuang_supervisor::{Connection, HostError, HostServices, LiveStream, StreamEvent};
+use ono_kuang_supervisor::{
+    Connection, HostError, HostLimits, HostServices, LiveStream, StreamEvent,
+};
 use ono_kuang_testhost::TestHost;
 use ono_kubernetes_plugin::broker::encode_hex;
 use ono_value::{RecordValue, Value};
@@ -209,6 +211,11 @@ struct RecordedCluster {
     /// five kinds the earlier tests need. Off by default so that adding a kind to this fixture
     /// cannot change what those tests prove.
     tier_one: bool,
+    /// Whether the objects are the richer ones the relationship tests read: a Pod that states
+    /// an owner, a node, an account, a config and a secret, and a second Pod the Service's
+    /// selector deliberately excludes. Layered over `tier_one` rather than replacing it, and off
+    /// by default so that giving the Pod an owner cannot change what the projection tests prove.
+    relations: bool,
     /// The TLS identity this server presents, where it speaks HTTPS at all. `None` is the plain
     /// HTTP/1.1 an API server behind `kubectl proxy` speaks.
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -276,6 +283,29 @@ impl RecordedCluster {
             pods: 2,
             apps: true,
             deny_pod_get: true,
+            ..Self::default()
+        })
+    }
+
+    /// A server whose objects carry the references §23 to §32 derive relationships from.
+    fn with_relations() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            tier_one: true,
+            relations: true,
+            ..Self::default()
+        })
+    }
+
+    /// The same server, refusing to enumerate the Pods a Service's selector is evaluated against.
+    fn with_relations_denying_pod_list() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            tier_one: true,
+            relations: true,
+            deny_pod_list: true,
             ..Self::default()
         })
     }
@@ -964,6 +994,144 @@ fn tier_one_document(path: &str) -> Option<Json> {
     })
 }
 
+/// The Pod every relationship test starts at.
+///
+/// One object carrying one instance of each evidence class §23 defines that a single object can
+/// state about itself: an owner reference with the controller flag, and four native fields
+/// pointing at four different kinds — one of them cluster-scoped, so that a namespace copied onto
+/// it would be visible (§9.2, §24.2).
+fn related_pod() -> Json {
+    json!({
+        "metadata": {
+            "name": "api-7d9f-abc",
+            "namespace": "default",
+            "uid": "11111111-1111-1111-1111-111111111111",
+            "resourceVersion": "4711",
+            "creationTimestamp": "2026-09-01T09:00:00Z",
+            "labels": {"app": "api"},
+            "ownerReferences": [
+                {"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "api-7d9f",
+                 "uid": "a1a1a1a1-0000-0000-0000-000000000001", "controller": true},
+            ],
+        },
+        "spec": {
+            "nodeName": "node-a",
+            "serviceAccountName": "api",
+            "containers": [{
+                "name": "api",
+                "envFrom": [{"configMapRef": {"name": "api-config"}}],
+            }],
+            "volumes": [{"name": "token", "secret": {"secretName": "api-token"}}],
+        },
+        "status": {"phase": "Running", "podIP": "10.1.2.3"},
+    })
+}
+
+/// A Pod in the same namespace that the Service's selector deliberately does not match.
+///
+/// Without it a selector that matched everything would pass every assertion below, and the edge
+/// would be reporting the namespace rather than the labels.
+fn unselected_pod() -> Json {
+    json!({
+        "metadata": {
+            "name": "worker-1",
+            "namespace": "default",
+            "uid": "22222222-2222-2222-2222-000000000001",
+            "resourceVersion": "4712",
+            "creationTimestamp": "2026-09-01T09:05:00Z",
+            "labels": {"app": "worker"},
+        },
+        "spec": {"nodeName": "node-a", "containers": [{"name": "worker"}]},
+        "status": {"phase": "Running"},
+    })
+}
+
+/// The Service whose selector the relationship tests evaluate.
+fn related_service() -> Json {
+    json!({
+        "metadata": {
+            "name": "api",
+            "namespace": "default",
+            "uid": "a4a4a4a4-0000-0000-0000-000000000001",
+            "creationTimestamp": "2026-08-20T08:00:00Z",
+        },
+        "spec": {
+            "type": "LoadBalancer",
+            "clusterIP": "10.96.0.42",
+            "selector": {"app": "api"},
+            "ports": [{"name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP"}],
+        },
+        "status": {"loadBalancer": {"ingress": [{"hostname": "lb.example"}]}},
+    })
+}
+
+/// What a cluster whose objects state relationships answers, where it differs from Tier 1.
+///
+/// Every path here is an *object* endpoint except the two collections a derivation reads: the
+/// Pods a Service's selector is evaluated against, and the slices its service-name label points
+/// at. That is the fixture half of §26.1 — a selector edge needs two objects, and one of them is
+/// a second read that can be denied.
+fn relations_document(path: &str) -> Option<Json> {
+    Some(match path {
+        "/api/v1/namespaces/default/pods" => {
+            collection("Pod", "v1", &[related_pod(), unselected_pod()])
+        }
+        "/api/v1/namespaces/default/pods/api-7d9f-abc" => standalone(related_pod(), "v1", "Pod"),
+        "/api/v1/namespaces/default/services" => collection("Service", "v1", &[related_service()]),
+        "/api/v1/namespaces/default/services/api" => standalone(related_service(), "v1", "Service"),
+        "/apis/networking.k8s.io/v1/namespaces/default/ingresses/public" => standalone(
+            json!({
+                "metadata": {
+                    "name": "public", "namespace": "default",
+                    "uid": "a6a6a6a6-0000-0000-0000-000000000001",
+                    "creationTimestamp": "2026-08-20T08:00:00Z",
+                },
+                "spec": {
+                    "ingressClassName": "nginx",
+                    "tls": [{"hosts": ["shop.example"], "secretName": "shop-tls"}],
+                    "rules": [{
+                        "host": "shop.example",
+                        "http": {"paths": [
+                            {"path": "/", "pathType": "Prefix",
+                             "backend": {"service": {"name": "api", "port": {"number": 80}}}},
+                        ]},
+                    }],
+                },
+                "status": {"loadBalancer": {"ingress": [{"ip": "198.51.100.7"}]}},
+            }),
+            "networking.k8s.io/v1",
+            "Ingress",
+        ),
+        "/apis/apps/v1/namespaces/default/deployments/api" => standalone(
+            json!({
+                "metadata": {
+                    "name": "api", "namespace": "default",
+                    "uid": "66666666-6666-6666-6666-666666666666",
+                    "generation": 7,
+                    "creationTimestamp": "2026-08-20T08:00:00Z",
+                },
+                "spec": {"replicas": 3, "selector": {"matchLabels": {"app": "api"}}},
+                "status": {"readyReplicas": 2, "observedGeneration": 6},
+            }),
+            "apps/v1",
+            "Deployment",
+        ),
+        "/api/v1/namespaces/default/configmaps/api-config" => standalone(
+            json!({
+                "metadata": {
+                    "name": "api-config", "namespace": "default",
+                    "uid": "a9a9a9a9-0000-0000-0000-000000000001",
+                    "creationTimestamp": "2026-08-01T00:00:00Z",
+                },
+                "data": {"log_level": "info"},
+            }),
+            "v1",
+            "ConfigMap",
+        ),
+        _ => return None,
+    })
+}
+
 /// One API group with a single preferred version.
 fn group(name: &str) -> Json {
     json!({
@@ -986,8 +1154,18 @@ fn collection(kind: &str, api_version: &str, items: &[Json]) -> Json {
 fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let pods = cluster.pods;
     let path = path.split('?').next().unwrap_or(path);
+    // §60.5's refusal, before any of the layered fixtures answer for the same path: a derivation
+    // that reads the Pod collection must be able to meet it too, and not only a Pod query.
+    if cluster.deny_pod_list && path == "/api/v1/namespaces/default/pods" {
+        return denied(path, "list");
+    }
     if cluster.custom
         && let Some(body) = custom_document(path)
+    {
+        return response(&body.to_string());
+    }
+    if cluster.relations
+        && let Some(body) = relations_document(path)
     {
         return response(&body.to_string());
     }
@@ -3062,5 +3240,543 @@ async fn should_read_any_tier_one_kind_by_name_as_well_as_by_collection() {
         "the service's own endpoint was asked, not the collection: {:?}",
         cluster.heads()
     );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- relationships, and the evidence under each one (§23–§32, Gate D) --------------------------
+
+/// The package loaded against a cluster whose objects state relationships.
+async fn loaded_with_relations() -> ono_kuang_supervisor::LoadedPlugin {
+    loaded_for_relations(RecordedCluster::with_relations()).await
+}
+
+/// One relationship query costs more round trips than a listing does: the two discovery
+/// documents, a resource list per served group, the object's own endpoint, and a collection for
+/// every derivation that needs a second reading. The host's default call deadline is five seconds
+/// and this suite runs beside the whole workspace, so a loaded machine can starve one of those
+/// calls — and the failure would then be about the machine rather than about the relationships
+/// this file exists to prove. `tests/isolation.rs` records the same reasoning for the same
+/// reason; nothing here is testing how fast a host answers.
+async fn loaded_for_relations(cluster: Arc<RecordedCluster>) -> ono_kuang_supervisor::LoadedPlugin {
+    let limits = HostLimits {
+        call_deadline_ms: 120_000,
+        ..HostLimits::default()
+    };
+    TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .host(cluster as Arc<dyn HostServices>)
+        .limits(limits)
+        .load()
+        .await
+        .expect("the package loads under its own manifest")
+}
+
+/// Every edge `k8s-relation` answers about one object, with the schema already checked.
+async fn edges(
+    plugin: &ono_kuang_supervisor::LoadedPlugin,
+    extra: &[(&str, Json)],
+) -> Vec<Arc<RecordValue>> {
+    let invocation = plugin
+        .query("k8s-relation", at_cluster(extra))
+        .await
+        .expect("`k8s-relation` is a contributed target");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "an object whose every derivation was readable answers completely: {:?}",
+        result.error
+    );
+    let records = records(&events);
+    for record in &records {
+        assert_eq!(
+            record.schema_id().to_string(),
+            "io.github.godspeed-you.kubernetes.relation/1",
+            "an edge carries the one schema the package declares for edges"
+        );
+        record
+            .validate()
+            .expect("the record conforms to the schema it carries");
+    }
+    records
+}
+
+/// The one edge of that relation to that target, or a failure naming what did arrive.
+fn edge<'a>(
+    records: &'a [Arc<RecordValue>],
+    relation: &str,
+    target_name: &str,
+) -> &'a Arc<RecordValue> {
+    records
+        .iter()
+        .find(|record| {
+            text_of(record, "relation").as_deref() == Some(relation)
+                && text_of(record, "target_name").as_deref() == Some(target_name)
+        })
+        .unwrap_or_else(|| {
+            let seen: Vec<String> = records
+                .iter()
+                .map(|record| {
+                    format!(
+                        "{} -> {}",
+                        text_of(record, "relation").unwrap_or_default(),
+                        text_of(record, "target_name").unwrap_or_default()
+                    )
+                })
+                .collect();
+            panic!("no `{relation}` edge to `{target_name}`; the edges are {seen:?}")
+        })
+}
+
+#[tokio::test]
+async fn should_answer_what_a_pod_is_related_to_with_the_evidence_under_each_edge() {
+    // Gate D (§62.4) end to end: every edge a Pod states about itself reaches a user, and each
+    // one says which of §23's six classes it came from and which field decided it.
+    let plugin = loaded_with_relations().await;
+    let records = edges(
+        &plugin,
+        &[("kind", json!("Pod")), ("name", json!("api-7d9f-abc"))],
+    )
+    .await;
+
+    let relations: Vec<String> = records
+        .iter()
+        .map(|record| text_of(record, "relation").unwrap_or_default())
+        .collect();
+    for expected in [
+        "owned-by",
+        "controlled-by",
+        "scheduled-on",
+        "runs-as",
+        "references-config",
+        "references-secret",
+    ] {
+        assert!(
+            relations.contains(&expected.to_owned()),
+            "the Pod states a `{expected}` relationship, and the edges are {relations:?}"
+        );
+    }
+
+    for record in &records {
+        assert_eq!(
+            text_of(record, "uid").as_deref(),
+            Some("11111111-1111-1111-1111-111111111111"),
+            "an edge is a fact about the object it starts at, and identity is its uid (§16.1)"
+        );
+        assert_eq!(text_of(record, "name").as_deref(), Some("api-7d9f-abc"));
+        assert_eq!(text_of(record, "kind").as_deref(), Some("Pod"));
+        assert_eq!(
+            text_of(record, "source").as_deref(),
+            Some("k8s://recorded/ns/default/pod/api-7d9f-abc"),
+            "the near end is a place, built by the place grammar rather than formatted (§35.4)"
+        );
+        assert!(
+            text_of(record, "evidence").is_some_and(|evidence| !evidence.is_empty()),
+            "Gate D: an edge that cannot say what it rests on is one a user has to trust"
+        );
+    }
+
+    // §28.1: a native field decided it, and the record names the pointer that was read.
+    let node = edge(&records, "scheduled-on", "node-a");
+    assert_eq!(
+        text_of(node, "evidence_class").as_deref(),
+        Some("native-field")
+    );
+    assert_eq!(
+        text_of(node, "evidence_path").as_deref(),
+        Some("/spec/nodeName"),
+        "Gate D asks for the source fields used, and a class without a pointer is half an answer"
+    );
+    assert_eq!(
+        text_of(node, "evidence").as_deref(),
+        Some("/spec/nodeName = node-a")
+    );
+    assert_eq!(
+        node.get("asserted"),
+        Some(&Value::Bool(true)),
+        "the API server states `spec.nodeName`; this provider only read it"
+    );
+    assert_eq!(
+        text_of(node, "target").as_deref(),
+        Some("k8s://recorded/cluster/node/node-a"),
+        "a Node is cluster-scoped, so the address has no namespace slot (§9.2, ADR-0008)"
+    );
+    assert_eq!(
+        node.get("target_namespace"),
+        Some(&Value::Null),
+        "the Pod's namespace is not copied onto a cluster-scoped target (§24.2)"
+    );
+    assert_eq!(
+        list_of(node, "target_roles"),
+        Some(vec!["compute-node".to_owned()]),
+        "§36.2's role overlay travels with the far end, and the native kind stays beside it"
+    );
+
+    // §29.1 and §29.2: a config and a secret reference are two edges, each citing the container
+    // path that carries it.
+    let config = edge(&records, "references-config", "api-config");
+    assert_eq!(
+        text_of(config, "evidence_path").as_deref(),
+        Some("/spec/containers/0/envFrom/0/configMapRef/name"),
+        "the edge retains how the ConfigMap is consumed (§29.1)"
+    );
+    let secret = edge(&records, "references-secret", "api-token");
+    assert_eq!(
+        text_of(secret, "evidence_path").as_deref(),
+        Some("/spec/volumes/0/secret/secretName")
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_an_edge_whose_target_was_never_read() {
+    // §24.1: a relationship whose far end nobody looked at is a relationship, not a broken edge.
+    // The Node, the ServiceAccount and the ConfigMap below were never fetched, and every one of
+    // them is still addressable — with the lifetime identity left absent rather than invented.
+    let plugin = loaded_with_relations().await;
+    let records = edges(
+        &plugin,
+        &[("kind", json!("Pod")), ("name", json!("api-7d9f-abc"))],
+    )
+    .await;
+    let node = edge(&records, "scheduled-on", "node-a");
+    assert_eq!(
+        node.get("target_resolved"),
+        Some(&Value::Bool(false)),
+        "nothing read the Node, and the edge says so rather than disappearing"
+    );
+    assert_eq!(
+        node.get("target_uid"),
+        Some(&Value::Null),
+        "an unread target has no lifetime identity, and null is what that is (§16.1)"
+    );
+    assert_eq!(text_of(node, "target_kind").as_deref(), Some("Node"));
+
+    // An owner reference is the opposite case: it carries the owner's UID without the owner
+    // having been read, which is what makes the far end provable rather than a name match.
+    let owner = edge(&records, "owned-by", "api-7d9f");
+    assert_eq!(
+        text_of(owner, "target_uid").as_deref(),
+        Some("a1a1a1a1-0000-0000-0000-000000000001"),
+        "§24.1: a dangling edge keeps its target identity evidence"
+    );
+    assert_eq!(
+        owner.get("target_resolved"),
+        Some(&Value::Bool(false)),
+        "carrying a UID is not the same as having read the object it names"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_say_an_owner_reference_names_the_controller_where_it_does() {
+    // §24.3: `controller: true` earns the stronger word while generic `owned-by` is preserved,
+    // so a caller that wants all ownership does not have to know which of the two to ask for.
+    let plugin = loaded_with_relations().await;
+    let records = edges(
+        &plugin,
+        &[("kind", json!("Pod")), ("name", json!("api-7d9f-abc"))],
+    )
+    .await;
+    for relation in ["owned-by", "controlled-by"] {
+        let owner = edge(&records, relation, "api-7d9f");
+        assert_eq!(
+            text_of(owner, "evidence_class").as_deref(),
+            Some("owner-reference")
+        );
+        assert_eq!(
+            text_of(owner, "evidence").as_deref(),
+            Some("metadata.ownerReferences with controller: true"),
+            "§23.2 requires the controller flag to be preserved, not only the reference"
+        );
+        assert_eq!(
+            owner.get("asserted"),
+            Some(&Value::Bool(true)),
+            "the API server maintains `metadata.ownerReferences`"
+        );
+        assert_eq!(text_of(owner, "target_kind").as_deref(), Some("ReplicaSet"));
+        assert_eq!(
+            text_of(owner, "target_namespace").as_deref(),
+            Some("default"),
+            "a namespaced dependent's owner is namespace-local (§24.2)"
+        );
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_derive_a_service_s_selection_from_labels_and_say_that_it_derived_it() {
+    // §23.3 and §26.1: the API server states a selector and it states some labels, and it is
+    // *this provider* that evaluated one against the other. A record that lost that distinction
+    // would let a derivation read as an assertion (§4 invariant 20).
+    let plugin = loaded_with_relations().await;
+    let records = edges(
+        &plugin,
+        &[("kind", json!("Service")), ("name", json!("api"))],
+    )
+    .await;
+
+    let selected = edge(&records, "selects", "api-7d9f-abc");
+    assert_eq!(
+        text_of(selected, "evidence_class").as_deref(),
+        Some("selector")
+    );
+    assert_eq!(
+        selected.get("asserted"),
+        Some(&Value::Bool(false)),
+        "a selector edge is derived; nothing in the API states it"
+    );
+    assert_eq!(
+        text_of(selected, "evidence").as_deref(),
+        Some("selector {app=api} matched labels {app=api}"),
+        "§23.3: the selector and the observed label set are the evidence, and both are named"
+    );
+    assert_eq!(
+        selected.get("target_resolved"),
+        Some(&Value::Bool(true)),
+        "the Pod was read, so the far end carries its lifetime identity"
+    );
+    assert_eq!(
+        text_of(selected, "target_uid").as_deref(),
+        Some("11111111-1111-1111-1111-111111111111")
+    );
+
+    assert!(
+        !records
+            .iter()
+            .any(|record| text_of(record, "target_name").as_deref() == Some("worker-1")),
+        "the second Pod's labels do not satisfy the selector, and a namespace is not a selector"
+    );
+
+    // §26.2: the slice is reached by the standard service-name label, which is a convention
+    // rather than API structure — and the edge says which.
+    let slice = edge(&records, "represented-by", "api-x7k2");
+    assert_eq!(
+        text_of(slice, "evidence_class").as_deref(),
+        Some("convention"),
+        "§23.4: a well-known label is not the same evidence as a field the API maintains"
+    );
+    assert_eq!(
+        text_of(slice, "evidence").as_deref(),
+        Some("kubernetes.io/service-name = api")
+    );
+    assert_eq!(slice.get("asserted"), Some(&Value::Bool(false)));
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_the_host_and_path_of_a_routing_edge_attached_to_it() {
+    // §27.1: "which Service" without "for which URL" answers a question nobody asked, so the
+    // host, path and port stay on the edge as evidence that qualifies it rather than decides it.
+    let plugin = loaded_with_relations().await;
+    let records = edges(
+        &plugin,
+        &[("kind", json!("Ingress")), ("name", json!("public"))],
+    )
+    .await;
+    let route = edge(&records, "routes-to", "api");
+    let supporting = list_of(route, "supporting").expect("a routing edge carries its qualifiers");
+    let joined = supporting.join(" | ");
+    for expected in ["shop.example", "/"] {
+        assert!(
+            joined.contains(expected),
+            "the route's `{expected}` stays attached to the edge: {supporting:?}"
+        );
+    }
+    let tls = edge(&records, "uses-tls-secret", "shop-tls");
+    assert_eq!(
+        text_of(tls, "evidence_class").as_deref(),
+        Some("native-field")
+    );
+    let class = edge(&records, "uses-ingress-class", "nginx");
+    assert_eq!(
+        class.get("target_namespace"),
+        Some(&Value::Null),
+        "an IngressClass is cluster-scoped (§9.5)"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_never_present_an_inference_as_a_relationship() {
+    // §23.5 and §4 invariant 20: name similarity, IP matching and human convention are not
+    // promoted to verified relationships. Nothing in this provider produces the class at all,
+    // and this is the assertion that would fail the day something did.
+    let plugin = loaded_with_relations().await;
+    for (kind, name) in [
+        ("Pod", "api-7d9f-abc"),
+        ("Service", "api"),
+        ("Ingress", "public"),
+        ("ConfigMap", "api-config"),
+    ] {
+        let records = edges(&plugin, &[("kind", json!(kind)), ("name", json!(name))]).await;
+        for record in &records {
+            let class = text_of(record, "evidence_class").unwrap_or_default();
+            assert_ne!(
+                class, "inference",
+                "`{kind}/{name}` produced an inferred edge, which §23.5 forbids"
+            );
+            assert!(
+                [
+                    "native-field",
+                    "owner-reference",
+                    "selector",
+                    "convention",
+                    "adapter-derivation",
+                ]
+                .contains(&class.as_str()),
+                "every edge names one of Gate D's classes, and this one names `{class}`"
+            );
+        }
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_answer_one_relation_word_when_the_query_names_one() {
+    // §35.7: `follow` traverses a named relationship type, and the word it takes is the word
+    // the record carries. A word this provider does not know is refused rather than answered
+    // with nothing, because silence would read as "there are no such edges".
+    let plugin = loaded_with_relations().await;
+    let scheduled = edges(
+        &plugin,
+        &[
+            ("kind", json!("Pod")),
+            ("name", json!("api-7d9f-abc")),
+            ("relation", json!("scheduled-on")),
+        ],
+    )
+    .await;
+    assert_eq!(scheduled.len(), 1, "one Pod is scheduled on one Node");
+    assert_eq!(
+        text_of(&scheduled[0], "relation").as_deref(),
+        Some("scheduled-on")
+    );
+
+    let invocation = plugin
+        .query(
+            "k8s-relation",
+            at_cluster(&[
+                ("kind", json!("Pod")),
+                ("name", json!("api-7d9f-abc")),
+                ("relation", json!("sits-near")),
+            ]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Failed,
+        "a relationship word nobody defines is not an empty answer"
+    );
+    assert!(records(&events).is_empty());
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_a_relationship_query_that_names_no_object() {
+    // A relationship is a fact about one object. Asking for the edges of a whole collection
+    // without naming the object would fan out reads nobody asked for, and answering nothing
+    // would say the object has no relationships.
+    let plugin = loaded_with_relations().await;
+    let invocation = plugin
+        .query("k8s-relation", at_cluster(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the query starts");
+    let (_, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Failed);
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_say_a_derivation_that_could_not_read_is_a_gap_rather_than_an_absence() {
+    // §4 invariant 13 and §21.4 on the derived half of the graph. A Service's `selects` edges are
+    // evaluated against the Pods of its namespace; when that enumeration is refused, the edges
+    // that *were* derived are true and cross, and the invocation then fails naming what was
+    // missing. Answering the readable edges and completing would say the Service selects nothing,
+    // which is the one thing a refusal never means (ADR-0004, ADR-0007).
+    let plugin = loaded_for_relations(RecordedCluster::with_relations_denying_pod_list()).await;
+    let invocation = plugin
+        .query(
+            "k8s-relation",
+            at_cluster(&[("kind", json!("Service")), ("name", json!("api"))]),
+        )
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Failed,
+        "a derivation that could not read everything it needed is not a complete answer"
+    );
+    let message = result
+        .error
+        .as_ref()
+        .map(|error| error.message.clone())
+        .unwrap_or_default();
+    assert!(
+        message.contains("list denied"),
+        "the failure names §21.4's outcome rather than only that something went wrong: {message}"
+    );
+
+    let answered = records(&events);
+    assert!(
+        answered
+            .iter()
+            .any(|record| text_of(record, "relation").as_deref() == Some("represented-by")),
+        "the edges the provider could derive are true and still cross"
+    );
+    assert!(
+        !answered
+            .iter()
+            .any(|record| text_of(record, "relation").as_deref() == Some("selects")),
+        "a selector evaluated against a collection nobody could read is not a selector that \
+         matched nothing"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_read_ownership_downwards_and_say_the_reversal_is_a_derivation() {
+    // §25.1: the owner-reference chain is canonical for the ReplicaSets a Deployment controls,
+    // and the record of that reference lives on the *child*. Reading it from the owner's end is
+    // this provider's doing, so the edge keeps the owner reference as its deciding evidence and
+    // says in `supporting` that the direction was reversed — §23 does not let a derivation pass
+    // as something the object stated.
+    let plugin = loaded_with_relations().await;
+    let records = edges(
+        &plugin,
+        &[("kind", json!("Deployment")), ("name", json!("api"))],
+    )
+    .await;
+    for relation in ["owns", "controls"] {
+        let child = edge(&records, relation, "api-7d9f");
+        assert_eq!(
+            text_of(child, "evidence_class").as_deref(),
+            Some("owner-reference"),
+            "the reference the child carries is what decides the edge"
+        );
+        assert_eq!(
+            child.get("target_resolved"),
+            Some(&Value::Bool(true)),
+            "the child was read, so the far end carries its lifetime identity"
+        );
+        assert_eq!(
+            text_of(child, "target_uid").as_deref(),
+            Some("a1a1a1a1-0000-0000-0000-000000000001"),
+            "ownership is matched by UID: a Deployment recreated under one name is a second \
+             lifetime and does not inherit the first one's children (§16.3)"
+        );
+        let supporting =
+            list_of(child, "supporting").expect("the reversal is stated rather than assumed");
+        assert!(
+            supporting
+                .iter()
+                .any(|entry| entry.starts_with("adapter-derivation:")
+                    && entry.contains("owner-reference reversal")),
+            "the direction is this provider's derivation, and it says so: {supporting:?}"
+        );
+    }
     plugin.shutdown(ShutdownReason::Unload).await;
 }

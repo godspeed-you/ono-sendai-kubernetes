@@ -1,8 +1,8 @@
 //! HTTP over the brokered byte connection, and what a read knows about itself.
 //!
 //! Specification §17 (read operations), §18 (pagination), §19.1 (list/watch request shape),
-//! §20.1 and §20.2 (cache classes and object freshness), §21.4 (denied reads), §59.2 (fixture
-//! transport). Core `ADR-0573` settles why this provider owns an HTTP client at all: the host
+//! §20.1 and §20.2 (cache classes and object freshness), §21.4 (denied reads), §48 (error mapping
+//! and partial failure), §59.2 (fixture transport). Core `ADR-0573` settles why this provider owns an HTTP client at all: the host
 //! brokers a byte connection and speaks no protocol over it, so the protocol is ours.
 //!
 //! Every test here feeds recorded bytes to a fixture stream. Nothing opens a socket, nothing
@@ -16,13 +16,15 @@
     reason = "a test states its preconditions directly (AGENTS.md section 16)"
 )]
 
-use ono_provider_kubernetes::coverage::{Outcome, Scope};
+use std::time::Duration;
+
+use ono_provider_kubernetes::coverage::{Coverage, Gap, Outcome, Scope};
 use ono_provider_kubernetes::discovery::Gvr;
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::transport::{
-    ApiError, BreakReason, Client, Continuity, EndpointCategory, FixedClock, FixtureStream,
-    Freshness, HttpConnection, ListOptions, Method, ObservedAt, Operation, Origin, Read, Request,
-    get_request, list_request, watch_request,
+    ApiError, BreakReason, Client, Continuity, EndpointCategory, ErrorKind, FixedClock,
+    FixtureStream, Freshness, HttpConnection, ListOptions, Method, ObservedAt, Operation, Origin,
+    Read, Request, Retryability, Status, get_request, list_request, watch_request,
 };
 
 // --- fixtures ---------------------------------------------------------------------------------
@@ -696,7 +698,7 @@ fn should_map_404_to_absence_and_keep_it_apart_from_denial() {
     // acts on them differently: one calls for a different name, the other for different rights.
     let mut client = client(&[json_response(
         "404 Not Found",
-        &status(404, "NotFound", r#"pods "web" not found"#),
+        &status(404, "NotFound", r#"pods \"web\" not found"#),
     )]);
 
     let error = client
@@ -880,4 +882,379 @@ fn should_carry_a_cached_object_in_the_same_shape_a_direct_read_uses() {
         Some(false),
         "an unsynced cache says so rather than presenting itself as authoritative"
     );
+}
+
+// --- the error taxonomy (§48) -------------------------------------------------------------------
+
+/// A `Status` with a `details` block, which is where §48.1's structured fields live.
+fn detailed_status(code: u16, reason: &str, message: &str, details: &str) -> String {
+    format!(
+        r#"{{"kind":"Status","apiVersion":"v1","status":"Failure","message":"{message}","reason":"{reason}","code":{code},"details":{details}}}"#
+    )
+}
+
+fn widgets() -> Gvr {
+    Gvr::new("example.com", "v1", "widgets")
+}
+
+#[test]
+fn should_name_every_error_class_the_taxonomy_requires() {
+    // §48.2 lists the classes a Kubernetes failure must at minimum be sorted into. The list is
+    // the point: two classes sharing a word share a rendering, and then an expired token and a
+    // missing Role arrive at the operator as the same sentence.
+    let named: Vec<&str> = ErrorKind::taxonomy()
+        .into_iter()
+        .map(ErrorKind::as_str)
+        .collect();
+
+    assert_eq!(
+        named,
+        vec![
+            "unauthenticated",
+            "authorization denied",
+            "not found",
+            "conflict",
+            "invalid",
+            "rate limited",
+            "server timeout",
+            "timeout",
+            "service unavailable",
+            "api not served",
+            "watch expired",
+            "transport error",
+            "tls error",
+            "credential error",
+            "schema error",
+            "partial result",
+            "cancelled",
+        ]
+    );
+
+    let mut unique = named.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), named.len(), "two classes share a word");
+}
+
+#[test]
+fn should_classify_on_the_status_reason_rather_than_on_the_code_when_the_two_disagree() {
+    // §48.1 puts `reason` in the structured fields for a reason: it is more precise than the
+    // code. A 500 carrying `ServerTimeout` is the server asking to be asked again, while a 500
+    // classified from its code alone is a generic failure nobody retries — the opposite advice,
+    // from the same response.
+    let mut client = client(&[json_response(
+        "500 Internal Server Error",
+        &status(
+            500,
+            "ServerTimeout",
+            "the server cannot complete the request",
+        ),
+    )]);
+
+    let error = client
+        .get(&pods(), &Scope::in_namespace("shop"), "web")
+        .expect_err("500 is not an object");
+
+    assert_eq!(error.kind(Operation::Get), ErrorKind::ServerTimeout);
+    assert_eq!(error.retryability(), Retryability::Yes);
+}
+
+#[test]
+fn should_tell_an_unauthenticated_request_from_a_denied_one() {
+    // §48.2 keeps `unauthenticated` and `authorization_denied` apart, and they send an operator
+    // to two different places: a 401 means the credential expired and is theirs to renew, a 403
+    // means the credential is fine and the RBAC binding is not. Merging them into "access
+    // denied" is the mistake that has someone asking a cluster admin for a Role they already
+    // hold.
+    let mut client = client(&[
+        json_response(
+            "401 Unauthorized",
+            &status(401, "Unauthorized", "the token has expired"),
+        ),
+        json_response(
+            "403 Forbidden",
+            &status(403, "Forbidden", "pods is forbidden"),
+        ),
+    ]);
+
+    let unauthenticated = client
+        .get(&pods(), &Scope::in_namespace("shop"), "web")
+        .expect_err("401 is not an object");
+    let denied = client
+        .get(&pods(), &Scope::in_namespace("shop"), "web")
+        .expect_err("403 is not an object");
+
+    assert_eq!(
+        unauthenticated.kind(Operation::Get),
+        ErrorKind::Unauthenticated
+    );
+    assert_eq!(denied.kind(Operation::Get), ErrorKind::AuthorizationDenied);
+    assert_eq!(unauthenticated.retryability(), Retryability::No);
+    assert_eq!(denied.retryability(), Retryability::No);
+}
+
+#[test]
+fn should_class_a_conflict_and_an_already_existing_object_together_without_merging_their_reasons() {
+    // §48.2 offers one word, `conflict`, for both; §48.1 keeps the native reason. Both matter:
+    // the class decides that neither is retried (§48.4), and the reason decides what the operator
+    // is told — "someone wrote first" and "it is already there" are different stories with the
+    // same HTTP code.
+    let mut client = client(&[
+        json_response(
+            "409 Conflict",
+            &status(409, "Conflict", "the object has been modified"),
+        ),
+        json_response(
+            "409 Conflict",
+            &status(409, "AlreadyExists", r#"pods \"web\" already exists"#),
+        ),
+    ]);
+
+    let modified = client
+        .get(&pods(), &Scope::in_namespace("shop"), "web")
+        .expect_err("409 is not an object");
+    let existing = client
+        .get(&pods(), &Scope::in_namespace("shop"), "web")
+        .expect_err("409 is not an object");
+
+    assert_eq!(modified.kind(Operation::Get), ErrorKind::Conflict);
+    assert_eq!(existing.kind(Operation::Get), ErrorKind::Conflict);
+    assert_eq!(
+        modified.status().and_then(Status::reason),
+        Some("Conflict"),
+        "the native reason is what §48.1 preserves"
+    );
+    assert_eq!(
+        existing.status().and_then(Status::reason),
+        Some("AlreadyExists")
+    );
+    assert_eq!(
+        modified.retryability(),
+        Retryability::No,
+        "§48.4: a conflict must never be silently retried as a destructive overwrite"
+    );
+}
+
+#[test]
+fn should_expose_the_field_causes_an_admission_failure_named() {
+    // §48.5: validation errors carry `causes`, and each one names the field that was refused.
+    // Reducing them to the prose message leaves the caller parsing English to find out that
+    // `spec.replicas` was the problem — and §48.1 asks for the structured form precisely so
+    // nobody has to.
+    let mut client = client(&[json_response(
+        "422 Unprocessable Entity",
+        &detailed_status(
+            422,
+            "Invalid",
+            "Deployment.apps \\\"web\\\" is invalid",
+            r#"{"group":"apps","kind":"deployments","name":"web","causes":[{"reason":"FieldValueInvalid","message":"must be greater than or equal to 0","field":"spec.replicas"}]}"#,
+        ),
+    )]);
+
+    let error = client
+        .get(&deployments(), &Scope::in_namespace("shop"), "web")
+        .expect_err("422 is not an object");
+
+    assert_eq!(error.kind(Operation::Get), ErrorKind::Invalid);
+    let status = error.status().expect("a Status came back");
+    assert_eq!(status.details_group(), Some("apps"));
+    assert_eq!(status.details_kind(), Some("deployments"));
+    let causes = status.causes();
+    assert_eq!(causes.len(), 1);
+    assert_eq!(causes[0].field(), Some("spec.replicas"));
+    assert_eq!(causes[0].reason(), Some("FieldValueInvalid"));
+}
+
+#[test]
+fn should_call_a_missing_collection_endpoint_an_unserved_api_rather_than_an_absence() {
+    // §48.3: a 404 is ambiguous, and the request context resolves it. Asking for one object and
+    // being told "not found" is a fact about the object; asking a collection endpoint that does
+    // not exist is a fact about what this cluster serves at all (§11.5). Calling the second one
+    // absence is how an uninstalled CRD renders as "you have no widgets".
+    let mut client = client(&[json_response(
+        "404 Not Found",
+        &status(
+            404,
+            "NotFound",
+            "the server could not find the requested resource",
+        ),
+    )]);
+
+    let error = client
+        .list_page(
+            &widgets(),
+            &Scope::in_namespace("shop"),
+            &ListOptions::new(),
+        )
+        .expect_err("404 is not a collection");
+
+    assert_eq!(error.kind(Operation::List), ErrorKind::ApiNotServed);
+    assert_eq!(error.kind(Operation::Get), ErrorKind::NotFound);
+    assert_eq!(error.retryability(), Retryability::No);
+}
+
+#[test]
+fn should_call_an_expired_continuity_token_a_watch_expiry_rather_than_a_retryable_failure() {
+    // §19.4 and §48.2's `watch_expired`. Repeating the same request with the same token cannot
+    // succeed, so declaring it retryable would spend the whole budget on a request that is
+    // arithmetically certain to fail. Resuming is a different request against a different
+    // snapshot, and that is the caller's decision, not a retry.
+    let mut client = client(&[json_response(
+        "410 Gone",
+        &status(410, "Expired", "too old resource version"),
+    )]);
+
+    let error = client
+        .list_page(&pods(), &Scope::in_namespace("shop"), &ListOptions::new())
+        .expect_err("410 is not a collection");
+
+    assert_eq!(error.kind(Operation::List), ErrorKind::WatchExpired);
+    assert_eq!(error.retryability(), Retryability::No);
+    assert!(error.is_continuity_expiry());
+}
+
+#[test]
+fn should_take_the_retry_delay_from_the_status_details_when_no_header_carries_one() {
+    // §48.1 lists `retryAfterSeconds` among the fields to preserve, and §49.2 says upstream retry
+    // guidance is honoured. A server that put its advice in the body rather than in a header has
+    // still given advice; ignoring it and guessing a backoff is how a client makes an overloaded
+    // control plane worse while believing it is being polite.
+    let mut client = client(&[json_response(
+        "503 Service Unavailable",
+        &detailed_status(
+            503,
+            "ServiceUnavailable",
+            "the server is currently unable to handle the request",
+            r#"{"retryAfterSeconds":5}"#,
+        ),
+    )]);
+
+    let error = client
+        .get(&pods(), &Scope::in_namespace("shop"), "web")
+        .expect_err("503 is not an object");
+
+    assert_eq!(error.kind(Operation::Get), ErrorKind::ServiceUnavailable);
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(5)));
+    assert_eq!(error.retryability(), Retryability::Yes);
+}
+
+#[test]
+fn should_prefer_the_retry_after_header_to_the_delay_in_the_body() {
+    // §49.2 names `Retry-After` specifically, and it is the value an intermediary between this
+    // client and the API server would also have rewritten. Taking the body's number when the two
+    // disagree means honouring advice the last hop already replaced.
+    let mut client = client(&[response(
+        "429 Too Many Requests",
+        &[("Retry-After", "2"), ("Content-Type", "application/json")],
+        &detailed_status(
+            429,
+            "TooManyRequests",
+            "please try again later",
+            r#"{"retryAfterSeconds":30}"#,
+        ),
+    )]);
+
+    let error = client
+        .get(&pods(), &Scope::in_namespace("shop"), "web")
+        .expect_err("429 is not an object");
+
+    assert_eq!(error.kind(Operation::Get), ErrorKind::RateLimited);
+    assert_eq!(error.retry_after(), Some(Duration::from_secs(2)));
+}
+
+#[test]
+fn should_leave_the_retryability_of_a_gateway_timeout_unknown_rather_than_calling_it_yes() {
+    // §19.4 of the generic contract: retryability is declared where it is known, and what is not
+    // known is not "yes". A 504 means the request may have reached the API server and may have
+    // been executed — for a read that is harmless, for a mutation it is not, and the error alone
+    // cannot tell which it was. Saying "yes" here is how the safety decision quietly moves from
+    // the caller to the error.
+    let mut client = client(&[json_response(
+        "504 Gateway Timeout",
+        &status(
+            504,
+            "Timeout",
+            "request did not complete within the allotted time",
+        ),
+    )]);
+
+    let error = client
+        .get(&pods(), &Scope::in_namespace("shop"), "web")
+        .expect_err("504 is not an object");
+
+    assert_eq!(error.kind(Operation::Get), ErrorKind::Timeout);
+    assert_eq!(error.retryability(), Retryability::Unknown);
+    assert!(!error.retryability().is_declared_safe());
+}
+
+#[test]
+fn should_keep_the_named_diagnostic_headers_and_no_others() {
+    // §19.2 of the generic contract: provider-native codes, request identifiers and safe
+    // diagnostic fields may be preserved, and secrets must not. An allow-list of four named
+    // headers is the only version of that rule that fails closed — a filter that removes the
+    // headers it knows to be dangerous keeps the one nobody thought of, and a `Set-Cookie`
+    // echoed into a `Debug` line is a session token in a log file.
+    let mut client = client(&[response(
+        "429 Too Many Requests",
+        &[
+            ("Audit-Id", "8f0c-1"),
+            ("Retry-After", "1"),
+            ("X-Kubernetes-PF-FlowSchema-UID", "flow-77"),
+            ("X-Kubernetes-PF-PriorityLevel-UID", "level-4"),
+            ("Set-Cookie", "session=s3cr3t"),
+            ("Content-Type", "application/json"),
+        ],
+        &status(429, "TooManyRequests", "please try again later"),
+    )]);
+
+    let error = client
+        .get(&pods(), &Scope::in_namespace("shop"), "web")
+        .expect_err("429 is not an object");
+
+    let status = error.status().expect("a Status came back");
+    assert_eq!(status.request_id(), Some("8f0c-1"));
+    assert_eq!(status.flow_schema_uid(), Some("flow-77"));
+    assert_eq!(status.priority_level_uid(), Some("level-4"));
+
+    let rendered = format!("{error:?}");
+    assert!(
+        !rendered.contains("s3cr3t"),
+        "a header nobody allow-listed came along: {rendered}"
+    );
+}
+
+#[test]
+fn should_keep_the_scopes_that_answered_when_one_api_group_is_not_served() {
+    // §48.6: an all-resource view spanning several GVRs may keep what it saw, as long as the hole
+    // is stated. The taxonomy and the coverage vocabulary meet here — `api_not_served` becomes a
+    // `not served` gap rather than a second, parallel way of saying "incomplete" — and the
+    // failure this prevents is the tidy one: dropping the pods because the widgets CRD is absent.
+    let mut client = client(&[
+        json_response(
+            "200 OK",
+            &pod_list("400", None, &[pod("web", "u-1", "400")]),
+        ),
+        json_response(
+            "404 Not Found",
+            &status(
+                404,
+                "NotFound",
+                "the server could not find the requested resource",
+            ),
+        ),
+    ]);
+    let scope = Scope::all_namespaces();
+
+    let pods_seen = client.list(&pods(), &scope, &ListOptions::new());
+    let widgets_seen = client.list(&widgets(), &scope, &ListOptions::new());
+
+    let mut coverage = Coverage::complete(scope.clone());
+    coverage.observed(scope.clone());
+    let error = widgets_seen.error().expect("the widget list failed");
+    assert_eq!(error.kind(Operation::List), ErrorKind::ApiNotServed);
+    coverage.record(Gap::new(scope, error.outcome(Operation::List)));
+
+    assert_eq!(pods_seen.objects().len(), 1, "what answered is kept");
+    assert!(!coverage.is_complete());
+    assert_eq!(coverage.describe(), "all-namespaces: not served");
 }

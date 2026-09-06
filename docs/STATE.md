@@ -242,6 +242,22 @@ both halves:
 
 ## Found, not yet filed
 
+- **`tests/isolation.rs` fails about one run in four under `cargo test --workspace` (2026-09-06).**
+  Always a TLS handshake rejection reaching the plugin as `invalid peer certificate: BadSignature`,
+  seen at three different lines in the file, and essentially never when the suite runs alone —
+  including with `--test-threads=3`. **Four explanations have been ruled out with evidence**, so
+  the next person does not repeat them: it is not the host call deadline (the test already sets
+  120 s, and a deadline does not produce a signature rejection); it is not ECDSA DER signature
+  encoding (switching both key pairs to Ed25519 left 4 failures in 15 runs); it is not
+  wrong-cluster routing (`network_connect` selects on `server_name == host`, deterministically);
+  and it is not another process editing concurrently (it reproduces with nothing else running).
+  What is still unknown is the part that matters: **whether the defect is in the fixture or in
+  `broker.rs`'s `ByteStream`.** The fixture serves TLS from a task that runs only when the client
+  writes, and `decrypt` swallows a `process_new_packets` error by returning empty and continuing
+  with a broken session — both are suspicious. But a byte stream that loses, reorders or merges
+  chunks under load would corrupt a real cluster connection too, and the fixture would merely be
+  what made it visible. That question must be answered before this is called a test problem.
+
 - **`get pod` needs core's contributed-target route, which landed on 2026-09-05.** ADR-0582 in
   core wires a contributed *target* to `provider.query`; before it, a package could only answer
   `get` through a contributed *command*, which returns whatever it likes with no declared schema,

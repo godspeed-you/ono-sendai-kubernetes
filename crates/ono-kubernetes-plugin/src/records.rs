@@ -22,8 +22,9 @@ use std::sync::Arc;
 use ono_provider_kubernetes::condition;
 use ono_provider_kubernetes::discovery::Resource;
 use ono_provider_kubernetes::object::{Object, OwnerReference};
+use ono_provider_kubernetes::place::Place;
 use ono_provider_kubernetes::redaction::Guarded;
-use ono_provider_kubernetes::relationship::Relation;
+use ono_provider_kubernetes::relationship::{Edge, Relation};
 use ono_provider_kubernetes::transport::{EndpointCategory, Freshness, Origin};
 use ono_provider_kubernetes::workload::{Endpoint as WorkloadEndpoint, Workload};
 use ono_value::{ErrorValue, MapValue, Provenance, RecordValue, Schema, Value, builtin_schemas};
@@ -57,6 +58,92 @@ pub fn record(
     let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
     for field in target.fields {
         builder = builder.set(field.name, field_value(field.name, guarded))?;
+    }
+    Ok(Value::Record(Arc::new(builder.build())))
+}
+
+/// Builds one record of one relationship, with the evidence it rests on (§23 to §32, Gate D).
+///
+/// The source's metadata comes from the same projection every other schema uses, so `uid`,
+/// `name`, `namespace`, `api_version` and `kind` mean here exactly what they mean there: this
+/// record is a fact *about* that object (ADR-0013). What the edge adds is the word, the far end
+/// and the evidence, and the evidence is not optional in any of its three parts — the class, what
+/// was read, and whether the API server states it or this provider derived it.
+///
+/// Both places are built by `place.rs` and handed in rather than formatted here (§35.4,
+/// ADR-0008). That is what keeps a cluster-scoped target from acquiring the source's namespace,
+/// and it is why the far end of an edge nobody has read is still an address (§24.1). They are
+/// arguments because an address that cannot be built is a refusal the caller expresses in the
+/// error vocabulary of the wire, which this function has no way to reach.
+///
+/// # Errors
+///
+/// [`ErrorValue`] when a field name is not one the schema declares — a drift between this crate's
+/// table and the schema built from it, never something a cluster can cause.
+pub fn edge_record(
+    target: &Target,
+    schema: &Arc<Schema>,
+    here: &Place,
+    there: &Place,
+    source: &Guarded,
+    edge: &Edge,
+    freshness: &Freshness,
+) -> Result<Value, ErrorValue> {
+    let evidence = edge.evidence();
+    let mut builder = RecordValue::builder(Arc::clone(schema), provenance(schema, freshness));
+    for field in target.fields {
+        let value = match field.name {
+            // --- what it is, in the vocabulary `follow` takes (§35.7) ---
+            "relation" => Value::String(edge.relation().as_str().into()),
+
+            // --- where it starts and where it points, as places (§35.4) ---
+            "source" => Value::String(here.uri().to_string().into()),
+            "target" => Value::String(there.uri().to_string().into()),
+            "target_kind" => Value::String(edge.target().kind().into()),
+            "target_name" => Value::String(edge.target().name().into()),
+            // Null is cluster scope and never "wherever the source lives": a namespace copied
+            // onto a cluster-scoped target would name an address nobody can look up (§9.2, §24.2).
+            "target_namespace" => text(edge.target().namespace()),
+            "target_uid" => text(edge.target().uid()),
+            // §24.1: an edge whose far end nobody read is a relationship rather than a broken
+            // edge, and the record says which of the two this is instead of hiding it.
+            "target_resolved" => Value::Bool(edge.target().is_resolved()),
+            // §36.1 and §36.2: the role overlay travels beside the native kind, never instead of
+            // it. An empty list is a kind with no role, which is a statement rather than a gap.
+            "target_roles" => Value::List(
+                there
+                    .roles()
+                    .iter()
+                    .map(|role| Value::String(role.as_str().into()))
+                    .collect(),
+            ),
+
+            // --- why it exists: Gate D, in three fields that cannot be dropped ---
+            "evidence_class" => Value::String(evidence.class().into()),
+            "evidence" => Value::String(evidence.describe().into()),
+            // Only the classes that rest on one field cite a pointer. Reporting one for a
+            // selector evaluation would name a field as the proof when the proof is two objects.
+            "evidence_path" => text(evidence.path()),
+            // §23.3: the server states a selector and it states some labels, and it is *this*
+            // provider that evaluated one against the other. §4 invariant 20 is the reason the
+            // difference is a field rather than a footnote.
+            "asserted" => Value::Bool(evidence.is_asserted_by_provider()),
+            // What qualifies the edge without deciding it: the host, path and port §27.1
+            // requires to stay attached, the adapter that read a custom resource (§33.8). Each
+            // entry keeps its own class, because a supporting fact is checkable on the same terms
+            // as a deciding one.
+            "supporting" => Value::List(
+                edge.supporting()
+                    .iter()
+                    .map(|support| {
+                        Value::String(format!("{}: {}", support.class(), support.describe()).into())
+                    })
+                    .collect(),
+            ),
+
+            name => field_value(name, source),
+        };
+        builder = builder.set(field.name, value)?;
     }
     Ok(Value::Record(Arc::new(builder.build())))
 }

@@ -1,7 +1,7 @@
 //! HTTP/1.1 over a byte stream, Kubernetes requests over that, and what a read knows about
 //! itself.
 //!
-//! Specification §17, §18, §19.1, §20.1, §20.2 and §21.4. Core `ADR-0573` is why this module
+//! Specification §17, §18, §19.1, §20.1, §20.2, §21.4 and §48. Core `ADR-0573` is why this module
 //! exists at all: KUANG/11 brokers a *connection* and deliberately serves no `network.request`,
 //! because "a request is a protocol, HTTP today, whatever else tomorrow, spoken over a connection
 //! the host brokers". The host verified the destination, not the protocol — so the protocol is
@@ -23,7 +23,7 @@
 //! chunk frames, freshness, coverage — and stops there.
 
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value as Json;
 
@@ -760,17 +760,70 @@ impl<S: ByteStream> ResponseStream<'_, S> {
 
 // --- Kubernetes errors ---------------------------------------------------------------------------
 
+/// One reason a `Status` gives for refusing, naming the field it refused (§48.5).
+///
+/// Admission and validation answer with a list of these. The prose message repeats them in
+/// English, which is fine to read and useless to act on: `spec.replicas` as a field name can be
+/// pointed at, highlighted or compared with what was sent, and the same string inside a sentence
+/// cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cause {
+    reason: Option<String>,
+    message: Option<String>,
+    field: Option<String>,
+}
+
+impl Cause {
+    /// The machine-readable reason, such as `FieldValueInvalid`.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    /// What the server said about this one cause.
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    /// The field path the cause is about.
+    #[must_use]
+    pub fn field(&self) -> Option<&str> {
+        self.field.as_deref()
+    }
+}
+
 /// A Kubernetes `Status`, as the server sends it when it refuses.
 ///
-/// Kept whole rather than reduced to a code: the message is the part that names the missing
-/// permission or the expired token, and it is the part an operator can act on.
+/// Kept whole rather than reduced to a code: `reason` is the field the taxonomy is decided on
+/// (§48.2), `details` names the group, kind and object the refusal is about, `causes` names the
+/// fields admission rejected (§48.5), and the message is the part an operator reads.
+///
+/// Four values here did not come from the body at all — the request identifier, the retry advice
+/// and the two API Priority and Fairness identifiers arrive in the response head (§49.2). They
+/// ride along on the `Status` because the head and the body are one refusal: splitting them would
+/// make "what the server said" a different shape depending on which [`ApiError`] variant carried
+/// it, and a caller would have to destructure twice to ask one question.
+///
+/// **Which headers are kept is an allow-list, and that is the security property.** §19.2 of the
+/// generic contract permits provider-native diagnostics and forbids secrets, and only an
+/// allow-list satisfies both: a filter that strips the headers known to be dangerous keeps the
+/// one nobody thought of, and a `Set-Cookie` surviving into a `Debug` line is a session token in
+/// a log file. Four headers are named below. Everything else is dropped unread.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
     code: Option<u16>,
     reason: Option<String>,
     message: Option<String>,
+    details_group: Option<String>,
     details_kind: Option<String>,
     details_name: Option<String>,
+    retry_after_seconds: Option<u64>,
+    causes: Vec<Cause>,
+    request_id: Option<String>,
+    retry_after_header: Option<String>,
+    flow_schema_uid: Option<String>,
+    priority_level_uid: Option<String>,
 }
 
 impl Status {
@@ -789,9 +842,40 @@ impl Status {
                 .and_then(|code| u16::try_from(code).ok()),
             reason: text(json.get("reason")),
             message: text(json.get("message")),
+            details_group: text(details.and_then(|details| details.get("group"))),
             details_kind: text(details.and_then(|details| details.get("kind"))),
             details_name: text(details.and_then(|details| details.get("name"))),
+            retry_after_seconds: details
+                .and_then(|details| details.get("retryAfterSeconds"))
+                .and_then(Json::as_u64),
+            causes: details
+                .and_then(|details| details.get("causes"))
+                .and_then(Json::as_array)
+                .map(|causes| causes.iter().map(cause).collect())
+                .unwrap_or_default(),
+            ..Self::default()
         })
+    }
+
+    /// Reads what the response said about the refusal, head and body together.
+    ///
+    /// The body may be anything — a proxy's HTML, an empty document — so the head is the part
+    /// that is always there, and a refusal with no `Status` still knows its code.
+    #[must_use]
+    fn from_response(response: &Response) -> Self {
+        let body = Self::parse(response.body())
+            .unwrap_or_else(|| Self::from_http(response.status(), response.reason()));
+        Self {
+            request_id: response.header("audit-id").map(str::to_owned),
+            retry_after_header: response.header("retry-after").map(str::to_owned),
+            flow_schema_uid: response
+                .header("x-kubernetes-pf-flowschema-uid")
+                .map(str::to_owned),
+            priority_level_uid: response
+                .header("x-kubernetes-pf-prioritylevel-uid")
+                .map(str::to_owned),
+            ..body
+        }
     }
 
     /// What is known when the server did not send a `Status` at all — a proxy's error page, say.
@@ -799,10 +883,8 @@ impl Status {
     pub fn from_http(code: u16, reason: &str) -> Self {
         Self {
             code: Some(code),
-            reason: None,
             message: (!reason.is_empty()).then(|| reason.to_owned()),
-            details_kind: None,
-            details_name: None,
+            ..Self::default()
         }
     }
 
@@ -835,10 +917,305 @@ impl Status {
     pub fn details_name(&self) -> Option<&str> {
         self.details_name.as_deref()
     }
+
+    /// The API group the details name (§48.1).
+    ///
+    /// Empty for the core group, which is why it is `None` rather than `""`: an absent group and
+    /// the core group are the same fact spelled two ways, and only one of them sorts.
+    #[must_use]
+    pub fn details_group(&self) -> Option<&str> {
+        self.details_group.as_deref()
+    }
+
+    /// What admission or validation refused, field by field (§48.5).
+    #[must_use]
+    pub fn causes(&self) -> &[Cause] {
+        &self.causes
+    }
+
+    /// The `Audit-Id` the API server stamped on this exchange.
+    ///
+    /// §19.2 of the generic contract calls this a request identifier, and it is the one string
+    /// that lets a cluster administrator find this exact request in the audit log. It carries no
+    /// user data, which is why it is on the allow-list.
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    /// Which API Priority and Fairness flow schema matched this request (§49.2).
+    ///
+    /// The difference between "you were throttled" and "you were throttled because you match this
+    /// flow schema at this priority level" — the second one can be acted on, by moving the
+    /// workload's identity into a different flow schema or by asking for a different level.
+    #[must_use]
+    pub fn flow_schema_uid(&self) -> Option<&str> {
+        self.flow_schema_uid.as_deref()
+    }
+
+    /// Which API Priority and Fairness priority level queued this request (§49.2).
+    #[must_use]
+    pub fn priority_level_uid(&self) -> Option<&str> {
+        self.priority_level_uid.as_deref()
+    }
+
+    /// How long the server asked to be left alone, where it said (§48.1, §49.2).
+    ///
+    /// The `Retry-After` header wins over `details.retryAfterSeconds` when both are present: it
+    /// is the value §49.2 names, and it is the one an intermediary between this client and the
+    /// API server would have rewritten on the way back.
+    ///
+    /// Only the delay-seconds form is read. `Retry-After` may also carry an HTTP date, and
+    /// resolving one needs a clock and the server's idea of now; guessing at that would turn a
+    /// stated delay into an invented one, so an unreadable value is `None` and the caller falls
+    /// back to its own bounded backoff.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after_header
+            .as_deref()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .or(self.retry_after_seconds)
+            .map(Duration::from_secs)
+    }
 }
 
 fn text(value: Option<&Json>) -> Option<String> {
     value.and_then(Json::as_str).map(str::to_owned)
+}
+
+fn cause(value: &Json) -> Cause {
+    Cause {
+        reason: text(value.get("reason")),
+        message: text(value.get("message")),
+        field: text(value.get("field")),
+    }
+}
+
+/// What class of failure this is, in the vocabulary §48.2 requires.
+///
+/// The taxonomy is the layer between "what Kubernetes answered" and "what the user is told".
+/// [`ApiError`] keeps the native answer — the code, the `reason`, the causes, the audit id — and
+/// this says which of the seventeen things that answer *is*. Both are needed: the native detail
+/// is what an operator acts on, and the class is what a renderer, a retry policy and a coverage
+/// gap can all be decided from without re-reading prose.
+///
+/// The mapping is made on the structured `reason` first and the HTTP code second, because the
+/// reason is the more precise of the two and the code is the fallback for a server, or a
+/// middlebox, that sent none. A 500 carrying `ServerTimeout` is a request to try again; the same
+/// 500 read from its code alone is a generic failure nobody retries.
+///
+/// Five classes are never produced by this module and are named here anyway, because the
+/// taxonomy is one list rather than one list per module: `tls_error` comes from the TLS session
+/// below this one, `credential_error` from kubeconfig and exec credential plugins,
+/// `schema_error` from the OpenAPI projection, `partial_result` from a coverage gap, and
+/// `cancelled` from the host. A provider whose error words differ by which file produced them
+/// has no taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ErrorKind {
+    /// The credential was absent, malformed or expired: `401`.
+    Unauthenticated,
+    /// The credential was understood and is not allowed to do this: `403` (§21.4).
+    AuthorizationDenied,
+    /// The object asked for is not there.
+    NotFound,
+    /// Someone else wrote first, or the object already exists (§48.4).
+    Conflict,
+    /// Validation or admission refused the document (§48.5).
+    Invalid,
+    /// The request has not happened yet and should be repeated later (§49.2).
+    RateLimited,
+    /// The server could not complete in time and invites the request again.
+    ServerTimeout,
+    /// The request timed out with the server's outcome unknown.
+    Timeout,
+    /// The server is up and refusing work for now.
+    ServiceUnavailable,
+    /// This cluster serves no such endpoint (§11.5, §48.3).
+    ApiNotServed,
+    /// A `resourceVersion` or `continue` token is too old to resume from (§18.2, §19.4).
+    WatchExpired,
+    /// The bytes did not arrive, or did not arrive as an answer.
+    TransportError,
+    /// The TLS session could not be established or trusted (§8.4).
+    TlsError,
+    /// A credential could not be obtained or read (§8.2, §8.3).
+    CredentialError,
+    /// The document and the schema disagree (§12).
+    SchemaError,
+    /// Some of what was asked for came back, and some did not (§48.6).
+    PartialResult,
+    /// The caller stopped waiting (§50.1).
+    Cancelled,
+}
+
+impl ErrorKind {
+    /// Every class §48.2 requires, in the order that section lists them.
+    ///
+    /// A list rather than a doc sentence, so that a test can hold the vocabulary itself: the way
+    /// a taxonomy decays is one class at a time, each merge locally reasonable.
+    #[must_use]
+    pub fn taxonomy() -> [Self; 17] {
+        [
+            Self::Unauthenticated,
+            Self::AuthorizationDenied,
+            Self::NotFound,
+            Self::Conflict,
+            Self::Invalid,
+            Self::RateLimited,
+            Self::ServerTimeout,
+            Self::Timeout,
+            Self::ServiceUnavailable,
+            Self::ApiNotServed,
+            Self::WatchExpired,
+            Self::TransportError,
+            Self::TlsError,
+            Self::CredentialError,
+            Self::SchemaError,
+            Self::PartialResult,
+            Self::Cancelled,
+        ]
+    }
+
+    /// The word this class is reported under.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::AuthorizationDenied => "authorization denied",
+            Self::NotFound => "not found",
+            Self::Conflict => "conflict",
+            Self::Invalid => "invalid",
+            Self::RateLimited => "rate limited",
+            Self::ServerTimeout => "server timeout",
+            Self::Timeout => "timeout",
+            Self::ServiceUnavailable => "service unavailable",
+            Self::ApiNotServed => "api not served",
+            Self::WatchExpired => "watch expired",
+            Self::TransportError => "transport error",
+            Self::TlsError => "tls error",
+            Self::CredentialError => "credential error",
+            Self::SchemaError => "schema error",
+            Self::PartialResult => "partial result",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Whether repeating the request could plausibly succeed (§19.4 of the generic contract).
+    ///
+    /// This is a statement about the *failure*, never about the request. An error saying
+    /// [`Retryability::Yes`] does not make a repeat safe — that also depends on whether the
+    /// operation can be replayed at all, which is the caller's fact and not the server's
+    /// (§49.3). What this rules out is the other direction: a `403` or a `409` cannot become a
+    /// success by being asked again, and spending a retry budget on one is spending it on
+    /// arithmetic.
+    #[must_use]
+    pub fn retryability(self) -> Retryability {
+        match self {
+            Self::RateLimited | Self::ServerTimeout | Self::ServiceUnavailable => Retryability::Yes,
+            // The server may have executed the request before the answer was lost. For a read
+            // that is harmless and for a mutation it is not, and the error cannot tell which.
+            Self::Timeout | Self::TransportError | Self::PartialResult => Retryability::Unknown,
+            Self::Unauthenticated
+            | Self::AuthorizationDenied
+            | Self::NotFound
+            | Self::Conflict
+            | Self::Invalid
+            | Self::ApiNotServed
+            | Self::WatchExpired
+            | Self::TlsError
+            | Self::CredentialError
+            | Self::SchemaError
+            | Self::Cancelled => Retryability::No,
+        }
+    }
+
+    fn from_reason(reason: &str, operation: Operation) -> Option<Self> {
+        Some(match reason {
+            "Unauthorized" => Self::Unauthenticated,
+            "Forbidden" => Self::AuthorizationDenied,
+            "NotFound" => Self::absence(operation),
+            "AlreadyExists" | "Conflict" => Self::Conflict,
+            "Gone" | "Expired" | "ResourceExpired" => Self::WatchExpired,
+            "Invalid" | "BadRequest" | "RequestEntityTooLarge" => Self::Invalid,
+            "ServerTimeout" => Self::ServerTimeout,
+            "Timeout" | "StoreReadError" => Self::Timeout,
+            "TooManyRequests" => Self::RateLimited,
+            "ServiceUnavailable" | "InternalError" => Self::ServiceUnavailable,
+            "MethodNotAllowed" => Self::ApiNotServed,
+            "NotAcceptable" | "UnsupportedMediaType" => Self::SchemaError,
+            _ => return None,
+        })
+    }
+
+    fn from_code(code: u16, operation: Operation) -> Self {
+        match code {
+            400 | 413 | 422 => Self::Invalid,
+            401 => Self::Unauthenticated,
+            403 => Self::AuthorizationDenied,
+            404 => Self::absence(operation),
+            405 => Self::ApiNotServed,
+            406 | 415 => Self::SchemaError,
+            409 => Self::Conflict,
+            410 => Self::WatchExpired,
+            429 => Self::RateLimited,
+            504 => Self::Timeout,
+            // A code this provider has no rule for still points somewhere: a 4xx is the server
+            // saying the request was wrong, a 5xx is the server saying it failed, and those are
+            // the two directions an operator moves in.
+            other if (400..500).contains(&other) => Self::Invalid,
+            other if other >= 500 => Self::ServiceUnavailable,
+            _ => Self::TransportError,
+        }
+    }
+
+    /// What "it is not there" means for the operation that asked (§48.3).
+    ///
+    /// One object being absent is a fact about the cluster's contents. A collection endpoint
+    /// being absent is a fact about what the cluster serves at all, and reading it as an empty
+    /// collection is how an uninstalled CRD renders as "you have no widgets".
+    fn absence(operation: Operation) -> Self {
+        match operation {
+            Operation::Get => Self::NotFound,
+            Operation::List => Self::ApiNotServed,
+        }
+    }
+}
+
+/// Whether repeating a request could succeed, as far as the failure says (§19.4).
+///
+/// Three answers rather than two, and the third is the one that matters: an unknown outcome is
+/// not a permission to retry. Collapsing `Unknown` into `Yes` moves the safety decision from the
+/// caller — who knows whether the operation can be replayed — into the error, which does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retryability {
+    /// The failure is transient and a repeat may succeed.
+    Yes,
+    /// A repeat cannot succeed; something else has to change first.
+    No,
+    /// The server's outcome is not known, so only an operation that can prove replay is harmless
+    /// may try again.
+    Unknown,
+}
+
+impl Retryability {
+    /// The word this is reported under.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Yes => "retryable",
+            Self::No => "not retryable",
+            Self::Unknown => "retryability unknown",
+        }
+    }
+
+    /// Whether the failure itself declares a repeat to be worthwhile.
+    ///
+    /// Deliberately false for [`Self::Unknown`]: §19.4 says retryability is declared where it is
+    /// known, and what is not known is not "yes".
+    #[must_use]
+    pub fn is_declared_safe(self) -> bool {
+        matches!(self, Self::Yes)
+    }
 }
 
 /// Which operation asked, because the answer to a refusal depends on it.
@@ -925,6 +1302,56 @@ impl ApiError {
         matches!(self, Self::ContinuityExpired(_))
     }
 
+    /// Which class of failure this is, in §48.2's vocabulary.
+    ///
+    /// The operation is an argument for the same reason it is one on [`Self::outcome`]: a `404`
+    /// answers two different questions depending on what was asked (§48.3).
+    #[must_use]
+    pub fn kind(&self, operation: Operation) -> ErrorKind {
+        // The three failures below never reached a Kubernetes answer. A body that is not a
+        // Kubernetes document is counted with them rather than as a schema disagreement: the
+        // usual sender of an HTML page on a 200 is a proxy between this client and the API
+        // server, and pointing an operator at API versions when the problem is their ingress
+        // costs them the afternoon.
+        let status = match self {
+            Self::Stream(_) | Self::Protocol(_) | Self::Malformed(_) => {
+                return ErrorKind::TransportError;
+            }
+            _ => match self.status() {
+                Some(status) => status,
+                None => return ErrorKind::TransportError,
+            },
+        };
+        if let Some(reason) = status.reason()
+            && let Some(kind) = ErrorKind::from_reason(reason, operation)
+        {
+            return kind;
+        }
+        ErrorKind::from_code(
+            self.code().or_else(|| status.code()).unwrap_or_default(),
+            operation,
+        )
+    }
+
+    /// Whether the failure declares a repeat worth attempting (§19.4).
+    ///
+    /// Independent of the operation: `not_found` and `api_not_served` are the two readings of a
+    /// `404` and neither is retryable, so the split does not change the answer.
+    #[must_use]
+    pub fn retryability(&self) -> Retryability {
+        self.kind(Operation::Get).retryability()
+    }
+
+    /// How long the server asked to be left alone (§48.1, §49.2).
+    ///
+    /// Present on any refusal that carried the advice, not only on a `429`: a `503` with a
+    /// `Retry-After` has said the same thing, and dropping it there while honouring it on a `429`
+    /// is honouring a header selectively.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.status().and_then(Status::retry_after)
+    }
+
     /// The coverage outcome this answer amounts to, for the operation that asked (§21.4).
     ///
     /// The operation matters: the same `403` is a refused read for a get and a refused list for a
@@ -1002,9 +1429,7 @@ fn classify(response: Response) -> Result<Response, ApiError> {
         return Ok(response);
     }
     let retry_after = response.header("retry-after").map(str::to_owned);
-    let status = Status::parse(response.body())
-        .unwrap_or_else(|| Status::from_http(code, response.reason()));
-    let status = Box::new(status);
+    let status = Box::new(Status::from_response(&response));
     Err(match code {
         403 => ApiError::Denied(status),
         404 => ApiError::NotFound(status),

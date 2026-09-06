@@ -135,6 +135,13 @@ fn should_declare_every_field_as_exactly_one_of_required_and_nullable() {
 #[test]
 fn should_identify_every_kubernetes_object_by_uid_rather_than_by_name() {
     for target in TARGETS {
+        // A relationship is the one thing this package answers for that is not an object: it has
+        // no `metadata.uid`, so it is keyed on the four things that make two edges the same edge.
+        // The exception is named here rather than written as `!= relation`, so that a *second*
+        // schema drifting off `uid` fails this test instead of joining a category.
+        if matches!(target.reads, Reads::Relations) {
+            continue;
+        }
         let schema = target.schema_contribution().to_schema().unwrap();
         let identity: Vec<&str> = schema.identity().iter().map(|field| &**field).collect();
         assert_eq!(
@@ -148,6 +155,38 @@ fn should_identify_every_kubernetes_object_by_uid_rather_than_by_name() {
             target.fields.iter().any(|field| field.name == "name"),
             "`{}` still carries the name as a locator (§16.2)",
             target.schema
+        );
+    }
+}
+
+#[test]
+fn should_key_an_edge_on_what_makes_two_edges_the_same_edge() {
+    // ADR-0014. An edge has no `metadata.uid`, and every component below is there because
+    // dropping it merges edges that are not the same relationship: `owned-by` and `controlled-by`
+    // are one fact at two strengths (§24.3), one Pod's two owner references differ only in the
+    // far end, and a Pod naming one ConfigMap from two containers differs only in the pointer.
+    let relation = target("k8s-relation").expect("the package answers for `k8s-relation`");
+    let schema = relation.schema_contribution().to_schema().unwrap();
+    let identity: Vec<&str> = schema.identity().iter().map(|field| &**field).collect();
+    assert_eq!(identity, vec!["uid", "relation", "target", "evidence_path"]);
+    for component in &identity {
+        assert!(
+            relation.fields.iter().any(|field| field.name == *component),
+            "`{component}` is part of the identity and must be a field of the schema"
+        );
+    }
+    // Gate D (§62.4) as a schema obligation: an edge that could not name its class, what was
+    // read, or whether the API server stated it would not be checkable.
+    for required in ["evidence_class", "evidence", "asserted", "supporting"] {
+        let field = relation
+            .fields
+            .iter()
+            .find(|field| field.name == required)
+            .unwrap_or_else(|| panic!("Gate D needs `{required}` on every edge"));
+        assert!(
+            field.required,
+            "`{required}` is what makes an edge checkable rather than trusted, so it is never \
+             absent"
         );
     }
 }

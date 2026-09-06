@@ -21,12 +21,16 @@
 //! redaction     Secret payloads, destroyed at the boundary rather than filtered
 //! place         resources as addresses, and what is near them
 //! coverage      what a query observed, and what it did not
+//! budget        what a query may cost, and what it says when it stops
 //! diagnostics   which cluster this is, whether it answers, and who the provider is to it
 //! kubeconfig    a context becomes a connection identity
+//! live          a bounded view of a watch, and the states it may honestly show
+//! logs          container logs as observations, and the remote sessions this cannot open
 //! tls           a TLS session, wrapping the brokered byte stream below HTTP
 //! session       what one provider instance holds between two invocations
 //! ```
 
+pub mod budget;
 pub mod condition;
 pub mod coverage;
 pub mod diagnostics;
@@ -34,6 +38,8 @@ pub mod discovery;
 pub mod events;
 pub mod evidence;
 pub mod kubeconfig;
+pub mod live;
+pub mod logs;
 pub mod object;
 pub mod place;
 pub mod redaction;

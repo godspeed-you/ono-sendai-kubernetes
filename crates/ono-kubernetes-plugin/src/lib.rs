@@ -12,6 +12,7 @@
 //! cluster         the diagnostic: which cluster, reachable, as whom, and what is unknown
 //! dynamic         a resource nobody compiled in: resolving it, and typing it from the cluster
 //! records         one Kubernetes object, as a record of the target's schema
+//! relations       one object's relationships, as a record per edge with its evidence
 //! ```
 //!
 //! **`main.rs` is four lines on purpose.** Everything above lives in the library so that the
@@ -23,6 +24,7 @@ pub mod contributions;
 pub mod dynamic;
 pub mod query;
 pub mod records;
+pub mod relations;
 
 use ono_kuang_sdk::Plugin;
 
@@ -55,6 +57,7 @@ pub fn plugin() -> Plugin {
             // rather than a collection, and there is no listing path it could take.
             .provider(target.name, move |ctx| match target.reads {
                 contributions::Reads::Instance => cluster::answer(target, ctx),
+                contributions::Reads::Relations => relations::answer(target, ctx),
                 contributions::Reads::Kind { .. } | contributions::Reads::Discovered => {
                     query::answer(target, ctx)
                 }

@@ -83,6 +83,15 @@ pub enum Reads {
     /// facts about the session rather than about anything in the cluster. A group and a kind here
     /// would name a collection nobody lists.
     Instance,
+    /// The relationships of one object, rather than the object (§23 to §32, Gate D).
+    ///
+    /// A relationship has no `metadata.uid` and is not fetched from a collection: it is derived
+    /// from one object the query names, plus — for the derived classes — whatever second reading
+    /// the rule needs. So this variant names no kind either. Which object the edges start at is
+    /// the *query's* answer, resolved against discovery exactly as [`Self::Discovered`] resolves
+    /// one, which is what makes a CRD's owner references reachable without recompiling anything
+    /// (§33.1). ADR-0014.
+    Relations,
 }
 
 impl Reads {
@@ -91,7 +100,7 @@ impl Reads {
     pub const fn group(self) -> Option<&'static str> {
         match self {
             Self::Kind { group, .. } => Some(group),
-            Self::Discovered | Self::Instance => None,
+            Self::Discovered | Self::Instance | Self::Relations => None,
         }
     }
 
@@ -100,7 +109,7 @@ impl Reads {
     pub const fn kind(self) -> Option<&'static str> {
         match self {
             Self::Kind { kind, .. } => Some(kind),
-            Self::Discovered | Self::Instance => None,
+            Self::Discovered | Self::Instance | Self::Relations => None,
         }
     }
 }
@@ -134,7 +143,11 @@ impl Target {
             id: self.schema.to_owned(),
             name: self.schema_name.to_owned(),
             summary: self.schema_summary.to_owned(),
-            identity: vec![IDENTITY.to_owned()],
+            identity: self
+                .identity_fields()
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect(),
             fields: self
                 .fields
                 .iter()
@@ -145,6 +158,20 @@ impl Target {
                     nullable: !field.required,
                 })
                 .collect(),
+        }
+    }
+
+    /// What makes two records of this target's schema the same thing.
+    ///
+    /// [`IDENTITY`] for everything that projects a Kubernetes object, without exception. An edge
+    /// is the one thing here that is not an object: it has no `metadata.uid`, so it is keyed on
+    /// `uid`, `relation`, `target` and `evidence_path` — the object it starts at, the word, the
+    /// far end, and the field that decided. See ADR-0014 for why all four are needed.
+    #[must_use]
+    pub const fn identity_fields(&self) -> &'static [&'static str] {
+        match self.reads {
+            Reads::Relations => EDGE_IDENTITY,
+            Reads::Kind { .. } | Reads::Discovered | Reads::Instance => OBJECT_IDENTITY,
         }
     }
 
@@ -167,6 +194,25 @@ impl Target {
 /// inherit the history of the one it replaced, which is precisely the discontinuity §16.3 exists
 /// to make visible.
 pub const IDENTITY: &str = "uid";
+
+/// [`IDENTITY`] as a schema's identity list.
+const OBJECT_IDENTITY: &[&str] = &[IDENTITY];
+
+/// What makes two edges the same edge (§23, §24.1, ADR-0014).
+///
+/// Four components, and each one is there because dropping it merges edges that are not the same
+/// relationship:
+///
+/// - `uid` — the object the edge starts at, by the identity every other schema here uses. Two
+///   edges of one Pod share it, which is exactly why it is not the whole key;
+/// - `relation` — `owned-by` and `controlled-by` are the same fact read at two strengths (§24.3)
+///   and a key without the word would collapse them;
+/// - `target` — the far end's address, which is what distinguishes one owner reference from the
+///   next. An address rather than a UID, because §24.1 keeps an edge whose target nobody read;
+/// - `evidence_path` — a Pod that names one ConfigMap from two containers has two edges, and the
+///   pointer is the only thing that differs. Null for the classes that rest on no single field,
+///   where the three components above already separate them.
+const EDGE_IDENTITY: &[&str] = &["uid", "relation", "target", "evidence_path"];
 
 /// The metadata every Kubernetes object carries, projected the same way for every kind (§14).
 ///
@@ -495,6 +541,60 @@ const RESOURCE_FIELDS: [Field; 18] = with_metadata(
         Field::required("untyped", "list<string>"),
     ],
 );
+
+/// One relationship, with the evidence that decided it (§23 to §32, Gate D, ADR-0014).
+///
+/// **A record per edge, rather than a list of edges on the object's record.** An edge is a value
+/// a pipeline filters, sorts and groups; folded into a Pod's record it would be one opaque list
+/// field, and every one of the nineteen schemas would grow it. It would also inherit the object's
+/// identity, so a Pod's six relationships would be one thing six times.
+///
+/// Four groups of fields, and the boundaries between them are the point:
+///
+/// - **where it starts** — §14's metadata of the source object, spelled exactly as every other
+///   schema here spells it, plus `source` as the place address of §35.4. The record is a fact
+///   *about* that object, which is why `uid` means here what it means everywhere else;
+/// - **what it is** — `relation`, the word `follow` takes (§35.7). One vocabulary: a curated
+///   routing edge and an owner reference are the same kind of thing with different evidence
+///   behind them;
+/// - **where it points** — the far end, as an address and in parts. `target_resolved` is false
+///   for an edge whose target nobody read, which §24.1 requires to stay an edge; `target_uid` is
+///   then whatever the reference itself carried, and null where it carried none. `target_roles`
+///   is §36.2's overlay, beside the native kind rather than instead of it (§36.1);
+/// - **why it exists** — `evidence_class` is Gate D's six-way choice, `evidence` is what was read
+///   and what it held, `evidence_path` is the pointer where the class cites one, and `asserted`
+///   is §23.3's distinction: the API server states an owner reference and a `nodeName`, and it is
+///   *this provider* that evaluates a selector against labels. `supporting` carries what
+///   qualifies the edge without deciding it — the host, path and port §27.1 requires to stay
+///   attached, the adapter that read a custom resource (§33.8).
+///
+/// Everything but `evidence_path` and the two nullable target parts is required, because an edge
+/// that could not say one of them would not be checkable, and Gate D is the requirement that it
+/// is.
+const RELATION_FIELDS: &[Field] = &[
+    Field::nullable("uid", "string"),
+    Field::required("name", "string"),
+    Field::nullable("namespace", "string"),
+    Field::required("api_version", "string"),
+    Field::required("kind", "string"),
+    Field::required("source", "string"),
+    Field::required("relation", "string"),
+    Field::required("target", "string"),
+    Field::required("target_kind", "string"),
+    Field::required("target_name", "string"),
+    Field::nullable("target_namespace", "string"),
+    Field::nullable("target_uid", "string"),
+    Field::required("target_resolved", "bool"),
+    Field::required("target_roles", "list<string>"),
+    Field::required(
+        "evidence_class",
+        "enum<native-field|owner-reference|selector|convention|adapter-derivation|inference>",
+    ),
+    Field::required("evidence", "string"),
+    Field::nullable("evidence_path", "string"),
+    Field::required("asserted", "bool"),
+    Field::required("supporting", "list<string>"),
+];
 
 /// What `k8s-cluster` answers: which cluster this is, whether it answers, and who the provider is
 /// to it (§8.5, §8.6, §10, §34.3, §61.1).
@@ -837,6 +937,20 @@ pub static TARGETS: &[Target] = &[
                        whatever kind they are.",
         reads: Reads::Discovered,
         fields: &RESOURCE_FIELDS,
+    },
+    Target {
+        name: "k8s-relation",
+        schema: "io.github.godspeed-you.kubernetes.relation/1",
+        schema_name: "KubernetesRelation",
+        schema_summary: "One relationship between two Kubernetes objects, and the evidence it \
+                         rests on.",
+        summary: "What one object is related to, with the evidence class and the fields that \
+                  decided each edge (specification sections 23 to 32).",
+        identity_doc: "Two observations are the same edge when the object they start at, the \
+                       relationship word, the far end's address and the field that decided all \
+                       match. An edge has no `metadata.uid` of its own.",
+        reads: Reads::Relations,
+        fields: RELATION_FIELDS,
     },
     Target {
         name: "k8s-cluster",

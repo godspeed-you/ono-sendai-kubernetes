@@ -134,27 +134,89 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
         return Outcome::Cancelled;
     }
 
-    // The brokered connection borrows the context for as long as it lives, so the whole
-    // conversation with the API server happens inside this block and only its result escapes.
+    let answer = converse(
+        ctx,
+        &endpoint,
+        Listed {
+            target,
+            endpoint: &endpoint,
+            selector: &selector,
+            lookup: lookup.as_deref(),
+        },
+    );
+    let (answer, shape) = match answer {
+        Ok(answer) => answer,
+        Err(error) => return Outcome::Failed(error),
+    };
+    emit(ctx, target, &schema, &shape, answer)
+}
+
+/// The listing conversation, as one value [`converse`] can run over either kind of stream.
+struct Listed<'a> {
+    target: &'static Target,
+    endpoint: &'a Endpoint,
+    selector: &'a Selector,
+    lookup: Option<&'a str>,
+}
+
+impl Conversation for Listed<'_> {
+    type Answer = (Answer, Shape);
+
+    fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
+        read(
+            client,
+            self.target,
+            self.endpoint,
+            self.selector,
+            self.lookup,
+        )
+    }
+}
+
+/// One exchange with the API server, written once and run over whichever stream the endpoint has.
+///
+/// A trait rather than a closure because the two arms of [`converse`] hold *different* stream
+/// types — plain brokered bytes and a TLS session over them — and one `FnOnce` cannot be called
+/// with both. The alternative is the connect-and-close dance written out twice, and the half that
+/// would rot is the closing: `network.close` on a handle the host has already retired is a
+/// protocol violation that quarantines the package.
+pub(crate) trait Conversation {
+    /// What the exchange comes back with.
+    type Answer;
+
+    /// Talks to the API server over `client`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the exchange could not do, in the vocabulary of core's `errors.yaml`.
+    fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError>;
+}
+
+/// Opens the brokered connection, runs one conversation over it, and closes it.
+///
+/// The brokered connection borrows the context for as long as it lives, so the whole conversation
+/// happens inside the block below and only its result escapes.
+pub(crate) fn converse<C: Conversation>(
+    ctx: &mut Ctx<'_>,
+    endpoint: &Endpoint,
+    conversation: C,
+) -> Result<C::Answer, WireError> {
     let (answer, handle, open) = {
-        let stream = match BrokeredStream::connect(ctx, &endpoint.host, endpoint.port) {
-            Ok(stream) => stream,
-            Err(error) => return Outcome::Failed(error),
-        };
+        let stream = BrokeredStream::connect(ctx, &endpoint.host, endpoint.port)?;
         let handle = stream.handle();
         match &endpoint.tls {
             // Plain HTTP/1.1 over the brokered bytes: what an API server reached through
             // `kubectl proxy` speaks, and never what one reached directly does.
             None => {
                 let mut client = endpoint.client(stream);
-                let answer = read(&mut client, target, &endpoint, &selector, lookup.as_deref());
+                let answer = conversation.run(&mut client);
                 let open = client.into_stream().is_open();
                 (answer, handle, open)
             }
             Some(settings) => match TlsStream::connect(stream, &endpoint.server_name, settings) {
                 Ok(session) => {
                     let mut client = endpoint.client(session);
-                    let answer = read(&mut client, target, &endpoint, &selector, lookup.as_deref());
+                    let answer = conversation.run(&mut client);
                     let open = client.into_stream().into_inner().is_open();
                     (answer, handle, open)
                 }
@@ -162,7 +224,7 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
                 // connection cannot be asked here. Not closing leaks a handle until the
                 // invocation ends; closing one the host has already retired is a protocol
                 // violation that quarantines the package, and that is the worse of the two.
-                Err(error) => (Err(handshake_failure(&endpoint, &error)), handle, false),
+                Err(error) => (Err(handshake_failure(endpoint, &error)), handle, false),
             },
         }
     };
@@ -171,12 +233,7 @@ pub fn answer(target: &'static Target, ctx: &mut Ctx<'_>) -> Outcome {
         // retired is a protocol violation, and the host retires one the moment the peer closes.
         let _ = ctx.host_call(method::NETWORK_CLOSE, json!({"connection": handle}));
     }
-
-    let (answer, shape) = match answer {
-        Ok(answer) => answer,
-        Err(error) => return Outcome::Failed(error),
-    };
-    emit(ctx, target, &schema, &shape, answer)
+    answer
 }
 
 /// How the records of one answer are built.
@@ -204,7 +261,7 @@ enum Shape {
 /// *silences* mean different things and the difference has to survive as far as the outcome. A
 /// listing that came back short is incomplete (§18.3); a get that came back with nothing is a
 /// complete answer about one object.
-enum Answer {
+pub(crate) enum Answer {
     /// A whole collection, as far as it could be read (§17.2, §18).
     ///
     /// Boxed for the same reason the transport boxes its `Status` payloads: a listing carries
@@ -370,6 +427,17 @@ fn read<S: ByteStream>(
                 "This target reports on the session rather than on anything in the cluster.",
             ));
         }
+        // Nor is a relationship: it has no collection of its own, and `relations::answer` routes
+        // it long before a collection is chosen.
+        Reads::Relations => {
+            return Err(failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                "a relationship is derived from one object rather than fetched from a collection"
+                    .to_owned(),
+                "Ask for the object's relationships with `get k8s-relation --kind ... --name ...`.",
+            ));
+        }
         Reads::Discovered => {
             let resource = discovered(client, endpoint, &served, selector)?;
             let typing = typing_of(client, endpoint, &resource)?;
@@ -423,7 +491,7 @@ fn read<S: ByteStream>(
 /// readable by name in a namespace nobody may enumerate — and a provider that answered `name` by
 /// listing would report that Pod as denied. `get` is also the only verb a resource may offer
 /// without offering `list` at all (§11.5).
-fn fetch<S: ByteStream>(
+pub(crate) fn fetch<S: ByteStream>(
     client: &mut Client<S>,
     resource: &Resource,
     scope: &Scope,
@@ -635,7 +703,7 @@ fn typing_of<S: ByteStream>(
 }
 
 /// One group-version's resource list, as a snapshot of its own.
-fn resource_list<S: ByteStream>(
+pub(crate) fn resource_list<S: ByteStream>(
     client: &mut Client<S>,
     endpoint: &Endpoint,
     group_version: &str,
@@ -655,7 +723,7 @@ fn resource_list<S: ByteStream>(
 }
 
 /// `group/version`, or the bare version for the core group (§13.3).
-fn group_version_of(group: &str, version: &str) -> String {
+pub(crate) fn group_version_of(group: &str, version: &str) -> String {
     if group.is_empty() {
         version.to_owned()
     } else {
@@ -664,7 +732,7 @@ fn group_version_of(group: &str, version: &str) -> String {
 }
 
 /// Where a group-version's resource list lives: `/api` for the core group, `/apis` for the rest.
-fn resource_list_path(group_version: &str) -> String {
+pub(crate) fn resource_list_path(group_version: &str) -> String {
     if group_version.contains('/') {
         format!("/apis/{group_version}")
     } else {
@@ -673,7 +741,7 @@ fn resource_list_path(group_version: &str) -> String {
 }
 
 /// A selector that did not name exactly one served, listable resource.
-fn unresolved_failure(
+pub(crate) fn unresolved_failure(
     unresolved: &Unresolved,
     selector: &Selector,
     discovery: &Discovery,
@@ -707,6 +775,15 @@ fn unresolved_failure(
             UNSUPPORTED,
             format!("the cluster serves `{gvr}` but does not offer `list` on it"),
             "A resource that cannot be listed is not an empty collection.",
+        ),
+        // A different permission on a different endpoint from `list`, and saying so is the
+        // difference between an operator granting the right one and the wrong one (§60.5).
+        Unresolved::NotGettable { gvr } => failure(
+            UNSUPPORTED_CODE,
+            UNSUPPORTED,
+            format!("the cluster serves `{gvr}` but does not offer `get` on one of them"),
+            "A resource whose objects cannot be read one at a time is not an object that is not \
+             there.",
         ),
         // §35.8: a name several types share must not resolve by an arbitrary type priority. The
         // candidates travel with the refusal, because "be more specific" that does not say what
