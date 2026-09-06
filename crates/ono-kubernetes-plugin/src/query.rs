@@ -70,7 +70,9 @@ use ono_provider_kubernetes::budget::{
     Budget, Cancellation, Decision, Estimate, Idempotent, Jitter, Overrun, RetryPolicy, StopReason,
 };
 use ono_provider_kubernetes::coverage::{Gap, Outcome as Coverage, Scope};
-use ono_provider_kubernetes::discovery::{self, Discovery, Resource, Verb};
+use ono_provider_kubernetes::discovery::{
+    self, Builder, Discovery, Mechanism, Provenance, Resource, Source, Verb,
+};
 use ono_provider_kubernetes::kubeconfig::{Credential, Kubeconfig, Secret, Trust};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
@@ -1007,7 +1009,26 @@ pub(crate) fn served<S: ByteStream>(
 ) -> Result<Discovery, WireError> {
     let core = root_document(session, client, endpoint, "/api")?;
     let groups = root_document(session, client, endpoint, "/apis")?;
-    assemble(core, groups)
+    // The two paths are the request paths, not the cache keys: the aggregated form lives at the
+    // same two endpoints with a longer `Accept`, so what an operator would have typed is the
+    // same either way and the mechanism is what differs.
+    let source = Source::new(
+        Mechanism::combined(core.mechanism(), groups.mechanism()),
+        vec!["/api".to_owned(), "/apis".to_owned()],
+    );
+    // §11.3's five fields, taken from the pass rather than reconstructed later. `coverage` is
+    // complete because both root documents answered — `root_document` fails the whole read
+    // otherwise (§11.1: a cluster that will not say what it serves cannot be read at all), so
+    // there is no state in which this line is reached with a hole in it. The per-group holes
+    // §34.2 is about belong to the group document that has one, not to this snapshot.
+    let provenance = Provenance::new(
+        endpoint.instance.clone(),
+        client.now(),
+        endpoint.authority.clone(),
+        ono_provider_kubernetes::coverage::Coverage::complete(Scope::cluster()),
+        source,
+    );
+    Ok(assemble(core, groups)?.observed(provenance).build())
 }
 
 /// Which form of a root discovery document arrived (§11.2, §5.3).
@@ -1021,6 +1042,16 @@ pub(crate) enum RootDocument {
     /// `APIVersions` or `APIGroupList`: the versions only, with a request per group-version still
     /// to come.
     Legacy(String),
+}
+
+impl RootDocument {
+    /// Which of §11.2's two forms this document is, for §11.3's `source`.
+    fn mechanism(&self) -> Mechanism {
+        match self {
+            Self::Aggregated(_) => Mechanism::Aggregated,
+            Self::Legacy(_) => Mechanism::Legacy,
+        }
+    }
 }
 
 /// Reads `/api` or `/apis`, taking the aggregated form where the server offers it (§11.2).
@@ -1080,7 +1111,7 @@ pub(crate) fn root_document<S: ByteStream>(
 }
 
 /// The served surface, from whichever pair of root documents arrived (§11.2's fallback).
-fn assemble(core: RootDocument, groups: RootDocument) -> Result<Discovery, WireError> {
+fn assemble(core: RootDocument, groups: RootDocument) -> Result<Builder, WireError> {
     let mut builder = Discovery::builder();
     let unreadable = |error: ono_provider_kubernetes::discovery::DiscoveryError| {
         failure(
@@ -1102,7 +1133,7 @@ fn assemble(core: RootDocument, groups: RootDocument) -> Result<Discovery, WireE
             builder = builder.groups(&text).map_err(unreadable)?;
         }
     }
-    Ok(builder.build())
+    Ok(builder)
 }
 
 /// A cluster that will not say what it serves, which is a cluster that cannot be read (§11.1).

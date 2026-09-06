@@ -307,6 +307,11 @@ pub struct Discovery {
     /// word for it. The legacy path learns the same fact from a `503` on the group's own resource
     /// list, which is a coverage outcome rather than a property of the snapshot.
     stale: BTreeSet<String>,
+    /// What §11.3 requires the snapshot to say about itself.
+    ///
+    /// `None` where nothing observed a cluster — a builder fed a fixture document, which has a
+    /// served surface and no provenance because no pass happened.
+    provenance: Option<Provenance>,
 }
 
 impl Discovery {
@@ -335,6 +340,16 @@ impl Discovery {
             .get(group_version)?
             .values()
             .find(|resource| resource.kind() == kind)
+    }
+
+    /// What this snapshot is a fact about, where a pass produced it (§11.3).
+    ///
+    /// `None` is §21.4's *not queried*: this surface was assembled from documents rather than
+    /// observed from a cluster, and answering with a made-up instance and the current time would
+    /// be the exact substitution §4 forbids.
+    #[must_use]
+    pub fn provenance(&self) -> Option<&Provenance> {
+        self.provenance.as_ref()
     }
 
     /// The first resource offering this short name.
@@ -687,6 +702,17 @@ impl Builder {
         }
     }
 
+    /// Records what §11.3 requires the snapshot to carry.
+    ///
+    /// Separate from the documents, and taken last, because the five fields are facts about the
+    /// *pass* rather than about any one document it read: which instance asked, when, of what
+    /// server, how completely, and by which route.
+    #[must_use]
+    pub fn observed(mut self, provenance: Provenance) -> Self {
+        self.discovery.provenance = Some(provenance);
+        self
+    }
+
     /// The snapshot.
     #[must_use]
     pub fn build(self) -> Discovery {
@@ -808,4 +834,151 @@ struct RawResource {
     verbs: Vec<String>,
     #[serde(rename = "shortNames", default)]
     short_names: Vec<String>,
+}
+
+// --- §11.3: a discovery snapshot is a provider fact -----------------------------------------------
+
+/// How a discovery snapshot was read (§11.2, §11.3's "source endpoint / mechanism").
+///
+/// Two mechanisms and a mixture, because §11.2's fallback is per-document rather than per-pass: a
+/// cluster can answer `/apis` with an aggregated document and `/api` with a legacy one, and a
+/// snapshot that reported either word alone would be describing a pass that never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mechanism {
+    /// The stable aggregated Discovery API answered (§11.2).
+    Aggregated,
+    /// The per-group `APIResourceList` documents answered, which is the compatible fallback.
+    Legacy,
+    /// One root document arrived each way.
+    Mixed,
+}
+
+impl Mechanism {
+    /// The word a record carries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aggregated => "aggregated",
+            Self::Legacy => "legacy",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    /// The mechanism of a pass that read one document each way.
+    #[must_use]
+    pub fn combined(first: Self, second: Self) -> Self {
+        if first == second { first } else { Self::Mixed }
+    }
+}
+
+impl fmt::Display for Mechanism {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Where a snapshot came from: the mechanism, and the endpoints it was actually read at.
+///
+/// The endpoints are kept beside the mechanism rather than derived from it. `aggregated` says how
+/// the server was asked; it does not say *what was asked*, and a reader deciding whether a
+/// snapshot could have contained a kind needs the second. They are the request paths, so a
+/// snapshot assembled from `/api` and `/apis` says so in the two strings an operator would have
+/// typed themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    mechanism: Mechanism,
+    endpoints: Vec<String>,
+}
+
+impl Source {
+    /// A source, from the mechanism and the paths read.
+    #[must_use]
+    pub fn new(mechanism: Mechanism, endpoints: Vec<String>) -> Self {
+        Self {
+            mechanism,
+            endpoints,
+        }
+    }
+
+    /// How the server was asked.
+    #[must_use]
+    pub fn mechanism(&self) -> Mechanism {
+        self.mechanism
+    }
+
+    /// The request paths the snapshot was read from.
+    #[must_use]
+    pub fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+}
+
+/// What §11.3 requires a discovery snapshot to carry.
+///
+/// The five fields are the difference between a snapshot and a lookup table. Without them a
+/// [`Discovery`] answers "does this cluster serve `widgets`?" with a bare yes, and a reader has
+/// no way to ask *which* cluster, *when*, *how completely*, or *by what route* — which is the
+/// shape of every mistake §4's invariants are arranged against. A stale snapshot read from one
+/// cluster answering for another is indistinguishable from a live one, unless the snapshot says.
+///
+/// It is deliberately optional on [`Discovery`]. A builder fed a fixture document has not
+/// observed a cluster, and giving it a provenance would be inventing one: §21.4 keeps "not
+/// queried" apart from every other non-answer, and a `None` here is that word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    provider_instance: String,
+    observed_at: crate::transport::ObservedAt,
+    api_server: String,
+    coverage: crate::coverage::Coverage,
+    source: Source,
+}
+
+impl Provenance {
+    /// A provenance for one pass over one API server.
+    #[must_use]
+    pub fn new(
+        provider_instance: impl Into<String>,
+        observed_at: crate::transport::ObservedAt,
+        api_server: impl Into<String>,
+        coverage: crate::coverage::Coverage,
+        source: Source,
+    ) -> Self {
+        Self {
+            provider_instance: provider_instance.into(),
+            observed_at,
+            api_server: api_server.into(),
+            coverage,
+            source,
+        }
+    }
+
+    /// Which provider instance observed it (§6.2).
+    #[must_use]
+    pub fn provider_instance(&self) -> &str {
+        &self.provider_instance
+    }
+
+    /// When it was observed (§17.1).
+    #[must_use]
+    pub fn observed_at(&self) -> crate::transport::ObservedAt {
+        self.observed_at
+    }
+
+    /// Which API server answered — the authority, never a name a kubeconfig gave it.
+    #[must_use]
+    pub fn api_server(&self) -> &str {
+        &self.api_server
+    }
+
+    /// What the pass covered, and what it could not (§21.4, §34.2).
+    #[must_use]
+    pub fn coverage(&self) -> &crate::coverage::Coverage {
+        &self.coverage
+    }
+
+    /// How and where it was read (§11.2).
+    #[must_use]
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
 }

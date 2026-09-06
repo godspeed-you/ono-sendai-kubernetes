@@ -30,7 +30,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::coverage::Outcome;
-use crate::discovery::{Discovery, Verb};
+use crate::discovery::{Discovery, Provenance, Verb};
 
 // --- the signals a cluster can be recognised by --------------------------------------------------
 
@@ -1304,6 +1304,7 @@ pub struct ClusterDiagnostic {
     health: Health,
     tls: TlsPosture,
     capabilities: CapabilityReport,
+    discovery: Option<Provenance>,
 }
 
 impl ClusterDiagnostic {
@@ -1321,7 +1322,30 @@ impl ClusterDiagnostic {
             health: Health::unknown(),
             tls,
             capabilities: CapabilityReport::unknown(),
+            discovery: None,
         }
+    }
+
+    /// Records what §11.3 requires a discovery snapshot to carry.
+    ///
+    /// On the diagnostic rather than only inside the [`Discovery`]
+    /// because §11.3 calls the snapshot a *provider fact*, and a fact nothing can read is not one.
+    /// This is the field that lets an operator ask when the served surface was last observed,
+    /// through which mechanism, and of which API server — the three questions a stale snapshot
+    /// silently answers wrongly.
+    ///
+    /// `None` is §21.4's *not queried*: a cluster whose discovery documents did not read has no
+    /// snapshot, and a provenance with a time in it would describe a pass that produced nothing.
+    #[must_use]
+    pub fn with_discovery(mut self, provenance: Provenance) -> Self {
+        self.discovery = Some(provenance);
+        self
+    }
+
+    /// What the served surface was observed by, when, of what, how completely and how (§11.3).
+    #[must_use]
+    pub fn discovery(&self) -> Option<&Provenance> {
+        self.discovery.as_ref()
     }
 
     /// Records the cluster fingerprint.

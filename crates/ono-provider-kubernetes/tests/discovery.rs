@@ -16,7 +16,9 @@
     reason = "a test states its preconditions directly (AGENTS.md section 16)"
 )]
 
-use ono_provider_kubernetes::discovery::{Discovery, Scope, Verb};
+use ono_provider_kubernetes::coverage::{Gap, Outcome, Scope as CoverageScope};
+use ono_provider_kubernetes::discovery::{Discovery, Mechanism, Provenance, Scope, Source, Verb};
+use ono_provider_kubernetes::transport::ObservedAt;
 
 /// `/api` — the unnamed core group, whose `apiVersion` is a bare `v1`.
 const CORE_VERSIONS: &str = r#"{"kind":"APIVersions","versions":["v1"]}"#;
@@ -405,4 +407,116 @@ fn should_refuse_an_aggregated_document_that_does_not_read_rather_than_build_an_
     // which is the collapse §4 invariant 13 forbids, arrived at through content negotiation.
     assert!(Discovery::builder().aggregated(GROUPS).is_err());
     assert!(Discovery::builder().aggregated("not json at all").is_err());
+}
+
+// --- §11.3: a discovery snapshot is a provider fact -----------------------------------------------
+
+#[test]
+fn should_carry_the_five_things_a_discovery_snapshot_must_say_about_itself() {
+    // §11.3 lists them exactly: `provider_instance`, `observed_at`, `api_server`, `coverage`,
+    // and the source endpoint / mechanism. They are what makes a snapshot a *fact* rather than a
+    // lookup table — without them a served surface answers "does this cluster serve widgets?"
+    // with a bare yes, and a reader cannot ask which cluster, when, how completely, or by what
+    // route. Every one of those is a question a stale snapshot silently answers wrongly.
+    let served = Discovery::builder()
+        .core_versions(CORE_VERSIONS)
+        .expect("the core version list reads")
+        .resources(CORE_V1)
+        .expect("the core resource list reads")
+        .observed(Provenance::new(
+            "kubernetes:staging",
+            ObservedAt::from_unix_millis(1_760_000_000_000),
+            "api.staging.example:6443",
+            ono_provider_kubernetes::coverage::Coverage::complete(CoverageScope::cluster()),
+            Source::new(
+                Mechanism::Aggregated,
+                vec!["/api".to_owned(), "/apis".to_owned()],
+            ),
+        ))
+        .build();
+
+    let snapshot = served
+        .provenance()
+        .expect("a snapshot that observed a cluster says so");
+    assert_eq!(snapshot.provider_instance(), "kubernetes:staging");
+    assert_eq!(snapshot.observed_at().unix_millis(), 1_760_000_000_000);
+    assert_eq!(snapshot.api_server(), "api.staging.example:6443");
+    assert!(snapshot.coverage().is_complete());
+    assert_eq!(snapshot.source().mechanism(), Mechanism::Aggregated);
+    assert_eq!(snapshot.source().endpoints(), ["/api", "/apis"]);
+
+    // And the surface it describes is still the surface: a provenance is carried beside the
+    // inventory, never in place of it.
+    assert!(served.resource("v1", "pods").is_some());
+}
+
+#[test]
+fn should_say_a_surface_assembled_from_documents_observed_no_cluster() {
+    // §21.4's *not queried*, at the one place it is easiest to fake. A `Discovery` built from
+    // fixture text has a served surface and no pass behind it, and answering with the current
+    // time and a made-up instance would be exactly the substitution §4's invariants forbid — a
+    // reader could not tell a snapshot of a cluster from a snapshot of a file.
+    let assembled = Discovery::builder()
+        .core_versions(CORE_VERSIONS)
+        .expect("the core version list reads")
+        .build();
+
+    assert!(assembled.resource("v1", "pods").is_none() || assembled.provenance().is_none());
+    assert!(
+        assembled.provenance().is_none(),
+        "nothing observed a cluster, so there is no `observed_at` to state"
+    );
+}
+
+#[test]
+fn should_keep_a_partial_pass_distinguishable_from_a_complete_one() {
+    // §34.2 and §21.4 where they meet §11.3. A pass that read the group list and was refused one
+    // group's resource list has a served surface that is *usably* right and *not* whole, and the
+    // difference has to survive into the snapshot: a reader asking "does this cluster serve
+    // widgets?" of an incomplete snapshot is owed "not as far as I could see", never "no".
+    let mut coverage =
+        ono_provider_kubernetes::coverage::Coverage::complete(CoverageScope::cluster());
+    coverage.record(Gap::new(
+        CoverageScope::in_group_version("example.io/v1"),
+        Outcome::ListDenied,
+    ));
+    let partial = Discovery::builder()
+        .core_versions(CORE_VERSIONS)
+        .expect("the core version list reads")
+        .observed(Provenance::new(
+            "kubernetes:staging",
+            ObservedAt::from_unix_millis(1),
+            "api.staging.example:6443",
+            coverage,
+            Source::new(Mechanism::Legacy, vec!["/apis".to_owned()]),
+        ))
+        .build();
+
+    let snapshot = partial.provenance().expect("the pass is recorded");
+    assert!(!snapshot.coverage().is_complete());
+    assert!(
+        snapshot.coverage().describe().contains("example.io/v1"),
+        "the hole names the group-version that would not answer: {}",
+        snapshot.coverage().describe()
+    );
+}
+
+#[test]
+fn should_call_a_pass_that_read_one_document_each_way_mixed() {
+    // §11.2's fallback is per-document, not per-pass: a cluster can answer `/apis` with an
+    // aggregated document and `/api` with a legacy one, and a snapshot reporting either word
+    // alone would describe a pass that never happened.
+    assert_eq!(
+        Mechanism::combined(Mechanism::Aggregated, Mechanism::Aggregated),
+        Mechanism::Aggregated
+    );
+    assert_eq!(
+        Mechanism::combined(Mechanism::Legacy, Mechanism::Legacy),
+        Mechanism::Legacy
+    );
+    assert_eq!(
+        Mechanism::combined(Mechanism::Aggregated, Mechanism::Legacy),
+        Mechanism::Mixed
+    );
+    assert_eq!(Mechanism::Mixed.as_str(), "mixed");
 }

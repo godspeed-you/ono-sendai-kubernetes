@@ -852,7 +852,7 @@ fn endpoint_word(endpoint: EndpointCategory) -> &'static str {
 /// Rendered as RFC 3339 and parsed back, because the value model builds a timestamp from text
 /// and this package has no date library of its own. The rendering is proleptic-Gregorian UTC,
 /// which is the calendar RFC 3339 defines and the one the API server's own timestamps are in.
-fn instant(unix_millis: u64) -> Value {
+pub(crate) fn instant(unix_millis: u64) -> Value {
     ono_value::from_json(
         &serde_json::json!({"$timestamp": rfc3339(unix_millis)}),
         builtin_schemas(),

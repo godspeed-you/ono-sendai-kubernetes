@@ -990,3 +990,71 @@ async fn should_surface_the_kubeconfig_deviation_rather_than_only_documenting_it
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }
+
+#[tokio::test]
+async fn should_say_when_what_and_how_the_served_surface_was_last_observed() {
+    // §11.3, which is a `MUST` about a *snapshot* and therefore only kept if something can read
+    // it. It names five things exactly: `provider_instance`, `observed_at`, `api_server`,
+    // `coverage`, and the source endpoint / mechanism.
+    //
+    // The reason they matter is that every one of them is a question a stale snapshot answers
+    // wrongly in silence. A served surface with no instance on it cannot be told from another
+    // cluster's; with no `observed_at` it cannot be told from one read an hour ago, which for a
+    // cluster that has since installed a CRD is the difference between "not served" and "not
+    // looked at"; with no coverage it cannot be told from one that was refused a group; and with
+    // no mechanism a reader cannot tell an aggregated inventory from a legacy pass that stopped
+    // at the group list.
+    let plugin = loaded(RecordedCluster::new(
+        "11111111-1111-1111-1111-111111111111",
+        Review::Answers,
+    ))
+    .await;
+    let record = diagnostic(&plugin, "prod.test", "prod").await;
+
+    let Some(Value::Map(snapshot)) = record.get("discovery") else {
+        panic!(
+            "the diagnostic states the discovery snapshot, and it is {:?}",
+            record.get("discovery")
+        );
+    };
+    let field = |name: &str| {
+        snapshot
+            .iter()
+            .find(|(key, _)| &**key == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("§11.3 requires `{name}`, and the snapshot has {snapshot:?}"))
+    };
+
+    assert_eq!(
+        field("provider_instance"),
+        Value::String("kubernetes:prod".into()),
+        "which instance observed it (§6.2) — never which cluster it is, which is a separate field"
+    );
+    assert_eq!(
+        field("api_server"),
+        Value::String("prod.test:8001".into()),
+        "which server answered, as the authority reached rather than a name a kubeconfig gave it"
+    );
+    assert_eq!(
+        field("coverage"),
+        Value::String("complete".into()),
+        "both root documents answered, so there is no hole to report (§21.4)"
+    );
+    assert_eq!(
+        field("mechanism"),
+        Value::String("legacy".into()),
+        "this path asks for the per-group documents on purpose, and says so rather than claiming \
+         the aggregated form it did not use (§11.2)"
+    );
+    assert_eq!(
+        field("endpoints"),
+        Value::List(vec![Value::String("/api".into()), Value::String("/apis".into()),].into()),
+        "and the two paths it was read from, which is what a reader checks a claimed absence \
+         against"
+    );
+    assert!(
+        matches!(field("observed_at"), Value::Timestamp(_)),
+        "`observed_at` is an instant the shell can compare and sort on, not text: {:?}",
+        field("observed_at")
+    );
+}

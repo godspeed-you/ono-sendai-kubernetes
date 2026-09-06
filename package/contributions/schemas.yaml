@@ -3680,6 +3680,20 @@ schemas:
           **`available on resource` is a statement about the resource, never about the identity**
           — it means a served resource offers the verb, and whether the current user may use it
           on a given object is `k8s-plan`'s preflight answer (§21.2, §21.6).
+      discovery:
+        type: map
+        nullable: true
+        doc: >-
+          What §11.3 requires a discovery snapshot to carry, as the five things it names:
+          `provider_instance` (which instance observed the served surface), `observed_at` (when,
+          as an instant), `api_server` (the authority that answered, never a name a kubeconfig
+          gave it), `coverage` (`complete`, or the holes in §21.4's words), and the source —
+          `mechanism`, one of `aggregated`, `legacy` or `mixed` (§11.2), beside `endpoints`, the
+          request paths it was read from. Null where the discovery documents did not read, which
+          is a cluster with no snapshot rather than a snapshot with nothing in it.
+          Without these a served surface cannot be told from another cluster's, from one read an
+          hour ago, or from one that was refused a group — and a cluster that has since installed
+          a CRD makes the second of those the difference between `not served` and `not looked at`.
     default_view:
       columns: [name, server, reachable, server_version, effective_identity, tls]
 

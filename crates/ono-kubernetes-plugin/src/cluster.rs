@@ -27,13 +27,19 @@ use std::time::Instant;
 
 use ono_kuang_sdk::protocol::{CheckAnswer, WireError, method};
 use ono_kuang_sdk::{Ctx, EmitError, Outcome as InvocationOutcome};
+use ono_provider_kubernetes::coverage::{Coverage, Scope as CoverageScope};
 use ono_provider_kubernetes::coverage::{Outcome, Scope};
 use ono_provider_kubernetes::diagnostics::{
     Availability, CapabilityReport, ClusterDiagnostic, Fingerprint, Grant, Health, Identity,
     Impersonation, Known, Probe, ProbeStatus, ProviderCapability, ServerVersion, Signal, Subject,
     TlsPosture, normalised_origin,
 };
-use ono_provider_kubernetes::discovery::{Discovery, Verb};
+// `Provenance` is aliased: `records::Provenance` is what a *record* carries, and
+// `discovery::Provenance` is what a *snapshot* carries. Two different facts about two different
+// things, and a file that used one word for both would eventually put one where the other belongs.
+use ono_provider_kubernetes::discovery::{
+    Discovery, Mechanism, Provenance as DiscoveryProvenance, Source, Verb,
+};
 use ono_provider_kubernetes::tls::TlsStream;
 use ono_provider_kubernetes::transport::{
     ByteStream, Client, Method, Request, collection_path, object_path,
@@ -213,13 +219,15 @@ fn observe(
         let _ =
             lease.with(|ctx| ctx.host_call(method::NETWORK_CLOSE, json!({"connection": handle})));
     }
-    Ok(
-        ClusterDiagnostic::for_instance(endpoint.instance.clone(), posture)
-            .with_fingerprint(observed.fingerprint)
-            .with_identity(observed.identity)
-            .with_health(observed.health)
-            .with_capabilities(observed.capabilities),
-    )
+    let diagnostic = ClusterDiagnostic::for_instance(endpoint.instance.clone(), posture)
+        .with_fingerprint(observed.fingerprint)
+        .with_identity(observed.identity)
+        .with_health(observed.health)
+        .with_capabilities(observed.capabilities);
+    Ok(match observed.discovery {
+        Some(snapshot) => diagnostic.with_discovery(snapshot),
+        None => diagnostic,
+    })
 }
 
 /// The diagnostic of a cluster that could not be reached at all.
@@ -335,6 +343,12 @@ fn interrogate<S: ByteStream>(
         fingerprint,
         identity,
         capabilities,
+        // §11.3: what the discovery pass was, carried out of the interrogation rather than
+        // reconstructed. `None` where the documents did not read, which is a cluster with no
+        // snapshot rather than a snapshot with nothing in it.
+        discovery: served
+            .as_ref()
+            .and_then(|served| served.versions.provenance().cloned()),
     }
 }
 
@@ -344,6 +358,8 @@ struct Observed {
     fingerprint: Fingerprint,
     identity: Identity,
     capabilities: CapabilityReport,
+    /// What §11.3 requires the discovery snapshot to say about itself.
+    discovery: Option<DiscoveryProvenance>,
 }
 
 /// What this session found for each capability §57 lists, beside what the provider supports.
@@ -479,10 +495,25 @@ fn discover<S: ByteStream>(
 ) -> Option<Served> {
     let core = text(ask(client, endpoint, health, Request::get("/api")))?;
     let groups = text(ask(client, endpoint, health, Request::get("/apis")))?;
+    // §11.3: the pass that read these two documents is a fact in its own right, and it is
+    // recorded here rather than reconstructed by a reader. The mechanism is `legacy` and not
+    // negotiated: this path asks for the per-group documents on purpose, because what it needs
+    // from discovery is the core group's preferred version rather than the whole inventory.
+    let provenance = DiscoveryProvenance::new(
+        endpoint.instance.clone(),
+        client.now(),
+        endpoint.authority.clone(),
+        Coverage::complete(CoverageScope::cluster()),
+        Source::new(
+            Mechanism::Legacy,
+            vec!["/api".to_owned(), "/apis".to_owned()],
+        ),
+    );
     let versions = Discovery::builder()
         .core_versions(&core)
         .and_then(|builder| builder.groups(&groups))
         .ok()?
+        .observed(provenance)
         .build();
     // Which version of the core group is preferred is the server's answer, not this build's
     // (§5.2). A cluster that serves none of it serves no Namespace either.
@@ -793,6 +824,51 @@ fn field_value(name: &str, diagnostic: &ClusterDiagnostic) -> Value {
                 })
                 .collect::<MapValue>(),
         )),
+
+        // --- what it serves, and when that was last observed (§11.3) ---
+        "discovery" => diagnostic.discovery().map_or(Value::Null, |snapshot| {
+            Value::Map(Arc::new(
+                [
+                    (
+                        Arc::from("provider_instance"),
+                        Value::String(snapshot.provider_instance().into()),
+                    ),
+                    (
+                        Arc::from("observed_at"),
+                        crate::records::instant(snapshot.observed_at().unix_millis()),
+                    ),
+                    (
+                        Arc::from("api_server"),
+                        Value::String(snapshot.api_server().into()),
+                    ),
+                    (
+                        Arc::from("coverage"),
+                        Value::String(if snapshot.coverage().is_complete() {
+                            "complete".into()
+                        } else {
+                            snapshot.coverage().describe().into()
+                        }),
+                    ),
+                    (
+                        Arc::from("mechanism"),
+                        Value::String(snapshot.source().mechanism().as_str().into()),
+                    ),
+                    (
+                        Arc::from("endpoints"),
+                        Value::List(
+                            snapshot
+                                .source()
+                                .endpoints()
+                                .iter()
+                                .map(|endpoint| Value::String(endpoint.as_str().into()))
+                                .collect(),
+                        ),
+                    ),
+                ]
+                .into_iter()
+                .collect::<MapValue>(),
+            ))
+        }),
 
         // --- what it could not determine ---
         "unknowns" => Value::List(

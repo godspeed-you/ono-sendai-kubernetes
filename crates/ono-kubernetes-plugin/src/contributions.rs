@@ -1636,6 +1636,7 @@ const CLUSTER_FIELDS: &[Field] = &[
     Field::required("probes", "map"),
     Field::required("latency_ms", "map"),
     Field::required("capabilities", "map"),
+    Field::nullable("discovery", "map"),
 ];
 
 /// The targets this package answers for.

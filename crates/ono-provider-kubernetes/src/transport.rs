@@ -2310,6 +2310,16 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
         &self.provider_instance
     }
 
+    /// This client's clock, so a caller can time an observation the same way a read does.
+    ///
+    /// Discovery is why it is public: §11.3 requires a snapshot to carry `observed_at`, the
+    /// snapshot is assembled from several reads, and a caller reaching for the wall clock instead
+    /// would put a fixture's snapshot on real time and make freshness unassertable (§59.2).
+    #[must_use]
+    pub fn now(&self) -> ObservedAt {
+        self.clock.now()
+    }
+
     /// The stream underneath, for a fixture to be inspected.
     #[must_use]
     pub fn stream(&self) -> &S {
