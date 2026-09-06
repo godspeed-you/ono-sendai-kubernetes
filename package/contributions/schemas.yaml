@@ -2533,14 +2533,17 @@ schemas:
     fields:
       change:
         type: enum
-        values: [listed, added, modified, deleted, gap]
+        values: [listed, added, modified, deleted, gap, notice]
         required: true
         doc: >-
           What this record reports. `listed` is an object that was in the collection when
           observation began — a starting state rather than a change (§19.1). `added`, `modified`
           and `deleted` are §19.3's classes verbatim. `gap` is a period this provider could not
           observe, which is a fact about time rather than about an object, and its object fields
-          are therefore all null.
+          are therefore all null. `notice` reports that the *view* changed state while the cluster
+          did not — a stream that started reconnecting, or one that has gone stale — and exists
+          because §41.4 forbids a disconnected watch leaving a table that still looks live: a
+          reader learns from arriving records, so a state nothing carries is a state nobody sees.
       resource:
         type: string
         required: true
@@ -2569,9 +2572,25 @@ schemas:
         type: string
         required: true
         doc: >-
-          What a live view may honestly show right now (§41.4) — `syncing`, `live`,
-          `reconnecting`, `gap detected` or `denied`. `live` is the only one of the five that
-          entitles anybody to read an absence as an absence (§20.3).
+          What the *connection* is doing — `syncing`, `live`, `reconnecting`, `gap detected` or
+          `denied`. `live` is the only one of the five that entitles anybody to read an absence as
+          an absence (§20.3).
+      view_state:
+        type: enum
+        values: [syncing, live, reconnecting, "gap detected", stale, denied]
+        required: true
+        doc: >-
+          What a reader is looking at (§41.4) — `sync_state`'s five words and one more. A stream
+          that is `live` and has produced no observation for longer than `stale_after_ms` is
+          `stale`: the connection is fine and what is on the screen may not be. The two fields can
+          honestly disagree, which is why they are two.
+      withheld:
+        type: int
+        required: true
+        doc: >-
+          How many objects of the collection the view is bounded out of holding (§18.5, §50.4).
+          Zero when everything observed fits. A bound that is not reported is a truncation
+          presented as a complete picture.
       uid:
         type: string
         nullable: true

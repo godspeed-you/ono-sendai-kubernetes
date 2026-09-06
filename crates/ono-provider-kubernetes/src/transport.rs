@@ -40,6 +40,7 @@ use crate::object::Object;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamError {
     message: String,
+    quiet: bool,
 }
 
 impl StreamError {
@@ -48,6 +49,25 @@ impl StreamError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            quiet: false,
+        }
+    }
+
+    /// A window passed and the peer said nothing — which is not a failure at all.
+    ///
+    /// The one outcome of a read that is neither bytes nor a broken stream. An implementation
+    /// that polls with a deadline uses it to hand control back to its caller during silence:
+    /// **nothing has been lost and nothing has ended**, the connection is open, and reading again
+    /// continues exactly where it stopped, mid-frame if that is where it was.
+    ///
+    /// It exists because a watch spends its life blocked in a read, and a caller that cannot
+    /// regain control during silence cannot say anything about the silence — which is what a live
+    /// view's staleness is (§41.4).
+    #[must_use]
+    pub fn quiet(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            quiet: true,
         }
     }
 
@@ -55,6 +75,13 @@ impl StreamError {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Whether this is [`StreamError::quiet`] — a window that brought nothing, rather than a
+    /// stream that failed.
+    #[must_use]
+    pub const fn is_quiet(&self) -> bool {
+        self.quiet
     }
 }
 
@@ -644,10 +671,13 @@ impl<S: ByteStream> HttpConnection<S> {
 
     fn fill(&mut self) -> Result<usize, ApiError> {
         let mut chunk = [0_u8; 4096];
-        let read = self
-            .stream
-            .read(&mut chunk)
-            .map_err(|error| ApiError::Stream(error.message().to_owned()))?;
+        let read = self.stream.read(&mut chunk).map_err(|error| {
+            if error.is_quiet() {
+                ApiError::Quiet
+            } else {
+                ApiError::Stream(error.message().to_owned())
+            }
+        })?;
         self.buffer.extend_from_slice(&chunk[..read]);
         Ok(read)
     }
@@ -719,8 +749,10 @@ impl<S: ByteStream> ResponseStream<'_, S> {
 
     /// The next frame, or `None` when the body has ended.
     ///
-    /// A returned error also ends the body: a stream whose framing has been lost cannot be
-    /// resynchronised, and pretending otherwise would hand the caller invented boundaries.
+    /// A returned error also ends the body — a stream whose framing has been lost cannot be
+    /// resynchronised, and pretending otherwise would hand the caller invented boundaries — with
+    /// the one exception the type names: [`ApiError::Quiet`] is a window that brought nothing, so
+    /// the framing is intact, the body has not ended, and the caller may read again.
     pub fn next_chunk(&mut self) -> Option<Result<Vec<u8>, ApiError>> {
         if self.finished {
             return None;
@@ -751,7 +783,7 @@ impl<S: ByteStream> ResponseStream<'_, S> {
                 Err(error) => Err(error),
             },
         };
-        if outcome.is_err() {
+        if matches!(outcome, Err(ref error) if !matches!(error, ApiError::Quiet)) {
             self.finished = true;
         }
         Some(outcome)
@@ -1239,6 +1271,13 @@ pub enum Operation {
 pub enum ApiError {
     /// The connection failed or ended mid-message.
     Stream(String),
+    /// A read window passed and the peer said nothing, on a connection that is still open.
+    ///
+    /// Not a failure and not an end: the framing is intact, nothing was consumed, and the next
+    /// read continues where this one stopped. A caller that has nothing to do during silence
+    /// simply reads again; one that has something to say about it — a live view crossing its
+    /// staleness window (§41.4) — says it here.
+    Quiet,
     /// The bytes are not an HTTP/1.1 response this client can read.
     Protocol(String),
     /// The response arrived and is not the Kubernetes document it should be.
@@ -1271,7 +1310,7 @@ impl ApiError {
     #[must_use]
     pub fn code(&self) -> Option<u16> {
         match self {
-            Self::Stream(_) | Self::Protocol(_) | Self::Malformed(_) => None,
+            Self::Stream(_) | Self::Quiet | Self::Protocol(_) | Self::Malformed(_) => None,
             Self::Denied(_) => Some(403),
             Self::NotFound(_) => Some(404),
             Self::ContinuityExpired(_) => Some(410),
@@ -1284,7 +1323,7 @@ impl ApiError {
     #[must_use]
     pub fn status(&self) -> Option<&Status> {
         match self {
-            Self::Stream(_) | Self::Protocol(_) | Self::Malformed(_) => None,
+            Self::Stream(_) | Self::Quiet | Self::Protocol(_) | Self::Malformed(_) => None,
             Self::Denied(status)
             | Self::NotFound(status)
             | Self::ContinuityExpired(status)
@@ -1367,6 +1406,10 @@ impl ApiError {
     pub fn outcome(&self, operation: Operation) -> Outcome {
         match self {
             Self::Stream(_) => Outcome::Disconnected,
+            // A window that brought nothing is not a coverage outcome at all: nothing was asked
+            // and nothing failed. It reaches this vocabulary only if a caller mistakes it for an
+            // end, and `not queried` is the one word that says nothing happened.
+            Self::Quiet => Outcome::NotQueried,
             Self::Protocol(_) | Self::Malformed(_) => Outcome::RequestFailed,
             Self::Denied(_) => match operation {
                 Operation::Get => Outcome::ReadDenied,
@@ -1393,6 +1436,7 @@ impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Stream(detail) => write!(f, "the connection failed: {detail}"),
+            Self::Quiet => f.write_str("the connection produced nothing in this window"),
             Self::Protocol(detail) => write!(f, "the response is not HTTP/1.1: {detail}"),
             Self::Malformed(detail) => {
                 write!(f, "the response is not a Kubernetes document: {detail}")

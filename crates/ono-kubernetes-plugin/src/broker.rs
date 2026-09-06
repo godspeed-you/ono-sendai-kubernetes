@@ -81,6 +81,13 @@ const CHUNKS_PER_READ: u64 = 16;
 pub struct ReadPolicy {
     deadline_seconds: f64,
     idle_windows: Option<u32>,
+    /// After how many quiet windows the read hands control back without ending anything.
+    ///
+    /// `None` is "wait as long as it takes", which is right for a request. A *watch* needs the
+    /// other answer: it spends its life blocked here, and a caller that never regains control
+    /// during silence cannot say anything about the silence — which is what §41.4's `stale`
+    /// is, and what its "MUST not leave a frozen table" needs somebody to be able to notice.
+    quiet_windows: Option<u32>,
 }
 
 impl ReadPolicy {
@@ -90,6 +97,7 @@ impl ReadPolicy {
         Self {
             deadline_seconds: REQUEST_DEADLINE_SECONDS,
             idle_windows: Some(IDLE_WINDOWS),
+            quiet_windows: None,
         }
     }
 
@@ -98,11 +106,18 @@ impl ReadPolicy {
     /// No window limit at all. A watch is ended by the operator, by the server closing it, or by
     /// a budget the query named — never by this provider deciding that a quiet cluster is a
     /// broken one (§4 invariant 13 applied to time rather than to scope).
+    ///
+    /// It does hand control back after one quiet window, which is a different thing from ending:
+    /// [`QUIET`] says "nothing this window", the connection stays open and unconsumed, and the
+    /// caller resumes reading where it was. That is what lets a watch notice something about its
+    /// own silence — §41.4 asks a live view not to look live while it is not, and a reader learns
+    /// only from records that arrive.
     #[must_use]
     pub const fn watch() -> Self {
         Self {
             deadline_seconds: WATCH_POLL_SECONDS,
             idle_windows: None,
+            quiet_windows: Some(1),
         }
     }
 }
@@ -317,6 +332,12 @@ impl ByteStream for BrokeredStream<'_, '_, '_> {
                     return Err(StreamError::new(CANCELLED));
                 }
                 idle += 1;
+                // Nothing arrived, the peer has not gone away, and the caller asked to be told.
+                // The buffer is untouched and the connection is still open, so resuming the read
+                // continues exactly where it stopped — this is a yield, not an end.
+                if self.policy.quiet_windows.is_some_and(|limit| idle >= limit) {
+                    return Err(StreamError::quiet(QUIET));
+                }
                 if self.policy.idle_windows.is_some_and(|limit| idle >= limit) {
                     return Err(StreamError::new(format!(
                         "the API server sent nothing for {}s across {idle} reads, and the \
@@ -361,6 +382,15 @@ pub fn decode_hex(text: &str) -> Option<Vec<u8>> {
     }
     Some(bytes)
 }
+
+/// What a read reports when a window passed and the peer said nothing (§41.4).
+///
+/// The message beside `StreamError::quiet`, which is what a caller actually matches on: the
+/// transport carries the distinction as a flag on its own error type rather than as a string this
+/// implementation invented, so nothing above has to know which `ByteStream` it is reading.
+/// Everything about the connection is unchanged — the caller may read again immediately and
+/// continue mid-frame.
+pub const QUIET: &str = "the connection produced nothing in this window";
 
 /// What a read reports when the invocation was cancelled while the connection was open.
 ///

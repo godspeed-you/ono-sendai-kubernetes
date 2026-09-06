@@ -5685,6 +5685,112 @@ fn observation(record: &RecordValue) -> (String, i128, bool) {
 }
 
 #[tokio::test]
+async fn should_say_what_a_reader_is_looking_at_on_every_change_it_reports() {
+    // §41.4. Five of its six words are what the *connection* is doing, which `watch.rs` knows
+    // without a clock, and the sixth — `stale` — is what a *reader* is looking at, which needs
+    // one. Both ride on every record, because a reader learns from what arrives and a state
+    // carried only by the record that changed it is a state most readers never see.
+    //
+    // `withheld` rides along for the same reason (§18.5, §50.4): a view holding a bounded number
+    // of a collection's objects and not saying so is a truncation presented as a whole picture.
+    // Bounded with `max_changes`, because a watch has no end: `collect` on an unbounded answer
+    // is exactly the shape `ADR-0588 (core)` exists to stop the *shell* doing, and a test may
+    // not do it either.
+    let (_, plugin) = watched(Watching::Changes).await;
+    let (events, result) = plugin
+        .query(
+            "k8s-change",
+            at_cluster(&[("kind", json!("Pod")), ("max_changes", json!(3))]),
+        )
+        .await
+        .expect("the watch starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+
+    let seen = records(&events);
+    assert!(!seen.is_empty(), "the acquisition alone is a record");
+    for record in &seen {
+        let view = text_of(record, "view_state").expect("every record says what is on the screen");
+        assert!(
+            [
+                "syncing",
+                "live",
+                "reconnecting",
+                "gap detected",
+                "stale",
+                "denied"
+            ]
+            .contains(&view.as_str()),
+            "§41.4 has six words and `{view}` is not one of them"
+        );
+        assert_eq!(
+            int_of(record, "withheld"),
+            Some(0),
+            "nothing was withheld from a view of two objects, and the field says so rather than \
+             being absent"
+        );
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_tell_a_reader_the_view_went_stale_rather_than_leaving_it_looking_live() {
+    // §41.4's second sentence: "A disconnected watch MUST not leave a frozen table that visually
+    // appears live." A reader of a stream learns only from records that arrive, so a watch that
+    // goes quiet says nothing at all — and the last thing it said was `live`. That is the frozen
+    // table, and the only way out of it is a record nobody's cluster caused.
+    //
+    // The server here opens the watch, sends one frame, and then holds the body open forever. A
+    // one-millisecond window makes the silence that follows longer than the view's cadence, so
+    // the view crosses into `stale` while the read is blocked — which is where a real watch
+    // spends its life, and the reason the check cannot live only between rounds.
+    let (cluster, plugin) = watched(Watching::Paced).await;
+    let mut invocation = plugin
+        .query(
+            "k8s-change",
+            at_cluster(&[("kind", json!("Pod")), ("stale_after_ms", json!(1))]),
+        )
+        .await
+        .expect("the watch starts");
+
+    let acquired = next_record(&mut invocation, "the acquisition").await;
+    assert_eq!(observation(&acquired), ("listed".to_owned(), 1, true));
+
+    cluster.release.notify_one();
+    let arrival = next_record(&mut invocation, "the arrival").await;
+    assert_eq!(observation(&arrival), ("added".to_owned(), 1, true));
+
+    // Nothing more is released, so nothing more is going to arrive from the cluster. What arrives
+    // instead is the view correcting itself.
+    let notice = next_record(&mut invocation, "the notice").await;
+    assert_eq!(
+        text_of(&notice, "change").as_deref(),
+        Some("notice"),
+        "a state the cluster did not cause is not reported as a change to an object"
+    );
+    assert_eq!(
+        text_of(&notice, "view_state").as_deref(),
+        Some("stale"),
+        "and it says which state, in §41.4's own word"
+    );
+    assert_eq!(
+        text_of(&notice, "uid"),
+        None,
+        "a notice is about the view, so every object field is null, exactly as a gap's is"
+    );
+    assert_eq!(
+        text_of(&notice, "sync_state").as_deref(),
+        Some("live"),
+        "the connection is fine and the screen is not — which is why the two are two fields"
+    );
+
+    invocation.cancel().await;
+    let _ = tokio::time::timeout(SOON, invocation.finish()).await;
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
 async fn should_emit_a_record_as_each_change_arrives_rather_than_when_the_stream_ends() {
     // §19 and §41's live view, end to end. The recorded server opens the watch and then sends
     // nothing: each frame goes on the wire only when this test releases it, and the terminating

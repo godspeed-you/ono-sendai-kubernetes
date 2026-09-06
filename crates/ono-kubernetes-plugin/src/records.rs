@@ -232,8 +232,12 @@ pub struct Change<'a> {
     pub segment: usize,
     /// Whether observation has been unbroken from the acquisition to this record (§19.4).
     pub continuous: bool,
-    /// What a live view may honestly show right now (§41.4).
+    /// What the *connection* is doing: five of §41.4's six words, as `watch.rs` knows them.
     pub sync_state: &'a str,
+    /// What a reader is *looking at* — §41.4's six words, including the one a clock decides.
+    pub view_state: &'a str,
+    /// How many objects the view is bounded out of holding (§18.5, §50.4).
+    pub withheld: usize,
     /// Why continuity broke, for the record that reports a break.
     pub gap_reason: Option<&'a str>,
     /// The break with both of its edges, in the shape Appendix D.4 sketches.
@@ -272,6 +276,8 @@ pub fn change_record(
             "segment" => integer(i64::try_from(change.segment).unwrap_or(i64::MAX)),
             "continuous" => Value::Bool(change.continuous),
             "sync_state" => Value::String(change.sync_state.into()),
+            "view_state" => Value::String(change.view_state.into()),
+            "withheld" => integer(i64::try_from(change.withheld).unwrap_or(i64::MAX)),
 
             // --- what was not observed ---
             "gap_reason" => text(change.gap_reason),

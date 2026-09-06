@@ -546,6 +546,14 @@ impl Target {
                      version. Default true; the gap record is emitted either way \
                      (specification section 19.4).",
                 ));
+                options.push(Parameter::defaulting(
+                    "stale_after_ms",
+                    "int",
+                    "How long without a live observation before the view calls itself stale \
+                     (specification section 41.4). A threshold this source declares, not a rule \
+                     the shell applies to everything.",
+                    "30000",
+                ));
             }
             Reads::Events => {
                 options.extend_from_slice(SCOPE);
@@ -1476,13 +1484,26 @@ const CONDITION_FIELDS: &[Field] = &[
 /// all.
 const CHANGE_FIELDS: &[Field] = &[
     // --- what happened, and to what ---
-    Field::required("change", "enum<listed|added|modified|deleted|gap>"),
+    Field::required("change", "enum<listed|added|modified|deleted|gap|notice>"),
     Field::required("resource", "string"),
     Field::required("scope", "string"),
     // --- which observation period, and whether anything was missed reaching it ---
     Field::required("segment", "int"),
     Field::required("continuous", "bool"),
     Field::required("sync_state", "string"),
+    // §41.4's six words, which are `sync_state`'s five and one more. `sync_state` is about the
+    // *connection* — what `watch.rs` can know without a clock — and `view_state` is about what a
+    // reader is looking at: a stream that is `live` and has told nobody anything for longer than
+    // the window is `stale`, and a table that kept rendering it would be the frozen one §41.4
+    // forbids. The two are separate fields because they answer different questions and can
+    // honestly disagree.
+    Field::required(
+        "view_state",
+        "enum<syncing|live|reconnecting|gap detected|stale|denied>",
+    ),
+    // How many objects the view is holding, and how many it is not (§18.5, §50.4). A bound that
+    // is not reported is a truncation presented as a complete picture.
+    Field::required("withheld", "int"),
     // --- the object it happened to, where there was one ---
     Field::nullable("uid", "string"),
     Field::nullable("name", "string"),

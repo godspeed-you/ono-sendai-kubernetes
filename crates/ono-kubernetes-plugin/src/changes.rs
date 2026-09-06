@@ -41,11 +41,12 @@ use ono_kuang_sdk::protocol::WireError;
 use ono_kuang_sdk::{Ctx, EmitError, Outcome};
 use ono_provider_kubernetes::coverage::Scope;
 use ono_provider_kubernetes::discovery::{self, Discovery, Gvr, Resource, Verb};
+use ono_provider_kubernetes::live::{LiveView, ViewState};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::session::{Session, SyncRefused};
 use ono_provider_kubernetes::transport::{
-    ApiError, ByteStream, Client, Freshness, ListOptions, Listing, watch_request,
+    ApiError, ByteStream, Client, Freshness, ListOptions, Listing, SystemClock, watch_request,
 };
 use ono_provider_kubernetes::watch::{
     Backoff, Reception, SyncState, WatchDecoder, WatchEvent, WatchFailure,
@@ -75,6 +76,24 @@ const PAGE_SIZE: u32 = 500;
 const RECONNECT_FLOOR: Duration = Duration::from_millis(50);
 const RECONNECT_CEILING: Duration = Duration::from_secs(1);
 
+/// How long a view may go without a live observation before it says `stale` (§41.4).
+///
+/// **A source-declared threshold rather than a universal rule.** The shell has none and must not
+/// grow one — a live event stream with nothing recent in it is not automatically stale — but a
+/// *source* may declare the cadence it expects, and this one can: a Kubernetes watch that is
+/// healthy is refreshed on every round of this loop, so a view that has not been refreshed
+/// against a live stream for thirty seconds is one whose reader is looking at something older
+/// than the connection claims. The operator can move it with `stale_after_ms`.
+const STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// How many objects of the watched collection the view holds before it starts withholding.
+///
+/// §18.5 and §50.4: a bound, and one that is *reported* — `withheld` rides on every record, so a
+/// truncated view is never a complete-looking one. Two thousand is enough for the collections an
+/// operator watches by hand and small enough that a runaway namespace cannot exhaust the
+/// instance's 256 MiB.
+const VIEW_CAPACITY: usize = 2_000;
+
 /// Answers a `k8s-change` query: acquire the collection, watch it, and account for the gaps.
 #[must_use]
 pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -> Outcome {
@@ -96,6 +115,15 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
     // know *that* continuity broke should not have to pay for it — the gap record is emitted
     // either way, which is the part that is not optional.
     let reacquire = ctx.arguments().get("reacquire").and_then(Json::as_bool) != Some(false);
+    // §41.4's `stale`, and the window it is measured against. A source-declared threshold, which
+    // is the only kind that may exist: the shell must not grow a universal "stale after N
+    // seconds" rule, and a *source* that knows its own cadence may say so.
+    let stale_after = ctx
+        .arguments()
+        .get("stale_after_ms")
+        .and_then(Json::as_u64)
+        .filter(|window| *window > 0)
+        .map_or(STALE_AFTER, Duration::from_millis);
     let endpoint = match Endpoint::resolve(ctx) {
         Ok(endpoint) => endpoint,
         Err(error) => return Outcome::Failed(error),
@@ -116,6 +144,9 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
                 schema,
                 budget,
                 emitted: 0,
+                view: None,
+                clock: SystemClock,
+                stale_after,
             };
             observe(
                 &lease,
@@ -185,6 +216,9 @@ fn observe(
     }
 
     let mut backoff = Backoff::new(RECONNECT_FLOOR, RECONNECT_CEILING);
+    // What the last record told a reader the view was. A notice is emitted when this stops being
+    // true and nothing else is going to say so (§41.4).
+    let mut announced = emitter.observed_state(session, &gvr, &scope);
     loop {
         if lease.cancelled() {
             return Outcome::Cancelled;
@@ -260,9 +294,24 @@ fn observe(
             SyncState::Denied | SyncState::Syncing => return Outcome::Completed,
         }
 
+        // §41.4. A round that delivered a record has already told the reader where the view
+        // stands; one that delivered nothing has not, and if the view moved — the stream started
+        // reconnecting, or the window passed with no live observation — the last thing the reader
+        // was told is now false. That is precisely the frozen table §41.4 forbids, so the notice
+        // goes out before the backoff rather than after the next arrival, which may never come.
+        let now = emitter.observed_state(session, &gvr, &scope);
+        if now != announced {
+            announced = now;
+            if let Step::Stopped(outcome) = emitter.notice(lease, session, &gvr, &scope, &freshness)
+            {
+                return outcome;
+            }
+        }
+
         // A round that carried nothing and ended at once is the one shape that could spin.
         if emitter.emitted > delivered {
             backoff.reset();
+            announced = emitter.observed_state(session, &gvr, &scope);
         } else {
             std::thread::sleep(backoff.next_delay());
         }
@@ -286,6 +335,7 @@ fn acquisition(
         .map(|stream| stream.objects().cloned().collect())
         .unwrap_or_default();
     for object in objects {
+        let view = emitter.refresh(session, gvr, scope);
         match emitter.deliver(
             lease,
             session,
@@ -294,6 +344,7 @@ fn acquisition(
             freshness,
             "listed",
             Some(object),
+            view,
         ) {
             Step::Reading | Step::Ended => {}
             Step::Stopped(outcome) => return Step::Stopped(outcome),
@@ -321,6 +372,18 @@ struct Emitter {
     /// `None` is a watch that runs until the operator stops it, which is the default.
     budget: Option<usize>,
     emitted: usize,
+    /// §41's view over the collection, built once the acquisition says which collection it is.
+    ///
+    /// The view is what turns a stream of changes into something a reader can be told the *state*
+    /// of. `watch.rs` knows five of §41.4's six words without a clock; the sixth — `stale` — is
+    /// the view's, because it is a statement about how long ago rather than about the connection.
+    view: Option<LiveView>,
+    /// The clock the staleness window is measured against. `live.rs` takes it as a parameter and
+    /// has a test that it never reaches for one of its own, so this is where the wall clock
+    /// enters.
+    clock: SystemClock,
+    /// How long without a live observation makes the view stale (§41.4).
+    stale_after: Duration,
 }
 
 impl Emitter {
@@ -342,6 +405,12 @@ impl Emitter {
         freshness: &Freshness,
         class: &str,
         object: Option<Object>,
+        // What the view was when this record was decided — refreshed by an arrival, and merely
+        // *read* by a notice. A notice that refreshed first would report the state it had just
+        // erased: `LiveView::refresh` advances the live observation it measures staleness
+        // against, which is right for something that arrived and wrong for something that did
+        // not.
+        view: (ViewState, usize),
     ) -> Step {
         if lease.cancelled() {
             return Step::Stopped(Outcome::Cancelled);
@@ -368,6 +437,7 @@ impl Emitter {
             freshness.as_watch_event()
         };
         let (segment, continuous, state, gap) = continuity(session, gvr, scope);
+        let (view_state, withheld) = view;
         let collection = gvr.to_string();
         let asked_about = scope.to_string();
         let change = Change {
@@ -377,6 +447,8 @@ impl Emitter {
             segment,
             continuous,
             sync_state: state.as_str(),
+            view_state: view_state.as_str(),
+            withheld,
             gap_reason: gap.as_ref().map(|(reason, _)| *reason),
             gap_detail: gap.map(|(_, detail)| detail),
             object: guarded.as_ref(),
@@ -414,6 +486,59 @@ impl Emitter {
             ))),
             Err(overlap) => Step::Stopped(Outcome::Failed(overlap)),
         }
+    }
+}
+
+impl Emitter {
+    /// Refreshes the view against the session's stream and answers what a reader is looking at.
+    ///
+    /// Built lazily, because the collection is not known until the acquisition has resolved it,
+    /// and rebuilt on every emission because that is where the clock is read: `LiveView` does no
+    /// timing of its own, so a view refreshed once and asked twice would go stale between the two
+    /// asks rather than because anything happened.
+    fn refresh(&mut self, session: &Session, gvr: &Gvr, scope: &Scope) -> (ViewState, usize) {
+        let Some(stream) = session.watch_stream(gvr, scope) else {
+            // No stream yet is the acquisition, and §20.3 is explicit that a view which has not
+            // synchronised is `syncing` rather than a cluster with nothing in it.
+            return (ViewState::Syncing, 0);
+        };
+        let view = self.view.get_or_insert_with(|| {
+            LiveView::new(gvr.clone(), scope.clone(), VIEW_CAPACITY, self.stale_after)
+        });
+        view.refresh(stream, &self.clock);
+        (view.state(&self.clock), view.withheld().len())
+    }
+
+    /// The state a reader would be looking at right now, without touching the view's rows.
+    ///
+    /// Used by the loop between rounds, where nothing arrived to carry a state on.
+    fn observed_state(&self, session: &Session, gvr: &Gvr, scope: &Scope) -> ViewState {
+        match (self.view.as_ref(), session.watch_stream(gvr, scope)) {
+            (Some(view), Some(_)) => view.state(&self.clock),
+            _ => ViewState::Syncing,
+        }
+    }
+
+    /// Emits one `notice`: the view changed state and no observation arrived to say so.
+    ///
+    /// **This is what §41.4's second sentence asks for.** "A disconnected watch MUST not leave a
+    /// frozen table that visually appears live" — and a reader of a stream learns only from
+    /// records that arrive, so a stream that goes quiet *because* it is reconnecting says nothing
+    /// at all, and the last thing it said was `live`. A notice carries no object, exactly as a
+    /// gap does: it is a fact about the view rather than about anything in the cluster.
+    fn notice(
+        &mut self,
+        lease: &Lease<'_, '_>,
+        session: &Session,
+        gvr: &Gvr,
+        scope: &Scope,
+        freshness: &Freshness,
+    ) -> Step {
+        let view = (
+            self.observed_state(session, gvr, scope),
+            self.view.as_ref().map_or(0, |view| view.withheld().len()),
+        );
+        self.deliver(lease, session, gvr, scope, freshness, "notice", None, view)
     }
 }
 
@@ -587,11 +712,26 @@ impl Conversation for Live<'_, '_, '_> {
             );
         }
 
+        let mut announced = emitter.observed_state(session, gvr, scope);
         loop {
             // §62.12: between two chunks, which is where a live watch spends its life. The read
             // itself watches for it too, because a quiet watch is quiet for minutes at a time.
             if lease.cancelled() {
                 return Ok(Step::Stopped(Outcome::Cancelled));
+            }
+            // §41.4, in the place where the silence actually happens. A watch spends most of its
+            // life blocked here, and if the view crosses its staleness window while it does, the
+            // last thing the reader was told is `live` and nothing is coming to correct it. That
+            // is the frozen table §41.4 forbids, so the correction is emitted rather than waited
+            // for.
+            let now = emitter.observed_state(session, gvr, scope);
+            if now != announced {
+                announced = now;
+                if let Step::Stopped(outcome) =
+                    emitter.notice(lease, session, gvr, scope, freshness)
+                {
+                    return Ok(Step::Stopped(outcome));
+                }
             }
             let Some(chunk) = stream.next_chunk() else {
                 break;
@@ -605,6 +745,12 @@ impl Conversation for Live<'_, '_, '_> {
                     // that follows opens at the last position anything was actually observed at.
                     Err(error) => interrupted(&error.to_string()),
                 },
+                // A window passed and the server said nothing. The connection is open, the
+                // buffer is untouched, and the next read continues mid-frame — so this is the
+                // one read outcome that is neither an event nor an interruption. It exists so
+                // that a watch can notice its own silence: the loop head above has just checked
+                // whether the view moved, which is §41.4's "MUST not leave a frozen table".
+                Err(ApiError::Quiet) => continue,
                 // The body stopped mid-stream. §19.5: an interruption is not an expiry — the
                 // checkpoint is still usable — so it suspends the stream rather than voiding it.
                 Err(error) => {
@@ -621,6 +767,9 @@ impl Conversation for Live<'_, '_, '_> {
                     Step::Stopped(outcome) => return Ok(Step::Stopped(outcome)),
                 }
             }
+            // Whatever arrived carried the state on its own record, so that is what the reader
+            // was last told.
+            announced = emitter.observed_state(session, gvr, scope);
         }
 
         let rest = match decoder.finish() {
@@ -670,15 +819,25 @@ fn apply(
                 "DELETED" => "deleted",
                 _ => "modified",
             };
-            emitter.deliver(lease, session, gvr, scope, freshness, word, object)
+            let view = emitter.refresh(session, gvr, scope);
+            emitter.deliver(lease, session, gvr, scope, freshness, word, object, view)
         }
         // A checkpoint moved and nothing else did; a bookmark is not a change and reporting it
         // as one is how a cache picks up a change the cluster never made (§19.3).
-        Reception::Checkpointed | Reception::Discarded => Step::Reading,
+        //
+        // It *is* evidence the stream is alive, though, which is the one thing §41.4's `stale`
+        // is measured against — so the view is refreshed and no record is emitted. A healthy
+        // watch that nothing is happening in stays `live` because its bookmarks say so, and a
+        // connected watch whose server has gone silent goes `stale` because nothing does.
+        Reception::Checkpointed | Reception::Discarded => {
+            emitter.refresh(session, gvr, scope);
+            Step::Reading
+        }
         // The body is over as far as observation goes, and the checkpoint survives it.
         Reception::Suspended => Step::Ended,
         Reception::ContinuityBroken => {
-            match emitter.deliver(lease, session, gvr, scope, freshness, "gap", None) {
+            let view = emitter.refresh(session, gvr, scope);
+            match emitter.deliver(lease, session, gvr, scope, freshness, "gap", None, view) {
                 Step::Reading | Step::Ended => Step::Ended,
                 Step::Stopped(outcome) => Step::Stopped(outcome),
             }

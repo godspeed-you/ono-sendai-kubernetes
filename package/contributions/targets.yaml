@@ -319,6 +319,10 @@ targets:
       - name: reacquire
         type: bool
         doc: "After a continuity gap, list the collection again to resume from a known version. Default true; the gap record is emitted either way (specification section 19.4)."
+      - name: stale_after_ms
+        type: int
+        doc: "How long without a live observation before the view calls itself stale (specification section 41.4). A threshold this source declares, not a rule the shell applies to everything."
+        default: "30000"
   # The Events a cluster reported about one object (§38). Not a collection of the query's kind: the
   # query names the object the Events are *about*, and the Events themselves come from whichever of
   # §38.2's two representations the cluster serves. Options: `kind`/`group`/`version`/`resource` and

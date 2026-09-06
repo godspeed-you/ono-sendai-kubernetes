@@ -46,7 +46,7 @@ use ono_provider_kubernetes::logs::{
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::session::Session;
 use ono_provider_kubernetes::temporal::ClockSource;
-use ono_provider_kubernetes::transport::{ByteStream, Client, Freshness, Request};
+use ono_provider_kubernetes::transport::{ApiError, ByteStream, Client, Freshness, Request};
 use ono_value::Schema;
 use serde_json::Value as Json;
 
@@ -546,6 +546,12 @@ impl Conversation for Following<'_, '_, '_> {
             };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
+                // A window passed and the container printed nothing. A followed log is quiet for
+                // most of its life, and a quiet log is neither an ended one nor a failed one —
+                // the connection is open and the next read continues mid-line. The read hands
+                // control back so that a follow can notice the operator stopping it promptly
+                // (§62.12), which the check at the head of this loop is for.
+                Err(ApiError::Quiet) => continue,
                 Err(error) => {
                     if lease.cancelled() {
                         follow.cancel();
