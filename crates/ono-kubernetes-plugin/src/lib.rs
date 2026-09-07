@@ -38,6 +38,7 @@ pub mod changes;
 pub mod cluster;
 pub mod conditions;
 pub mod contributions;
+pub(crate) mod credential_store;
 pub mod credentials;
 pub mod dynamic;
 pub mod events;
@@ -105,6 +106,13 @@ pub fn plugin() -> Plugin {
     // own; the interior mutability lives in `Sessions`, where §6.5's key is checked beside the
     // lock that arbitrates who may use the session that key names.
     let sessions = Arc::new(Sessions::new());
+    // The credential store lives beside the session registry and for the same reason: it is
+    // process-lived state a `Ctx`-scoped value could not hold (§8.3, ADR-0055). It is reached
+    // through a process-global rather than handed to each handler, because `Endpoint::resolve`
+    // reaches it from every handler with nothing but a `Ctx` — a value threaded to it would have
+    // to cross handler signatures this package does not own. Installing it here keeps the two
+    // registries built in one place.
+    credential_store::install();
     let mut plugin = Plugin::new(PACKAGE, VERSION).concurrent_invocations(CONCURRENT_INVOCATIONS);
     for target in contributions::TARGETS {
         let sessions = Arc::clone(&sessions);

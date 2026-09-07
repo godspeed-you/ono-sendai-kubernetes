@@ -261,3 +261,35 @@ fn should_carry_only_the_environment_the_block_declares() {
     assert!(!plugin.env().contains_key("PATH"));
     assert!(!plugin.env().contains_key("HOME"));
 }
+
+#[test]
+fn should_state_its_expiry_as_an_instant_a_store_can_refresh_before() {
+    // §8.3, ADR-0055: a credential store refreshes *before* a request when the credential is
+    // about to expire, and it can only do that from an instant it can compare with a clock. A
+    // timestamp this provider cannot read is `None` — not an expiry in the past, which would
+    // refuse a good credential on an inference §4 forbids, and not one in the future either.
+    let stated = ExecCredential::parse(
+        r#"{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1",
+            "status":{"token":"t","expirationTimestamp":"2026-09-07T10:11:12Z"}}"#,
+    )
+    .expect("a credential with an expiry reads");
+    assert_eq!(stated.expires_at_millis(), Some(1_788_775_872_000));
+
+    let unstated = ExecCredential::parse(
+        r#"{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1",
+            "status":{"token":"t"}}"#,
+    )
+    .expect("a credential without an expiry reads");
+    assert_eq!(unstated.expires_at_millis(), None);
+
+    let unreadable = ExecCredential::parse(
+        r#"{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1",
+            "status":{"token":"t","expirationTimestamp":"tomorrow-ish"}}"#,
+    )
+    .expect("a credential with an unreadable expiry still reads");
+    assert_eq!(
+        unreadable.expires_at_millis(),
+        None,
+        "an expiry this provider cannot parse is no instant, not an expired one"
+    );
+}

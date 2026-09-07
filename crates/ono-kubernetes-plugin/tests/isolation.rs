@@ -41,7 +41,9 @@
     reason = "a failed precondition in a test should abort the test loudly"
 )]
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ono_kuang_sdk::protocol::{Capability, InvokeStatus, ShutdownReason};
 use ono_kuang_supervisor::{
@@ -239,9 +241,36 @@ struct Cluster {
     heads: Arc<Mutex<Vec<String>>>,
     /// The transcript both servers share, when a test needs to see the two queries overlap.
     watching: Option<Arc<Overlap>>,
+    /// Bearer tokens this server answers `401` to, as an API server does once a credential has
+    /// been revoked or has expired on its side (§8.3, ADR-0055). Empty for every test that is
+    /// not about refresh.
+    refuses: Arc<Mutex<Vec<String>>>,
 }
 
 impl Cluster {
+    /// A `401`, as the API server writes one: a `Status` with reason `Unauthorized`.
+    fn unauthorized() -> Vec<u8> {
+        let body = json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "message": "Unauthorized", "reason": "Unauthorized", "code": 401,
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// The bearer token a request head carries, where it carries one.
+    fn bearer_of(head: &str) -> Option<String> {
+        head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().strip_prefix("Bearer ").map(str::to_owned))?
+        })
+    }
+
     fn heads(&self) -> Vec<String> {
         self.heads
             .lock()
@@ -353,6 +382,27 @@ impl Cluster {
                     "status": {"phase": "Running"},
                 })).collect::<Vec<_>>(),
             }),
+            // §17.1's direct read of one Pod at its own endpoint, for the tests that retry a
+            // `get` rather than a listing.
+            ("GET", other)
+                if other
+                    .strip_prefix(&format!("{pods}/"))
+                    .is_some_and(|name| self.pods.contains(&name)) =>
+            {
+                let name = other.rsplit('/').next().unwrap_or_default();
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": name,
+                        "namespace": self.namespace,
+                        "uid": format!("{}-{name}", self.kube_system_uid),
+                        "creationTimestamp": "2026-09-01T09:00:00Z",
+                    },
+                    "spec": {"containers": [{"name": "app"}]},
+                    "status": {"phase": "Running"},
+                })
+            }
             _ => return Self::not_found(path),
         };
         Self::ok(&body.to_string())
@@ -387,6 +437,47 @@ fn requests(buffered: &mut Vec<u8>) -> Vec<(String, String, String)> {
 /// One program the host was asked to run: what, with which arguments, in which environment.
 type Run = (String, Vec<String>, Vec<(String, String)>);
 
+/// A scripted helper answer that makes the run fail to start.
+const HELPER_FAILS: &str = "<the helper fails>";
+
+/// An `ExecCredential` as a helper prints one, with the expiry it states, where it states one.
+fn exec_credential(token: &str, expires_at: Option<&str>) -> String {
+    match expires_at {
+        None => format!(
+            r#"{{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1","status":{{"token":"{token}"}}}}"#
+        ),
+        Some(at) => format!(
+            r#"{{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1","status":{{"token":"{token}","expirationTimestamp":"{at}"}}}}"#
+        ),
+    }
+}
+
+/// An RFC 3339 instant `offset` seconds from now, in UTC, as a credential plugin writes one.
+fn from_now(offset: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs();
+    let seconds = i64::try_from(now).expect("the epoch fits") + offset;
+    let days = seconds.div_euclid(86_400);
+    let of_day = seconds.rem_euclid(86_400);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mp = (5 * (doe - (365 * yoe + yoe / 4 - yoe / 100)) + 2) / 153;
+    let day = doe - (365 * yoe + yoe / 4 - yoe / 100) - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        of_day / 3_600,
+        (of_day % 3_600) / 60,
+        of_day % 60
+    )
+}
+
 /// Two clusters behind one host, told apart by the name the query connected to.
 ///
 /// A single `HostServices`, because Gate J is about one *session* reaching two clusters. Two test
@@ -394,8 +485,15 @@ type Run = (String, Vec<String>, Vec<(String, String)>);
 #[derive(Clone)]
 struct Fleet {
     clusters: Vec<Arc<Cluster>>,
-    /// What a credential plugin prints, for the `helper` context (§8.2, §8.3).
-    credential: String,
+    /// What a credential plugin prints, for the `helper` context (§8.2, §8.3), run by run.
+    ///
+    /// A script rather than one answer: a refresh is only observable if the second run can say
+    /// something different from the first (ADR-0055). The front answer is taken by each run and
+    /// the last one is kept, so a helper scripted with one answer repeats it. [`HELPER_FAILS`]
+    /// makes a run fail to start.
+    credentials: Arc<Mutex<VecDeque<String>>>,
+    /// How long a run holds before it answers, so two invocations can meet one expiry.
+    helper_delay: Arc<Mutex<Duration>>,
     /// Every program this host was asked to run, with its arguments and its environment.
     ///
     /// §51.3's least authority is a claim about *what a helper was given*, and the only place it
@@ -447,7 +545,7 @@ impl HostServices for Fleet {
                 let mut replies: Vec<Vec<u8>> = Vec::new();
                 for (method, path, head) in requests(&mut buffered) {
                     if let Ok(mut heads) = cluster.heads.lock() {
-                        heads.push(head);
+                        heads.push(head.clone());
                     }
                     if let Some(watching) = &cluster.watching {
                         // Recorded rather than withheld. A server that held its answer back until
@@ -462,7 +560,21 @@ impl HostServices for Fleet {
                             path.split('?').next().unwrap_or(&path)
                         ));
                     }
-                    replies.push(cluster.document(&method, &path));
+                    // A credential this server no longer accepts is refused before the document
+                    // is consulted, which is where a real API server refuses it: authentication
+                    // precedes everything else (§8.3, ADR-0055).
+                    let refused = Cluster::bearer_of(&head).is_some_and(|token| {
+                        cluster
+                            .refuses
+                            .lock()
+                            .map(|refuses| refuses.contains(&token))
+                            .unwrap_or(false)
+                    });
+                    replies.push(if refused {
+                        Cluster::unauthorized()
+                    } else {
+                        cluster.document(&method, &path)
+                    });
                 }
                 let outbound = encrypt(&mut session, &replies);
                 if outbound.is_empty() {
@@ -550,9 +662,25 @@ impl HostServices for Fleet {
         if let Ok(mut ran) = self.ran.lock() {
             ran.push((program.clone(), arguments, environment));
         }
+        let printed = {
+            let mut script = self.credentials.lock().expect("the script is readable");
+            if script.len() > 1 {
+                script.pop_front().expect("a front answer")
+            } else {
+                script.front().cloned().unwrap_or_default()
+            }
+        };
+        if printed == HELPER_FAILS {
+            return Err(HostError::unavailable(
+                "the credential plugin could not be started",
+            ));
+        }
+        let delay = *self.helper_delay.lock().expect("the delay is readable");
         let (sender, receiver) = mpsc::channel(4);
-        let printed = self.credential.clone();
         tokio::spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             for line in printed.lines() {
                 let _ = sender
                     .send(Ok(json!({"stream": "stdout", "line": line})))
@@ -630,6 +758,7 @@ impl Fixture {
             tls: alpha_authority.server_config(),
             heads: Arc::default(),
             watching: watching.clone(),
+            refuses: Arc::default(),
         });
         let beta = Arc::new(Cluster {
             server_name: "beta.test",
@@ -645,6 +774,7 @@ impl Fixture {
             tls: beta_authority.server_config(),
             heads: Arc::default(),
             watching: watching.clone(),
+            refuses: Arc::default(),
         });
 
         let document = format!(
@@ -702,11 +832,11 @@ contexts:
         Self {
             fleet: Fleet {
                 clusters: vec![Arc::clone(&alpha), Arc::clone(&beta)],
-                credential: format!(
-                    r#"{{"kind":"ExecCredential","apiVersion":"client.authentication.k8s.io/v1",
-                        "status":{{"token":"{}"}}}}"#,
-                    alpha.token
-                ),
+                credentials: Arc::new(Mutex::new(VecDeque::from([exec_credential(
+                    alpha.token,
+                    None,
+                )]))),
+                helper_delay: Arc::new(Mutex::new(Duration::ZERO)),
                 ran: Arc::default(),
             },
             alpha,
@@ -791,6 +921,39 @@ contexts:
             host = host.grant(capability);
         }
         host
+    }
+
+    /// Scripts what the helper prints, run by run (the last answer repeats).
+    fn helper_answers(&self, answers: &[String]) {
+        *self
+            .fleet
+            .credentials
+            .lock()
+            .expect("the script is writable") = answers.iter().cloned().collect();
+    }
+
+    /// Makes every helper run hold for `delay` before it answers.
+    fn helper_holds(&self, delay: Duration) {
+        *self
+            .fleet
+            .helper_delay
+            .lock()
+            .expect("the delay is writable") = delay;
+    }
+
+    /// Makes `alpha` answer `401` to `token` from now on, as an API server does once a
+    /// credential is revoked or has expired on its side.
+    fn alpha_refuses(&self, token: &str) {
+        self.alpha
+            .refuses
+            .lock()
+            .expect("the refusal list is writable")
+            .push(token.to_owned());
+    }
+
+    /// How many helper runs the host has seen.
+    fn helper_runs(&self) -> usize {
+        self.fleet.ran.lock().expect("the record is readable").len()
     }
 
     /// The options that reach one cluster through its own context and nothing else.
@@ -1503,5 +1666,538 @@ async fn should_refuse_to_run_a_credential_plugin_without_the_capability_that_go
         "and no request reached either cluster"
     );
 
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- §8.3: the credential's lifetime (ADR-0055) -------------------------------------------------
+//
+// The recorded helper answers a script rather than one line, `alpha` can be told to refuse a token
+// with `401`, and every head `alpha` saw carries the bearer that was on the wire — which is the
+// only evidence that says *which* credential a request travelled with. Tokens in this section are
+// deliberately unlike anything else in the file, so a leak into a record, an error, the audit
+// trail or a log line is unmistakable.
+
+/// The bearer tokens on `alpha`'s heads from index `from` on, in order.
+fn bearers_from(cluster: &Cluster, from: usize) -> Vec<String> {
+    cluster
+        .heads()
+        .iter()
+        .skip(from)
+        .filter_map(|head| Cluster::bearer_of(head))
+        .collect()
+}
+
+/// The request lines on `alpha`'s heads from index `from` on that read the Pod collection or an
+/// object in it, in order.
+fn pod_requests_from(cluster: &Cluster, from: usize) -> Vec<String> {
+    cluster
+        .heads()
+        .iter()
+        .skip(from)
+        .filter(|head| head.starts_with("GET /api/v1/namespaces/shop/pods"))
+        .map(|head| head.lines().next().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn should_run_the_credential_plugin_once_while_its_credential_stays_valid() {
+    // §8.3, ADR-0055: a credential that is valid throughout is fetched once, and the second
+    // invocation of the same context reuses it rather than running the helper again.
+    let fixture = Fixture::build();
+    fixture.helper_answers(&[exec_credential(
+        "valid-for-an-hour-7c1e",
+        Some(&from_now(3_600)),
+    )]);
+    let plugin = fixture.loaded_with_process_exec().await;
+
+    for _ in 0..2 {
+        let (events, result) = plugin
+            .query("k8s-pod", fixture.context("helper"))
+            .await
+            .expect("the query starts")
+            .collect()
+            .await;
+        assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+        assert_eq!(records(&events).len(), 1);
+    }
+
+    assert_eq!(
+        fixture.helper_runs(),
+        1,
+        "one helper run served both invocations"
+    );
+    assert!(
+        bearers_from(&fixture.alpha, 0)
+            .iter()
+            .all(|token| token == "valid-for-an-hour-7c1e"),
+        "and every request carried it: {:?}",
+        fixture.alpha.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_a_credential_that_had_already_expired_when_it_arrived() {
+    // §8.3: "credential expiry MUST be honored." A helper whose own cache is stale hands back a
+    // token that is already dead, and sending it would produce a `401` an operator reads as their
+    // RBAC being wrong. Nothing is sent.
+    let fixture = Fixture::build();
+    fixture.helper_answers(&[exec_credential("already-dead-9b40", Some(&from_now(-60)))]);
+    let plugin = fixture.loaded_with_process_exec().await;
+
+    let (events, result) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("expired"),
+        "the refusal names the expiry: {error:?}"
+    );
+    assert_eq!(fixture.helper_runs(), 1);
+    assert!(
+        fixture.alpha.heads().is_empty(),
+        "nothing reached the cluster with a dead credential"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_run_the_credential_plugin_again_once_its_credential_has_expired() {
+    // §8.3's `SHOULD`: refresh "before a request when the credential is expired". The first
+    // credential expires three seconds past the early-refresh margin; by the second invocation it
+    // is inside the margin, the helper runs again *before* anything is sent, and the second
+    // invocation travels on the replacement.
+    //
+    // The wall clock is the only thing that can move a credential from valid to expiring, so this
+    // test sleeps once. The assertions are shaped so that a stalled machine cannot fail them
+    // by refreshing earlier than expected: the second invocation must carry the replacement and
+    // nothing but the replacement.
+    let fixture = Fixture::build();
+    fixture.helper_answers(&[
+        exec_credential("first-short-lived-2a7d", Some(&from_now(33))),
+        exec_credential("second-long-lived-5e13", Some(&from_now(3_600))),
+    ]);
+    let plugin = fixture.loaded_with_process_exec().await;
+
+    let (_, first) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(first.status, InvokeStatus::Completed, "{:?}", first.error);
+    let seen = fixture.alpha.heads().len();
+    assert!(
+        bearers_from(&fixture.alpha, 0)
+            .iter()
+            .all(|token| token == "first-short-lived-2a7d"),
+        "the first invocation travelled on the first credential"
+    );
+
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+
+    let (_, second) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(second.status, InvokeStatus::Completed, "{:?}", second.error);
+    let later = bearers_from(&fixture.alpha, seen);
+    assert!(
+        !later.is_empty() && later.iter().all(|token| token == "second-long-lived-5e13"),
+        "the second invocation travelled on the replacement and nothing else: {later:?}"
+    );
+    assert!(
+        fixture.helper_runs() >= 2,
+        "the helper ran again before the second invocation's first request"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+/// One invocation of `helper` whose credential the cluster then stops accepting, so the next
+/// invocation meets a `401` with discovery already cached — a token revoked between two queries.
+async fn revoked_between_invocations(
+    fixture: &Fixture,
+    answers: &[String],
+) -> (ono_kuang_supervisor::LoadedPlugin, usize) {
+    fixture.helper_answers(answers);
+    let plugin = fixture.loaded_with_process_exec().await;
+    let (_, first) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(first.status, InvokeStatus::Completed, "{:?}", first.error);
+    assert_eq!(fixture.helper_runs(), 1);
+    (plugin, fixture.alpha.heads().len())
+}
+
+#[tokio::test]
+async fn should_send_the_replacement_credential_the_plugin_returns_after_a_401() {
+    // ADR-0055's one refresh and one retry, on a listing. The API server refuses the credential
+    // this provider still holds as valid; the helper runs once more; the same request goes out
+    // once more with the replacement. Exactly two requests to the collection, with two different
+    // credentials, and the second one answered.
+    let fixture = Fixture::build();
+    let (plugin, seen) = revoked_between_invocations(
+        &fixture,
+        &[
+            exec_credential("revoked-later-c0de", None),
+            exec_credential("replacement-a11b", None),
+        ],
+    )
+    .await;
+    fixture.alpha_refuses("revoked-later-c0de");
+
+    let (events, result) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(records(&events).len(), 1, "the retry was answered");
+    assert_eq!(
+        pod_requests_from(&fixture.alpha, seen).len(),
+        2,
+        "exactly two requests to the collection: the refused one and its retry"
+    );
+    assert_eq!(
+        bearers_from(&fixture.alpha, seen),
+        vec![
+            "revoked-later-c0de".to_owned(),
+            "replacement-a11b".to_owned()
+        ],
+        "two distinct credentials, the replacement on the retry"
+    );
+    assert_eq!(fixture.helper_runs(), 2, "the helper ran once more, once");
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_retry_a_direct_read_once_with_the_replacement_credential() {
+    // The same rule on §17.1's direct read by name, which takes a different path from a listing.
+    let fixture = Fixture::build();
+    let (plugin, seen) = revoked_between_invocations(
+        &fixture,
+        &[
+            exec_credential("revoked-for-get-77aa", None),
+            exec_credential("replacement-for-get-88bb", None),
+        ],
+    )
+    .await;
+    fixture.alpha_refuses("revoked-for-get-77aa");
+
+    let mut named = fixture.context("helper");
+    named.insert("name".to_owned(), json!("alpha-till"));
+    let (events, result) = plugin
+        .query("k8s-pod", named)
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records(&events)
+            .iter()
+            .filter_map(|record| text_of(record, "name"))
+            .collect::<Vec<_>>(),
+        vec!["alpha-till".to_owned()]
+    );
+    let requests = pod_requests_from(&fixture.alpha, seen);
+    assert_eq!(
+        requests.len(),
+        2,
+        "one refused get and one retry: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|line| line.starts_with("GET /api/v1/namespaces/shop/pods/alpha-till ")),
+        "both were the object endpoint: {requests:?}"
+    );
+    assert_eq!(
+        bearers_from(&fixture.alpha, seen),
+        vec![
+            "revoked-for-get-77aa".to_owned(),
+            "replacement-for-get-88bb".to_owned()
+        ]
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_stop_after_one_refresh_when_the_api_server_refuses_the_replacement_too() {
+    // The bound. A `401`, a refresh, a retry, a second `401` — and then an explicit
+    // authentication failure rather than a third request or a second refresh.
+    let fixture = Fixture::build();
+    let (plugin, seen) = revoked_between_invocations(
+        &fixture,
+        &[
+            exec_credential("refused-once-1111", None),
+            exec_credential("refused-twice-2222", None),
+            exec_credential("never-asked-for-3333", None),
+        ],
+    )
+    .await;
+    fixture.alpha_refuses("refused-once-1111");
+    fixture.alpha_refuses("refused-twice-2222");
+
+    let (events, result) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("authentication") && error.message.contains("replacement"),
+        "the refusal says the replacement was refused too: {error:?}"
+    );
+    assert_eq!(
+        pod_requests_from(&fixture.alpha, seen).len(),
+        2,
+        "two requests and no third"
+    );
+    assert_eq!(fixture.helper_runs(), 2, "one refresh and no second");
+    assert!(
+        !fixture
+            .alpha
+            .heads()
+            .iter()
+            .any(|head| head.contains("never-asked-for-3333")),
+        "the third credential was never fetched or sent"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_run_one_credential_plugin_when_two_invocations_meet_one_expiry() {
+    // §8.3 without a stampede (ADR-0055): two invocations that both find the credential expiring
+    // share one helper run — the second waits for the first's run and reuses its answer.
+    let fixture = Fixture::build();
+    fixture.helper_answers(&[
+        exec_credential("expiring-soon-4d4d", Some(&from_now(33))),
+        exec_credential("shared-replacement-6f6f", Some(&from_now(3_600))),
+    ]);
+    let plugin = fixture.loaded_with_process_exec().await;
+    let (_, first) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(first.status, InvokeStatus::Completed, "{:?}", first.error);
+    let seen = fixture.alpha.heads().len();
+
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    fixture.helper_holds(Duration::from_millis(500));
+
+    let one = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the first concurrent query starts");
+    let two = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the second concurrent query starts");
+    let ((_, one), (_, two)) = tokio::join!(one.collect(), two.collect());
+    assert_eq!(one.status, InvokeStatus::Completed, "{:?}", one.error);
+    assert_eq!(two.status, InvokeStatus::Completed, "{:?}", two.error);
+
+    assert_eq!(
+        fixture.helper_runs(),
+        2,
+        "the first invocation's run, and exactly one refresh shared by the two that met the expiry"
+    );
+    let later = bearers_from(&fixture.alpha, seen);
+    assert!(
+        !later.is_empty() && later.iter().all(|token| token == "shared-replacement-6f6f"),
+        "both concurrent invocations travelled on the one replacement: {later:?}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_a_replacement_that_is_not_an_exec_credential() {
+    // §8.3: the output is the `ExecCredential` contract or it is nothing, at refresh as at first
+    // acquisition. A helper that prints a usage message on its second run gets an explicit
+    // authentication failure, and nothing is sent with a token scraped out of it.
+    let fixture = Fixture::build();
+    let (plugin, seen) = revoked_between_invocations(
+        &fixture,
+        &[
+            exec_credential("fine-at-first-abcd", None),
+            "usage: cloud-cli token --cluster NAME".to_owned(),
+        ],
+    )
+    .await;
+    fixture.alpha_refuses("fine-at-first-abcd");
+
+    let (events, result) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("authentication") && error.message.contains("ExecCredential"),
+        "the refusal names the contract that was not met: {error:?}"
+    );
+    assert_eq!(
+        pod_requests_from(&fixture.alpha, seen).len(),
+        1,
+        "the refused request, and nothing retried with what the helper printed"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_a_replacement_that_has_already_expired() {
+    // A refresh that hands back a credential already past its expiry is a failed refresh, not a
+    // credential to try: the stale-cache helper of ADR-0054, met at refresh time.
+    let fixture = Fixture::build();
+    let (plugin, seen) = revoked_between_invocations(
+        &fixture,
+        &[
+            exec_credential("good-then-revoked-e1e1", None),
+            exec_credential("dead-on-arrival-f2f2", Some(&from_now(-60))),
+        ],
+    )
+    .await;
+    fixture.alpha_refuses("good-then-revoked-e1e1");
+
+    let (events, result) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("authentication") && error.message.contains("expired"),
+        "the refusal names the expiry: {error:?}"
+    );
+    assert!(
+        !bearers_from(&fixture.alpha, seen)
+            .iter()
+            .any(|token| token == "dead-on-arrival-f2f2"),
+        "the dead replacement was never sent"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_report_a_credential_plugin_that_fails_at_refresh() {
+    // The helper itself fails on its second run — the host cannot start it. An explicit
+    // authentication failure, and nothing more sent with the credential the server refused.
+    let fixture = Fixture::build();
+    let (plugin, seen) = revoked_between_invocations(
+        &fixture,
+        &[
+            exec_credential("works-once-9a9a", None),
+            HELPER_FAILS.to_owned(),
+        ],
+    )
+    .await;
+    fixture.alpha_refuses("works-once-9a9a");
+
+    let (events, result) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+
+    assert!(records(&events).is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert!(
+        error.message.contains("authentication") && error.message.contains("cloud-cli"),
+        "the refusal names the helper that failed: {error:?}"
+    );
+    assert_eq!(
+        pod_requests_from(&fixture.alpha, seen).len(),
+        1,
+        "nothing was retried with the stale credential"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_keep_the_credential_out_of_every_record_error_audit_and_log() {
+    // §8.1 and §8.3 of the generic contract, over the whole of what an invocation leaves behind:
+    // the records and events it emitted, the error it ended with, the audit trail the host kept
+    // and the log lines the package wrote. A successful invocation and a failed refresh both, so
+    // the error path is covered as well as the happy one.
+    let fixture = Fixture::build();
+    let token = "never-to-be-seen-0badc0ffee";
+    let replacement = "nor-this-one-deadbeef";
+    let (plugin, _) = revoked_between_invocations(
+        &fixture,
+        &[
+            exec_credential(token, Some(&from_now(3_600))),
+            exec_credential(replacement, Some(&from_now(-60))),
+        ],
+    )
+    .await;
+    fixture.alpha_refuses(token);
+    let (events, result) = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Failed);
+
+    let everything = format!(
+        "{events:?}\n{result:?}\n{:?}\n{:?}",
+        plugin.audit(),
+        plugin.logs()
+    );
+    for material in [token, replacement] {
+        assert!(
+            !everything.contains(material),
+            "credential material reached what an invocation leaves behind: {material}"
+        );
+    }
+    assert!(
+        plugin
+            .audit()
+            .iter()
+            .filter(|event| event.capability == "audit.event")
+            .filter(|event| format!("{:?}", event).contains("credential-plugin"))
+            .count()
+            >= 2,
+        "both helper runs — the acquisition and the refresh — are in the trail (§51.6)"
+    );
+    assert!(
+        fixture
+            .alpha
+            .heads()
+            .iter()
+            .any(|head| head.contains(token)),
+        "and the credential did travel on the wire, which is the one place it belongs"
+    );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

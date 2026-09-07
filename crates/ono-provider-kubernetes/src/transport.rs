@@ -2395,6 +2395,23 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
         self
     }
 
+    /// Replaces a header sent on every request, or adds it where none of that name is set.
+    ///
+    /// The seam a credential refresh needs (§8.3, ADR-0055): a client is built with the
+    /// `Authorization` its endpoint resolved to, and when the API server refuses that credential
+    /// and the helper is run again, the *same* connection carries the replacement on its retry.
+    /// The value never reaches [`fmt::Debug`], as with [`Self::with_default_header`].
+    pub fn replace_default_header(&mut self, name: &str, value: impl Into<String>) {
+        let value = value.into();
+        for (existing, held) in &mut self.default_headers {
+            if existing.eq_ignore_ascii_case(name) {
+                *held = value;
+                return;
+            }
+        }
+        self.default_headers.push((name.to_owned(), value));
+    }
+
     /// Which provider instance this client speaks for (§6.2).
     #[must_use]
     pub fn provider_instance(&self) -> &str {

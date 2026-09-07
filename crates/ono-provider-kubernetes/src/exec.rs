@@ -364,6 +364,17 @@ impl ExecCredential {
         self.expires_at.as_deref()
     }
 
+    /// When this credential expires, in Unix milliseconds, where the plugin stated a timestamp
+    /// this provider can parse (§8.3).
+    ///
+    /// [`None`] both when the plugin stated no expiry and when it stated one this provider cannot
+    /// read: neither is an instant a store can refresh *before*, and a credential this provider
+    /// cannot time out is one the API server times out instead, with a `401` (ADR-0054, ADR-0055).
+    #[must_use]
+    pub fn expires_at_millis(&self) -> Option<u64> {
+        self.expires_at.as_deref().and_then(rfc3339_millis)
+    }
+
     /// Whether the credential had already expired at `now` (§8.3).
     ///
     /// A credential with no `expirationTimestamp` never expires *as far as this provider can
