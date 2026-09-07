@@ -379,6 +379,26 @@ impl Request {
         format!("{}?{}", self.path, query.join("&"))
     }
 
+    /// The same request with `base` prepended to its path (ADR-0057, §7.1).
+    ///
+    /// A kubeconfig `server` may carry a path — `https://host/k8s/clusters/c-m-xxxxx` is how
+    /// Rancher and other API-server proxies address a cluster — and every request this package
+    /// sends then travels *under* that path rather than at the API server's root. The prefix is
+    /// applied once, here, so no handler string-concatenates it and none can forget to: the
+    /// connection that owns the base path prepends it to whatever request it is asked to send.
+    ///
+    /// An empty `base` returns the request unchanged, so a cluster addressed at the root pays
+    /// nothing for the mechanism.
+    #[must_use]
+    pub fn with_base_path(&self, base: &str) -> Request {
+        if base.is_empty() {
+            return self.clone();
+        }
+        let mut prefixed = self.clone();
+        prefixed.path = format!("{base}{}", self.path);
+        prefixed
+    }
+
     /// The request as an HTTP/1.1 message.
     ///
     /// CRLF everywhere and an empty line before the body: an API server answers nothing else, and
@@ -486,6 +506,10 @@ struct Head {
 pub struct HttpConnection<S: ByteStream> {
     stream: S,
     host: String,
+    /// A path every request travels under, or empty for a cluster addressed at the root
+    /// (ADR-0057, §7.1). Applied at the one point every request passes through — see
+    /// [`Self::write_and_read_head`] — so nothing above it prepends the prefix by hand.
+    base_path: String,
     buffer: Vec<u8>,
 }
 
@@ -496,8 +520,16 @@ impl<S: ByteStream> HttpConnection<S> {
         Self {
             stream,
             host: host.into(),
+            base_path: String::new(),
             buffer: Vec::new(),
         }
+    }
+
+    /// Puts every request this connection sends under `base_path` (ADR-0057, §7.1).
+    #[must_use]
+    pub fn under_base_path(mut self, base_path: impl Into<String>) -> Self {
+        self.base_path = base_path.into();
+        self
     }
 
     /// The stream underneath, for a fixture to be inspected.
@@ -566,7 +598,17 @@ impl<S: ByteStream> HttpConnection<S> {
     }
 
     fn write_and_read_head(&mut self, request: &Request) -> Result<Head, ApiError> {
-        let wire = request.serialise(&self.host);
+        // ADR-0057: the base path is applied here, at the one seam every request — a discovery
+        // read, a list, a watch, a mutation, a log — passes through. A request built anywhere in
+        // this workspace carries the API server's own path and this connection puts it under the
+        // prefix the operator's `server` URL named, so nothing above concatenates a path by hand.
+        let wire = if self.base_path.is_empty() {
+            request.serialise(&self.host)
+        } else {
+            request
+                .with_base_path(&self.base_path)
+                .serialise(&self.host)
+        };
         self.stream
             .write_all(&wire)
             .map_err(|error| ApiError::Stream(error.message().to_owned()))?;
@@ -2309,6 +2351,17 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
         }
     }
 
+    /// Puts every request this client sends under `base_path` (ADR-0057, §7.1).
+    ///
+    /// The path a kubeconfig `server` URL carries, threaded to the one connection that owns the
+    /// wire. Empty for a cluster addressed at its root, which is every cluster but one behind an
+    /// API-server proxy.
+    #[must_use]
+    pub fn under_base_path(mut self, base_path: impl Into<String>) -> Self {
+        self.connection = self.connection.under_base_path(base_path);
+        self
+    }
+
     /// Puts everything this client does from now on under `budget`, counting from now (§49.1).
     ///
     /// Called by the question rather than by the connection, and called once: the elapsed bound
@@ -2340,6 +2393,23 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
     ) -> Self {
         self.default_headers.push((name.into(), value.into()));
         self
+    }
+
+    /// Replaces a header sent on every request, or adds it where none of that name is set.
+    ///
+    /// The seam a credential refresh needs (§8.3, ADR-0055): a client is built with the
+    /// `Authorization` its endpoint resolved to, and when the API server refuses that credential
+    /// and the helper is run again, the *same* connection carries the replacement on its retry.
+    /// The value never reaches [`fmt::Debug`], as with [`Self::with_default_header`].
+    pub fn replace_default_header(&mut self, name: &str, value: impl Into<String>) {
+        let value = value.into();
+        for (existing, held) in &mut self.default_headers {
+            if existing.eq_ignore_ascii_case(name) {
+                *held = value;
+                return;
+            }
+        }
+        self.default_headers.push((name.to_owned(), value));
     }
 
     /// Which provider instance this client speaks for (§6.2).

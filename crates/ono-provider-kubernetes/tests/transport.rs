@@ -134,6 +134,62 @@ fn should_serialise_a_request_as_an_http_1_1_message_with_crlf_framing() {
 }
 
 #[test]
+fn should_prepend_the_base_path_to_every_request_a_client_sends() {
+    // ADR-0057, §7.1: a kubeconfig `server` may carry a path — Rancher and other API-server
+    // proxies address a cluster as `https://host/k8s/clusters/c-m-xxxxx` — and every request
+    // this package sends then travels under it. The prefix is applied once, at the connection,
+    // so a list and a get both arrive under the path without either handler concatenating it.
+    let mut client = client(&[
+        json_response("200 OK", &pod_list("1", None, &[])),
+        json_response("200 OK", &pod("api-7d9f", "u-1", "1")),
+    ])
+    .under_base_path("/k8s/clusters/c-m-xxxxx");
+
+    let _ = client.list_page(&pods(), &Scope::in_namespace("shop"), &ListOptions::new());
+    let _ = client.get(&pods(), &Scope::in_namespace("shop"), "api-7d9f");
+
+    let lines = request_lines(client.stream());
+    assert_eq!(
+        lines,
+        vec![
+            "GET /k8s/clusters/c-m-xxxxx/api/v1/namespaces/shop/pods HTTP/1.1".to_owned(),
+            "GET /k8s/clusters/c-m-xxxxx/api/v1/namespaces/shop/pods/api-7d9f HTTP/1.1".to_owned(),
+        ],
+        "both the collection and the object endpoint travelled under the prefix"
+    );
+}
+
+#[test]
+fn should_send_requests_at_the_root_when_no_base_path_is_set() {
+    // The counterpart: the mechanism costs nothing for a cluster addressed at the API server's
+    // root, which is every cluster but one behind a proxy. Nothing is prepended, and the path is
+    // the API server's own.
+    let mut client = client(&[json_response("200 OK", &pod_list("1", None, &[]))]);
+
+    let _ = client.list_page(&pods(), &Scope::in_namespace("shop"), &ListOptions::new());
+
+    let lines = request_lines(client.stream());
+    assert_eq!(
+        lines,
+        vec!["GET /api/v1/namespaces/shop/pods HTTP/1.1".to_owned()],
+    );
+}
+
+#[test]
+fn should_prepend_the_base_path_to_a_request_built_anywhere() {
+    // The seam is `Request::with_base_path`, so a request assembled by a handler that talks to
+    // the connection directly — a watch, a discovery read, a mutation — is prefixed by the same
+    // rule as one the client builds. An empty base leaves the request untouched.
+    let request = Request::get("/apis/apps/v1").header("Accept", "application/json");
+
+    assert_eq!(
+        request.with_base_path("/k8s/clusters/c-m-xxxxx").path(),
+        "/k8s/clusters/c-m-xxxxx/apis/apps/v1"
+    );
+    assert_eq!(request.with_base_path("").path(), "/apis/apps/v1");
+}
+
+#[test]
 fn should_percent_encode_query_values_because_a_continue_token_is_not_url_safe() {
     // §18.1's continue token is an opaque server-issued blob that routinely carries `+`, `/` and
     // `=`. Pasting it into a query string raw corrupts it — `+` decodes as a space server-side —

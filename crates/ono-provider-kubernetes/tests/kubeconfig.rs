@@ -373,3 +373,291 @@ fn should_report_a_context_with_no_client_certificate_as_having_none() {
     assert!(dev.client_certificate().is_none());
     assert!(dev.client_certificate_files().is_empty());
 }
+
+// --- KUBECONFIG multi-file merge (§7.2, ADR-0056) ----------------------------------------------
+
+/// A `(path, text)` document, so a merge reads as a list of files.
+fn doc(path: &str, text: &str) -> (String, String) {
+    (path.to_owned(), text.to_owned())
+}
+
+#[test]
+fn should_let_the_first_file_to_define_a_name_win() {
+    // §7.2, client-go's rule: files load in list order and the first file to define a cluster, a
+    // user or a context wins. The second file's `shared` must not overwrite the first's.
+    let first = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: shared, cluster: {server: https://first.example.test:6443}}
+users:
+  - {name: shared, user: {token: first-token}}
+contexts:
+  - {name: shared, context: {cluster: shared, user: shared}}
+"#;
+    let second = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: shared, cluster: {server: https://second.example.test:6443}}
+users:
+  - {name: shared, user: {token: second-token}}
+contexts:
+  - {name: shared, context: {cluster: shared, user: shared}}
+"#;
+    let config = Kubeconfig::merge(&[
+        doc("/home/op/.kube/first", first),
+        doc("/home/op/.kube/second", second),
+    ])
+    .expect("the merge succeeds");
+
+    let shared = config.connection("shared").expect("`shared` resolves");
+    assert_eq!(
+        shared.server(),
+        "https://first.example.test:6443",
+        "the first file to define `shared` wins"
+    );
+    assert_eq!(
+        config.source_of_cluster("shared"),
+        Some("/home/op/.kube/first"),
+        "the merge records which file supplied the cluster"
+    );
+}
+
+#[test]
+fn should_resolve_a_context_defined_only_in_the_second_file() {
+    // The list is a union: a context in the second file is reachable, which is the whole point of
+    // a `KUBECONFIG` list.
+    let first = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: a, cluster: {server: https://a.example.test:6443}}
+users:
+  - {name: a, user: {token: a-token}}
+contexts:
+  - {name: a, context: {cluster: a, user: a}}
+"#;
+    let second = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: b, cluster: {server: https://b.example.test:6443}}
+users:
+  - {name: b, user: {token: b-token}}
+contexts:
+  - {name: b, context: {cluster: b, user: b, namespace: warehouse}}
+"#;
+    let config = Kubeconfig::merge(&[doc("/k/first", first), doc("/k/second", second)])
+        .expect("the merge succeeds");
+
+    let b = config
+        .connection("b")
+        .expect("`b` from the second file resolves");
+    assert_eq!(b.server(), "https://b.example.test:6443");
+    assert_eq!(b.namespace(), Some("warehouse"), "namespace is per context");
+    assert_eq!(config.source_of_context("b"), Some("/k/second"));
+}
+
+#[test]
+fn should_take_current_context_from_the_first_file_that_sets_one() {
+    // §7.2: `current-context` is the first non-empty one across the list.
+    let first = "apiVersion: v1\nkind: Config\n";
+    let second = "apiVersion: v1\nkind: Config\ncurrent-context: from-second\n";
+    let third = "apiVersion: v1\nkind: Config\ncurrent-context: from-third\n";
+    let config = Kubeconfig::merge(&[
+        doc("/k/first", first),
+        doc("/k/second", second),
+        doc("/k/third", third),
+    ])
+    .expect("the merge succeeds");
+    assert_eq!(
+        config.current_context(),
+        Some("from-second"),
+        "the first file to set a non-empty current-context wins"
+    );
+}
+
+#[test]
+fn should_skip_an_empty_document() {
+    // An empty `KUBECONFIG` list entry (or a file a caller omitted) is skipped rather than failing
+    // the merge.
+    let real = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://c.example.test:6443}}
+users:
+  - {name: u, user: {token: t}}
+contexts:
+  - {name: only, context: {cluster: c, user: u}}
+"#;
+    let config = Kubeconfig::merge(&[doc("/k/empty", "   "), doc("/k/real", real)])
+        .expect("an empty document does not fail the merge");
+    assert!(config.connection("only").is_ok());
+}
+
+#[test]
+fn should_name_the_file_that_does_not_parse() {
+    // An existing file that does not parse is an error naming the file — "one of them is broken"
+    // is not a fix anyone can act on when a list has several.
+    let good = "apiVersion: v1\nkind: Config\n";
+    let broken = "this: is: not: valid: yaml: at: all: [";
+    let error = Kubeconfig::merge(&[doc("/k/good", good), doc("/k/broken.yaml", broken)])
+        .expect_err("a document that does not parse fails the merge");
+    assert!(
+        format!("{error}").contains("/k/broken.yaml"),
+        "the error names the file that did not parse, got {error}"
+    );
+}
+
+#[test]
+fn should_resolve_a_relative_certificate_authority_against_its_own_file_s_directory() {
+    // §7.2, client-go's rule: a relative `certificate-authority` resolves against the directory of
+    // the file that defined it, because a caller reads it there.
+    let text = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://c.example.test:6443, certificate-authority: ca.crt}}
+users:
+  - {name: u, user: {token: t}}
+contexts:
+  - {name: ctx, context: {cluster: c, user: u}}
+"#;
+    let config = Kubeconfig::merge(&[doc("/home/op/.kube/clusters/prod", text)])
+        .expect("the merge succeeds");
+    let ctx = config.connection("ctx").expect("`ctx` resolves");
+    assert_eq!(
+        ctx.trust(),
+        &Trust::CertificateAuthorityFile("/home/op/.kube/clusters/ca.crt".to_owned()),
+        "the relative CA path resolved against the defining file's directory"
+    );
+}
+
+#[test]
+fn should_resolve_relative_client_certificate_paths_against_their_own_file_s_directory() {
+    let text = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://c.example.test:6443}}
+users:
+  - name: u
+    user:
+      client-certificate: pki/admin.crt
+      client-key: pki/admin.key
+contexts:
+  - {name: ctx, context: {cluster: c, user: u}}
+"#;
+    let config = Kubeconfig::merge(&[doc("/etc/k8s/config", text)]).expect("the merge succeeds");
+    let ctx = config.connection("ctx").expect("`ctx` resolves");
+    assert_eq!(
+        ctx.client_certificate_files(),
+        vec!["/etc/k8s/pki/admin.crt", "/etc/k8s/pki/admin.key"],
+        "relative client-certificate paths resolve against the defining file's directory"
+    );
+}
+
+#[test]
+fn should_leave_an_absolute_or_tilde_path_unchanged() {
+    // An absolute path is already resolved; a `~/`-anchored one is the host's to expand against
+    // the operator's home (core ADR-0593), not this provider's.
+    let text = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: a, cluster: {server: https://a:6443, certificate-authority: /abs/ca.crt}}
+  - {name: b, cluster: {server: https://b:6443, certificate-authority: ~/.kube/ca.crt}}
+users:
+  - {name: u, user: {token: t}}
+contexts:
+  - {name: abs, context: {cluster: a, user: u}}
+  - {name: home, context: {cluster: b, user: u}}
+"#;
+    let config = Kubeconfig::merge(&[doc("/etc/k8s/config", text)]).expect("the merge succeeds");
+    assert_eq!(
+        config.connection("abs").unwrap().trust(),
+        &Trust::CertificateAuthorityFile("/abs/ca.crt".to_owned())
+    );
+    assert_eq!(
+        config.connection("home").unwrap().trust(),
+        &Trust::CertificateAuthorityFile("~/.kube/ca.crt".to_owned()),
+        "`~/` passes through verbatim for the host to expand"
+    );
+}
+
+#[test]
+fn should_resolve_an_exec_command_against_its_file_only_when_it_names_a_path() {
+    // client-go resolves an `exec` command against the file's directory only when it contains a
+    // path separator; a bare `aws` stays a `PATH` lookup.
+    let pathful = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://c:6443}}
+users:
+  - name: u
+    user:
+      exec:
+        apiVersion: client.authentication.k8s.io/v1
+        command: ./helpers/get-token
+contexts:
+  - {name: ctx, context: {cluster: c, user: u}}
+"#;
+    let config = Kubeconfig::merge(&[doc("/home/op/.kube/config", pathful)]).expect("merge");
+    let plugin = config
+        .connection("ctx")
+        .expect("`ctx` resolves")
+        .exec()
+        .expect("it names a plugin")
+        .clone();
+    assert_eq!(
+        plugin.command(),
+        "/home/op/.kube/./helpers/get-token",
+        "a command that names a path resolves against the file's directory"
+    );
+
+    let bare = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://c:6443}}
+users:
+  - name: u
+    user:
+      exec:
+        apiVersion: client.authentication.k8s.io/v1
+        command: aws
+contexts:
+  - {name: ctx, context: {cluster: c, user: u}}
+"#;
+    let config = Kubeconfig::merge(&[doc("/home/op/.kube/config", bare)]).expect("merge");
+    assert_eq!(
+        config.connection("ctx").unwrap().exec().unwrap().command(),
+        "aws",
+        "a bare command stays a PATH lookup"
+    );
+}
+
+#[test]
+fn should_leave_relative_paths_relative_in_a_single_document_parse() {
+    // `parse` knows no file, so there is nothing to resolve a relative path against: it stays
+    // relative, which is what every existing single-document test relies on.
+    let text = r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: https://c:6443, certificate-authority: ca.crt}}
+users:
+  - {name: u, user: {token: t}}
+contexts:
+  - {name: ctx, context: {cluster: c, user: u}}
+"#;
+    let config = Kubeconfig::parse(text).expect("the document parses");
+    assert_eq!(
+        config.connection("ctx").unwrap().trust(),
+        &Trust::CertificateAuthorityFile("ca.crt".to_owned()),
+        "a single-document parse leaves a relative path relative"
+    );
+}

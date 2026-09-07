@@ -938,13 +938,16 @@ pub enum ProviderCapability {
     Attach,
     /// Forwarding a local port into the cluster (§42.5).
     PortForward,
-    /// Merging several kubeconfig files the way `KUBECONFIG` asks for (§7.2).
+    /// Merging several kubeconfig files the way `KUBECONFIG` asks for (§7.2, ADR-0056).
     ///
-    /// Reported because §7.2 requires it. Its sentence is conditional — "if the host chooses to
-    /// honor `KUBECONFIG` multi-file merge semantics, it SHOULD match standard Kubernetes client
-    /// behavior" — and then unconditional: "any intentional deviation MUST be documented **and
-    /// surfaced by `explain provider` or equivalent diagnostics**". This provider reads one file,
-    /// which is a deviation from what a `kubectl` user expects, and a deviation a reader has to
+    /// Reported because §7.2 requires it. The merge itself is now implemented — files load in
+    /// list order, first-definition wins, `current-context` is the first non-empty one, relative
+    /// paths resolve against their file's directory. What remains a deviation from what a
+    /// `kubectl` user expects is that the *list* must be handed over explicitly: the supervisor
+    /// sanitises a package's environment to `PATH`, `HOME`, `LC_ALL` and `TZ` (core `sandbox.rs`),
+    /// so this package never sees the operator's `KUBECONFIG` variable and an operator passes
+    /// `--kubeconfig $KUBECONFIG` instead. §7.2 is unconditional that an intentional deviation be
+    /// "surfaced by `explain provider` or equivalent diagnostics", and a deviation a reader has to
     /// find in a document is one they find after it has already surprised them.
     KubeconfigMerge,
 }
@@ -980,10 +983,11 @@ impl ProviderCapability {
             | Self::Relationships
             | Self::Mutations
             | Self::RemoteLogs
-            | Self::SubjectAccessReview => Support::ByProvider,
-            Self::RemoteExec | Self::Attach | Self::PortForward | Self::KubeconfigMerge => {
-                Support::NotByProvider
-            }
+            | Self::SubjectAccessReview
+            // The merge is implemented now (§7.2, ADR-0056); what remains is the deviation that
+            // the list is passed explicitly, carried by `Availability::Deviates`.
+            | Self::KubeconfigMerge => Support::ByProvider,
+            Self::RemoteExec | Self::Attach | Self::PortForward => Support::NotByProvider,
         }
     }
 
@@ -1078,6 +1082,10 @@ pub enum Availability {
     NotDetermined(Outcome),
     /// The provider does not implement it, so no session has it (§26.3).
     UnavailableInAnySession,
+    /// The provider implements it, and it deviates from what an upstream `kubectl` user expects
+    /// (§7.2, ADR-0056). The note says how, because §7.2 requires an intentional deviation to be
+    /// "surfaced by `explain provider` or equivalent diagnostics" rather than only documented.
+    Deviates(&'static str),
 }
 
 impl Availability {
@@ -1146,9 +1154,18 @@ impl Availability {
             Self::NotServedByCluster => "not served by cluster".to_owned(),
             Self::NotDetermined(outcome) => format!("not determined: {}", outcome.as_str()),
             Self::UnavailableInAnySession => "unavailable in any session".to_owned(),
+            Self::Deviates(note) => note.to_owned(),
         }
     }
 }
+
+/// How this provider's `KUBECONFIG` handling deviates from `kubectl`'s (§7.2, ADR-0056).
+///
+/// The merge is implemented; the deviation that survives is that a package never sees the
+/// operator's `KUBECONFIG` environment variable — the supervisor sanitises the environment to
+/// `PATH`, `HOME`, `LC_ALL` and `TZ` — so the list is handed over explicitly.
+const KUBECONFIG_MERGE_DEVIATION: &str = "deviates from kubectl: this package cannot read the `KUBECONFIG` environment variable, so a \
+     multi-file list is passed explicitly as `--kubeconfig $KUBECONFIG`";
 
 /// One capability, what the provider supports, and what this session found (§57.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1167,6 +1184,12 @@ impl CapabilityStatement {
     #[must_use]
     pub fn new(capability: ProviderCapability, availability: Availability) -> Self {
         let availability = match capability.support() {
+            // The kubeconfig-merge deviation is a constant of this build, not a session finding:
+            // it is the same whether the cluster answered or not, so it is forced here rather than
+            // gathered, the way `UnavailableInAnySession` is (§7.2, ADR-0056).
+            _ if capability == ProviderCapability::KubeconfigMerge => {
+                Availability::Deviates(KUBECONFIG_MERGE_DEVIATION)
+            }
             Support::ByProvider => availability,
             Support::NotByProvider => Availability::UnavailableInAnySession,
         };

@@ -201,6 +201,24 @@ impl ExecPlugin {
         })
     }
 
+    /// Resolves this plugin's `command` against `dir`, following client-go's rule (§7, ADR-0056).
+    ///
+    /// A command is resolved against the kubeconfig's own directory **only when it names a path** —
+    /// contains a separator — so `./get-token` beside the file resolves and a bare `aws` stays a
+    /// `PATH` lookup. An absolute command, a `~/`-anchored one, and an empty `dir` (a
+    /// single-document parse that knew no file) all leave the command unchanged.
+    #[must_use]
+    pub fn resolve_command_against(mut self, dir: &str) -> Self {
+        if !dir.is_empty()
+            && self.command.contains('/')
+            && !self.command.starts_with('/')
+            && !self.command.starts_with("~/")
+        {
+            self.command = format!("{}/{}", dir.trim_end_matches('/'), self.command);
+        }
+        self
+    }
+
     /// The `ExecCredential` contract version this plugin speaks.
     #[must_use]
     pub fn api_version(&self) -> &str {
@@ -344,6 +362,17 @@ impl ExecCredential {
     #[must_use]
     pub fn expires_at(&self) -> Option<&str> {
         self.expires_at.as_deref()
+    }
+
+    /// When this credential expires, in Unix milliseconds, where the plugin stated a timestamp
+    /// this provider can parse (§8.3).
+    ///
+    /// [`None`] both when the plugin stated no expiry and when it stated one this provider cannot
+    /// read: neither is an instant a store can refresh *before*, and a credential this provider
+    /// cannot time out is one the API server times out instead, with a `401` (ADR-0054, ADR-0055).
+    #[must_use]
+    pub fn expires_at_millis(&self) -> Option<u64> {
+        self.expires_at.as_deref().and_then(rfc3339_millis)
     }
 
     /// Whether the credential had already expired at `now` (§8.3).

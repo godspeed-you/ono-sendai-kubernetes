@@ -50,6 +50,10 @@ pub(crate) struct Ran {
     pub(crate) token: Option<Secret>,
     /// The client certificate and its key, where the plugin returned that form instead.
     pub(crate) client_certificate: Option<(Secret, Secret)>,
+    /// When the credential expires, in Unix milliseconds, where the helper stated a timestamp
+    /// this provider could parse (§8.3). Carried so the credential store can refresh *before* the
+    /// credential dies rather than after the API server refuses it (ADR-0055).
+    pub(crate) expires_at: Option<u64>,
 }
 
 /// Runs `plugin` through the host and reads what it printed (§8.2, §8.3).
@@ -169,6 +173,7 @@ pub(crate) fn run(
         client_certificate: credential
             .client_certificate()
             .map(|(certificate, key)| (certificate.clone(), key.clone())),
+        expires_at: credential.expires_at_millis(),
     })
 }
 

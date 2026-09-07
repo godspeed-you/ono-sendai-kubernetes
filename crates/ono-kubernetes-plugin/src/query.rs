@@ -73,20 +73,22 @@ use ono_provider_kubernetes::coverage::{Gap, Outcome as Coverage, Scope};
 use ono_provider_kubernetes::discovery::{
     self, Builder, Discovery, Mechanism, Provenance, Resource, Source, Verb,
 };
+use ono_provider_kubernetes::exec::ExecPlugin;
 use ono_provider_kubernetes::kubeconfig::{Credential, Kubeconfig, Secret, Trust};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
 use ono_provider_kubernetes::session::{Capability, Lookup, Session};
 use ono_provider_kubernetes::tls::{Anchors, ClientIdentity, TlsError, TlsSettings, TlsStream};
 use ono_provider_kubernetes::transport::{
-    ApiError, ByteStream, Client, Freshness, ListOptions, Listing, Operation, Page, Reader,
-    Request, Walk,
+    ApiError, ByteStream, Client, Clock as _, ErrorKind, Freshness, ListOptions, Listing,
+    Operation, Page, Reader, Request, SystemClock, Walk,
 };
 use ono_value::{Schema, Value};
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use crate::broker::{BrokeredStream, Lease, ReadPolicy, decode_hex};
 use crate::contributions::{Reads, Target};
+use crate::credential_store::{self, Resolved, SourceKey};
 use crate::credentials;
 use crate::dynamic::{self, Selector, Typing, Unresolved};
 use crate::records::{Upstream, dynamic_record, record};
@@ -130,6 +132,18 @@ pub(crate) const UNSUPPORTED: &str = "provider.unsupported";
 pub(crate) const AMBIGUOUS_CODE: &str = "Ono-Sendai-E0103";
 /// The dotted name of [`AMBIGUOUS_CODE`].
 pub(crate) const AMBIGUOUS: &str = "resolve.ambiguous";
+/// The error a credential that could not be obtained, refreshed or accepted is reported as
+/// (§8.3, §8.4 of the generic contract, ADR-0055).
+///
+/// One constant and one function ([`authentication_failure`]) for the whole class — a helper
+/// that fails at refresh, a malformed `ExecCredential`, a replacement that has already expired,
+/// a grant gone at refresh time, an API server that refuses the replacement too — so that a
+/// dedicated authentication code, once core publishes one, is adopted in one edit here. Until
+/// then it borrows `provider.unavailable`: a cluster this provider cannot reach *as anyone* is
+/// unreachable to it, and the message says why in §8.4's own word, `authentication`.
+pub(crate) const AUTHENTICATION_CODE: &str = UNAVAILABLE_CODE;
+/// The dotted name of [`AUTHENTICATION_CODE`].
+pub(crate) const AUTHENTICATION: &str = UNAVAILABLE;
 
 /// The port `kubectl proxy` listens on unless told otherwise.
 ///
@@ -878,7 +892,7 @@ fn read<S: ByteStream>(
             Lookup::ConfirmedAbsent => Answer::Absent,
             Lookup::NotWatched | Lookup::NotSynced(_) => {
                 afford(client)?;
-                let fetched = fetch(client, &resource, &scope, name);
+                let fetched = fetch_refreshing(client, &resource, &scope, name, endpoint, lease);
                 client.ledger().end_request();
                 fetched?
             }
@@ -916,7 +930,24 @@ fn read<S: ByteStream>(
     }
     // §17.6 and §9.4: the namespace, or every namespace, counted as the breadth it is.
     client.ledger().enter_scope(&scope).map_err(over_budget)?;
-    let listing = client.walk(resource.gvr(), &scope, &options, &mut streamed);
+    let mut listing = client.walk(resource.gvr(), &scope, &options, &mut streamed);
+    // §8.3 and ADR-0055: the API server refused the credential before any record crossed. The
+    // credential plugin is run once more, the same connection carries the replacement, and the
+    // walk is sent again from its first page — one refresh, one retry, and then the refusal
+    // stands. Replaying is safe because authentication precedes admission and persistence: a
+    // request the API server refused as unauthenticated ran nothing. After a page has crossed
+    // nothing is replayed, because a second first page would be a second snapshot (§18.2).
+    if unauthenticated(listing.error(), Operation::List)
+        && streamed.pages == 0
+        && endpoint.can_refresh()
+    {
+        let token = endpoint.refresh_authorization(lease)?;
+        client.replace_default_header("Authorization", format!("Bearer {}", token.expose()));
+        listing = client.walk(resource.gvr(), &scope, &options, &mut streamed);
+        if unauthenticated(listing.error(), Operation::List) {
+            return Ok(Outcome::Failed(still_unauthenticated(endpoint)));
+        }
+    }
     // §17.5, and the reason it is a `MUST` rather than a `SHOULD`: "unsupported field selection
     // MUST not become an empty result". A `400` here means the API server would not select on the
     // field label, so nothing was ever filtered and nothing was ever listed — and the cheapest
@@ -1022,7 +1053,59 @@ pub(crate) fn fetch<S: ByteStream>(
             "A resource that cannot be read by name is not an object that is not there.",
         ));
     }
-    match client.get(resource.gvr(), scope, name) {
+    fetched(
+        client.get(resource.gvr(), scope, name),
+        resource,
+        scope,
+        name,
+    )
+}
+
+/// [`fetch`] with §8.3's one refresh and one retry after a `401` (ADR-0055).
+///
+/// The same read as [`fetch`], for the caller that holds the lease a refresh needs. A `401` on a
+/// refreshable credential runs the plugin once more, puts the replacement on the client, and
+/// sends the same request once more; a second `401` is reported as the authentication failure
+/// it is, and nothing is sent a third time. Replaying a `get` the API server refused as
+/// unauthenticated is safe for the same reason it is safe for a list: nothing ran.
+fn fetch_refreshing<S: ByteStream>(
+    client: &mut Client<S>,
+    resource: &Resource,
+    scope: &Scope,
+    name: &str,
+    endpoint: &Endpoint,
+    lease: &Lease<'_, '_>,
+) -> Result<Answer, WireError> {
+    if !resource.supports(Verb::Get) {
+        return fetch(client, resource, scope, name);
+    }
+    let first = client.get(resource.gvr(), scope, name);
+    let refused = first
+        .as_ref()
+        .is_err_and(|error| error.kind(Operation::Get) == ErrorKind::Unauthenticated);
+    if !(refused && endpoint.can_refresh()) {
+        return fetched(first, resource, scope, name);
+    }
+    let token = endpoint.refresh_authorization(lease)?;
+    client.replace_default_header("Authorization", format!("Bearer {}", token.expose()));
+    let second = client.get(resource.gvr(), scope, name);
+    if second
+        .as_ref()
+        .is_err_and(|error| error.kind(Operation::Get) == ErrorKind::Unauthenticated)
+    {
+        return Err(still_unauthenticated(endpoint));
+    }
+    fetched(second, resource, scope, name)
+}
+
+/// What one `get` answered, in §21.4's vocabulary.
+fn fetched(
+    read: Result<ono_provider_kubernetes::transport::Read, ApiError>,
+    resource: &Resource,
+    scope: &Scope,
+    name: &str,
+) -> Result<Answer, WireError> {
+    match read {
         Ok(read) => {
             let (object, freshness) = read.into_parts();
             Ok(Answer::Fetched(Box::new((object, freshness))))
@@ -1047,6 +1130,55 @@ pub(crate) fn fetch<S: ByteStream>(
             )),
         },
     }
+}
+
+/// Whether a request failed because the API server did not accept the credential (§8.4 of the
+/// generic contract: `authentication expired` is a different state from `authorization denied`).
+fn unauthenticated(error: Option<&ApiError>, operation: Operation) -> bool {
+    error.is_some_and(|error| error.kind(operation) == ErrorKind::Unauthenticated)
+}
+
+/// The API server refused the replacement credential too, and this provider stops (ADR-0055).
+fn still_unauthenticated(endpoint: &Endpoint) -> WireError {
+    authentication_failure(
+        &endpoint.instance,
+        "the API server refused the credential, the credential plugin was run once more, and \
+         the API server refused the replacement too",
+    )
+}
+
+/// The identity of a credential source, for the store's key (§8.1, ADR-0055).
+///
+/// The kubeconfig path list, the context, and the helper's command, arguments and environment —
+/// what the operator configured — beside the session identity. Nothing the helper *returned*.
+fn credential_source(
+    instance: &str,
+    server_url: &str,
+    transport: &'static str,
+    paths: &[&str],
+    context: &str,
+    plugin: &ExecPlugin,
+) -> SourceKey {
+    let env: Vec<String> = plugin
+        .env()
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    SourceKey {
+        instance: instance.to_owned(),
+        endpoint: server_url.to_owned(),
+        transport,
+        source: format!(
+            "{paths:?}|{context}|{}|{:?}|{env:?}",
+            plugin.command(),
+            plugin.args()
+        ),
+    }
+}
+
+/// What a helper run becomes in the store.
+fn resolved_from(ran: credentials::Ran) -> Resolved {
+    Resolved::new(ran.token, ran.client_certificate, ran.expires_at)
 }
 
 /// The whole preferred discovery surface, as one snapshot (§4 invariants 1–2, §5.2).
@@ -2042,6 +2174,26 @@ pub(crate) struct Endpoint {
     /// the first as a fact about the configuration and never the second, because a scope one
     /// invocation chose has no business surviving into the next (§6.5).
     pub(crate) default_namespace: Option<String>,
+    /// A path every request travels under, from the kubeconfig `server` URL (ADR-0057, §7.1).
+    ///
+    /// Empty for a cluster addressed at the API server's root, which is every cluster but one
+    /// behind an API-server proxy such as Rancher. It is part of [`Self::server_url`] — and so of
+    /// the session key — because two clusters at one host and port distinguished only by their
+    /// path are two clusters, not one.
+    pub(crate) base_path: String,
+    /// How to obtain a fresh credential mid-invocation, where the context authenticates through
+    /// a credential plugin (§8.3, ADR-0055). `None` for a token or certificate the kubeconfig
+    /// carries: those cannot be refreshed, and a `401` on them is the API server's final word.
+    pub(crate) refresh: Option<CredentialRefresh>,
+}
+
+/// What re-running a context's credential plugin needs, and nothing the plugin returned
+/// (§8.2, §8.3, ADR-0055).
+pub(crate) struct CredentialRefresh {
+    key: SourceKey,
+    plugin: ExecPlugin,
+    context: String,
+    instance: String,
 }
 
 impl fmt::Debug for Endpoint {
@@ -2148,6 +2300,10 @@ impl Endpoint {
             // saying nothing: the API server decides what an anonymous request means.
             credential: Credential::Anonymous,
             default_namespace: None,
+            // An explicitly named `host` addresses the API server at its root: §7.3's endpoint is
+            // a host and a port, and a path prefix belongs to a kubeconfig `server` URL.
+            base_path: String::new(),
+            refresh: None,
         })
     }
 
@@ -2164,31 +2320,65 @@ impl Endpoint {
         options: &JsonMap<String, Json>,
         context: Option<&str>,
     ) -> Result<Self, WireError> {
-        let path = options
+        // §7.2, ADR-0056: the `kubeconfig` option accepts a `KUBECONFIG` list — the same
+        // colon-separated syntax `kubectl` reads from the environment, which the supervisor
+        // sanitises away before this package runs (core `sandbox.rs`), so an operator hands it
+        // over with `--kubeconfig $KUBECONFIG`. The files are read in list order and merged with
+        // client-go's rules; a single path is just a list of one.
+        let raw = options
             .get("kubeconfig")
             .and_then(Json::as_str)
             .filter(|path| !path.is_empty())
             .unwrap_or(DEFAULT_KUBECONFIG)
             .to_owned();
-        let document = match read_file(ctx, &path, "the kubeconfig") {
-            Ok(document) => document,
-            Err(error) if context.is_none() => return Err(no_endpoint_and_no_kubeconfig(&error)),
-            Err(error) => return Err(error),
+        let paths: Vec<&str> = raw.split(':').filter(|path| !path.is_empty()).collect();
+
+        // Each file, read in order. A *missing* file is skipped — client-go ignores nonexistent
+        // entries in the list — while a denied read is reported, because "you did not grant this
+        // path" and "this path is not there" are different states with different fixes (§21.4).
+        let mut documents: Vec<(String, String)> = Vec::new();
+        for path in &paths {
+            match read_kubeconfig_file(ctx, path) {
+                Ok(Some(bytes)) => {
+                    let text = String::from_utf8(bytes).map_err(|error| {
+                        failure(
+                            UNAVAILABLE_CODE,
+                            UNAVAILABLE,
+                            format!("`{path}` is not text: {error}"),
+                            "A kubeconfig is YAML.",
+                        )
+                    })?;
+                    documents.push(((*path).to_owned(), text));
+                }
+                Ok(None) => {}
+                Err(error) if context.is_none() => {
+                    return Err(no_endpoint_and_no_kubeconfig(&error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if documents.is_empty() {
+            // Every listed file was missing (or the list was empty): no cluster could be
+            // resolved, which is not "the cluster is empty" but "there was no kubeconfig to read".
+            let cause = file_not_found(paths.first().copied().unwrap_or(DEFAULT_KUBECONFIG));
+            if context.is_none() {
+                return Err(no_endpoint_and_no_kubeconfig(&cause));
+            }
+            return Err(cause);
+        }
+        let sources = || {
+            documents
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        let text = String::from_utf8(document).map_err(|error| {
+        let config = Kubeconfig::merge(&documents).map_err(|error| {
             failure(
                 UNAVAILABLE_CODE,
                 UNAVAILABLE,
-                format!("`{path}` is not text: {error}"),
-                "A kubeconfig is YAML.",
-            )
-        })?;
-        let config = Kubeconfig::parse(&text).map_err(|error| {
-            failure(
-                UNAVAILABLE_CODE,
-                UNAVAILABLE,
-                format!("`{path}` did not read: {error}"),
-                "The file was read; what is in it is not a kubeconfig this provider understands.",
+                format!("the kubeconfig ({}) did not read: {error}", sources()),
+                "The files were read; what is in them is not a kubeconfig this provider understands.",
             )
         })?;
         let contexts = |config: &Kubeconfig| -> String {
@@ -2211,14 +2401,16 @@ impl Endpoint {
                         UNAVAILABLE_CODE,
                         UNAVAILABLE,
                         format!(
-                            "the query named neither a kubeconfig `context` nor a `host`, and \
-                             `{path}` elects no `current-context` to fall back to"
+                            "the query named neither a kubeconfig `context` nor a `host`, and the \
+                             kubeconfig ({}) elects no `current-context` to fall back to",
+                            sources()
                         ),
                         &format!(
-                            "`{path}` defines these contexts: {}. Pass one as `context`, or pass \
-                             `host` (and `port`, which defaults to 8001) to name an endpoint \
-                             directly, which speaks plain HTTP/1.1 and so reaches an API server \
-                             through `kubectl proxy` rather than over TLS.",
+                            "the kubeconfig ({}) defines these contexts: {}. Pass one as \
+                             `context`, or pass `host` (and `port`, which defaults to 8001) to \
+                             name an endpoint directly, which speaks plain HTTP/1.1 and so reaches \
+                             an API server through `kubectl proxy` rather than over TLS.",
+                            sources(),
                             contexts(&config)
                         ),
                     ));
@@ -2232,14 +2424,15 @@ impl Endpoint {
                 UNAVAILABLE,
                 format!("{error}"),
                 &format!(
-                    "`{path}` defines these contexts: {}. Naming one that is not there is a \
-                     different answer from connecting to the wrong one.",
+                    "the kubeconfig ({}) defines these contexts: {}. Naming one that is not there \
+                     is a different answer from connecting to the wrong one.",
+                    sources(),
                     contexts(&config)
                 ),
             )
         })?;
 
-        let (secure, host, port) = parse_server(connection.server()).map_err(|detail| {
+        let (secure, host, port, base_path) = parse_server(connection.server()).map_err(|detail| {
             failure(
                 UNAVAILABLE_CODE,
                 UNAVAILABLE,
@@ -2256,14 +2449,35 @@ impl Endpoint {
         // §8.2's credential plugin, run before the TLS settings are built because it may be what
         // supplies the client certificate they carry. `None` for every other credential form, so
         // an ordinary context pays nothing for this and no helper is composed.
-        let ran = match connection.exec() {
-            None => None,
-            Some(plugin) => Some(credentials::run(
-                ctx,
-                plugin,
-                context,
-                &connection.instance_id(),
+        //
+        // Resolved through the credential store (ADR-0055): the second invocation of a context
+        // reuses the helper's answer for as long as it is valid, and one that has expired — or is
+        // within the early-refresh margin of expiring — pays for a fresh run *before* a request
+        // is sent (§8.3). The store's key is the session identity and the source identity, never
+        // the token the helper returned (§8.1).
+        let instance = connection.instance_id();
+        let scheme = if secure { "https" } else { "http" };
+        let server_url = format!("{scheme}://{host}:{port}{base_path}");
+        let transport = if !secure {
+            "plaintext"
+        } else if connection.is_insecure() {
+            "tls-unverified"
+        } else {
+            "tls-verified"
+        };
+        let refresh = connection.exec().map(|plugin| CredentialRefresh {
+            key: credential_source(&instance, &server_url, transport, &paths, context, plugin),
+            plugin: plugin.clone(),
+            context: context.to_owned(),
+            instance: instance.clone(),
+        });
+        let ran = match (&refresh, connection.exec()) {
+            (Some(refresh), Some(plugin)) => Some(credential_store::global().resolve(
+                &refresh.key,
+                SystemClock.now(),
+                || credentials::run(ctx, plugin, context, &instance).map(resolved_from),
             )?),
+            _ => None,
         };
         let identity = match ran.as_ref().and_then(|ran| ran.client_certificate.as_ref()) {
             // A plugin that returned a certificate pair supplies the identity, and the
@@ -2305,6 +2519,8 @@ impl Endpoint {
             authorization,
             credential: connection.credential(),
             default_namespace: connection.namespace().map(str::to_owned),
+            base_path,
+            refresh,
         })
     }
 
@@ -2342,20 +2558,73 @@ impl Endpoint {
     }
 
     /// The API server as a URL, which is how §6.3 records an endpoint.
+    ///
+    /// The base path is part of it (ADR-0057): two clusters at one host and port distinguished
+    /// only by their path are two clusters, so the URL that keys the session and names the
+    /// endpoint in the diagnostic carries the whole address the operator wrote.
     fn server_url(&self) -> String {
         let scheme = if self.tls.is_some() { "https" } else { "http" };
-        format!("{scheme}://{}:{}", self.host, self.port)
+        format!("{scheme}://{}:{}{}", self.host, self.port, self.base_path)
     }
 
     /// A client over `stream`, carrying whatever credential the context resolved to.
     pub(crate) fn client<S: ByteStream>(&self, stream: S) -> Client<S> {
-        let client = Client::new(stream, self.authority.clone(), self.instance.clone());
+        let client = Client::new(stream, self.authority.clone(), self.instance.clone())
+            .under_base_path(self.base_path.clone());
         match &self.authorization {
             None => client,
             Some(token) => {
                 client.with_default_header("Authorization", format!("Bearer {}", token.expose()))
             }
         }
+    }
+
+    /// Whether a `401` on this endpoint is worth one more attempt (§8.3, ADR-0055).
+    pub(crate) fn can_refresh(&self) -> bool {
+        self.refresh.is_some()
+    }
+
+    /// Runs the credential plugin again and hands back the replacement token (§8.3, ADR-0055).
+    ///
+    /// The one route that replaces a credential the store still holds as valid: the API server
+    /// refused it, and a `401` outranks a timestamp. The run is the same as first acquisition —
+    /// the `process.exec` grant is checked again, `interactiveMode` is honoured again, the output
+    /// is an `ExecCredential` or nothing, an already-expired replacement is refused — and every
+    /// way it can fail is routed through [`authentication_failure`].
+    ///
+    /// # Errors
+    ///
+    /// [`authentication_failure`] naming what stopped the refresh.
+    pub(crate) fn refresh_authorization(&self, lease: &Lease<'_, '_>) -> Result<Secret, WireError> {
+        let Some(refresh) = &self.refresh else {
+            return Err(authentication_failure(
+                &self.instance,
+                "the credential is a fixed token or certificate and cannot be refreshed",
+            ));
+        };
+        let resolved = credential_store::global().refresh(&refresh.key, || {
+            match lease.with(|ctx| {
+                credentials::run(ctx, &refresh.plugin, &refresh.context, &refresh.instance)
+            }) {
+                Ok(Ok(ran)) => Ok(resolved_from(ran)),
+                Ok(Err(cause)) | Err(cause) => Err(authentication_failure(
+                    &refresh.context,
+                    &format!(
+                        "the credential plugin `{}` could not refresh the credential: {}",
+                        refresh.plugin.command(),
+                        cause.message
+                    ),
+                )),
+            }
+        })?;
+        resolved.token.ok_or_else(|| {
+            authentication_failure(
+                &refresh.context,
+                "the credential plugin answered the refresh with a client certificate rather \
+                 than a token, and a certificate cannot replace a bearer credential on an open \
+                 session",
+            )
+        })
     }
 
     /// The same request, carrying the credential (§8.1: built at the call site, never stored on
@@ -2538,8 +2807,16 @@ fn tls_settings(
         .map_err(|error| tls_configuration_failure(context, &error))
 }
 
-/// Splits a kubeconfig `server` URL into whether it is TLS, its host and its port.
-fn parse_server(server: &str) -> Result<(bool, String, u16), String> {
+/// Splits a kubeconfig `server` URL into whether it is TLS, its host, its port and its base path.
+///
+/// The base path is the fourth element and it is usually empty: most clusters are addressed at
+/// the API server's root. A `server` such as `https://host/k8s/clusters/c-m-xxxxx` — how Rancher
+/// and other API-server proxies address a cluster — carries a path, and this provider prepends it
+/// to every request rather than dropping it (ADR-0057, §7.1). Dropping it would send every
+/// request to a path the operator did not name, and the answers would look like a different
+/// cluster's rather than like an error. The returned base path has a leading `/` and no trailing
+/// one, or is empty.
+fn parse_server(server: &str) -> Result<(bool, String, u16, String), String> {
     let (scheme, rest) = server
         .split_once("://")
         .ok_or_else(|| "it names no scheme".to_owned())?;
@@ -2549,14 +2826,16 @@ fn parse_server(server: &str) -> Result<(bool, String, u16), String> {
         other => return Err(format!("`{other}` is not a scheme this provider speaks")),
     };
     let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-    if !path.is_empty() {
-        // Dropping the prefix would send every request to a path the operator did not name, and
-        // the answers would look like a different cluster's rather than like an error.
-        return Err(format!(
-            "it names the path prefix `/{path}`, and this provider does not yet prepend one to \
-             its requests"
-        ));
-    }
+    // Kept and prepended rather than refused (ADR-0057). A trailing slash is dropped so the
+    // prefix joins the API server's own leading-slash paths without doubling one.
+    let base_path = {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("/{trimmed}")
+        }
+    };
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         // An IPv6 literal: `[::1]:6443`.
         let (host, tail) = rest
@@ -2584,7 +2863,7 @@ fn parse_server(server: &str) -> Result<(bool, String, u16), String> {
             .parse()
             .map_err(|_| format!("`{port}` is not a port number"))?,
     };
-    Ok((secure, host, port))
+    Ok((secure, host, port, base_path))
 }
 
 /// Reads one file through the host, in chunks, under the `filesystem.read` capability.
@@ -2594,15 +2873,27 @@ fn parse_server(server: &str) -> Result<(bool, String, u16), String> {
 /// package declares the paths it needs and the operator grants them, and a package that opened
 /// the file itself would be making that decision on its own.
 fn read_file(ctx: &mut Ctx<'_>, path: &str, what: &str) -> Result<Vec<u8>, WireError> {
-    let path = expand_home(path)?;
+    host_read_all(ctx, path).map_err(|error| file_failure(path, what, &error))
+}
+
+/// Reads one file through the host, in chunks, returning the host's own error unwrapped.
+///
+/// The raw `filesystem.read` error travels back so a caller can tell a *missing* file
+/// (`io.not_found`) from a *denied* one (`capability.denied`) — a `KUBECONFIG` list skips the
+/// first (client-go ignores nonexistent files) and reports the second. [`read_file`] wraps
+/// whatever this returns for the callers that want one file or nothing.
+///
+/// **`~/` is passed through verbatim.** The host resolves a leading `~/` against the operator's
+/// own home (core ADR-0593); this package no longer expands it, because the only home it could
+/// read is the sandbox working directory the supervisor set as `HOME`, which is the wrong one
+/// (ADR-0056).
+fn host_read_all(ctx: &mut Ctx<'_>, path: &str) -> Result<Vec<u8>, WireError> {
     let mut bytes: Vec<u8> = Vec::new();
     loop {
-        let answer = ctx
-            .host_call(
-                method::FILESYSTEM_READ,
-                json!({"path": path, "offset": bytes.len(), "length": READ_CHUNK}),
-            )
-            .map_err(|error| file_failure(&path, what, &error))?;
+        let answer = ctx.host_call(
+            method::FILESYSTEM_READ,
+            json!({"path": path, "offset": bytes.len(), "length": READ_CHUNK}),
+        )?;
         let hex = answer
             .get("content")
             .and_then(|content| content.get("$bytes"))
@@ -2625,31 +2916,37 @@ fn read_file(ctx: &mut Ctx<'_>, path: &str, what: &str) -> Result<Vec<u8>, WireE
             return Err(failure(
                 UNAVAILABLE_CODE,
                 UNAVAILABLE,
-                format!("`{path}` is larger than {MAX_KUBECONFIG} bytes, which {what} is not"),
+                format!(
+                    "`{path}` is larger than {MAX_KUBECONFIG} bytes, which a configuration file this provider reads is not"
+                ),
                 "The path was read; what is at it is not the file this provider expected.",
             ));
         }
     }
 }
 
-/// Resolves a leading `~/`, which the host does not.
+/// Reads one file of a `KUBECONFIG` list, skipping a missing one (§7.2, ADR-0056).
 ///
-/// The host checks the *resolved* path against the granted scope, so an unexpanded `~` would be
-/// checked as a literal directory name and denied for a reason that has nothing to do with the
-/// operator's decision.
-fn expand_home(path: &str) -> Result<String, WireError> {
-    let Some(rest) = path.strip_prefix("~/") else {
-        return Ok(path.to_owned());
-    };
-    let home = std::env::var("HOME").map_err(|_| {
-        failure(
-            UNAVAILABLE_CODE,
-            UNAVAILABLE,
-            format!("`{path}` starts at a home directory, and `HOME` is not set"),
-            "Pass `kubeconfig` with an absolute path.",
-        )
-    })?;
-    Ok(format!("{}/{rest}", home.trim_end_matches('/')))
+/// [`Ok(None)`] is a file that is not there — client-go ignores a nonexistent entry in the list,
+/// so it is skipped rather than failing the merge. A denied read is still an error, because "you
+/// did not grant this path" and "this path is not there" are different states (§21.4).
+fn read_kubeconfig_file(ctx: &mut Ctx<'_>, path: &str) -> Result<Option<Vec<u8>>, WireError> {
+    match host_read_all(ctx, path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.name == "io.not_found" => Ok(None),
+        Err(error) => Err(file_failure(path, "the kubeconfig", &error)),
+    }
+}
+
+/// No kubeconfig existed at the path a query named or defaulted to.
+fn file_not_found(path: &str) -> WireError {
+    failure(
+        UNAVAILABLE_CODE,
+        UNAVAILABLE,
+        format!("no kubeconfig was read; `{path}` does not exist"),
+        "Pass `kubeconfig` with a path to a file that exists — a `KUBECONFIG` list is accepted, \
+         colon-separated — or pass `host` to name an API server without a kubeconfig.",
+    )
 }
 
 /// A file the host would not or could not read.
@@ -2845,6 +3142,23 @@ pub(crate) fn transport_failure(path: &str, error: &ApiError) -> WireError {
         "The bytes travel through the host's broker; a refusal there is a capability decision, \
          and a protocol error here usually means the endpoint speaks TLS while this build \
          speaks plain HTTP/1.1.",
+    )
+}
+
+/// An authentication failure: a credential that could not be obtained, refreshed or accepted
+/// (§8.3, §8.4 of the generic contract, ADR-0055).
+///
+/// Every such failure — whatever stopped it — comes through here, so the code it carries is
+/// decided in one place ([`AUTHENTICATION_CODE`]) and the help says the one thing an operator
+/// needs first: nothing was sent with a stale credential.
+pub(crate) fn authentication_failure(context: &str, cause: &str) -> WireError {
+    failure(
+        AUTHENTICATION_CODE,
+        AUTHENTICATION,
+        format!("authentication for `{context}` failed: {cause}"),
+        "The credential this context authenticates with was not accepted and could not be \
+         replaced. Nothing was sent with a stale credential. Run the credential plugin's own \
+         login flow, check the `process.exec` grant, or use a context with a token.",
     )
 }
 

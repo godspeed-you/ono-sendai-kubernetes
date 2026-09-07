@@ -20,7 +20,7 @@
 # What they mean:
 #
 #   context      a kubeconfig context; its server, namespace, trust anchors and credential
-#   kubeconfig   which file to read it from, default `~/.kube/config`
+#   kubeconfig   which file(s) to read it from - one path or a colon-separated KUBECONFIG list; default `~/.kube/config`
 #   host, port   an explicit endpoint instead of a context (§7.3), spoken as plain HTTP/1.1
 #   namespace    one namespace, beating the context's default (§7.5)
 #   all_namespaces  every namespace the caller can see, and never a silent fan-out (§9.4)
@@ -72,7 +72,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -378,7 +378,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -439,7 +439,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -503,7 +503,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -578,7 +578,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -649,7 +649,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -692,7 +692,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -747,7 +747,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -795,7 +795,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -856,7 +856,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
@@ -882,7 +882,7 @@ targets:
         doc: "A kubeconfig context: its server, default namespace, trust anchors and credential."
       - name: kubeconfig
         type: string
-        doc: "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`."
+        doc: "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the operator's list. Default `~/.kube/config`."
       - name: host
         type: string
         doc: "An explicit API server host instead of a context (specification section 7.3)."
