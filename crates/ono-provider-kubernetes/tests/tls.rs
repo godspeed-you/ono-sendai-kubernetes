@@ -764,3 +764,56 @@ fn should_present_the_client_certificate_over_tls_1_2_and_over_tls_1_3() {
         );
     }
 }
+
+// --- the certificate the session settled on ----------------------------------------------------
+
+#[test]
+fn should_hand_back_the_certificate_the_session_verified_and_say_it_was_verified() {
+    // §10.2's server public-key signal has to come from the session the requests travel over,
+    // and it has to be the end entity: the certificate the verifier checked against the anchors
+    // and the name, not an intermediate the server chose to send along (ADR-0064).
+    let authority = authority("cluster.test");
+    let session = TlsStream::connect(
+        LoopbackServer::new(&authority, b"ok"),
+        "cluster.test",
+        &verifying(&authority, None),
+    )
+    .expect("the server certificate chains to the pinned authority");
+
+    let peer = session
+        .peer_certificate()
+        .expect("a completed handshake has a peer certificate");
+    assert!(
+        peer.is_verified(),
+        "this session verified what it was shown"
+    );
+    assert_eq!(
+        peer.der(),
+        authority.server_chain[0].as_ref(),
+        "the end-entity certificate the server was configured with, byte for byte"
+    );
+}
+
+#[test]
+fn should_mark_the_certificate_of_an_insecure_session_as_unverified() {
+    // The same bytes, a different state. Verification was off, so anything able to route the
+    // connection could have presented this certificate, and a caller that hashed it into a
+    // cluster fingerprint would let an interception decide which cluster this is (ADR-0064).
+    let cluster = authority("cluster.test");
+    let insecure = TlsSettings::without_certificate_verification(None).expect("the settings build");
+    let session = TlsStream::connect(
+        LoopbackServer::new(&cluster, b"ok"),
+        "cluster.test",
+        &insecure,
+    )
+    .expect("verification is off, so any certificate is accepted");
+
+    let peer = session
+        .peer_certificate()
+        .expect("the peer presented a certificate even though nothing checked it");
+    assert!(
+        !peer.is_verified(),
+        "presented is not verified, and the value says which it is"
+    );
+    assert_eq!(peer.der(), cluster.server_chain[0].as_ref());
+}

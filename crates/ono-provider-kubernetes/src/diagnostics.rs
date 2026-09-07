@@ -48,6 +48,10 @@ pub enum Signal {
     /// The public key rather than the whole certificate: a renewed certificate for the same
     /// cluster keeps its key far more often than not, and fingerprinting the certificate would
     /// report an ordinary rotation as a cluster replacement (§10.4).
+    ///
+    /// Obtained only from the certificate the TLS session *verified*. An insecure session is
+    /// shown one too, and reports it as [`Known::Unverified`] rather than as this signal
+    /// (`ADR-0064`).
     ServerPublicKey,
     /// The UID of the `kube-system` namespace, where the caller may read it.
     ///
@@ -98,24 +102,44 @@ pub enum Known<T> {
     Obtained(T),
     /// It could not be obtained, and this is why.
     Unavailable(Outcome),
+    /// The provider was shown it, and nothing vouched for it.
+    ///
+    /// A third state rather than either of the others, for the server public key of an insecure
+    /// session (`ADR-0064`): "could not learn it" would be false, because the bytes arrived, and
+    /// "obtained" would let a certificate anything on the path could have presented decide which
+    /// cluster this is. Every operation that composes or compares fingerprints treats this as not
+    /// there; [`Self::unverified`] is for the one caller that asks for it by that name.
+    Unverified(T),
 }
 
 impl<T> Known<T> {
-    /// The value, where there is one.
+    /// The value, where there is one the provider can stand behind.
     #[must_use]
     pub fn obtained(&self) -> Option<&T> {
         match self {
             Self::Obtained(value) => Some(value),
-            Self::Unavailable(_) => None,
+            Self::Unavailable(_) | Self::Unverified(_) => None,
         }
     }
 
     /// Why there is none, where there is none.
+    ///
+    /// `None` for an unverified value too: it is not a §21.4 outcome, because the request did
+    /// not fail and nobody refused anything.
     #[must_use]
     pub fn outcome(&self) -> Option<Outcome> {
         match self {
-            Self::Obtained(_) => None,
+            Self::Obtained(_) | Self::Unverified(_) => None,
             Self::Unavailable(outcome) => Some(*outcome),
+        }
+    }
+
+    /// The value that was presented and not verified, where that is what happened.
+    #[must_use]
+    pub fn unverified(&self) -> Option<&T> {
+        match self {
+            Self::Unverified(value) => Some(value),
+            Self::Obtained(_) | Self::Unavailable(_) => None,
         }
     }
 
@@ -1259,7 +1283,16 @@ impl CapabilityReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unknown {
     subject: String,
-    outcome: Outcome,
+    reason: Reason,
+}
+
+/// Why something is unknown: one of §21.4's outcomes, or the one state that is not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reason {
+    Outcome(Outcome),
+    /// Presented by the peer and verified by nobody (`ADR-0064`). Not an outcome, because no
+    /// request failed and nothing refused: the provider chose not to trust what it was shown.
+    Unverified,
 }
 
 impl Unknown {
@@ -1268,7 +1301,16 @@ impl Unknown {
     pub fn new(subject: impl Into<String>, outcome: Outcome) -> Self {
         Self {
             subject: subject.into(),
-            outcome,
+            reason: Reason::Outcome(outcome),
+        }
+    }
+
+    /// Something that was presented and that the provider does not stand behind.
+    #[must_use]
+    pub fn unverified(subject: impl Into<String>) -> Self {
+        Self {
+            subject: subject.into(),
+            reason: Reason::Unverified,
         }
     }
 
@@ -1278,16 +1320,31 @@ impl Unknown {
         &self.subject
     }
 
-    /// Why not.
+    /// Why not, where the reason is one of §21.4's outcomes.
+    ///
+    /// `None` for a value that was presented and not verified: that is not an outcome, and
+    /// reporting it under one would mean something else.
     #[must_use]
-    pub fn outcome(&self) -> Outcome {
-        self.outcome
+    pub fn outcome(&self) -> Option<Outcome> {
+        match self.reason {
+            Reason::Outcome(outcome) => Some(outcome),
+            Reason::Unverified => None,
+        }
     }
 
     /// Both, in one line.
     #[must_use]
     pub fn describe(&self) -> String {
-        format!("{}: {}", self.subject, self.outcome.as_str())
+        match self.reason {
+            Reason::Outcome(outcome) => format!("{}: {}", self.subject, outcome.as_str()),
+            // The value itself stays out of the sentence: a hash in a line an operator reads
+            // is a hash an operator compares, and this one may not be.
+            Reason::Unverified => format!(
+                "{}: presented by the peer and not verified, because certificate verification \
+                 is disabled for this session",
+                self.subject
+            ),
+        }
     }
 }
 
@@ -1425,11 +1482,11 @@ impl ClusterDiagnostic {
     pub fn unknowns(&self) -> Vec<Unknown> {
         let mut unknowns = Vec::new();
         for signal in Fingerprint::signals() {
-            if let Some(outcome) = self.fingerprint.signal(signal).outcome() {
-                unknowns.push(Unknown::new(
-                    format!("cluster fingerprint: {}", signal.as_str()),
-                    outcome,
-                ));
+            let subject = format!("cluster fingerprint: {}", signal.as_str());
+            match self.fingerprint.signal(signal) {
+                Known::Obtained(_) => {}
+                Known::Unavailable(outcome) => unknowns.push(Unknown::new(subject, *outcome)),
+                Known::Unverified(_) => unknowns.push(Unknown::unverified(subject)),
             }
         }
         if let Some(outcome) = self.health.version().outcome() {

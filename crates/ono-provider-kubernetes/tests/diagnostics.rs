@@ -652,3 +652,97 @@ fn should_carry_the_capability_report_on_the_diagnostic_the_session_answers_with
         "§42.1's logs are available when `pods/log` is served, and not because this build has code"
     );
 }
+
+// --- a signal that was presented and not verified (ADR-0064) --------------------------------------
+
+#[test]
+fn should_keep_an_unverified_public_key_out_of_the_digest_and_the_comparison() {
+    // §8.4 with §10.2: a certificate an insecure session was shown is not known to be the
+    // server's, so its key is neither obtained nor unavailable. It is a third thing, and every
+    // operation that composes or compares fingerprints treats it as not there.
+    let hash = public_key_fingerprint(&certificate("api.prod.example")).unwrap();
+    let origin = || Known::Obtained("https://api.prod.example".to_owned());
+    let verified = Fingerprint::unknown()
+        .with_origin(origin())
+        .with_server_public_key(Known::Obtained(hash.clone()));
+    let unverified = Fingerprint::unknown()
+        .with_origin(origin())
+        .with_server_public_key(Known::Unverified(hash.clone()));
+    let without = Fingerprint::unknown().with_origin(origin());
+
+    assert_eq!(
+        unverified.obtained_signals(),
+        vec![Signal::Origin],
+        "an unverified key is not among the signals the fingerprint holds"
+    );
+    assert_eq!(
+        unverified.digest(),
+        without.digest(),
+        "and the digest is the digest of a fingerprint that never saw it"
+    );
+    assert_ne!(verified.digest(), unverified.digest());
+
+    let verdict = verified.compare(&unverified);
+    assert!(
+        !verdict.agreed().contains(&Signal::ServerPublicKey)
+            && !verdict.disagreed().contains(&Signal::ServerPublicKey),
+        "the same bytes unverified neither confirm nor refute an alias: {}",
+        verdict.describe()
+    );
+
+    let signal = unverified.signal(Signal::ServerPublicKey);
+    assert_eq!(signal.obtained(), None);
+    assert_eq!(signal.outcome(), None, "it is not a §21.4 outcome either");
+    assert_eq!(
+        signal.unverified(),
+        Some(&hash),
+        "the value is still there for whoever asks for it by that name"
+    );
+    assert!(!signal.is_obtained());
+}
+
+#[test]
+fn should_list_an_unverified_public_key_among_the_unknowns_with_its_own_reason() {
+    // It is reported, in the list a reader consults for what could not be determined, with a
+    // reason that says what happened rather than borrowing one of §21.4's words for something
+    // §21.4 never described.
+    let hash = public_key_fingerprint(&certificate("api.prod.example")).unwrap();
+    let diagnostic =
+        ClusterDiagnostic::for_instance("kubernetes:prod", TlsPosture::InsecureSkipVerify)
+            .with_fingerprint(
+                Fingerprint::unknown()
+                    .with_origin(Known::Obtained("https://api.prod.example".to_owned()))
+                    .with_server_public_key(Known::Unverified(hash.clone()))
+                    .with_kube_system_uid(Known::Obtained(
+                        "11111111-1111-1111-1111-111111111111".to_owned(),
+                    )),
+            );
+
+    let unknowns = diagnostic.unknowns();
+    let entry = unknowns
+        .iter()
+        .find(|unknown| unknown.subject() == "cluster fingerprint: server-public-key")
+        .expect("the unverified signal is listed");
+    assert_eq!(
+        entry.outcome(),
+        None,
+        "and not under an outcome that would mean something else"
+    );
+    let described = entry.describe();
+    assert!(
+        described.contains("not verified"),
+        "the reason says what happened: {described}"
+    );
+    assert!(
+        !described.contains(&hash),
+        "the presented key does not travel with the reason, where it would be copied: {described}"
+    );
+    assert_eq!(
+        unknowns
+            .iter()
+            .filter(|unknown| unknown.subject().starts_with("cluster fingerprint"))
+            .count(),
+        1,
+        "and no other signal of the fingerprint was unknown: {unknowns:?}"
+    );
+}

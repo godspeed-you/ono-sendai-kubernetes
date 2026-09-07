@@ -21,6 +21,7 @@ use ono_kuang_sdk::protocol::{Capability, InvokeStatus, ShutdownReason};
 use ono_kuang_supervisor::{Connection, HostError, HostServices, LiveStream, StreamEvent};
 use ono_kuang_testhost::TestHost;
 use ono_kubernetes_plugin::broker::encode_hex;
+use ono_provider_kubernetes::diagnostics::public_key_fingerprint;
 use ono_value::{RecordValue, Value};
 use serde_json::{Map as JsonMap, Value as Json, json};
 use tokio::sync::mpsc;
@@ -117,8 +118,155 @@ fn capability_of(record: &RecordValue, capability: &str) -> String {
 
 // --- the recorded cluster ----------------------------------------------------------------------
 
+// --- a certificate authority, and TLS on the wire ----------------------------------------------
+
+/// A certificate authority and the server certificate it signed, generated for the test.
+///
+/// Generated rather than checked in, so nothing here expires on a date nobody chose — and so
+/// that the fingerprint a test expects is computed from the very certificate the server presents.
+struct Authority {
+    ca_pem: String,
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+impl Authority {
+    /// An authority that vouches for `server_name` and nothing else.
+    fn issuing(server_name: &str) -> Self {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "recorded cluster authority");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+
+        let params = rcgen::CertificateParams::new(vec![server_name.to_owned()]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&key, &ca, &ca_key).unwrap();
+
+        Self {
+            ca_pem: ca.pem(),
+            chain: vec![certificate.der().clone()],
+            key: rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+        }
+    }
+
+    /// The authority as a kubeconfig writes it: base64 of the PEM.
+    fn certificate_authority_data(&self) -> String {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            self.ca_pem.as_bytes(),
+        )
+    }
+
+    /// The hash §10.2's signal is expected to carry: the SPKI of the certificate the server
+    /// presents, computed here from the same bytes the server was configured with.
+    fn expected_fingerprint(&self) -> String {
+        public_key_fingerprint(self.chain[0].as_ref()).expect("a generated certificate hashes")
+    }
+
+    fn server_config(&self) -> rustls::ServerConfig {
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(self.chain.clone(), self.key.clone_key())
+        .unwrap()
+    }
+}
+
+/// Feeds received TLS bytes into the server session and returns whatever plaintext came out.
+fn decrypt(connection: &mut rustls::ServerConnection, bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut cursor = bytes;
+    while !cursor.is_empty() {
+        match connection.read_tls(&mut cursor) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if connection.process_new_packets().is_err() {
+            return Vec::new();
+        }
+    }
+    let mut plaintext = Vec::new();
+    // `WouldBlock` is "nothing decrypted yet", which is every byte of the handshake.
+    let _ = connection.reader().read_to_end(&mut plaintext);
+    plaintext
+}
+
+/// Encrypts the replies and whatever handshake the session still owes.
+fn encrypt(connection: &mut rustls::ServerConnection, replies: &[Vec<u8>]) -> Vec<u8> {
+    use std::io::Write as _;
+    for reply in replies {
+        connection.writer().write_all(reply).unwrap();
+    }
+    let mut outbound = Vec::new();
+    while connection.wants_write() {
+        if connection.write_tls(&mut outbound).is_err() {
+            break;
+        }
+    }
+    outbound
+}
+
+/// Writes a kubeconfig into a directory of its own and hands back both paths.
+///
+/// A real file, because the host reads it through `filesystem.read` against the real filesystem.
+fn kubeconfig_at(name: &str, document: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let directory = std::env::temp_dir().join(format!(
+        "ono-kubernetes-cluster-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&directory).expect("the test may write a temporary directory");
+    let path = directory.join("config");
+    std::fs::write(&path, document).expect("the kubeconfig is written");
+    (directory, path)
+}
+
+/// A `filesystem.read` grant scoped to one directory, the way an operator scopes one.
+fn readable(directory: &std::path::Path) -> JsonMap<String, Json> {
+    options(&[("paths", json!([format!("{}/**", directory.display())]))])
+}
+
+/// A kubeconfig for the recorded TLS cluster: pinned to `authority`, or told to check nothing.
+fn kubeconfig_for(authority: &Authority, insecure: bool) -> String {
+    let trust = if insecure {
+        "insecure-skip-tls-verify: true".to_owned()
+    } else {
+        format!(
+            "certificate-authority-data: {}",
+            authority.certificate_authority_data()
+        )
+    };
+    format!(
+        r#"
+apiVersion: v1
+kind: Config
+current-context: recorded
+clusters:
+  - name: recorded
+    cluster:
+      server: https://cluster.test:6443
+      {trust}
+users:
+  - {{name: operator, user: {{token: recorded-token}}}}
+contexts:
+  - {{name: recorded, context: {{cluster: recorded, user: operator, namespace: shop}}}}
+"#
+    )
+}
+
+// --- the recorded cluster ----------------------------------------------------------------------
+
 /// An API server that answers the diagnostic's questions from recorded documents.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct RecordedCluster {
     /// The UID of its `kube-system` namespace — §10.2's strongest identifying signal, and what
     /// makes two of these different clusters rather than one.
@@ -129,6 +277,21 @@ struct RecordedCluster {
     access_review: AccessReview,
     /// Whether it may be reached at all.
     reachable: bool,
+    /// The TLS identity this server presents, where it speaks HTTPS at all. `None` is the plain
+    /// HTTP/1.1 of an explicit `host`, which is every other test in this file.
+    tls: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl std::fmt::Debug for RecordedCluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordedCluster")
+            .field("kube_system_uid", &self.kube_system_uid)
+            .field("review", &self.review)
+            .field("access_review", &self.access_review)
+            .field("reachable", &self.reachable)
+            .field("tls", &self.tls.is_some())
+            .finish()
+    }
 }
 
 impl RecordedCluster {
@@ -138,6 +301,7 @@ impl RecordedCluster {
             review,
             access_review: AccessReview::Absent,
             reachable: true,
+            tls: None,
         })
     }
 
@@ -148,6 +312,7 @@ impl RecordedCluster {
             review: Review::Answers,
             access_review,
             reachable: true,
+            tls: None,
         })
     }
 
@@ -157,6 +322,18 @@ impl RecordedCluster {
             review: Review::Unserved,
             access_review: AccessReview::Absent,
             reachable: false,
+            tls: None,
+        })
+    }
+
+    /// A cluster that answers everything over TLS, presenting `authority`'s certificate.
+    fn over_tls(kube_system_uid: &'static str, authority: &Authority) -> Arc<Self> {
+        Arc::new(Self {
+            kube_system_uid,
+            review: Review::Answers,
+            access_review: AccessReview::Absent,
+            reachable: true,
+            tls: Some(Arc::new(authority.server_config())),
         })
     }
 }
@@ -349,17 +526,35 @@ impl HostServices for RecordedCluster {
         let (outgoing, mut written) = mpsc::channel::<Vec<u8>>(64);
         let cluster = self.clone();
         tokio::spawn(async move {
+            // A TLS server where the cluster has an identity, and nothing at all where it does
+            // not. The handshake runs here rather than in a fixture, so the package's own
+            // `rustls` session is what is on the other end of it — and the certificate it
+            // fingerprints is the one this server was configured with.
+            let mut session = cluster.tls.as_ref().map(|config| {
+                rustls::ServerConnection::new(Arc::clone(config))
+                    .expect("the recorded server configuration is usable")
+            });
             let mut buffered: Vec<u8> = Vec::new();
             while let Some(bytes) = written.recv().await {
-                buffered.extend(bytes);
+                let plaintext = match &mut session {
+                    None => bytes,
+                    Some(connection) => decrypt(connection, &bytes),
+                };
+                buffered.extend(plaintext);
                 let replies: Vec<Vec<u8>> = requests(&mut buffered)
                     .iter()
                     .map(|(method, path)| document(method, path, &cluster))
                     .collect();
-                if replies.is_empty() {
+                let outbound = match &mut session {
+                    None if replies.is_empty() => continue,
+                    None => replies.concat(),
+                    // Mid-handshake there is nothing to reply to and still bytes to send.
+                    Some(connection) => encrypt(connection, &replies),
+                };
+                if outbound.is_empty() {
                     continue;
                 }
-                let chunk = json!({"bytes": {"$bytes": encode_hex(&replies.concat())}});
+                let chunk = json!({"bytes": {"$bytes": encode_hex(&outbound)}});
                 if inbound.send(Ok(chunk)).await.is_err() {
                     return;
                 }
@@ -484,8 +679,31 @@ async fn diagnostic(
     host: &str,
     context: &str,
 ) -> Arc<RecordValue> {
+    diagnostic_with(plugin, at(host, context)).await
+}
+
+/// Runs `get k8s-cluster` for a context resolved through a kubeconfig on disk, the way an
+/// operator's own context is — server, trust and credential all from the file (§7.4, §8.4).
+async fn diagnostic_through(
+    plugin: &ono_kuang_supervisor::LoadedPlugin,
+    kubeconfig: &std::path::Path,
+) -> Arc<RecordValue> {
+    diagnostic_with(
+        plugin,
+        options(&[
+            ("context", json!("recorded")),
+            ("kubeconfig", json!(kubeconfig.display().to_string())),
+        ]),
+    )
+    .await
+}
+
+async fn diagnostic_with(
+    plugin: &ono_kuang_supervisor::LoadedPlugin,
+    query: JsonMap<String, Json>,
+) -> Arc<RecordValue> {
     let invocation = plugin
-        .query("k8s-cluster", at(host, context))
+        .query("k8s-cluster", query)
         .await
         .expect("the query starts");
     let (events, result) = invocation.collect().await;
@@ -1057,4 +1275,111 @@ async fn should_say_when_what_and_how_the_served_surface_was_last_observed() {
         "`observed_at` is an instant the shell can compare and sort on, not text: {:?}",
         field("observed_at")
     );
+}
+
+// --- the server's public key, from the session that verified it (ADR-0064) ---------------------
+
+/// A loaded package pointed at a TLS cluster through a kubeconfig it may read.
+async fn loaded_over_tls(
+    cluster: Arc<RecordedCluster>,
+    directory: &std::path::Path,
+) -> ono_kuang_supervisor::LoadedPlugin {
+    TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(directory))
+        .host(cluster as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads")
+}
+
+#[tokio::test]
+async fn should_fingerprint_the_public_key_of_the_certificate_the_session_verified() {
+    // §10.2's third signal, end to end: the real binary, a real handshake against a certificate
+    // this test's own authority issued, and the hash the record reports computed here from the
+    // same certificate — so what is proven is that the fingerprint is of the certificate the
+    // session actually verified, and not of a file somebody parsed.
+    let authority = Authority::issuing("cluster.test");
+    let (directory, path) = kubeconfig_at("verified", &kubeconfig_for(&authority, false));
+    let cluster = RecordedCluster::over_tls("33333333-3333-3333-3333-333333333333", &authority);
+    let plugin = loaded_over_tls(cluster, &directory).await;
+
+    let record = diagnostic_through(&plugin, &path).await;
+
+    assert_eq!(text_of(&record, "tls").as_deref(), Some("verified"));
+    assert_eq!(
+        text_of(&record, "server").as_deref(),
+        Some("https://cluster.test:6443")
+    );
+    assert_eq!(
+        text_of(&record, "server_key_fingerprint"),
+        Some(authority.expected_fingerprint()),
+        "the SPKI hash of the certificate the server presented and the session verified"
+    );
+    assert_eq!(
+        list_of(&record, "fingerprint_signals"),
+        ["origin", "server-public-key", "kube-system-uid"],
+        "all three of §10.2's signals, obtained"
+    );
+    assert!(
+        list_of(&record, "unknowns").is_empty(),
+        "nothing was left undetermined: {:?}",
+        list_of(&record, "unknowns")
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_not_present_an_unverified_certificate_as_the_cluster_fingerprint() {
+    // The same server, reached with `insecure-skip-tls-verify: true`. The certificate was
+    // presented and nothing vouched for it, so it is reported as exactly that — not as the
+    // fingerprint, and not as a signal nobody asked for (§8.4, §21.4, ADR-0064).
+    let authority = Authority::issuing("cluster.test");
+    let (directory, path) = kubeconfig_at("insecure", &kubeconfig_for(&authority, true));
+    let cluster = RecordedCluster::over_tls("33333333-3333-3333-3333-333333333333", &authority);
+    let plugin = loaded_over_tls(cluster, &directory).await;
+
+    let record = diagnostic_through(&plugin, &path).await;
+
+    assert_eq!(
+        text_of(&record, "tls").as_deref(),
+        Some("insecure: certificate verification disabled"),
+        "§8.4: the active insecure state is visible"
+    );
+    assert_eq!(
+        text_of(&record, "server_key_fingerprint"),
+        None,
+        "an unverified key is never the fingerprint"
+    );
+    assert_eq!(
+        list_of(&record, "fingerprint_signals"),
+        ["origin", "kube-system-uid"],
+        "the fingerprint is composed without it"
+    );
+    let unknowns = list_of(&record, "unknowns");
+    assert!(
+        unknowns.iter().any(|unknown| {
+            unknown.starts_with("cluster fingerprint: server-public-key: ")
+                && unknown.contains("not verified")
+        }),
+        "and the reason is that it was presented and not verified, in those words: {unknowns:?}"
+    );
+    assert!(
+        !unknowns
+            .iter()
+            .any(|unknown| unknown.ends_with("not queried")),
+        "it was seen, so `not queried` would be false: {unknowns:?}"
+    );
+    let expected = authority.expected_fingerprint();
+    for field in record.schema().fields() {
+        if let Some(Value::String(text)) = record.get(field.name()) {
+            assert_ne!(
+                text.as_ref(),
+                expected.as_str(),
+                "the unverified hash appears in no field, and it appeared in `{}`",
+                field.name()
+            );
+        }
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
 }

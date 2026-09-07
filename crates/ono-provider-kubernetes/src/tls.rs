@@ -23,6 +23,13 @@
 //! only way to an unverified session is [`TlsSettings::without_certificate_verification`], whose
 //! name is what a reviewer greps for.
 //!
+//! **The certificate a session settled on is answerable, with its state.** §10.2's server
+//! public-key signal has to come from the session the diagnostic's own requests travel over, so
+//! [`TlsStream::peer_certificate`] hands back the end-entity certificate together with whether
+//! *this* session verified it. An insecure session was shown a certificate and checked nothing,
+//! and [`PeerCertificate::is_verified`] is how a caller is stopped from hashing that into a
+//! cluster identity (`ADR-0064`).
+//!
 //! What is *not* here: bearer tokens and impersonation headers. Those are HTTP, and putting them
 //! in a TLS module would be the first step towards a transport that knows about credentials.
 
@@ -530,6 +537,56 @@ impl<S: ByteStream> Write for IoBridge<S> {
     }
 }
 
+// --- the certificate at the far end ------------------------------------------------------------
+
+/// The end-entity certificate the peer presented, and whether the session it came from verified
+/// it.
+///
+/// The end entity and nothing else: it is the certificate the verifier checked against the trust
+/// anchors and the server name, and therefore the only one whose key is *the server's*. An
+/// intermediate is whatever the server chose to send along and a root is often not sent at all.
+///
+/// `verified` is a fact about the session, captured from the [`TlsSettings`] it was built with.
+/// It is deliberately not derivable from the bytes — a certificate cannot say whether anybody
+/// checked it — and not from a kubeconfig, which says what was asked for rather than what was
+/// done. A caller that hashes the key into a cluster fingerprint reads this flag first, because
+/// a certificate an insecure session was shown could have been presented by anything able to
+/// route the connection (§8.4, §10.2, `ADR-0064`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerCertificate {
+    der: Vec<u8>,
+    verified: bool,
+}
+
+impl PeerCertificate {
+    /// The certificate, DER-encoded, as the peer sent it.
+    #[must_use]
+    pub fn der(&self) -> &[u8] {
+        &self.der
+    }
+
+    /// Whether the session this came from verified it against its trust anchors and the server
+    /// name.
+    ///
+    /// `false` for a session built with [`TlsSettings::without_certificate_verification`]: the
+    /// certificate was presented, and nothing vouched for it.
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        self.verified
+    }
+}
+
+impl fmt::Debug for PeerCertificate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The state and the size, never the bytes: a certificate is public, but a diagnostic
+        // that prints one is a diagnostic that would print the next thing too.
+        f.debug_struct("PeerCertificate")
+            .field("verified", &self.verified)
+            .field("der_length", &self.der.len())
+            .finish()
+    }
+}
+
 // --- the session ---------------------------------------------------------------------------
 
 /// A TLS session over another byte stream.
@@ -540,6 +597,7 @@ impl<S: ByteStream> Write for IoBridge<S> {
 pub struct TlsStream<S: ByteStream> {
     connection: ClientConnection,
     bridge: IoBridge<S>,
+    verified: bool,
 }
 
 impl<S: ByteStream> TlsStream<S> {
@@ -566,7 +624,25 @@ impl<S: ByteStream> TlsStream<S> {
         connection
             .complete_io(&mut bridge)
             .map_err(|error| TlsError::Handshake(error.to_string()))?;
-        Ok(Self { connection, bridge })
+        Ok(Self {
+            connection,
+            bridge,
+            verified: settings.verifies,
+        })
+    }
+
+    /// The end-entity certificate the peer presented, and whether this session verified it.
+    ///
+    /// `None` only before a handshake has produced one, which [`Self::connect`] never leaves a
+    /// session in; it is an `Option` because `rustls` answers one and inventing a certificate
+    /// where it reports none would be worse than saying so.
+    #[must_use]
+    pub fn peer_certificate(&self) -> Option<PeerCertificate> {
+        let end_entity = self.connection.peer_certificates()?.first()?;
+        Some(PeerCertificate {
+            der: end_entity.as_ref().to_vec(),
+            verified: self.verified,
+        })
     }
 
     /// The stream underneath, for a fixture to be inspected.

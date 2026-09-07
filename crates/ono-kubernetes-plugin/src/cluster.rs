@@ -32,7 +32,7 @@ use ono_provider_kubernetes::coverage::{Outcome, Scope};
 use ono_provider_kubernetes::diagnostics::{
     Availability, CapabilityReport, ClusterDiagnostic, Fingerprint, Grant, Health, Identity,
     Impersonation, Known, Probe, ProbeStatus, ProviderCapability, ServerVersion, Signal, Subject,
-    TlsPosture, normalised_origin,
+    TlsPosture, normalised_origin, public_key_fingerprint,
 };
 // `Provenance` is aliased: `records::Provenance` is what a *record* carries, and
 // `discovery::Provenance` is what a *snapshot* carries. Two different facts about two different
@@ -40,7 +40,7 @@ use ono_provider_kubernetes::diagnostics::{
 use ono_provider_kubernetes::discovery::{
     Discovery, Mechanism, Provenance as DiscoveryProvenance, Source, Verb,
 };
-use ono_provider_kubernetes::tls::TlsStream;
+use ono_provider_kubernetes::tls::{PeerCertificate, TlsStream};
 use ono_provider_kubernetes::transport::{
     ByteStream, Client, Method, Request, collection_path, object_path,
 };
@@ -189,14 +189,18 @@ fn observe(
         match &endpoint.tls {
             None => {
                 let mut client = endpoint.client(stream);
-                let observed = interrogate(&mut client, endpoint, relations);
+                let observed = interrogate(&mut client, endpoint, relations, None);
                 let open = client.into_stream().is_open();
                 (observed, handle, open)
             }
             Some(settings) => match TlsStream::connect(stream, &endpoint.server_name, settings) {
                 Ok(session) => {
+                    // §10.2's server public key, taken from the session the requests below
+                    // travel over — the certificate this handshake settled on, before the first
+                    // request line is written, and never a file somebody parsed (ADR-0064).
+                    let peer = session.peer_certificate();
                     let mut client = endpoint.client(session);
-                    let observed = interrogate(&mut client, endpoint, relations);
+                    let observed = interrogate(&mut client, endpoint, relations, peer.as_ref());
                     let open = client.into_stream().into_inner().is_open();
                     (observed, handle, open)
                 }
@@ -253,7 +257,7 @@ fn unreachable(
             // The origin is configuration rather than an observation, so it survives a cluster
             // that never answered — a fingerprint of one weak signal, which is what §10.2 means
             // by composing whatever was obtainable.
-            fingerprint_of(endpoint)
+            fingerprint_of(endpoint, None)
                 .with_kube_system_uid(Known::Unavailable(Outcome::Disconnected)),
         )
         .with_identity(
@@ -280,16 +284,31 @@ fn posture(endpoint: &Endpoint) -> TlsPosture {
     }
 }
 
-/// The fingerprint before any request: the origin, and the signals nothing has asked for yet.
+/// The fingerprint before any request: the origin, the server's key where a TLS session settled
+/// on one, and the signal nothing has asked for yet.
 ///
-/// The server's public key is `not queried` rather than absent. This build's TLS session does not
-/// surrender the certificate it verified, so the provider never has the bytes to hash — and a
-/// signal nobody asked for is a different state from one the cluster refused (§21.4, §10.2).
-fn fingerprint_of(endpoint: &Endpoint) -> Fingerprint {
+/// The server's public key is three different things, and the record keeps them apart (§10.2,
+/// §21.4, ADR-0064): the hash of the certificate a *verifying* session accepted is the signal;
+/// the certificate an insecure session was shown is `Known::Unverified`, which no digest or
+/// comparison counts; and a plain HTTP/1.1 session presents no certificate, so the signal stays
+/// `not queried` — there is no key to fingerprint, which is a different state from one the
+/// cluster refused.
+fn fingerprint_of(endpoint: &Endpoint, peer: Option<&PeerCertificate>) -> Fingerprint {
     let scheme = if endpoint.tls.is_some() {
         "https"
     } else {
         "http"
+    };
+    let server_public_key = match peer {
+        None => Known::Unavailable(Outcome::NotQueried),
+        Some(certificate) => match public_key_fingerprint(certificate.der()) {
+            Some(hash) if certificate.is_verified() => Known::Obtained(hash),
+            Some(hash) => Known::Unverified(hash),
+            // A certificate `rustls` accepted that the SPKI walk cannot read. Theoretical, and
+            // reported as a signal this session could not obtain rather than as a hash of
+            // something else.
+            None => Known::Unavailable(Outcome::Unavailable),
+        },
     };
     Fingerprint::unknown()
         .with_origin(Known::Obtained(normalised_origin(
@@ -297,7 +316,7 @@ fn fingerprint_of(endpoint: &Endpoint) -> Fingerprint {
             &endpoint.server_name,
             endpoint.port,
         )))
-        .with_server_public_key(Known::Unavailable(Outcome::NotQueried))
+        .with_server_public_key(server_public_key)
 }
 
 /// Asks the cluster everything this diagnostic reports, over an open connection.
@@ -309,9 +328,10 @@ fn interrogate<S: ByteStream>(
     client: &mut Client<S>,
     endpoint: &Endpoint,
     relations: Grant,
+    peer: Option<&PeerCertificate>,
 ) -> Observed {
     let mut health = Health::unknown();
-    let mut fingerprint = fingerprint_of(endpoint);
+    let mut fingerprint = fingerprint_of(endpoint, peer);
 
     let version = match ask(client, endpoint, &mut health, Request::get("/version")) {
         Answer::Body(body) => ServerVersion::parse(&body)
