@@ -400,6 +400,12 @@ pub struct Session<C: Clock = SystemClock> {
     schemas: SchemaCache,
     watches: BTreeMap<(Gvr, Scope), Watched>,
     capabilities: BTreeSet<Capability>,
+    /// The optional behaviours this cluster refused when they were asked for (§19.2, §29.4 core).
+    ///
+    /// Kept apart from the negotiated set rather than as its complement: a capability that was
+    /// never asked for is neither, and a session that treated "not negotiated" as "refused"
+    /// would never try, while one that treated it as "available" would ask on every watch.
+    refused: BTreeSet<Capability>,
     clock: C,
 }
 
@@ -446,6 +452,7 @@ impl Session<SystemClock> {
             schemas: SchemaCache::new(""),
             watches: BTreeMap::new(),
             capabilities: BTreeSet::new(),
+            refused: BTreeSet::new(),
             clock: SystemClock,
         }
     }
@@ -473,6 +480,7 @@ impl<C: Clock> Session<C> {
             schemas: SchemaCache::new(""),
             watches: BTreeMap::new(),
             capabilities: BTreeSet::new(),
+            refused: BTreeSet::new(),
             clock,
         }
     }
@@ -614,6 +622,7 @@ impl<C: Clock> Session<C> {
             self.watches.clear();
             self.identity = Identity::unknown();
             self.capabilities.clear();
+            self.refused.clear();
         }
         if matches!(
             change,
@@ -939,7 +948,27 @@ impl<C: Clock> Session<C> {
 
     /// Records that the server offers a capability, and this session may use it (§19.2).
     pub fn negotiate(&mut self, capability: Capability) {
+        self.refused.remove(&capability);
         self.capabilities.insert(capability);
+    }
+
+    /// Records that the server refused a capability it was asked for, so this session stops
+    /// asking (§19.2, §29.4 of the generic contract).
+    pub fn refuse(&mut self, capability: Capability) {
+        self.capabilities.remove(&capability);
+        self.refused.insert(capability);
+    }
+
+    /// Whether the cluster currently connected refused a capability this session asked for.
+    #[must_use]
+    pub fn is_refused(&self, capability: Capability) -> bool {
+        self.refused.contains(&capability)
+    }
+
+    /// Every capability the cluster refused, in a fixed order.
+    #[must_use]
+    pub fn refused(&self) -> Vec<Capability> {
+        self.refused.iter().copied().collect()
     }
 
     /// Whether a capability was negotiated with the cluster currently connected.
@@ -1091,7 +1120,44 @@ impl<C: Clock> Session<C> {
     pub fn observe_event(&mut self, gvr: &Gvr, scope: &Scope, event: WatchEvent) -> Reception {
         let now = self.clock.now();
         let watched = self.entry_for(gvr, scope);
-        Self::apply_event(watched, now, event)
+        let reception = Self::apply_event(watched, now, event);
+        // §19.2 and §19.5: a capability is negotiated from what the server *did*, never from
+        // what was asked for. A bookmark received is a server that sends bookmarks; a streaming
+        // list that ended is a server that serves them.
+        match reception {
+            Reception::Checkpointed => self.negotiate(Capability::WatchBookmarks),
+            Reception::Synchronised => {
+                self.negotiate(Capability::StreamingLists);
+                self.negotiate(Capability::WatchBookmarks);
+            }
+            _ => {}
+        }
+        reception
+    }
+
+    /// Begins a streaming list over one collection and scope (§19.2).
+    ///
+    /// The cache is not touched until the terminating bookmark arrives: the initial events are
+    /// staged on the stream, and [`Self::observe_event`] seeds the cache and its index from them
+    /// at the version the bookmark carries, which is what a listing's version would have been.
+    ///
+    /// # Errors
+    ///
+    /// What [`WatchStream::begin_streaming_list`] refuses.
+    pub fn begin_streaming_list(
+        &mut self,
+        gvr: &Gvr,
+        scope: &Scope,
+    ) -> Result<(), crate::watch::ResumeError> {
+        self.entry_for(gvr, scope).stream.begin_streaming_list()
+    }
+
+    /// Abandons a streaming list whose initial events never ended, so the ordinary list/watch
+    /// acquisition can take its place (§19.2's fallback). Returns whether one was in progress.
+    pub fn abandon_streaming_list(&mut self, gvr: &Gvr, scope: &Scope) -> bool {
+        self.watches
+            .get_mut(&(gvr.clone(), scope.clone()))
+            .is_some_and(|watched| watched.stream.abandon_streaming_list())
     }
 
     fn apply_event(watched: &mut Watched, now: ObservedAt, event: WatchEvent) -> Reception {
@@ -1104,7 +1170,9 @@ impl<C: Clock> Session<C> {
                 object.namespace().map(str::to_owned),
                 object.name().to_owned(),
             )),
-            WatchEvent::Bookmark(_) | WatchEvent::Error(_) => None,
+            WatchEvent::Bookmark(_) | WatchEvent::InitialEventsEnd(_) | WatchEvent::Error(_) => {
+                None
+            }
         };
         let reception = watched.stream.observe(event);
         if reception != Reception::Discarded {
@@ -1112,6 +1180,11 @@ impl<C: Clock> Session<C> {
             // any timestamp inside the object: §14.3 keeps `resourceVersion` from being a
             // clock, and `creationTimestamp` is about the object rather than the observation.
             watched.observed_at = now;
+        }
+        if reception == Reception::Synchronised {
+            // A streaming list synchronised the cache the way a listing does, and the index is
+            // rebuilt from it the same way (§50.4).
+            watched.index.rebuild(watched.stream.objects());
         }
         if reception == Reception::Applied
             && let Some(key) = key
@@ -1145,12 +1218,10 @@ impl<C: Clock> Session<C> {
         scope: &Scope,
         chunk: &[u8],
     ) -> Result<Vec<Reception>, FrameError> {
-        let now = self.clock.now();
-        let watched = self.entry_for(gvr, scope);
-        let events = watched.decoder.decode(chunk)?;
+        let events = self.entry_for(gvr, scope).decoder.decode(chunk)?;
         let mut receptions = Vec::with_capacity(events.len());
         for event in events {
-            receptions.push(Self::apply_event(watched, now, event));
+            receptions.push(self.observe_event(gvr, scope, event));
         }
         Ok(receptions)
     }
@@ -1350,6 +1421,7 @@ impl<C: Clock> fmt::Debug for Session<C> {
                     .collect::<Vec<_>>(),
             )
             .field("capabilities", &self.capabilities)
+            .field("refused", &self.refused)
             .finish()
     }
 }

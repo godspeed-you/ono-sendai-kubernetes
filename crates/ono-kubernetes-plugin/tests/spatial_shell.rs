@@ -851,8 +851,11 @@ fn should_say_why_up_has_nowhere_to_go_from_a_kubernetes_place() {
         said.contains("spatial.no_parent"),
         "`up` refuses rather than inventing a parent, got {run:?}"
     );
+    // Two wordings, one refusal: the host at the pinned revision names §36.4's aggregate space,
+    // and the host after `ADR-0597 (core)` names the kind of place a package would have had to
+    // declare above this one. Both say what is missing, which is what this asserts.
     assert!(
-        said.contains("aggregate space"),
+        said.contains("aggregate space") || said.contains("kind of place above"),
         "and the refusal names what is missing, got {run:?}"
     );
 }

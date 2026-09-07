@@ -250,6 +250,21 @@ fn not_found(path: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// What an API server without the `WatchList` feature answers a streaming-list request with.
+fn streaming_lists_refused() -> Vec<u8> {
+    let body = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+        "message": "sendInitialEvents is forbidden for watch unless the WatchList feature gate is enabled",
+        "reason": "BadRequest", "code": 400,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 /// One chunked `200 OK` whose body has not ended and will not — a watch, or a followed log.
 fn held_open(content_type: &str) -> Vec<u8> {
     format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n")
@@ -467,6 +482,11 @@ fn relating_document(route: &str) -> Option<Json> {
 /// What the recorded server answers, for the handful of paths it serves.
 fn document(cluster: &Cluster, path: &str) -> Vec<u8> {
     let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    // This server predates streaming lists (§19.2): the request is refused the way an API
+    // server without the feature refuses it, and the package falls back to list-then-watch.
+    if query.contains("sendInitialEvents=true") {
+        return streaming_lists_refused();
+    }
     if cluster.watch && route == PODS && query.contains("watch=true") {
         return held_open("application/json");
     }
@@ -853,8 +873,9 @@ async fn should_bound_a_watched_collection_at_the_view_capacity_and_report_the_r
     assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
     assert_eq!(
         cluster.asked_for(PODS),
-        21,
-        "the acquisition read the collection in twenty-one pages and the watch had not opened yet"
+        22,
+        "one streaming-list request this server refused (§19.2, ADR-0059), then the acquisition \
+         read the collection in twenty-one pages, and the watch had not opened yet"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }
@@ -1275,8 +1296,9 @@ async fn should_answer_a_relation_from_the_index_of_an_open_watch_without_listin
         let record = next_record(&mut watch, "the acquisition").await;
         assert_eq!(text_of(&record, "change").as_deref(), Some("listed"));
     }
-    // The listing and then the watch itself: the cache is synchronised and being kept true.
-    asked_for_at_least(&cluster, PODS, 2).await;
+    // The streaming-list request this server refuses (ADR-0059), the listing, and then the watch
+    // itself: the cache is synchronised and being kept true.
+    asked_for_at_least(&cluster, PODS, 3).await;
     let before = cluster.asked_for(PODS);
 
     let edges = relation(

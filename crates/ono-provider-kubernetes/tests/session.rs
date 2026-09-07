@@ -1465,3 +1465,131 @@ fn should_refuse_to_answer_from_an_index_whose_stream_is_not_live() {
         "a write drops the cache and the index with it (§20.5)"
     );
 }
+
+// --- §19.2, §19.5: capabilities negotiated from what the server did (ADR-0059) ------------------
+
+#[test]
+fn should_negotiate_bookmarks_from_the_first_bookmark_received() {
+    // §19.5: a reconnect resumes from the latest safe resourceVersion, and a bookmark is what
+    // makes "latest" recent on a quiet collection. `allowWatchBookmarks` is asked for on every
+    // watch; the capability is negotiated the moment the server answers with one, never before.
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), one_pod_listing())
+        .expect("a complete listing seeds the cache");
+    assert!(!session.negotiated(Capability::WatchBookmarks));
+
+    let bookmark = frame(
+        "BOOKMARK",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"18730"}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), bookmark.as_bytes())
+        .expect("the bookmark decodes");
+
+    assert!(session.negotiated(Capability::WatchBookmarks));
+    assert!(
+        !session.negotiated(Capability::StreamingLists),
+        "a bookmark says nothing about streaming lists"
+    );
+    assert_eq!(
+        session
+            .watch_stream(&pods(), &shop())
+            .and_then(|stream| stream
+                .checkpoint()
+                .map(|version| version.as_str().to_owned())),
+        Some("18730".to_owned()),
+        "and the checkpoint the next watch opens from is the bookmark's"
+    );
+}
+
+#[test]
+fn should_negotiate_streaming_lists_from_a_list_that_streamed_and_index_its_initial_state() {
+    // §19.2: the capability is earned by a streaming list that reached its terminating bookmark.
+    // What that bookmark seeds is a cache and an index like any listing's: the lookup answers
+    // from it, the index answers a selector over it, and absence in it is conclusive.
+    let mut session = session("dev");
+    session
+        .begin_streaming_list(&pods(), &shop())
+        .expect("a fresh stream may stream its list");
+    assert!(!session.negotiated(Capability::StreamingLists));
+    assert_eq!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::NotSynced(SyncState::Syncing),
+        "before the initial events end, nothing is synchronised (§20.3)"
+    );
+
+    let initial = frame(
+        "ADDED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-1","namespace":"shop","uid":"uid-1","resourceVersion":"18005","labels":{"app":"checkout"}}}"#,
+    ) + &frame(
+        "ADDED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"worker-1","namespace":"shop","uid":"uid-2","resourceVersion":"18006","labels":{"app":"worker"}}}"#,
+    ) + &frame(
+        "BOOKMARK",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"18050","annotations":{"k8s.io/initial-events-end":"true"}}}"#,
+    );
+    let receptions = session
+        .feed_watch(&pods(), &shop(), initial.as_bytes())
+        .expect("the frames decode");
+    assert_eq!(
+        receptions,
+        vec![
+            ono_provider_kubernetes::watch::Reception::Staged,
+            ono_provider_kubernetes::watch::Reception::Staged,
+            ono_provider_kubernetes::watch::Reception::Synchronised,
+        ]
+    );
+
+    assert!(session.negotiated(Capability::StreamingLists));
+    assert!(session.negotiated(Capability::WatchBookmarks));
+    assert!(matches!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::Cached(_)
+    ));
+    assert_eq!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-9"),
+        Lookup::ConfirmedAbsent
+    );
+    let indexed = session
+        .indexed(&pods(), &shop())
+        .expect("the index is usable over a stream a streaming list synchronised");
+    assert_eq!(
+        indexed
+            .matching(Some("shop"), &checkout_selector())
+            .iter()
+            .map(ono_provider_kubernetes::object::Object::name)
+            .collect::<Vec<_>>(),
+        vec!["checkout-1"]
+    );
+    assert_eq!(indexed.freshness().resource_version(), Some("18050"));
+}
+
+#[test]
+fn should_remember_a_refused_capability_until_the_cluster_is_replaced() {
+    // §19.2 requires the negotiation to have a fallback, and §29.4 of the generic contract asks
+    // for the degraded capability rather than a rejected provider. A refusal is remembered so the
+    // question costs one round trip per cluster — and forgotten with everything else the session
+    // knew about a cluster that has been replaced (§10.4).
+    let mut session = session("dev");
+    session.observed_fingerprint(fingerprint(&dev_origin(), Some("uid-cluster-a")));
+    assert!(!session.is_refused(Capability::StreamingLists));
+
+    session.refuse(Capability::StreamingLists);
+    assert!(session.is_refused(Capability::StreamingLists));
+    assert!(!session.negotiated(Capability::StreamingLists));
+    assert_eq!(session.refused(), vec![Capability::StreamingLists]);
+
+    session.negotiate(Capability::StreamingLists);
+    assert!(
+        !session.is_refused(Capability::StreamingLists),
+        "a server that later served one is not a server that refuses them"
+    );
+
+    session.refuse(Capability::StreamingLists);
+    session.observed_fingerprint(fingerprint(&dev_origin(), Some("uid-cluster-b")));
+    assert!(
+        !session.is_refused(Capability::StreamingLists),
+        "a refusal was the previous cluster's, and the new one is asked afresh"
+    );
+}

@@ -679,6 +679,21 @@ impl RecordedCluster {
     }
 }
 
+/// What an API server without the `WatchList` feature answers a streaming-list request with.
+fn streaming_lists_refused() -> Vec<u8> {
+    let body = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+        "message": "sendInitialEvents is forbidden for watch unless the WatchList feature gate is enabled",
+        "reason": "BadRequest", "code": 400,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 /// One HTTP/1.1 response with a stated length, as a keep-alive connection delivers it.
 fn response(body: &str) -> Vec<u8> {
     format!(
@@ -2162,6 +2177,13 @@ fn unacceptable(head: &str, path: &str) -> Option<Vec<u8>> {
 
 fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let pods = cluster.pods;
+    // This recorded server predates streaming lists (§19.2, ADR-0059): a watch asking for
+    // `sendInitialEvents` is refused the way an API server without the feature refuses it, and
+    // every watch script below is then played against the list-then-watch fallback it was
+    // written for.
+    if path.contains("sendInitialEvents=true") {
+        return streaming_lists_refused();
+    }
     // Read before the query string is dropped, because `watch=true` is the whole difference
     // between reading a collection and observing it, and it lives nowhere else in the request.
     if cluster.watch != Watching::NotOffered && path.contains("watch=true") {
@@ -2453,7 +2475,10 @@ impl HostServices for RecordedCluster {
                     // A paced watch answers with its head here and with its frames later, each
                     // one when the test releases it. The sender is cloned rather than moved,
                     // because the connection goes on carrying nothing until it is closed.
-                    if cluster.watch == Watching::Paced && path.contains("watch=true") {
+                    if cluster.watch == Watching::Paced
+                        && path.contains("watch=true")
+                        && !path.contains("sendInitialEvents=true")
+                    {
                         let sender = inbound.clone();
                         let gate = Arc::clone(&cluster.release);
                         tokio::spawn(async move {
@@ -6180,9 +6205,10 @@ async fn should_deliver_what_changed_while_it_was_watching() {
 
     assert_eq!(
         asked_for(&cluster, "/api/v1/namespaces/default/pods"),
-        2,
-        "one listing and one watch, both on the collection endpoint — the watch is the same \
-         path with `watch=true` on it"
+        3,
+        "one streaming-list request this server refused (§19.2, ADR-0059), one listing and one \
+         watch, all on the collection endpoint — the watch is the same path with `watch=true` \
+         on it"
     );
     assert!(
         cluster
@@ -6298,8 +6324,9 @@ async fn should_make_a_watch_gap_visible_rather_than_stitching_a_history_over_it
 
     assert_eq!(
         asked_for(&cluster, "/api/v1/namespaces/default/pods"),
-        3,
-        "one acquisition, one watch, and one re-acquisition on the far side of the gap (§19.4)"
+        4,
+        "one refused streaming list (ADR-0059), one acquisition, one watch, and one \
+         re-acquisition on the far side of the gap (§19.4)"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }
@@ -6631,9 +6658,9 @@ async fn should_go_on_watching_after_a_gap_rather_than_ending_at_the_break() {
     );
     assert_eq!(
         asked_for(&cluster, "/api/v1/namespaces/default/pods"),
-        4,
-        "one acquisition, the watch that broke, the re-acquisition, and the watch that replaced \
-         it (§19.4 step 4, §19.5)"
+        5,
+        "one refused streaming list (ADR-0059), one acquisition, the watch that broke, the \
+         re-acquisition, and the watch that replaced it (§19.4 step 4, §19.5)"
     );
 
     invocation.cancel().await;
@@ -6724,8 +6751,9 @@ async fn should_report_the_gap_even_where_the_query_refused_to_pay_for_a_re_acqu
     );
     assert_eq!(
         asked_for(&cluster, "/api/v1/namespaces/default/pods"),
-        2,
-        "one acquisition and one watch: the second listing is exactly what was declined"
+        3,
+        "one refused streaming list (ADR-0059), one acquisition and one watch: the second \
+         listing is exactly what was declined"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

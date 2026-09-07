@@ -995,3 +995,175 @@ fn should_ignore_the_blank_lines_between_frames() {
     assert_eq!(events.len(), 1);
     assert_eq!(decoder.pending_bytes(), 0);
 }
+
+// --- §19.2: streaming lists, and the bookmark that ends their initial events (ADR-0059) ----------
+
+#[test]
+fn should_decode_the_initial_events_end_bookmark_apart_from_an_ordinary_one() {
+    // §19.2's terminator is an ordinary BOOKMARK carrying one annotation, and the annotation is
+    // the whole difference between "you are current at this version" and "the initial state is
+    // complete at this version". Both are the upstream class BOOKMARK; neither is a mutation.
+    let mut decoder = WatchDecoder::new(INSTANCE);
+    let wire = frame(
+        "BOOKMARK",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"18050","annotations":{"k8s.io/initial-events-end":"true"}}}"#,
+    ) + &frame(
+        "BOOKMARK",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"18060"}}"#,
+    );
+
+    let events = decoder.decode(wire.as_bytes()).expect("both decode");
+
+    assert_eq!(
+        events,
+        vec![
+            WatchEvent::InitialEventsEnd(ResourceVersion::new("18050")),
+            WatchEvent::Bookmark(ResourceVersion::new("18060")),
+        ]
+    );
+    assert!(events.iter().all(|event| event.class() == "BOOKMARK"));
+    assert!(events.iter().all(|event| !event.is_mutation()));
+}
+
+#[test]
+fn should_seed_the_cache_from_a_streaming_list_at_the_version_the_end_bookmark_carries() {
+    // §19.2 and §20.3: the initial events are staged, not applied — before the terminating
+    // bookmark the set is incomplete and a cache seeded from it would answer absence for
+    // everything not yet received. When the bookmark arrives the cache is seeded from all of them
+    // at the bookmark's version, which is what a listing's `metadata.resourceVersion` would have
+    // been, and the stream is live from there.
+    let mut stream = pods();
+    stream
+        .begin_streaming_list()
+        .expect("a stream that has not acquired state may stream its list");
+    assert!(stream.is_streaming_list());
+
+    assert_eq!(
+        stream.observe(WatchEvent::Added(pod("checkout-1", "uid-1", "18005"))),
+        Reception::Staged
+    );
+    assert_eq!(
+        stream.observe(WatchEvent::Added(pod("checkout-2", "uid-2", "18006"))),
+        Reception::Staged
+    );
+    assert_eq!(stream.state(), SyncState::Syncing);
+    assert!(!stream.has_synced());
+    assert!(!stream.absence_is_conclusive());
+    assert_eq!(
+        stream.object_count(),
+        0,
+        "nothing is in the cache until the initial state is complete"
+    );
+
+    assert_eq!(
+        stream.observe(WatchEvent::InitialEventsEnd(ResourceVersion::new("18050"))),
+        Reception::Synchronised
+    );
+    assert_eq!(stream.state(), SyncState::Live);
+    assert!(stream.absence_is_conclusive());
+    assert!(!stream.is_streaming_list());
+    assert_eq!(stream.object_count(), 2);
+    assert_eq!(
+        stream.checkpoint().map(ResourceVersion::as_str),
+        Some("18050"),
+        "the watch resumes from the bookmark's version, as it would from a listing's"
+    );
+    assert!(stream.is_gap_free());
+    assert!(
+        stream.continuous_changes().is_empty(),
+        "the initial state is not a change"
+    );
+
+    // From here it is an ordinary live stream: a change is a change.
+    assert_eq!(
+        stream.observe(WatchEvent::Modified(pod("checkout-1", "uid-1", "18051"))),
+        Reception::Applied
+    );
+    assert_eq!(stream.continuous_changes().len(), 1);
+}
+
+#[test]
+fn should_break_continuity_when_a_streaming_list_expires_before_its_initial_events_end() {
+    // Gate F on the streaming path: a `410` while the initial events are still arriving is a gap
+    // like any other. What was staged is void with the stream that was delivering it — a partial
+    // initial state has no version to stand at — and the next acquisition closes the gap rather
+    // than continuing a history that never began.
+    let mut stream = pods();
+    stream.begin_streaming_list().expect("begins");
+    stream.observe(WatchEvent::Added(pod("checkout-1", "uid-1", "18005")));
+
+    assert_eq!(
+        stream.observe(WatchEvent::Error(WatchFailure::Expired)),
+        Reception::ContinuityBroken
+    );
+    assert_eq!(stream.state(), SyncState::GapDetected);
+    assert!(!stream.is_streaming_list());
+    assert_eq!(
+        stream.object_count(),
+        0,
+        "the staged object never reached the cache"
+    );
+    assert_eq!(stream.gaps().len(), 1);
+    assert_eq!(stream.gaps()[0].reason(), GapReason::Expired);
+    assert!(!stream.is_gap_free());
+
+    // §19.4 step 4: fresh state, and the gap closes at the version it was acquired at.
+    stream.listed(
+        vec![pod("checkout-1", "uid-1", "18100")],
+        ResourceVersion::new("18200"),
+    );
+    assert_eq!(stream.state(), SyncState::Live);
+    assert_eq!(
+        stream.gaps()[0].resumed_at().map(ResourceVersion::as_str),
+        Some("18200")
+    );
+    assert!(
+        !stream.is_gap_free(),
+        "closing a gap says observation continues, never that the unobserved period was filled"
+    );
+}
+
+#[test]
+fn should_abandon_a_streaming_list_whose_initial_events_never_ended() {
+    // §19.2's fallback: a server that closes the body, or refuses the request, before the
+    // terminating bookmark has delivered no initial state. The attempt is abandoned, the stream
+    // is back where it was, and a listing acquires the collection the way §19.1 spells out.
+    let mut stream = pods();
+    stream.begin_streaming_list().expect("begins");
+    stream.observe(WatchEvent::Added(pod("checkout-1", "uid-1", "18005")));
+
+    assert!(stream.abandon_streaming_list());
+    assert!(!stream.is_streaming_list());
+    assert_eq!(stream.state(), SyncState::Syncing);
+    assert_eq!(stream.object_count(), 0);
+    assert!(
+        !stream.abandon_streaming_list(),
+        "abandoning nothing is neither an error nor an achievement"
+    );
+
+    stream.listed(
+        vec![pod("checkout-1", "uid-1", "18005")],
+        ResourceVersion::new("18010"),
+    );
+    assert_eq!(stream.state(), SyncState::Live);
+    assert!(
+        stream.is_gap_free(),
+        "a fallback is an acquisition, not a break"
+    );
+}
+
+#[test]
+fn should_treat_an_end_bookmark_on_a_live_stream_as_an_ordinary_checkpoint() {
+    // A stream that did not ask for a streaming list has nothing to end. The annotation says
+    // what the server meant; the checkpoint moves and nothing else does.
+    let mut stream = live_pods();
+    assert_eq!(
+        stream.observe(WatchEvent::InitialEventsEnd(ResourceVersion::new("18999"))),
+        Reception::Checkpointed
+    );
+    assert_eq!(
+        stream.checkpoint().map(ResourceVersion::as_str),
+        Some("18999")
+    );
+    assert_eq!(stream.object_count(), 1, "the cache was not replaced");
+}
