@@ -126,6 +126,12 @@ declared:
   - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_go_up_from_a_pod_to_its_namespace_and_from_there_to_the_cluster"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_enter_the_cluster_and_find_its_namespaces_and_nodes_among_the_exits"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_find_workloads_by_role_across_the_kinds_that_carry_it"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
   - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_open_no_exit_from_a_kubernetes_place_without_the_relation_write_grant"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
