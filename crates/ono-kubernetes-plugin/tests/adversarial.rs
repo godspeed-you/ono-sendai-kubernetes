@@ -63,6 +63,9 @@ enum Answers {
     WithBrokenFraming,
     /// Every page of the Pod list carries the same `continue` token, so the sequence never ends.
     WithAContinueTokenThatNeverAdvances,
+    /// The Gateway API is served, and its one HTTPRoute names a Gateway and a Service whose
+    /// every human-readable field was chosen by whoever created the route.
+    WithAHostileRoute,
 }
 
 /// One recorded API server, and the request heads it received.
@@ -137,12 +140,36 @@ impl Cluster {
         })
     }
 
+    /// An HTTPRoute whose parent, backend and namespace references are attacker-chosen text.
+    ///
+    /// The curated Gateway API adapter reads these fields (§27.3, §33.8), and what it reads is
+    /// carried into an edge's target. The target is where a hostile name would become a place
+    /// address, which is the one string this package composes rather than copies.
+    fn hostile_route() -> Json {
+        json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {
+                "name": "shop",
+                "namespace": "shop",
+                "uid": "dddddddd-4444-4444-4444-444444444444",
+                "resourceVersion": "9002",
+                "creationTimestamp": "2026-09-01T09:00:00Z",
+            },
+            "spec": {
+                "parentRefs": [{"name": HOSTILE, "namespace": HOSTILE}],
+                "rules": [{"backendRefs": [{"name": HOSTILE, "port": 80}]}],
+            },
+        })
+    }
+
     fn secret_items(&self) -> Vec<Json> {
         let kind = match self.answers {
             Answers::WithItemsThatClaimAnotherKind => Some("ConfigMap"),
             Answers::Honestly
             | Answers::WithBrokenFraming
-            | Answers::WithAContinueTokenThatNeverAdvances => None,
+            | Answers::WithAContinueTokenThatNeverAdvances
+            | Answers::WithAHostileRoute => None,
         };
         let mut item = json!({
             "metadata": {
@@ -174,7 +201,38 @@ impl Cluster {
                 "major": "1", "minor": "34", "gitVersion": "v1.34.2+k0s",
             }),
             ("GET", "/api") => json!({"kind": "APIVersions", "versions": ["v1"]}),
-            ("GET", "/apis") => json!({"kind": "APIGroupList", "groups": []}),
+            ("GET", "/apis") => {
+                let mut groups = Vec::new();
+                if self.answers == Answers::WithAHostileRoute {
+                    groups.push(json!({
+                        "name": "gateway.networking.k8s.io",
+                        "versions": [{"groupVersion": "gateway.networking.k8s.io/v1",
+                                      "version": "v1"}],
+                        "preferredVersion": {"groupVersion": "gateway.networking.k8s.io/v1",
+                                             "version": "v1"},
+                    }));
+                }
+                json!({"kind": "APIGroupList", "groups": groups})
+            }
+            ("GET", "/apis/gateway.networking.k8s.io/v1")
+                if self.answers == Answers::WithAHostileRoute =>
+            {
+                json!({
+                    "kind": "APIResourceList",
+                    "groupVersion": "gateway.networking.k8s.io/v1",
+                    "resources": [
+                        {"name": "httproutes", "kind": "HTTPRoute", "namespaced": true,
+                         "verbs": ["get", "list", "watch"]},
+                        {"name": "gateways", "kind": "Gateway", "namespaced": true,
+                         "verbs": ["get", "list", "watch"]},
+                    ],
+                })
+            }
+            ("GET", "/apis/gateway.networking.k8s.io/v1/namespaces/shop/httproutes/shop")
+                if self.answers == Answers::WithAHostileRoute =>
+            {
+                Self::hostile_route()
+            }
             ("GET", "/api/v1") => json!({
                 "kind": "APIResourceList",
                 "groupVersion": "v1",
@@ -731,5 +789,94 @@ async fn should_end_an_invocation_whose_server_never_stops_paginating() {
         answer.error.contains("continuity"),
         "and it says why it stopped rather than simply stopping: {}",
         answer.error
+    );
+}
+
+// --- a curated adapter reading attacker-chosen references (§27.3, §33.8) ---------------------------
+
+#[tokio::test]
+async fn should_carry_a_hostile_reference_read_by_an_adapter_as_data_and_not_as_shape() {
+    // The registry's Gateway API member reads `spec.parentRefs[].name`, `.namespace` and
+    // `spec.rules[].backendRefs[].name` and puts them in an edge's target — and anyone who can
+    // create an HTTPRoute chooses those strings. Two things are pinned through the whole package:
+    // the values arrive whole, as data, in the fields the schema declares; and the edge's
+    // evidence is the field the adapter read, labelled as a native field with the adapter named
+    // as its support, so a reader can check it (Gate D, §62.4) and nothing arrives as an
+    // inference (§23.5).
+    let cluster = Cluster::new(Answers::WithAHostileRoute);
+    let mut options = at("shop");
+    options.insert("kind".to_owned(), json!("HTTPRoute"));
+    options.insert("name".to_owned(), json!("shop"));
+    let answer = ask(&cluster, "k8s-relation", options).await;
+
+    assert_eq!(answer.status, InvokeStatus::Completed, "{}", answer.error);
+    let records = answer.records();
+    assert_eq!(
+        records.len(),
+        2,
+        "one parent, one backend, and the value forged no third row: {records:?}"
+    );
+    for record in &records {
+        record
+            .validate()
+            .expect("the record conforms to the schema it carries");
+        assert_eq!(
+            record.schema_id().to_string(),
+            "io.github.godspeed-you.kubernetes.relation/1",
+            "the schema is the package's, never the data's"
+        );
+        assert_eq!(
+            text_of(record, "target_name").as_deref(),
+            Some(HOSTILE),
+            "every byte the route stated, including the ones a terminal would act on"
+        );
+        assert_eq!(
+            text_of(record, "evidence_class").as_deref(),
+            Some("native-field"),
+            "the adapter cites the field it read, and nothing here is an inference"
+        );
+        let supporting = format!("{:?}", record.get("supporting"));
+        assert!(
+            supporting.contains("curated Gateway API adapter for gateway.networking.k8s.io/v1"),
+            "the adapter and the version it assumed ride along as support: {supporting}"
+        );
+        // The target place is composed by this package from the reference, so it is the one
+        // string a hostile name could have reshaped. It did not: the grammar's segments are the
+        // grammar's, and the name is carried inside one of them.
+        let target = text_of(record, "target").expect("an edge names its target");
+        assert!(
+            target.contains("pwned"),
+            "the name is carried rather than stripped: {target:?}"
+        );
+    }
+
+    let attaches = records
+        .iter()
+        .find(|record| text_of(record, "relation").as_deref() == Some("attaches-to"))
+        .expect("the route attaches to its parent");
+    assert_eq!(text_of(attaches, "target_kind").as_deref(), Some("Gateway"));
+    assert_eq!(
+        text_of(attaches, "target_namespace").as_deref(),
+        Some(HOSTILE),
+        "a cross-namespace parentRef keeps the namespace it named (§27.3)"
+    );
+    assert_eq!(
+        text_of(attaches, "evidence_path").as_deref(),
+        Some("/spec/parentRefs/0/name")
+    );
+
+    let routes = records
+        .iter()
+        .find(|record| text_of(record, "relation").as_deref() == Some("routes-to"))
+        .expect("the route names a backend");
+    assert_eq!(text_of(routes, "target_kind").as_deref(), Some("Service"));
+    assert_eq!(
+        text_of(routes, "target_namespace").as_deref(),
+        Some("shop"),
+        "a backendRef without a namespace is local to the route"
+    );
+    assert_eq!(
+        text_of(routes, "evidence_path").as_deref(),
+        Some("/spec/rules/0/backendRefs/0/name")
     );
 }
