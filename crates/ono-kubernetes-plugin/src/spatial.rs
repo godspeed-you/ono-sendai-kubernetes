@@ -29,13 +29,16 @@
 //! edge, rather than travelling with a name that would bind a place to a word two resources can
 //! share.
 //!
-//! **`up` is not this.** §35.6 makes a namespace a Pod's spatial parent *even though a ReplicaSet
-//! owns it*, and the two are separate shapes here for exactly that reason: `…pod_to_namespace`
-//! carries `in-namespace` and `…pod_to_replicaset` carries `controlled-by`. Neither of them is
-//! `up`, which needs the plugin-defined aggregate space of §36.4 that a package cannot declare —
-//! `ADR-0584 (core)` says so in its own Consequences and refuses with `spatial.no_parent`. What
-//! this package can do is make the spatial parent reachable and keep it distinct from ownership;
-//! what it cannot do is make `up` land on it.
+//! **`up` climbs containment and never ownership.** §35.6 makes a namespace a Pod's spatial
+//! parent *even though a ReplicaSet owns it*, and the two are separate shapes here for exactly
+//! that reason: `…pod_to_namespace` carries `in-namespace` and `…pod_to_replicaset` carries
+//! `controlled-by`. `up` follows the first and only the first: every target declares the kind of
+//! place above it (`parent:` in `contributions/targets.yaml`, [`parent_of`]), the host walks the
+//! contributed edge that leads there (`ADR-0597 (core)`), and from a namespace or a
+//! cluster-scoped kind the next step up is the provider instance, `k8s-cluster`, which is the
+//! top of what this package contributes (ADR-0065). Above that `up` refuses with
+//! `spatial.no_parent`, because a cluster is not inside any place on the machine the shell runs
+//! on (§2.17 of core's spatial specification).
 //!
 //! **The capability is `relation.write`, and it is never granted by default.** A package without
 //! it contributes no relation at all — core drops the shapes before the merge, which is §35.5's

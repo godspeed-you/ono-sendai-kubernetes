@@ -30,8 +30,8 @@ the last two that were not, reach a reader through `changes.rs` and `query.rs`.
 | Domain layer | `crates/ono-provider-kubernetes`, twenty-four modules, no host and no cluster |
 | Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations, audit, spatial |
 | Contributions | 47 targets, 2 commands, 48 schemas, 64 relation shapes, **zero verbs of this package's own** |
-| Tests | 1055 across the workspace, all green; 27 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
-| Live proof | 14 tests in `live_cluster.rs` against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine. Thirteen of them announce a skip without one; the fourteenth is a static source scan that never does |
+| Tests | 1072 across the workspace, all green; 29 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
+| Live proof | 18 tests in `live_cluster.rs` against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine. Seventeen announce a skip without one; the eighteenth is a static source scan that never does |
 | Transport | HTTP/1.1 over a `rustls` session over the host's brokered `network.connect` |
 | Conformance level reached | **none claimed.** §0.1 binds a claim to the gates; see `docs/coverage.md` for the requirement-by-requirement map |
 | Licence | Apache-2.0 (core is MIT) |
@@ -46,7 +46,7 @@ ADR check and the instructions check. None of the document checks was dropped (A
 | `discovery` | §11, §13 | what the server serves; `Gvk` and `Gvr` are separate types |
 | `object` | §14, §16 | UID is lifetime identity, a name is not (Gate C) |
 | `relationship` | §23–§32 | every edge names the evidence it rests on (Gate D) |
-| `coverage` | §18, §21 | eight ways to come back with nothing (Gate E) |
+| `coverage` | §18, §21 | nine ways to come back with nothing (Gate E) |
 | `transport` | §17–§18, §21, §48 | HTTP/1.1 over a byte-stream trait; pagination, coverage, continuity, the whole error taxonomy |
 | `watch` | §19, §20 | the `410 Gone` state machine, and the decoder that reads one out of a `200 OK` stream (Gate F) |
 | `schema` | §12, §33 | an unknown CRD types fully through a path that names no kind (Gates A, B) |
@@ -110,8 +110,8 @@ checks the capability at every invocation before any of this package's code runs
 ([ADR-0024](adr/ADR-0024-a-mutation-is-a-command-with-a-declared-risk-and-a-granted-capability-and-its-easy-path-is-a-prediction.md)):
 
 ```text
-set k8s-resource      risk: mutate        capabilities: [network.connect]
-remove k8s-resource   risk: destructive   capabilities: [network.connect]
+set k8s-resource      risk: mutate        capabilities: [network.connect, provider.mutate]
+remove k8s-resource   risk: destructive   capabilities: [network.connect, provider.mutate]
 ```
 
 Both verbs are core's own. `dry_run` defaults to **true**, so the shortest sentence a user can
@@ -172,10 +172,10 @@ fifth verb, proven live.
 stops promptly when the operator does, and §41's live view is wired into `changes.rs` — a row that
 goes stale says so rather than staying there looking current.
 
-**Phases 5 through 8 landed out of order, and one cost of that remains.** Events, temporal,
-causal, logs, plan and mutation all reach a user. `set k8s-resource`'s answer is still verified by
-one immediate observation rather than against a watch, so §46.4's `Inconclusive` is doing work a
-live view would otherwise do — an honest answer, and a coarser one than the machinery now allows.
+**Phases 5 through 8 landed out of order, and the cost that used to remain is closed.** Events,
+temporal, causal, logs, plan and mutation all reach a user, and `set k8s-resource` now verifies a
+change by watching the controller converge rather than by one immediate read (ADR-0060); §46.4's
+`Inconclusive` is the honest answer where the watch times out, not a stand-in for a live view.
 
 ## Proven from a prompt (2026-09-05)
 
@@ -222,11 +222,36 @@ plain HTTP. What it establishes is that the route exists and the contracts hold 
 
 ## In progress
 
-Nothing. The follow-up completion pass of 2026-09-07 closed the whole of the previous gap list bar
-the one item that is a reserved conditional capability rather than a gap. **All fourteen acceptance
-gates of §62 are met**, and the live suite — now 17 tests — was run against `kind` at v1.35.8,
-v1.36.4 and v1.37.0 on a machine with no `kubectl`, and `scripts/demo.sh` was driven end to end at
-v1.37.0. The workspace is **1055 tests, all green**.
+Nothing. The completion pass closed the last wiring gap — the dependency-path causal finding — and
+made `trace`/`diff`'s absence an explicit out-of-scope boundary rather than an ambiguous one.
+**All fourteen acceptance gates of §62 are met**, and the live suite — now 18 tests — was run
+against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`. The workspace is
+**1072 tests, all green**.
+
+### The completion pass
+
+Two things were wired that the map had recorded as short:
+
+1. **`DEPENDENCY_PATH_EXISTS` is reachable.** `get k8s-why` derives the object's edges through the
+   one rule set that answers `k8s-relation` (`relations::derive`, lifted out for the purpose) and
+   walks outward through `causal::Walk` — bounded in hops (`depth`, at most 3) and in reads,
+   visiting every object once so a cycle is a path that stops, reporting an asserted edge as the
+   assertion and a derived one as a path. Proven at the domain, at the boundary and against a live
+   cluster whose ReplicaSet a controller made (ADR-0068).
+2. **`trace` and `diff` are an out-of-scope boundary, not a gap.** `trace` is the shell's
+   relationship verb, bound to core targets and not opened to contributed relations by
+   `ADR-0585 (core)`; `diff` is core's unbuilt v0.5 snapshot comparison. Both wait on a generic
+   core increment, `near`/`follow`/`k8s-relation`/`k8s-why` reach the same graph, and a test pins
+   the shape of `trace`'s refusal so it cannot become an empty graph (ADR-0069).
+
+**One defect the walk found and fixed.** Against a real cluster's *aggregated* discovery, each
+resource's `responseKind` leaves `group`/`version` empty to mean "the enclosing group-version".
+The reader fell back to the enclosing version but not the enclosing group, so a Deployment read
+over aggregated discovery was stored under the core group — and `k8s-resource --kind Deployment
+--group apps`, and the walk's far-end reads, resolved to nothing. The fixture had filled the
+field, so a hundred green tests never disagreed with it. Fixed in `discovery.rs`, with the
+fixtures rewritten to match what a real API server writes (a fixture written from the same belief
+as the code cannot disagree with it).
 
 ### The follow-up completion pass (2026-09-07)
 
@@ -264,6 +289,12 @@ Two things, each a reservation with a reason rather than a backlog position, and
    registry now exists (ADR-0062, Gateway API as its first member), so the reservation is "no
    member yet" rather than "no mechanism"; it expires when a maintainer with that expertise
    contributes an adapter.
+3. **`trace` and `diff` reaching Kubernetes (ADR-0069).** `trace` is the shell's relationship
+   verb, bound to core targets; `ADR-0585 (core)` opened `near`/`follow`/`map` to contributed
+   relations and not `trace`, so `trace k8s-pod` refuses by name and the same graph is reached
+   through `near`, `follow`, `get k8s-relation` and `get k8s-why`. `diff` is core's unbuilt v0.5
+   snapshot comparison. Both wait on a generic core increment, not on this provider, and a test
+   pins the shape of `trace`'s refusal so it cannot become an empty graph.
 
 ## The transport decision, and what it costs
 
@@ -297,17 +328,15 @@ or a credential refusal (`ADR-0592 (core)`, ADR-0067); a target's schema id unch
 (`ADR-0591 (core)`); the plugin partial-coverage path having no end-to-end test (now driven through
 the boundary); TLS 1.2 disabled (ADR-0063); a kubeconfig `server` path prefix refused (ADR-0057);
 the peer certificate modelled and not obtained (ADR-0064); and the `KUBECONFIG` single-file limit
-(ADR-0056). The two that remain open below are `current-context` as a default (a deliberate choice,
-§7.4) and the `docs/contracts/`/`MAINTAINERS.md` questions, which are process rather than code.
+(ADR-0056). What remains open below is process rather than code: the `docs/contracts/` scope and
+the `MAINTAINERS.md` question. The capability findings — `provider.mutate`, the error codes, TLS
+1.2, the peer fingerprint, the server prefix, credential refresh — are all closed and struck
+through for the record.
 
-- **A package cannot read `~/.kube/config` through a real host.** The supervisor sets a package's
-  `HOME` to its sandbox working directory (`sandbox.rs`), and the host matches a `filesystem.read`
-  grant against a *canonicalised absolute* path — so the scope this package's manifest declares,
-  `~/.kube/config`, matches nothing a package can ask for, whether the package expands the tilde
-  itself or passes it through. An operator must pass `kubeconfig` with an absolute path, or name
-  the endpoint with `host`/`port`. Found while making the argument-less invocation answer
-  (ADR-0027); it is core's boundary rather than this package's, and it is why the standing query
-  rather than `current-context` is the first fallback.
+- **~~A package cannot read `~/.kube/config` through a real host.~~ Closed in core
+  (`ADR-0593 (core)`).** The host resolves a leading `~/` against the operator's home before the
+  canonical scope check, so the manifest's declared `~/.kube/config` scope reaches the operator's
+  kubeconfig with no absolute path — proven by the demo connecting with no `--kubeconfig`.
 - **`near` without `relation.write` is indistinguishable from a place with no neighbours.** §35.5
   has the host filter before the merge, and `ADR-0585 (core)` implements it by dropping a
   package's shapes at load — so a package without the grant is never asked and there is nobody to
@@ -337,7 +366,7 @@ the peer certificate modelled and not obtained (ADR-0064); and the `KUBECONFIG` 
   core wires a contributed *target* to `provider.query`; before it, a package could only answer
   `get` through a contributed *command*, which returns whatever it likes with no declared schema,
   no identity and no provenance. This provider therefore requires a core at or after that commit,
-  and the compatibility table in `README.md` must say so once a version of core carries it.
+  and the compatibility table in `README.md` says so.
 - **~~A contributed target is invoked with no options.~~ Closed in core, verified here
   (2026-09-06).** It was the single largest thing between this package and a claimed gate. Against
   the pinned core checkout, `ono-cli`'s `invoke_contributed` now delegates to `invoke`, which
@@ -357,21 +386,17 @@ the peer certificate modelled and not obtained (ADR-0064); and the `KUBECONFIG` 
   `runtime.max_concurrent_invocations`, and the smaller wins — because no manifest can assert
   thread-safety and no package may declare its way past a resource budget.
 
-  **Nothing here uses it yet**, and the three reasons are independent: `Cargo.lock` pins the SDK
-  at core `879d390`, which predates the change; `sessions::Sessions` is `Rc<RefCell<…>>` and the
-  new handler bound is `Fn(&mut Ctx) -> Outcome + Send + Sync`; and no ceiling is declared in
-  either place. `tests/isolation.rs` still queries sequentially and its header still explains why,
-  in words that were true this morning. Kept rather than deleted, because a finding that moves
-  from "the protocol cannot" to "we have not" is the most useful kind to keep visible.
+  **This is used now.** The pinned core carries `ADR-0586 (core)`, `lib.rs` declares
+  `CONCURRENT_INVOCATIONS = 3` beside the manifest's `runtime.max_concurrent_invocations: 3`, and
+  `tests/isolation.rs` holds one context open on stream credit while another's whole conversation
+  runs — Gate J, genuinely concurrent. Kept rather than deleted, because a finding that moved from
+  "the protocol cannot" to "done" is worth keeping visible.
 - **Core registers an invocable target only from the on-disk document, never from the
-  handshake.** `ono-kuang-supervisor`'s `load()` validates a handshake target contribution and
-  mounts a `PluginProvider` for it; the thing that makes `get <word>` resolve is
-  `ono-cli`'s `plugin_registry::target_declarations()`, which reads `contributions/targets.yaml`
-  and synthesises one `ContributedCommand` per entry. A handshake-only target name therefore
-  yields a provider entry nothing can spell, and it is accepted silently — the reverse
-  disagreement (on disk, not answered at handshake) *is* refused, with a good message. This is
-  why a discovered CRD cannot earn a name today (ADR-0010), and the asymmetry is worth reporting
-  on its own.
+  handshake — and now says so.** `get <word>` resolves from `contributions/targets.yaml`, so a
+  handshake-only target name yields a provider entry nothing can spell; `ADR-0598 (core)` made the
+  host name such a target at load for what it is rather than accept it silently. This is still why
+  a discovered CRD cannot earn a *word* of its own today (ADR-0010) — every kind is reachable
+  through `k8s-resource`'s options — and earning the word remains a core increment.
 - **~~A target contribution has nowhere to declare its options.~~ Closed in core, taken here.**
   `ADR-0587 (core)` gave a contribution an `options` key that reaches the registry, and every
   target and command in this package declares every argument its handler reads —
@@ -382,85 +407,71 @@ the peer certificate modelled and not obtained (ADR-0064); and the `KUBECONFIG` 
 - **~~A contributed command cannot declare its options either.~~ Closed with the above.**
   `dry_run`, `set`, `unset`, `force_because` and `propagation` are declared and reach the
   registry, so the argument that decides whether a cluster changes is one a shell can complete.
-- **The KUANG/11 provider role has one method, and it is a read.** `protocol.v1.yaml` gives the
-  provider role `provider.query` and nothing else, so a mutating provider action must be delivered
-  as `command.invoke` — which is why the risk and the capability live on a command contribution.
-  Generic contract §21.1 asks an action to declare accepted target types, a parameter schema and
-  known idempotency semantics, and a `CommandContribution` has fields for none of the three.
-- **There is no capability family for "change state in the external system a provider fronts".**
-  The two mutating commands declare `network.connect`, which is the only honest choice: everything
-  they do travels as bytes through the network broker, and the broker cannot tell a `GET` from a
-  `PATCH`. **An operator who grants this package the ability to read a cluster has, in the same
-  act, granted it the ability to write to one.** `service.mutate` and `remote.mutate` carry scope
-  keys belonging to other domains, and an unknown capability id makes the manifest
-  `package.invalid`, so neither claiming one nor inventing a thirtieth is open. What is missing is
-  a `provider.mutate` family scoped by provider instance and resource class (ADR-0024).
+- **~~The KUANG/11 provider role has one method, and it is a read.~~ Closed in core, taken here.**
+  A mutating action is still a `command.invoke`, but `ADR-0595 (core)` gave a command contribution
+  an `action:` block that declares accepted target types, that it mutates, its idempotency and its
+  verification, read by the host before the first invocation (ADR-0066). Generic contract §21.1's
+  three fields are all declared.
+- **~~There is no capability family for "change state in the external system a provider fronts".~~ Closed in core, taken here.**
+  `ADR-0594 (core)` added the `provider.mutate` family, scoped by provider instance and resource
+  class, and both mutating commands now declare it beside `network.connect` (ADR-0066). The host
+  checks both before any code runs, so a read-only grant of `network.connect` can no longer write.
+  ADR-0024 recorded the finding this closes.
 - **~~`audit.event` has no observable channel in the test host.~~ Closed in core, taken here.**
   `ADR-0589 (core)` found that `audit.event` pushed a package's records onto a vector nothing read
   — not `LoadedPlugin::audit()`, not `get audit`, not the persisted trail — and joined them to the
   trail the broker writes, under host attribution and a host clock so a package cannot forge
   either. §51.6 is met: `audit.rs` records connect, denial and mutation, and no function in it
   takes an `Object` ([ADR-0047](adr/ADR-0047-what-the-broker-cannot-see-is-what-is-worth-recording.md)).
-- **The error registry has no code for a refusal by a provider's own safety rule.** A plan refused
-  for a missing precondition reports `safety.policy_denied`, whose summary says *configured*
-  policy; nothing was configured, the rule is this provider's. The two nearer codes are worse:
-  `provider.unsupported` says it cannot, and it can and declines; `provider.unavailable` says the
-  cluster did not answer, and it did. The same taxonomy has no entry for "the answer is empty and
-  its emptiness proves nothing", which is why `k8s-event` and `k8s-log` reuse
-  `provider.unavailable` for their refusals (ADR-0025).
-- **A target's declared schema id is not checked against the package's contributed schemas at
-  load — and there are no longer any placeholders to be caught by it.** Every target declares
-  a schema the package contributes, and `tests/contributions.rs` holds the document, the handshake
-  and the wiring table to each other. The core finding stands and is now only latent: the
-  supervisor checks a contributed target's schema id for a package-or-core *prefix*, never against
-  the package's contributed schemas. The check that bites is per record — a record whose schema id is
-  not in the handshake registry does not decode, and one that decodes but does not match the
-  target's declared schema is a `runtime.schema_violation`. So a target with an undeclared schema
-  would load happily and fail at its first emit, at runtime rather than at load.
+- **~~The empty-not-absence refusal borrowed the wrong code.~~ Closed (ADR-0067).** `k8s-event`'s
+  unobserved search and `k8s-log`'s empty read are `provider.inconclusive` now (`ADR-0592 (core)`),
+  the code that means "the answer is empty and its emptiness proves nothing". A plan refused for a
+  missing precondition is `contribution.refused` — this provider's own rule declining — which is a
+  different statement kept apart from the inconclusive one on purpose (ADR-0025, ADR-0028).
+- **~~A target's declared schema id is not checked at load.~~ Closed in core
+  (`ADR-0591 (core)`).** A contribution naming a schema the package does not contribute is refused
+  at load rather than at the first record. `tests/contributions.rs` holds the document, the
+  handshake and the wiring table to each other besides.
 - **~~§18.4's "more may exist" does not reach the user.~~ Closed.** It reaches twice over:
   `upstream=more-available` on each record's provenance, and `max_pages` as a declared option so a
   caller who bounded the answer can see that they did.
-- **The plugin's partial-coverage failure path has no end-to-end test.** It is proven at the
-  domain level (`tests/transport.rs` keeps the pages that arrived and attaches the error) and the
-  mapping from partial coverage to a failed invocation is read rather than run.
-- **TLS 1.2 is disabled.** The workspace declares `rustls` with `default-features = false` and
-  `["ring", "std", "logging"]`, which leaves out `tls12`. Every current API server negotiates
-  TLS 1.3, so this is a bound rather than a gap — and a cluster that offers only TLS 1.2 fails at
-  the handshake until the feature is added.
+- **~~The plugin's partial-coverage failure path has no end-to-end test.~~ Closed.** It is driven
+  through the boundary now: `should_keep_the_records_of_a_page_that_crossed_when_a_later_page_is_refused`
+  emits the pages that crossed and then fails the invocation naming the gap.
+- **~~TLS 1.2 is disabled.~~ Closed (ADR-0063).** The `tls12` feature is enabled beside 1.3, so an
+  API server pinned to TLS 1.2 is a reachable cluster rather than a handshake failure — with the
+  same anchors, the same name check and the same named insecure constructor as 1.3.
 - **A failed handshake does not close its brokered handle.** `TlsStream::connect` consumes the
   stream, so the package cannot ask whether the host still holds the connection; closing one the
   host has already retired is a protocol violation, which is worse. The handle is reclaimed when
   the invocation ends.
-- **A kubeconfig `server` with a path prefix is refused.** Rancher-style endpoints
-  (`https://host/k8s/clusters/c-xxx`) name one, and this build does not prepend it to its
-  requests. Refusing is deliberate: dropping the prefix silently would query a different cluster.
-- **The server certificate's public key is modelled and not obtained.** `diagnostics.rs`
-  extracts a certificate's `SubjectPublicKeyInfo` and hashes it, with tests over certificates
-  generated in the test — and `tls::TlsStream` does not expose the certificate it verified, so
-  the plugin has no bytes to hand it. The signal reports `not queried`, which §21.4 keeps apart
-  from absence. One accessor on `tls.rs` promotes it from a stated unknown to §10.2's second
-  signal, and it was left to the change that owns that module (ADR-0011).
+- **~~A kubeconfig `server` with a path prefix is refused.~~ Closed (ADR-0057).** A Rancher-style
+  endpoint (`https://host/k8s/clusters/c-xxx`) has its prefix carried on every request.
+- **~~The server certificate's public key is modelled and not obtained.~~ Closed (ADR-0064).**
+  `tls::TlsStream` exposes the peer certificate the session verified, and §10.2's second signal is
+  the SPKI hash of *that* certificate — `should_fingerprint_the_public_key_of_the_certificate_the_session_verified`.
 - **~~§10.4's cache invalidation is written and has no caller.~~ It has one, and only one.**
   `cluster::answer` hands the fingerprint it just observed to `Session::observed_fingerprint`,
   which empties discovery documents, schemas, watches, identity and capabilities on decisive
   disagreement. A fingerprint costs a read of `kube-system` and is not something §50.2 will pay
   for on every list, so this is the one moment the package has the evidence — and it means a
   cluster replaced behind an unchanged context name is caught by `get k8s-cluster` and by nothing
-  cheaper. `Session::crd_updated` and `group_version_changed` are the two that still have no
-  runtime caller, which is §33.2 and the other half of §11.4.
+  cheaper. `Session::crd_updated` and `group_version_changed` now have a runtime caller too: a
+  refreshed discovery document diffed against its predecessor fires both, so a CRD installed
+  mid-session is discovered within the 30 s validity window (ADR-0061), which is §33.2 and the
+  other half of §11.4.
 - **Alias detection is a comparison and a memory, and neither survives an invocation.**
   `Fingerprint::compare` answers whether two instances may be one cluster and `Session` now
   remembers one between calls — inside one process, for as long as somebody holds the value.
   Nothing persists it across invocations; `state.persist` is declared in the manifest and unused.
-- **~~Eleven domain modules cannot be reached from a prompt.~~ Two can not: `live` and
-  `budget`.** 1,474 lines, 40 tests, zero importers in `ono-kubernetes-plugin`, down from eleven
-  modules, 10,356 lines and 239 tests. `live.rs` is §41.1's live view and is the one unmet K3
-  requirement; `budget.rs` is §49.2's `Retry-After` and §49.5's throttling, and nothing anywhere
-  retries anything, so a rate-limited response is classified correctly and waited on never.
-- **`Relation::BoundTo` is a word nothing emits.** A `k8s-relation` query may narrow to
-  `bound-to` and will always come back empty, because §30.2's `PVC → bound-to → PV` has no
-  producer: `spec.volumeName` is read as a record field and never as an edge. A relation word that
-  can be asked for and never answered is worse than one that is refused.
+- **~~Eleven domain modules cannot be reached from a prompt.~~ Closed: all twenty-four are
+  imported.** `live.rs` reaches a reader through `changes.rs` (§41.1's live view, K3), and
+  `budget.rs` through `query.rs` — `RetryPolicy::plan` waits on a `Retry-After` in sliced naps
+  checking cancellation, and a query declares `max_requests`, `max_scopes` and `budget_ms`.
+- **~~`Relation::BoundTo` is a word nothing emits.~~ Closed (ADR-0031).** §30.2's
+  `PVC → bound-to → PV` has a producer: `claim_edges` reads `/spec/volumeName` with `/status/phase`
+  as supporting evidence, and an empty name is not an edge
+  (`should_bind_a_claim_to_the_volume_it_names`).
 - **~~§47.7's `MUST` is unmet although the evidence exists.~~ Met.** `get k8s-evidence` renders
   what Appendix C.3 spells, before any foreign provider is connected, one record per key.
 - **`get k8s-event` on a healthy object fails, and that is the most arguable thing here.** An
@@ -471,9 +482,12 @@ the peer certificate modelled and not obtained (ADR-0064); and the `KUBECONFIG` 
   accident. `k8s-log` does the same for a retrieval that produced no lines. ADR-0025 records the
   reasoning and the alternatives, and this is the entry to revisit if the shape proves wrong in
   use.
-- **`current-context` is not taken as a default.** §7.1 offers it as an optional default and §7.4
-  forbids a command silently following it when it changes on disk. A context is named; whether a
-  deliberate opt-in default is worth adding is open.
+- **~~`current-context` is not taken as a default.~~ Closed.** An invocation naming no endpoint
+  takes the kubeconfig's `current-context`, and one where the kubeconfig names none is refused
+  rather than guessed (`should_take_the_kubeconfig_s_current_context_when_a_query_names_no_endpoint`,
+  `should_refuse_a_query_naming_no_endpoint_when_the_kubeconfig_names_no_current_context`). §7.4's
+  rule against silently following a changed context on disk still holds: the standing query, not a
+  re-read of `current-context`, is what a wordless follow-up uses (ADR-0027).
 
 ## Deferred / blocked
 
@@ -495,8 +509,8 @@ the peer certificate modelled and not obtained (ADR-0064); and the `KUBECONFIG` 
   vocabulary; this package declares both, and `enter`, `near` and `follow` reach a cluster through
   the real `ono` binary. A CRD invented after the build is entered as a place keyed on the
   cluster's own `uid` — Gate A's fifth verb, proven against a live cluster
-  (`should_enter_a_custom_kind_the_cluster_learned_after_this_package_was_built`). `up` still
-  refuses, because the space above a namespace is an aggregate no single package can declare.
+  (`should_enter_a_custom_kind_the_cluster_learned_after_this_package_was_built`). `up` climbs
+  the declared containment to the cluster root now, and refuses only above it (ADR-0065).
 - **~~§34.2's failure isolation is not honoured on the dynamic search.~~ Closed.** The search now
   fails soft per group-version and `Searched` makes it impossible to hand on the groups that
   answered without the ones that did not, so one broken aggregated API server no longer fails an
@@ -507,13 +521,13 @@ the peer certificate modelled and not obtained (ADR-0064); and the `KUBECONFIG` 
   schema is cached too, because "this server publishes none" is an answer about this cluster and
   re-asking pays §50.2's cost for a document that will not be there next time either.
   `should_read_the_published_schema_once_for_two_queries_of_one_kind`.
-- **A stale snapshot is possible within one process, and nothing detects it.** A session caches
-  discovery *documents* rather than the assembled snapshot — because §35.8's ambiguity is a
-  property of the search space and an answer that depended on what an earlier query happened to
-  fetch would not be the same answer twice — and they are invalidated only by a decisive
-  fingerprint disagreement or a new process. A CRD installed while a session is live is therefore
-  invisible until one of those. §11.4 and §33.2 ask for more; what exists is the place to put it.
-- **`docs/contracts/` does not exist.** Whether this provider needs machine-readable contracts of
+- **A discovery document goes stale only after its validity window.** A session caches discovery
+  *documents* rather than the assembled snapshot, and a document older than 30 s is re-read and
+  diffed against its predecessor, firing `crd_updated`, `group_version_changed` and
+  `group_withdrawn` (ADR-0061). So a CRD installed while a session is live is discovered within the
+  window rather than at the next process. What is still not detected is a structural schema change
+  whose discovery footprint is byte-identical, because `SchemaCache` has no window of its own.
+- **`docs/contracts/` holds one contract, the skip register.** Whether this provider needs further machine-readable contracts of
   its own, or registers everything through core's, is still open. The package's contributions live
   in `package/contributions/*.yaml` and are checked against the handshake by
   `tests/contributions.rs`, which has answered the question in practice without deciding it.

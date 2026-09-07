@@ -35,13 +35,13 @@ jobs:
         with:
           path: ono-sendai-kubernetes
 
-      # The shell the host-side tests drive. Nine tests in `tests/spatial_shell.rs` contact no
+      # The shell the host-side tests drive. The tests in `tests/spatial_shell.rs` contact no
       # cluster — the API server is a `TcpListener` in the test process — and need only a built
       # `ono`; without one they announce a declared skip and the whole host-side layer goes
-      # unchecked: entering a place, `near`, `follow`, the namespace parent, `up`'s refusal, the
-      # `relation.write` gate, and a watch reaching the shell as a live stream. That layer is what
-      # K2 and K3 each have one requirement left in, and skipping it is the cheapest way not to
-      # know.
+      # unchecked: entering a place, `near`, `follow`, the namespace parent, `up` to the cluster
+      # root, `find place --role`, the `relation.write` gate, a watch reaching the shell as a live
+      # stream, and the shape of `trace`'s refusal. That layer is where K2's and K3's host-side
+      # requirements are proven, and skipping it is the cheapest way not to know.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: godspeed-you/ono-sendai

@@ -1,10 +1,11 @@
 # Security Policy
 
-This repository specifies the Kubernetes provider for
-[Ono-Sendai](https://github.com/godspeed-you/ono-sendai). **There is no implementation yet**, so
-there is no released code here to have a vulnerability in. This policy exists so that the
-reporting path is established before it is needed, and it covers the specification itself: a
-requirement that mandates unsafe behaviour is a security defect worth reporting.
+This repository holds the Kubernetes provider for
+[Ono-Sendai](https://github.com/godspeed-you/ono-sendai): its specification and its
+implementation, a KUANG/11 package that builds from this repository. **There is no release yet**,
+so nothing here has shipped to an operator, but the code exists and runs against real clusters,
+and a vulnerability in it is a vulnerability worth reporting privately. This policy covers the
+specification too: a requirement that mandates unsafe behaviour is a security defect.
 
 ## Reporting a vulnerability
 
@@ -44,9 +45,9 @@ maintenance commitment that does not exist.
 
 ## Why this provider is security-sensitive
 
-A Kubernetes provider is not an ordinary integration. When implemented it will hold or broker
-cluster credentials, reach production control planes, and act with whatever authority the
-operator's kubeconfig carries. The specification therefore makes several properties normative
+A Kubernetes provider is not an ordinary integration. It brokers cluster credentials, reaches
+control planes, and — under `provider.mutate` — acts with whatever authority the operator's
+kubeconfig carries. The specification therefore makes several properties normative
 rather than advisory, and a change that weakens one of them is a security change:
 
 - **Credentials never become values.** Tokens, private keys and client certificate material must

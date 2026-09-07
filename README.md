@@ -35,6 +35,7 @@ Ono verb that already existed. Reading is `get`; the two words that write are co
 
 ```text
 > grant capability network.connect --plugin io.github.godspeed-you.kubernetes
+> grant capability provider.mutate --plugin io.github.godspeed-you.kubernetes   # only to write
 
 > get k8s-pod --context prod --namespace shop | where phase == "Running"
 > get k8s-pod --context prod --namespace shop --selector 'app=api,tier!=cache'   # pushed to the server
@@ -47,6 +48,7 @@ Ono verb that already existed. Reading is `get`; the two words that write are co
 > get k8s-condition --context prod --kind Deployment --name checkout
 > get k8s-timeline --context prod --kind Pod --name api-7d9f
 > get k8s-why      --context prod --kind Pod --name api-7d9f
+> get k8s-why      --context prod --kind Pod --name api-7d9f --depth 2   # dependency paths, never a cause
 > get k8s-log      --context prod --name api-7d9f --container api --tail_lines 200
 > get k8s-evidence --context prod --name node-a          # what a Node says about the machine under it
 > get k8s-cluster  --context prod                        # which cluster, reachable, as whom
@@ -65,20 +67,24 @@ own. **`dry_run` defaults to `true`**, so the shortest sentence you can write as
 to run admission and persist nothing; `--dry_run false` is the one place you are asked to be
 explicit about which of the two you meant.
 
-One honest limit on that grant. KUANG/11 has no capability family for changing state in the
-system a provider fronts, so both commands declare `network.connect` — which means **an operator
-who grants this package the ability to read a cluster has, in the same act, granted it the ability
-to write to one.** The `risk` descriptor and the dry-run default stand in that gap and are not a
-security boundary.
+Reading a cluster and changing one are two grants. `network.connect` is the authority to reach
+the API server at all; **`provider.mutate` is the authority to change state in it**, declared by
+`set k8s-resource` and `remove k8s-resource` and checked by the host at every invocation before any
+of this package's code runs. An operator who grants only `network.connect` gets a read-only
+provider that cannot send a write. A mutation needs both grants; the `risk` descriptor and the
+dry-run default sit on top of that boundary rather than in place of it.
 
 Every flag above is declared and reaches the registry, so `help get k8s-pod` and
 `help set k8s-resource` list them with their types and defaults — including `--dry_run`, which is
 the argument that decides whether a cluster changes.
 
 **What you cannot type.** `exec`, `attach` and `port-forward` are refusals that say what is missing
-rather than sessions (§42.3–§42.5). `up` refuses, because the space above a namespace is an
-aggregate no single package can declare. A `KUBECONFIG` naming several files reads the first and
-says so. Each is named with its reason in [`docs/coverage.md`](docs/coverage.md).
+rather than sessions (§42.3–§42.5), waiting on a terminal-ownership contract core has specified and
+not built (`ADR-0599 (core)`). `trace` and `diff` reach no Kubernetes noun: `trace` is the shell's
+relationship verb, bound to core targets, so a Kubernetes object's graph is walked with `near`,
+`follow`, `get k8s-relation` and `get k8s-why` instead; `diff` is core's unbuilt v0.5 snapshot
+comparison. Both wait on a generic core increment rather than on this provider. Each limit is named
+with its reason in [`docs/coverage.md`](docs/coverage.md).
 
 **What needs one more grant.** A kubeconfig authenticating through an `exec` credential plugin —
 which is how EKS, GKE and AKS are usually configured — runs that plugin under `process.exec`, and
@@ -182,8 +188,7 @@ whether or not it is curated. Section-by-section evidence is in
 | Custom resources of any CRD | yes | no, and none is needed | yes, through owner references and generic rules | yes | yes, bounded |
 
 "Mutation capable" means one bounded field change or one deletion, of one object named by the
-caller, with the preconditions taken from the object that was read — never a bulk operation and
-never a bulk operation. §43.3's seven curated actions are served as *arguments* of those two
+caller, with the preconditions taken from the object that was read — never a bulk operation. §43.3's seven curated actions are served as *arguments* of those two
 verbs — `--replicas`, `--restart_rollout`, `--schedulable` and the rest — rather than as words of
 this package's own, which is where the pressure toward a mini-shell was and where it was refused. "Watch capable"
 means `get k8s-change` resolves the collection through discovery, so a kind invented after this
@@ -231,8 +236,9 @@ What the gate asks for that is *not* here is a provider it has been run against 
 
 The specification's §64 sets the implementation order: connection foundation, then the dynamic
 resource model, then the curated operational graph, then live observation. All four are closed,
-and parts of phases 5 through 8 arrived early — which cost one thing that is still true: a
-mutation is verified by an immediate read rather than against a watch.
+and parts of phases 5 through 8 arrived early. The one cost that used to remain — a mutation
+verified by an immediate read rather than against a watch — is closed: `set k8s-resource` watches
+the controller converge before it reports (§46.3).
 
 ## Ownership
 

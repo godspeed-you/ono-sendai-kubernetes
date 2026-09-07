@@ -23,8 +23,7 @@ Kubernetes minor versions.
 it stops, and it is the honest place to look for something to work on:
 
 - a section it marks partial, with the gap named;
-- a `SHOULD` nothing implements yet — §15.3's Tier 2 kinds are readable dynamically and none is
-  curated, which is the largest well-defined piece of work on the board;
+- a `SHOULD` or `MAY` the map records as untaken with its reason, where the reason has expired;
 - a curated CRD ecosystem (§15.4), through the adapter registry of §33.8 —
   [`docs/adapters.md`](docs/adapters.md) is the guide, fixture first, with a template;
 - the §68 open questions, which are explicitly reserved for later specifications or ADRs;

@@ -287,8 +287,9 @@ creating a Kubernetes-specific second shell. It was allowed to fail, and it did 
 interaction with no `kubectl` anywhere, UID-aware identity, kinds unknown at compile time,
 relationships with inspectable evidence, navigation through the existing spatial model, honest
 handling of RBAC denial and watch discontinuity, deterministic tests needing no live cluster, and
-**zero Kubernetes special cases in core** — the four core changes this provider needed
-(`ADR-0584` through `ADR-0589`) are all generic extensions the example package exercises. §62's
+**zero Kubernetes special cases in core** — every core change this provider needed
+(`ADR-0582 (core)` through `ADR-0599 (core)`) is a generic extension the example package
+exercises. §62's
 fourteen acceptance gates are the finer-grained version of the same question.
 
 What replaces it, until there is something to release: **`docs/coverage.md` has no unmet `MUST`.**

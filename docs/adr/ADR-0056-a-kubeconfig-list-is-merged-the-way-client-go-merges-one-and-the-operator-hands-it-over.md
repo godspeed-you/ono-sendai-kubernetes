@@ -95,9 +95,10 @@ being surfaced changed; the obligation to surface one did not.
   `should_skip_a_missing_first_kubeconfig_and_read_the_next` and
   `should_read_a_relative_certificate_authority_against_its_own_file_s_directory` prove the list
   reaches the wire, a missing file is skipped, and a relative CA resolves against its own file.
-- `~/` no longer breaks against the sandbox home. Against the pinned core it changes nothing that
-  passed before — the package matched a literal `~/.kube/config` and was denied — and it is
-  correct once core ADR-0593 lands.
+- `~/` no longer breaks against the sandbox home. Against the core pinned when this was written
+  it changed nothing that passed before — the package matched a literal `~/.kube/config` and was
+  denied — and it became correct when `ADR-0593 (core)` landed, which it has: the demo connects
+  with no `--kubeconfig`.
 - Preferences are not modeled: nothing in this provider reads kubeconfig `preferences`, so there
   is no first-wins to apply to a field no code consults.
 

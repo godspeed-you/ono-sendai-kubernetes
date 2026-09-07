@@ -135,9 +135,10 @@ contributions:
   # comment on each line is what runs along it, in §35.7's vocabulary.
   #
   # **`in-namespace` is §35.6's spatial parent and not ownership.** A Pod's namespace is where it
-  # is; its ReplicaSet is what owns it; they are two shapes because they are two questions. Note
-  # what this does *not* buy: `up` still refuses, because landing on a parent needs the
-  # plugin-defined aggregate space of §36.4 that no package can declare (`ADR-0584 (core)`).
+  # is; its ReplicaSet is what owns it; they are two shapes because they are two questions. `up`
+  # follows the first: each target declares its `parent:` in `contributions/targets.yaml`, the
+  # host climbs the edge declared here that leads to it (`ADR-0597 (core)`, ADR-0065), and the
+  # `in-cluster` shapes at the end of this list are the top of that climb.
   relations:
     # §35.5's own order for `near`: what a place selects, what carries its addresses, and what routes to it.
     - "io.github.godspeed-you.kubernetes.service/1->io.github.godspeed-you.kubernetes.pod/1"   # selects

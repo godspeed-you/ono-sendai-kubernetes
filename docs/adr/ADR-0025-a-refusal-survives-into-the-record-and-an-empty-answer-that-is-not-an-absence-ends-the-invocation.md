@@ -1,6 +1,6 @@
 # ADR-0025: A refusal survives into the record, and an empty answer that is not an absence ends the invocation
 
-- Status: accepted
+- Status: accepted; the dependency-path consequence below is superseded by ADR-0068
 - Date: 2026-09-06
 - Spec refs: §4 invariants 13, 20, 22, §14.1, §14.7, §16.1, §21.4, §23.3, §23.4, §28.3, §28.4, §28.5, §35.1, §37.1, §37.2, §37.3, §37.5, §38.1, §38.2, §38.3, §38.4, §38.5, §38.6, §39.1, §39.2, §39.3, §39.4, §40.1, §40.4, §40.5, §42.1, §42.2, §47.1, §47.2, §47.7, §62.11, §63.6
 - Decided by: agent (autonomous)
