@@ -5,15 +5,15 @@ reference KUANG/11 external-system provider.
 
 > Kubernetes is not a command namespace inside Ono. It is a system Ono can understand.
 
-**There is no release.** What exists is a KUANG/11 package that builds from this repository and
+**v0.1.0 is the first release.** It is a KUANG/11 package that builds from this repository and
 runs: it speaks HTTPS to an API server over the host's brokered connection, reads any kind the
 cluster serves, walks relationships with the evidence under each edge, watches a collection live
 at a terminal, and — under a declared risk and an operator's grant — predicts or makes one bounded
 change. Most of it is proven against recorded API bytes, and a suite of integration tests runs the
-real `ono` binary against ephemeral `kind` clusters at the declared oldest and newest supported
-Kubernetes minor versions, on a machine with no `kubectl` installed. It has not been run against a
-production cluster. [`docs/coverage.md`](docs/coverage.md) says section by section how far it
-goes, and [`docs/STATE.md`](docs/STATE.md) says what is next.
+real `ono` binary against ephemeral `kind` clusters across the declared supported Kubernetes minor
+versions, on a machine with no `kubectl` installed. It has not been run against a production
+cluster. [`docs/coverage.md`](docs/coverage.md) says section by section how far it goes, and
+[`docs/STATE.md`](docs/STATE.md) says where the whole surface stands.
 
 | | |
 |---|---|
@@ -146,7 +146,7 @@ Both are canonical in that repository and are deliberately not copied here.
 | Ono-Sendai core, to run | **at or after `ADR-0590 (core)`**, which is the revision every manifest here pins and CI builds the shell from. `ADR-0588 (core)` is what makes `get k8s-change` and `get k8s-log --follow` stream rather than be collected; `ADR-0590 (core)` is what makes a refusal from either of them *reach you*, and a host between the two answers an empty table where this provider refused |
 | Kubernetes versions | **v1.35 – v1.37**, which is what upstream maintained on the specification's snapshot date (§0.5, §5.1). The claim is a tested matrix rather than a parser guard: nothing in the provider inspects `gitVersion`, and a cluster outside the window may work perfectly (§5.2) |
 | Kubernetes versions actually exercised | **v1.35.8, v1.36.4 and v1.37.0** — the declared oldest, the one between and the newest — on ephemeral `kind` clusters in CI and on demand through `scripts/cluster.sh` (§5.5, §59.3, Gate N) |
-| Releases of this provider | none |
+| Releases of this provider | **v0.1.0** — the first, built from this repository as a KUANG/11 package |
 
 The provider is discovery-first by construction: every REST path is built from what the connected
 API server says it serves, and no endpoint is compiled in (§5.2). The matrix above is what CI
