@@ -2806,12 +2806,43 @@ impl Command {
             selectors: Vec::new(),
             options: self.options().iter().map(Parameter::contribution).collect(),
             risk: Some(self.risk.to_owned()),
-            action: None,
+            // The action contract of §21.1 of the generic provider contract, declared where the
+            // host reads an action's safety before running any package code (`ADR-0595 (core)`).
+            action: Some(self.action()),
             examples: self
                 .examples
                 .iter()
                 .map(|example| (*example).to_owned())
                 .collect(),
+        }
+    }
+
+    /// What this command does to the cluster, in the shape §21.1 asks an action to declare
+    /// (`ADR-0595 (core)`).
+    ///
+    /// The target is `["*"]` because `set`/`remove k8s-resource` acts on whatever kind the
+    /// invocation names, resolved against discovery rather than fixed here (§15.1, ADR-0010).
+    /// Every write is aimed at one object identified by its UID precondition, so repeating one is
+    /// safe under that precondition and no further — `conditionally-idempotent` (§56.1, §56.3).
+    /// The result is the same `mutation/1` the command already emits, and there is no separate
+    /// verification stream because the record carries the follow-up observation itself (§46.3).
+    #[must_use]
+    pub fn action(&self) -> ono_kuang_sdk::protocol::ActionContribution {
+        ono_kuang_sdk::protocol::ActionContribution {
+            targets: vec!["*".to_owned()],
+            mutates: true,
+            idempotency: ono_kuang_sdk::protocol::Idempotency::ConditionallyIdempotent,
+            result: None,
+            verification: Some(match self.writes {
+                Writes::Fields => "the object is re-read and the requested fields, the observed                                    generation and the reconciliation conditions are compared                                    against a watch of the target (§46.3)"
+                    .to_owned(),
+                Writes::Object => "the object's absence, or a different lifetime under its name,                                    is established by a follow-up read (§45.1, §16.3)"
+                    .to_owned(),
+            }),
+            effects: match self.writes {
+                Writes::Fields => vec!["changes-desired-state".to_owned()],
+                Writes::Object => vec!["deletes-object".to_owned()],
+            },
         }
     }
 
@@ -2940,14 +2971,15 @@ const DELETE_OPTIONS: &[Parameter] = &[Parameter::defaulting(
 /// verb and written by another, is the whole point of a verb-noun shell: nothing here is
 /// reachable that `get` could not already show.
 ///
-/// **`network.connect` is the capability, and it is the only honest one available.** Everything
-/// these commands do to a cluster travels as bytes through the host's network broker, and the
-/// broker's scope — the host and the port of the API server — is the operator's decision about
-/// which cluster this package may reach at all (§27.2 of the generic contract, §51.2). The
-/// capability model has no family for "change state in the external system a provider fronts":
-/// `service.mutate` is scoped to service-manager units and `remote.mutate` to Ono links, and
-/// claiming either would put a scope on an operator's grant that nothing checks — which §31.16
-/// forbids in as many words. See ADR-0024.
+/// **Two capabilities, and the second is the boundary ADR-0024 said was missing.**
+/// `network.connect` is the authority to reach the API server — its scope, the host and the
+/// port, is the operator's decision about which cluster this package may talk to at all
+/// (§27.2 of the generic contract, §51.2). `provider.mutate` (`ADR-0594 (core)`) is the
+/// authority to *change* the system this provider fronts, and the host checks it at every
+/// invocation before any of this package's code runs. A read-only grant — connectivity without
+/// `provider.mutate` — can no longer send a write, which is the finding ADR-0024 recorded and
+/// core closed: granting the ability to read a cluster is no longer granting the ability to
+/// write to one.
 pub static COMMANDS: &[Command] = &[
     Command {
         name: "set-k8s-resource",
@@ -2960,7 +2992,11 @@ pub static COMMANDS: &[Command] = &[
                   `dry_run false` is given (specification sections 43.3, 43.4, 44).",
         schema: "io.github.godspeed-you.kubernetes.mutation/1",
         risk: "mutate",
-        capabilities: &["network.connect"],
+        // Both the authority to *reach* a cluster and the authority to *change* one: a
+        // read-only grant of `network.connect` cannot invoke this, because the host checks
+        // `provider.mutate` at every invocation before any of this package's code runs
+        // (`ADR-0594 (core)`, ADR-0024). Granting connectivity is no longer granting the write.
+        capabilities: &["network.connect", "provider.mutate"],
         writes: Writes::Fields,
         extra: APPLY_OPTIONS,
         examples: &[
@@ -2987,7 +3023,7 @@ pub static COMMANDS: &[Command] = &[
         // reaches things this provider cannot get back, and `risk_levels` in core's
         // `capabilities.yaml` defines `destructive` as exactly "may cause irreversible loss".
         risk: "destructive",
-        capabilities: &["network.connect"],
+        capabilities: &["network.connect", "provider.mutate"],
         writes: Writes::Object,
         extra: DELETE_OPTIONS,
         examples: &[

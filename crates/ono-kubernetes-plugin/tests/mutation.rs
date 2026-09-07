@@ -997,8 +997,12 @@ fn label_the_crd(extra: &[(&str, Json)]) -> JsonMap<String, Json> {
 
 /// A loaded instance against a recorded cluster, with the grant the operator makes.
 async fn loaded(cluster: &Arc<RecordedCluster>) -> ono_kuang_supervisor::LoadedPlugin {
+    // The operator who means to change a cluster grants both: the transport (`network.connect`)
+    // and the mutation authority (`provider.mutate`, `ADR-0594 (core)`). Neither is enough alone,
+    // which the two tests below prove.
     TestHost::new(PLUGIN, MANIFEST)
         .grant(Capability::NetworkConnect)
+        .grant(Capability::ProviderMutate)
         .host(Arc::clone(cluster) as Arc<dyn HostServices>)
         .load()
         .await
@@ -1364,9 +1368,9 @@ async fn should_not_report_a_permission_as_denied_when_the_cluster_serves_no_rev
 
 #[tokio::test]
 async fn should_refuse_a_mutation_the_operator_granted_no_capability_for() {
-    // §31.19's floor, on the write path: deny by default. The command declares the capability it
-    // needs, the host checks it at invocation, and nothing this package does is reached — which
-    // is why the recorded cluster saw no request at all.
+    // §31.19's floor, on the write path: deny by default. The command declares the capabilities
+    // it needs, the host checks them at invocation, and nothing this package does is reached —
+    // which is why the recorded cluster saw no request at all.
     let cluster = RecordedCluster::playing(Scenario::Accepted);
     let plugin = TestHost::new(PLUGIN, MANIFEST)
         .host(Arc::clone(&cluster) as Arc<dyn HostServices>)
@@ -1382,13 +1386,64 @@ async fn should_refuse_a_mutation_the_operator_granted_no_capability_for() {
         "a denial is a refusal that names the decision, not a failure part-way through: {refusal:?}"
     );
     assert!(
-        refusal.message.contains("network.connect"),
-        "the refusal names the capability the operator has to grant: {}",
+        cluster.heads().is_empty(),
+        "the refusal came before any byte reached the cluster: {:?}",
+        cluster.heads()
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_a_mutation_to_a_read_only_grant_that_can_reach_the_cluster() {
+    // The boundary `ADR-0594 (core)` drew and the finding ADR-0024 recorded it closes: an
+    // operator who granted `network.connect` — the authority to *read* a cluster — has not
+    // thereby granted the authority to *change* one. The host checks `provider.mutate` at the
+    // invocation, so the write is refused before any of this package's code runs, and the
+    // cluster this same grant could read sees no PATCH.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .host(Arc::clone(&cluster) as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads under its own manifest");
+    let refusal = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect_err("a read grant does not authorise a write");
+    assert_eq!(refusal.name, "capability.denied");
+    assert!(
+        refusal.message.contains("provider.mutate"),
+        "the refusal names the mutation authority, not the transport: {}",
         refusal.message
     );
     assert!(
         cluster.heads().is_empty(),
-        "the refusal came before any byte reached the cluster: {:?}",
+        "nothing reached the cluster, dry run or not: {:?}",
+        cluster.heads()
+    );
+}
+
+#[tokio::test]
+async fn should_reach_no_cluster_with_a_mutation_grant_and_no_transport() {
+    // The other half: `provider.mutate` without `network.connect` authorises the change and
+    // grants no way to send it. The host refuses this package's first `network.connect` host
+    // call, so the write cannot leave — mutation authority is not transport authority
+    // (`ADR-0594 (core)`).
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::ProviderMutate)
+        .host(Arc::clone(&cluster) as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads under its own manifest");
+    let refusal = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect_err("mutation authority without transport reaches nothing");
+    assert_eq!(refusal.name, "capability.denied");
+    assert!(
+        cluster.heads().is_empty(),
+        "nothing reached the cluster: {:?}",
         cluster.heads()
     );
 }
@@ -1427,7 +1482,10 @@ async fn should_not_reach_a_mutation_through_a_read_verb() {
         "§31.75: a mutating command declares its risk, so host policy can apply its own \
          confirmation rules (§21.5 of the generic contract)"
     );
-    assert_eq!(set.contribution.capabilities, vec!["network.connect"]);
+    assert_eq!(
+        set.contribution.capabilities,
+        vec!["network.connect", "provider.mutate"]
+    );
 
     let remove = plugin
         .commands()

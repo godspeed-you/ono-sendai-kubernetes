@@ -86,9 +86,15 @@ commands:
     target: k8s-resource
     summary: "Change one Kubernetes object through a curated action — `--replicas` to scale, `--image` to set an image, `--restart_rollout`, `--schedulable` to cordon or uncordon a Node, `--label`, `--annotation` — or through the low-level `--set`/`--unset` JSON-pointer escape hatch. A server dry run unless `dry_run false` is given (specification sections 43.3, 43.4, 44)."
     output: stream<io.github.godspeed-you.kubernetes.mutation/1>
-    capabilities: [network.connect]
+    capabilities: [network.connect, provider.mutate]
     argument_mode: words
     risk: mutate
+    action:
+      targets: ["*"]
+      mutates: true
+      idempotency: conditionally-idempotent
+      verification: "the object is re-read and the requested fields, the observed generation and the reconciliation conditions are compared against a watch of the target (specification section 46.3)"
+      effects: [changes-desired-state]
     examples:
       - "set k8s-resource --context prod --kind Deployment --name api --replicas 2"
       - "set k8s-resource --context prod --kind Deployment --name api --replicas 2 --dry_run false"
@@ -182,9 +188,15 @@ commands:
     target: k8s-resource
     summary: "Delete one Kubernetes object, as a server dry run unless `dry_run false` is given (specification section 45)."
     output: stream<io.github.godspeed-you.kubernetes.mutation/1>
-    capabilities: [network.connect]
+    capabilities: [network.connect, provider.mutate]
     argument_mode: words
     risk: destructive
+    action:
+      targets: ["*"]
+      mutates: true
+      idempotency: conditionally-idempotent
+      verification: "the object's absence, or a different lifetime under its name, is established by a follow-up read (specification sections 45.1, 16.3)"
+      effects: [deletes-object]
     examples:
       - "remove k8s-resource --context prod --kind ConfigMap --name stale"
       - "remove k8s-resource --context prod --kind ConfigMap --name stale --dry_run false"
