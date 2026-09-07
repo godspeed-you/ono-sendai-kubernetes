@@ -34,7 +34,9 @@ use crate::discovery::{Discovery, Gvk, Gvr};
 use crate::index::{IndexState, LabelSelector, RelationshipIndex, Unusable};
 use crate::kubeconfig::{Connection, Credential, Secret};
 use crate::object::Object;
-use crate::schema::{Schema, SchemaCache};
+use crate::schema::{
+    Schema, SchemaCache, SchemaProvenance, group_version_path, schema_root_hashes,
+};
 use crate::tls::TlsSettings;
 use crate::transport::{
     Clock, EndpointCategory, Freshness, Listing, ObservedAt, Read, SystemClock,
@@ -209,6 +211,15 @@ impl Lookup {
 /// using, because the refresh happens when a question needs discovery rather than on a timer
 /// (§19.6's rule about work nobody asked for, applied to discovery).
 pub const DISCOVERY_VALIDITY: Duration = Duration::from_secs(30);
+
+/// How long a cached schema may answer without the server having vouched for it (§12.4, §33.2).
+///
+/// The same window as discovery's, because the two answer the same question — has the cluster
+/// changed what it serves — on the same clock. A schema entry is vouched for either by the
+/// `/openapi/v3` root document read within this window naming the hash it was loaded under, or,
+/// failing a root document, by having been loaded within it. Past that, [`Session::schema`]
+/// answers nothing and the next projection loads the document again (ADR-0061).
+pub const SCHEMA_VALIDITY: Duration = DISCOVERY_VALIDITY;
 
 /// One discovery document, and what this session knows about how true it still is.
 ///
@@ -846,15 +857,81 @@ impl<C: Clock> Session<C> {
         &self.schemas
     }
 
-    /// One cached schema, where it is still valid.
+    /// One cached schema, where it is still valid (§12.4, ADR-0061).
+    ///
+    /// Valid means vouched for: the entry's instant is within [`SCHEMA_VALIDITY`], and that
+    /// instant is either when it was loaded or when a root document last named its hash. A
+    /// schema nobody has vouched for in that long is not served as current — the next dynamic
+    /// projection loads it again, under the hash the root then publishes.
     #[must_use]
     pub fn schema(&self, gvk: &Gvk) -> Option<&Schema> {
-        self.schemas.get(gvk)
+        let provenance = self.schemas.provenance(gvk)?;
+        match provenance.observed_at() {
+            Some(observed_at) if self.expired(observed_at) => None,
+            _ => self.schemas.get(gvk),
+        }
     }
 
-    /// Remembers a schema for this cluster.
+    /// What a cached schema was loaded under: the root hash and the instant (§12.4, ADR-0061).
+    #[must_use]
+    pub fn schema_provenance(&self, gvk: &Gvk) -> Option<&SchemaProvenance> {
+        self.schemas.provenance(gvk)
+    }
+
+    /// Remembers a schema for this cluster, under the root hash this session knows for its
+    /// group-version, if any, and the instant it was loaded.
     pub fn cache_schema(&mut self, gvk: Gvk, schema: Schema) {
-        self.schemas.insert(gvk, schema);
+        let hash = self
+            .schemas
+            .root_hash(&group_version_path(&gvk))
+            .map(str::to_owned);
+        let now = self.clock.now();
+        self.schemas.insert_under(gvk, schema, hash, Some(now));
+    }
+
+    /// The `/openapi/v3` root document, where this session read one within the window.
+    ///
+    /// `None` is "read it": the root is small, it names every group-version's document with the
+    /// hash that changes when the schema does, and re-reading it within the window is what lets
+    /// every cached schema stay vouched for without any of their documents being downloaded
+    /// again (§50.2, ADR-0061).
+    #[must_use]
+    pub fn schema_root_is_current(&self) -> bool {
+        self.schemas
+            .root_observed_at()
+            .is_some_and(|observed_at| !self.expired(observed_at))
+    }
+
+    /// Takes a freshly read `/openapi/v3` root document (§12.4, §33.2, ADR-0061).
+    ///
+    /// Every held schema whose group-version's hash the root still publishes is vouched for
+    /// until the window runs out again; every one whose hash changed, vanished, or was never
+    /// recorded is forgotten, so the next projection loads the document the root now names.
+    /// Returns the kinds forgotten.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::schema::SchemaError`] when the bytes are not a root document.
+    pub fn cache_schema_root(
+        &mut self,
+        document: &str,
+    ) -> Result<Vec<Gvk>, crate::schema::SchemaError> {
+        let hashes = schema_root_hashes(document)?;
+        let now = self.clock.now();
+        Ok(self.schemas.root_refreshed(hashes, now))
+    }
+
+    /// Where one kind's schema document lives, with the root's hash on it where known.
+    ///
+    /// The hashed URL is the one the API server marks immutable and caches indefinitely; the
+    /// bare one is what a session that has not read the root asks for.
+    #[must_use]
+    pub fn schema_document_path(&self, gvk: &Gvk) -> String {
+        let path = group_version_path(gvk);
+        match self.schemas.root_hash(&path) {
+            Some(hash) => format!("/openapi/v3/{path}?hash={hash}"),
+            None => format!("/openapi/v3/{path}"),
+        }
     }
 
     /// Forgets a kind's schema, for a CRD whose structural schema changed (§12.4, §33.2).
@@ -957,6 +1034,12 @@ impl<C: Clock> Session<C> {
         if serves {
             self.discovery = None;
             self.mark_documents_stale();
+            // §12.4's first bullet at the one place a CRD write is certain: the definition named
+            // `<plural>.<group>` changed, so every schema of that group is a claim about a
+            // definition that has moved on.
+            if let Some((_, group)) = name.split_once('.') {
+                self.schemas.invalidate_group(group);
+            }
         }
         Invalidation {
             collections,
@@ -1140,7 +1223,24 @@ impl<C: Clock> Session<C> {
     pub fn observe_event(&mut self, gvr: &Gvr, scope: &Scope, event: WatchEvent) -> Reception {
         let now = self.clock.now();
         let watched = self.entry_for(gvr, scope);
+        let changed_definition = if defines_resources(gvr) {
+            definition_named(&event)
+        } else {
+            None
+        };
         let reception = Self::apply_event(watched, now, event);
+        // §33.2's "relevant watches where active": a CRD changing under a watch this session
+        // holds is a schema change observed the moment it happened, and every version of the
+        // kind it defines is forgotten before anything is projected through it again (§12.4).
+        if reception == Reception::Applied
+            && let Some(gvks) = changed_definition
+        {
+            for gvk in gvks {
+                self.crd_updated(&gvk);
+            }
+            self.discovery = None;
+            self.mark_documents_stale();
+        }
         // §19.2 and §19.5: a capability is negotiated from what the server *did*, never from
         // what was asked for. A bookmark received is a server that sends bookmarks; a streaming
         // list that ended is a server that serves them.
@@ -1405,6 +1505,28 @@ fn could_hold(scope: &Scope, namespace: Option<&str>) -> bool {
         None => true,
         Some(watched) => Some(watched) == namespace,
     }
+}
+
+/// The kinds a CRD event defines, one per version it names (§33.2).
+fn definition_named(event: &WatchEvent) -> Option<Vec<Gvk>> {
+    let object = match event {
+        WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
+            object
+        }
+        WatchEvent::Bookmark(_) | WatchEvent::InitialEventsEnd(_) | WatchEvent::Error(_) => {
+            return None;
+        }
+    };
+    let group = object.field("/spec/group")?.as_str()?.to_owned();
+    let kind = object.field("/spec/names/kind")?.as_str()?.to_owned();
+    let versions = object
+        .field("/spec/versions")?
+        .as_array()?
+        .iter()
+        .filter_map(|version| version.get("name")?.as_str())
+        .map(|version| Gvk::new(group.clone(), version, kind.clone()))
+        .collect();
+    Some(versions)
 }
 
 /// Whether writing to this collection changes what the cluster serves (§33.2).

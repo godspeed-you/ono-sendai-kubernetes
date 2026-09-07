@@ -262,6 +262,16 @@ struct RecordedCluster {
     /// The test holds it. A frame that is not on the wire cannot have been buffered by anything,
     /// so a record built from it proves the package emitted while the body was still open.
     release: Arc<tokio::sync::Notify>,
+    /// Whether the server serves `apiextensions.k8s.io` with the CRD behind `menagerie.example`,
+    /// a watch on that collection that delivers one MODIFIED and closes, and an OpenAPI document
+    /// for the group that *changes* once that event has been delivered (§12.4, §33.2, ADR-0061).
+    ///
+    /// Layered over `custom`. The flip is keyed on the watch rather than on a request count, so
+    /// the second read of the schema is the new schema because the definition changed and not
+    /// because it was the second read.
+    crd_rotates: bool,
+    /// Whether the CRD watch has delivered its change, after which the schema document differs.
+    rotated: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the server refuses a `fieldSelector` it does not index, as a real one does.
     ///
     /// §17.5's whole subject: "field selector availability varies by resource type and server
@@ -530,6 +540,18 @@ impl RecordedCluster {
         Arc::new(Self {
             pods: 2,
             apps: false,
+            ..Self::default()
+        })
+    }
+
+    /// The custom-resource server, whose one CRD changes under a watch and whose schema
+    /// document changes with it (ADR-0061).
+    fn with_a_crd_that_changes() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            custom: true,
+            crd_rotates: true,
             ..Self::default()
         })
     }
@@ -1050,6 +1072,73 @@ fn custom_document(path: &str) -> Option<Json> {
                 "payload": {"note": "not under spec, and still here"},
             }],
         }),
+        _ => return None,
+    })
+}
+
+const CRDS_PATH: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
+
+/// The definition behind `menagerie.example/v1 Sprocket`, before and after somebody changed it:
+/// the second revision no longer declares `renewAt` as an instant.
+fn sprocket_crd(changed: bool) -> Json {
+    json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {
+            "name": "sprockets.menagerie.example",
+            "uid": "crd-sprockets", "resourceVersion": if changed { "7002" } else { "7001" },
+            "creationTimestamp": "2026-09-01T00:00:00Z",
+            "generation": if changed { 2 } else { 1 },
+        },
+        "spec": {
+            "group": "menagerie.example", "scope": "Namespaced",
+            "names": {"plural": "sprockets", "singular": "sprocket", "kind": "Sprocket"},
+            "versions": [{"name": "v1", "served": true, "storage": true}],
+        },
+    })
+}
+
+/// The group's OpenAPI document after the definition changed: `renewAt` is plain text now.
+fn rotated_openapi() -> Json {
+    let mut document = custom_openapi();
+    document["components"]["schemas"]["some.vendors.own.naming.Convention"]["properties"]["spec"]
+        ["properties"]["renewAt"] =
+        json!({"type": "string", "description": "No longer an instant."});
+    document
+}
+
+/// What the CRD-rotating server answers, where it differs from the custom-resource one.
+fn crd_document(path: &str, cluster: &RecordedCluster) -> Option<Json> {
+    let rotated = cluster.rotated.load(std::sync::atomic::Ordering::SeqCst);
+    Some(match path {
+        "/apis" => {
+            let mut groups = custom_document("/apis")?;
+            groups["groups"]
+                .as_array_mut()?
+                .push(group_at("apiextensions.k8s.io", "v1"));
+            groups
+        }
+        "/apis/apiextensions.k8s.io/v1" => resource_list(
+            "apiextensions.k8s.io/v1",
+            &[(
+                "customresourcedefinitions",
+                "CustomResourceDefinition",
+                false,
+            )],
+        ),
+        CRDS_PATH => json!({
+            "kind": "CustomResourceDefinitionList",
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "metadata": {"resourceVersion": "7100"},
+            "items": [sprocket_crd(rotated)],
+        }),
+        "/openapi/v3/apis/menagerie.example/v1" => {
+            if rotated {
+                rotated_openapi()
+            } else {
+                custom_openapi()
+            }
+        }
         _ => return None,
     })
 }
@@ -2207,6 +2296,17 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     {
         return unindexed_field(selector);
     }
+    // §33.2's "relevant watches where active": the CRD watch delivers one change and closes, and
+    // from that moment the group's schema document is the new one.
+    if cluster.crd_rotates && path.starts_with(CRDS_PATH) && path.contains("watch=true") {
+        cluster
+            .rotated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        return chunked(&[format!(
+            "{}\n",
+            json!({"type": "MODIFIED", "object": sprocket_crd(true)})
+        )]);
+    }
     // §18: which page of the collection this is lives in the query string, exactly as `watch=true`
     // does, so it is answered before the query is dropped.
     if let Some(page) = paged_pods(path, cluster) {
@@ -2240,6 +2340,11 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     // that reads the Pod collection must be able to meet it too, and not only a Pod query.
     if cluster.deny_pod_list && path == "/api/v1/namespaces/default/pods" {
         return denied(path, "list");
+    }
+    if cluster.crd_rotates
+        && let Some(body) = crd_document(path, cluster)
+    {
+        return response(&body.to_string());
     }
     if cluster.custom
         && let Some(body) = custom_document(path)
@@ -8953,4 +9058,85 @@ fn resource_list(group_version: &str, resources: &[(&str, &str, bool)]) -> Json 
             }))
             .collect::<Vec<_>>(),
     })
+}
+
+// --- §12.4, §33.2: a schema is invalidated by the change a watch observed (ADR-0061) ------------
+
+#[tokio::test]
+async fn should_project_through_the_new_schema_once_a_watched_crd_changed() {
+    // §33.2 lists "schema changed" among what the provider SHOULD detect "through
+    // discovery/schema invalidation and relevant watches where active", and §12.4 makes CRD
+    // updates the first thing a schema cache MUST account for. The sequence: the kind is typed
+    // through schema A; a watch on the CRD collection observes the definition change; the next
+    // projection loads schema B and types the same field differently — and the old
+    // representation is never presented as current in between.
+    let cluster = RecordedCluster::with_a_crd_that_changes();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let options = at_cluster(&[
+        ("kind", json!("Sprocket")),
+        ("group", json!("menagerie.example")),
+    ]);
+
+    let (events, result) = plugin
+        .query("k8s-resource", options.clone())
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let before = records(&events);
+    assert!(
+        matches!(
+            before[0].get("spec"),
+            Some(Value::Map(spec)) if matches!(spec.get("renewAt"), Some(Value::Timestamp(_))),
+        ),
+        "schema A declares `renewAt` as an instant"
+    );
+
+    let (changes, result) = plugin
+        .query(
+            "k8s-change",
+            at_cluster(&[
+                ("kind", json!("CustomResourceDefinition")),
+                ("max_changes", json!(2)),
+            ]),
+        )
+        .await
+        .expect("the watch starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let observed: Vec<String> = records(&changes)
+        .iter()
+        .filter_map(|record| text_of(record, "change"))
+        .collect();
+    assert_eq!(
+        observed,
+        vec!["listed", "modified"],
+        "the watch observed the definition change"
+    );
+
+    let (events, result) = plugin
+        .query("k8s-resource", options)
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let after = records(&events);
+    assert!(
+        matches!(
+            after[0].get("spec"),
+            Some(Value::Map(spec)) if matches!(spec.get("renewAt"), Some(Value::String(_))),
+        ),
+        "schema B declares it as text, and the projection uses schema B: {:?}",
+        after[0].get("spec")
+    );
+    assert_eq!(
+        asked_for(&cluster, "/openapi/v3/apis/menagerie.example/v1"),
+        2,
+        "the schema was read once per definition, not once per query: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
 }

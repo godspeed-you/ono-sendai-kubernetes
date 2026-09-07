@@ -34,6 +34,7 @@ use serde_json::Value as Json;
 
 use crate::discovery::{Gvk, Gvr, Scope};
 use crate::object::Object;
+use crate::transport::ObservedAt;
 
 /// What went wrong reading a schema document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -992,16 +993,86 @@ impl CustomResourceDefinition {
     }
 }
 
+/// What one cached schema was loaded under, so a reader can tell how current it is (§12.4).
+///
+/// The hash is the API server's own freshness token: the `/openapi/v3` root document names every
+/// group-version's schema document with a `hash=` query parameter that changes when the schema
+/// does. An entry that recorded the hash it was loaded under can be checked against a later
+/// root document without downloading its own document again; one that recorded none was loaded
+/// blind and is only as current as its window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaProvenance {
+    hash: Option<String>,
+    observed_at: Option<ObservedAt>,
+}
+
+impl SchemaProvenance {
+    /// The root document's hash for the group-version when the schema was loaded, where known.
+    #[must_use]
+    pub fn hash(&self) -> Option<&str> {
+        self.hash.as_deref()
+    }
+
+    /// When the schema was loaded, where the cache was told.
+    #[must_use]
+    pub fn observed_at(&self) -> Option<ObservedAt> {
+        self.observed_at
+    }
+}
+
+/// The per-group-version hashes the `/openapi/v3` root document publishes (§12.4, §33.2).
+///
+/// # Errors
+///
+/// [`SchemaError::Malformed`] when the bytes are not JSON, and [`SchemaError::NotASchema`] when
+/// they are JSON without the `paths` map every root document carries.
+pub fn schema_root_hashes(document: &str) -> Result<BTreeMap<String, String>, SchemaError> {
+    let value: Json = serde_json::from_str(document)
+        .map_err(|error| SchemaError::Malformed(error.to_string()))?;
+    let paths = value
+        .get("paths")
+        .and_then(Json::as_object)
+        .ok_or_else(|| SchemaError::NotASchema("the root document has no `paths`".to_owned()))?;
+    Ok(paths
+        .iter()
+        .filter_map(|(path, entry)| {
+            let url = entry.get("serverRelativeURL")?.as_str()?;
+            let hash = url
+                .split_once('?')?
+                .1
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("hash="))?;
+            Some((path.trim_start_matches('/').to_owned(), hash.to_owned()))
+        })
+        .collect())
+}
+
+/// One held schema, and what it was loaded under.
+#[derive(Debug, Clone)]
+struct Entry {
+    schema: Schema,
+    provenance: SchemaProvenance,
+}
+
 /// Schemas held between requests, and the reasons they stop being true (§12.4).
 ///
 /// Schemas are cached apart from values because they change on a different clock: an object
 /// changes constantly, its schema when someone applies a CRD. The interesting part is not the
 /// storage but the invalidation, and the fingerprint is part of it — a GVK is unique within one
 /// cluster, so a cache keyed by GVK alone lets a second cluster inherit the first one's fields.
+///
+/// Two more things bound how long an entry may answer (ADR-0061): the `/openapi/v3` root
+/// document's hash for its group-version, recorded when the entry is loaded and compared when
+/// the root is re-read, and the instant it was loaded, which a session measures a validity
+/// window against.
 #[derive(Debug, Clone, Default)]
 pub struct SchemaCache {
     fingerprint: String,
-    entries: BTreeMap<Gvk, Schema>,
+    entries: BTreeMap<Gvk, Entry>,
+    /// The root document's hashes as last read, by group-version path (`api/v1`,
+    /// `apis/apps/v1`), and when.
+    root: BTreeMap<String, String>,
+    root_observed_at: Option<ObservedAt>,
 }
 
 impl SchemaCache {
@@ -1011,6 +1082,8 @@ impl SchemaCache {
         Self {
             fingerprint: fingerprint.to_owned(),
             entries: BTreeMap::new(),
+            root: BTreeMap::new(),
+            root_observed_at: None,
         }
     }
 
@@ -1021,14 +1094,84 @@ impl SchemaCache {
     }
 
     /// Remembers a schema, replacing any earlier one for that GVK.
+    ///
+    /// Loaded blind: no root hash and no instant. [`Self::insert_under`] is the form that lets
+    /// the entry be checked later, and a session uses it whenever it knows either.
     pub fn insert(&mut self, gvk: Gvk, schema: Schema) {
-        self.entries.insert(gvk, schema);
+        self.insert_under(gvk, schema, None, None);
+    }
+
+    /// Remembers a schema beside the root hash and the instant it was loaded under.
+    pub fn insert_under(
+        &mut self,
+        gvk: Gvk,
+        schema: Schema,
+        hash: Option<String>,
+        observed_at: Option<ObservedAt>,
+    ) {
+        self.entries.insert(
+            gvk,
+            Entry {
+                schema,
+                provenance: SchemaProvenance { hash, observed_at },
+            },
+        );
     }
 
     /// The cached schema, where one is still valid.
     #[must_use]
     pub fn get(&self, gvk: &Gvk) -> Option<&Schema> {
-        self.entries.get(gvk)
+        self.entries.get(gvk).map(|entry| &entry.schema)
+    }
+
+    /// What a cached schema was loaded under (§12.4, ADR-0061).
+    #[must_use]
+    pub fn provenance(&self, gvk: &Gvk) -> Option<&SchemaProvenance> {
+        self.entries.get(gvk).map(|entry| &entry.provenance)
+    }
+
+    /// The root document's hash for one group-version path, as last read.
+    #[must_use]
+    pub fn root_hash(&self, group_version_path: &str) -> Option<&str> {
+        self.root.get(group_version_path).map(String::as_str)
+    }
+
+    /// When the root document was last read, where it was.
+    #[must_use]
+    pub fn root_observed_at(&self) -> Option<ObservedAt> {
+        self.root_observed_at
+    }
+
+    /// Takes a freshly read root document and forgets every schema whose hash it no longer
+    /// vouches for (§12.4, §33.2, ADR-0061).
+    ///
+    /// An entry loaded under a hash the root still publishes is *revalidated*: its instant moves
+    /// to `now`, because the server has just said its document is unchanged. An entry whose
+    /// group-version's hash changed, or vanished from the root, is dropped, and so is one loaded
+    /// blind — with no hash there is nothing to vouch for it, and the next projection loads it
+    /// under one. Returns the GVKs forgotten.
+    pub fn root_refreshed(
+        &mut self,
+        hashes: BTreeMap<String, String>,
+        now: ObservedAt,
+    ) -> Vec<Gvk> {
+        let mut forgotten = Vec::new();
+        self.entries.retain(|gvk, entry| {
+            let current = hashes.get(&group_version_path(gvk));
+            match (&entry.provenance.hash, current) {
+                (Some(held), Some(current)) if held == current => {
+                    entry.provenance.observed_at = Some(now);
+                    true
+                }
+                _ => {
+                    forgotten.push(gvk.clone());
+                    false
+                }
+            }
+        });
+        self.root = hashes;
+        self.root_observed_at = Some(now);
+        forgotten
     }
 
     /// How many schemas are held.
@@ -1066,7 +1209,7 @@ impl SchemaCache {
     /// another CRD wearing the same name (§12.4, Gate J).
     pub fn reconnected(&mut self, fingerprint: &str) {
         if self.fingerprint != fingerprint {
-            self.entries.clear();
+            self.clear();
             self.fingerprint = fingerprint.to_owned();
         }
     }
@@ -1074,6 +1217,18 @@ impl SchemaCache {
     /// Forgets everything, for a caller that knows the cache is stale for a reason of its own.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.root.clear();
+        self.root_observed_at = None;
+    }
+}
+
+/// The root document's key for one kind's group-version: `api/v1` or `apis/<group>/<version>`.
+#[must_use]
+pub fn group_version_path(gvk: &Gvk) -> String {
+    if gvk.group().is_empty() {
+        format!("api/{}", gvk.version())
+    } else {
+        format!("apis/{}/{}", gvk.group(), gvk.version())
     }
 }
 

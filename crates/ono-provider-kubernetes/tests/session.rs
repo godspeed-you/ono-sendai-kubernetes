@@ -214,6 +214,7 @@ fn one_object_listing(gvr: &Gvr, scope: &Scope, namespace: &str) -> Listing {
     let kind = match gvr.resource() {
         "pods" => "Pod",
         "configmaps" => "ConfigMap",
+        "customresourcedefinitions" => "CustomResourceDefinition",
         other => panic!("this fixture does not know the kind of `{other}`"),
     };
     let body = format!(
@@ -1653,4 +1654,139 @@ fn should_quarantine_only_the_written_object_of_a_live_cache_until_its_event_arr
         "and what is served is what the server sent, never what the write asked for"
     );
     assert!(session.indexed(&pods(), &shop()).is_ok());
+}
+
+// --- §12.4, §33.2: schema freshness on the session's clock (ADR-0061) ---------------------------
+
+const ROOT_A: &str =
+    r#"{"paths":{"api/v1":{"serverRelativeURL":"/openapi/v3/api/v1?hash=AAA111"}}}"#;
+const ROOT_B: &str =
+    r#"{"paths":{"api/v1":{"serverRelativeURL":"/openapi/v3/api/v1?hash=AAA999"}}}"#;
+
+#[test]
+fn should_stop_serving_a_schema_nobody_has_vouched_for_within_the_window() {
+    // §12.4 gave the schema cache four invalidation triggers and no expiry, so a structural
+    // change whose discovery footprint was byte-identical stayed invisible for the life of the
+    // process. The window is the expiry half of §16.2's "explicit invalidation/expiry semantics":
+    // past it, `Session::schema` answers nothing and the next projection loads the document
+    // again — one document, for one kind, and never all of them on every request (§50.2).
+    use ono_provider_kubernetes::session::SCHEMA_VALIDITY;
+    let clock = SteppingClock::at(OBSERVED);
+    let mut session = Session::with_clock(connection("dev"), clock.clone());
+    session.cache_schema(pod_gvk(), Schema::absent());
+    assert_eq!(
+        session
+            .schema_provenance(&pod_gvk())
+            .and_then(|p| p.observed_at())
+            .map(|at| at.unix_millis()),
+        Some(OBSERVED),
+        "the entry says when it was loaded"
+    );
+
+    clock.advance(SCHEMA_VALIDITY - Duration::from_millis(1));
+    assert!(
+        session.schema(&pod_gvk()).is_some(),
+        "inside the window the schema answers, and no document is downloaded"
+    );
+
+    clock.advance(Duration::from_millis(1));
+    assert!(
+        session.schema(&pod_gvk()).is_none(),
+        "past the window the old representation is not presented as current"
+    );
+    assert!(
+        session.schema_provenance(&pod_gvk()).is_some(),
+        "though what it was loaded under is still inspectable"
+    );
+
+    // A schema loaded again is vouched for again, from now.
+    session.cache_schema(pod_gvk(), Schema::absent());
+    assert!(session.schema(&pod_gvk()).is_some());
+}
+
+#[test]
+fn should_vouch_for_a_schema_by_the_root_hash_and_forget_it_when_the_hash_moves() {
+    // The hash route: a root document read within the window names the hash a schema was loaded
+    // under, so the entry stays current without its document being downloaded again; a root
+    // that names a different hash forgets it, so the next projection loads the new one.
+    let mut session = session("dev");
+    session
+        .cache_schema_root(ROOT_A)
+        .expect("a root document reads");
+    assert!(session.schema_root_is_current());
+    session.cache_schema(pod_gvk(), Schema::absent());
+    assert_eq!(
+        session
+            .schema_provenance(&pod_gvk())
+            .and_then(|p| p.hash().map(str::to_owned)),
+        Some("AAA111".to_owned()),
+        "the entry recorded the hash the root published for its group-version"
+    );
+    assert_eq!(
+        session.schema_document_path(&pod_gvk()),
+        "/openapi/v3/api/v1?hash=AAA111",
+        "and the document is asked for at the hashed, immutable URL"
+    );
+
+    let unchanged = session
+        .cache_schema_root(ROOT_A)
+        .expect("a root document reads");
+    assert!(
+        unchanged.is_empty(),
+        "the same hash vouches for the entry again"
+    );
+    assert!(session.schema(&pod_gvk()).is_some());
+
+    let changed = session
+        .cache_schema_root(ROOT_B)
+        .expect("a root document reads");
+    assert_eq!(changed, vec![pod_gvk()]);
+    assert!(
+        session.schema(&pod_gvk()).is_none(),
+        "the hash moved, so the schema is invalidated before anything is projected through it"
+    );
+    assert_eq!(
+        session.schema_document_path(&pod_gvk()),
+        "/openapi/v3/api/v1?hash=AAA999"
+    );
+}
+
+#[test]
+fn should_forget_a_kind_s_schemas_when_a_watched_crd_changes() {
+    // §33.2's "relevant watches where active": a CRD changing under a watch this session holds
+    // is a schema change observed the moment it happened, and every version of the kind it
+    // defines is forgotten before anything is projected through it again (§12.4).
+    let crds = crds();
+    let widgets_v1 = Gvk::new("example.io", "v1", "Widget");
+    let widgets_v2 = Gvk::new("example.io", "v2", "Widget");
+    let mut session = session("dev");
+    session.cache_schema(widgets_v1.clone(), Schema::absent());
+    session.cache_schema(widgets_v2.clone(), Schema::absent());
+    session.cache_schema(pod_gvk(), Schema::absent());
+    session
+        .synchronise(
+            &crds,
+            &Scope::cluster(),
+            one_object_listing(&crds, &Scope::cluster(), "cluster"),
+        )
+        .expect("a complete listing seeds the cache");
+
+    let modified = frame(
+        "MODIFIED",
+        r#"{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"widgets.example.io","uid":"crd-1","resourceVersion":"7001"},"spec":{"group":"example.io","names":{"kind":"Widget","plural":"widgets"},"versions":[{"name":"v1","served":true},{"name":"v2","served":true,"storage":true}]}}"#,
+    );
+    session
+        .feed_watch(&crds, &Scope::cluster(), modified.as_bytes())
+        .expect("the frame decodes");
+
+    assert!(session.schema(&widgets_v1).is_none());
+    assert!(session.schema(&widgets_v2).is_none());
+    assert!(
+        session.schema(&pod_gvk()).is_some(),
+        "a kind the definition does not name keeps its schema"
+    );
+    assert!(
+        session.needs_discovery(),
+        "and what the cluster serves is asked again (§33.2)"
+    );
 }

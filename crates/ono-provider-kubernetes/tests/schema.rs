@@ -618,3 +618,81 @@ fn should_forget_every_schema_when_it_reconnects_to_a_different_cluster() {
     assert_eq!(cache.fingerprint(), "cluster-b-uid");
     assert!(cache.is_empty());
 }
+
+// --- §12.4, §33.2: the root document's hash is the freshness token (ADR-0061) --------------------
+
+#[test]
+fn should_read_every_group_version_s_hash_from_the_root_document() {
+    // `/openapi/v3` names each group-version's document with a `hash=` that changes when the
+    // schema does. That hash is the API server's own answer to "has this schema changed", and
+    // reading it costs one small document rather than every schema document again (§50.2).
+    use ono_provider_kubernetes::schema::schema_root_hashes;
+    let root = r#"{"paths":{
+      "api/v1":{"serverRelativeURL":"/openapi/v3/api/v1?hash=AAA111"},
+      "apis/machines.example.io/v1":{"serverRelativeURL":"/openapi/v3/apis/machines.example.io/v1?hash=BBB222"},
+      ".well-known/openid-configuration":{"serverRelativeURL":"/openapi/v3/.well-known/openid-configuration?hash=CCC333"}
+    }}"#;
+    let hashes = schema_root_hashes(root).expect("a root document reads");
+    assert_eq!(hashes.get("api/v1").map(String::as_str), Some("AAA111"));
+    assert_eq!(
+        hashes
+            .get("apis/machines.example.io/v1")
+            .map(String::as_str),
+        Some("BBB222")
+    );
+    assert!(schema_root_hashes(r#"{"openapi":"3.0.0"}"#).is_err());
+}
+
+#[test]
+fn should_forget_a_schema_whose_hash_the_refreshed_root_no_longer_vouches_for() {
+    // §12.4's "CRD updates" and §33.2's "schema changed", detected without downloading the
+    // schema: an entry recorded the hash it was loaded under, the root now names another, and
+    // the entry is forgotten. An entry whose hash the root still names is vouched for again;
+    // one loaded under no hash at all has nothing to vouch for it and is forgotten too.
+    use ono_provider_kubernetes::transport::ObservedAt;
+    let v1 = Gvk::new("machines.example.io", "v1", "Sprocket");
+    let other = Gvk::new("astro.example.dev", "v1", "Nebula");
+    let blind = Gvk::new("", "v1", "Pod");
+    let mut cache = SchemaCache::new("cluster-a-uid");
+    let at = |secs: u64| ObservedAt::from_unix_millis(secs * 1_000);
+    cache.insert_under(
+        v1.clone(),
+        sprocket_schema(),
+        Some("BBB222".to_owned()),
+        Some(at(1)),
+    );
+    cache.insert_under(
+        other.clone(),
+        Schema::absent(),
+        Some("DDD444".to_owned()),
+        Some(at(1)),
+    );
+    cache.insert(blind.clone(), Schema::absent());
+
+    let mut hashes = std::collections::BTreeMap::new();
+    hashes.insert(
+        "apis/machines.example.io/v1".to_owned(),
+        "BBB999".to_owned(),
+    );
+    hashes.insert("apis/astro.example.dev/v1".to_owned(), "DDD444".to_owned());
+    hashes.insert("api/v1".to_owned(), "AAA111".to_owned());
+    let forgotten = cache.root_refreshed(hashes, at(20));
+
+    assert_eq!(forgotten, vec![blind.clone(), v1.clone()]);
+    assert!(
+        cache.get(&v1).is_none(),
+        "the hash changed, so the schema is a claim about a definition that moved on"
+    );
+    assert!(
+        cache.get(&blind).is_none(),
+        "loaded under no hash, nothing vouches for it"
+    );
+    assert!(cache.get(&other).is_some(), "the root still names its hash");
+    assert_eq!(
+        cache.provenance(&other).and_then(|p| p.observed_at()),
+        Some(at(20)),
+        "and it is vouched for as of the root's own read"
+    );
+    assert_eq!(cache.root_hash("api/v1"), Some("AAA111"));
+    assert_eq!(cache.root_observed_at(), Some(at(20)));
+}
