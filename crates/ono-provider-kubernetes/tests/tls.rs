@@ -91,19 +91,43 @@ struct LoopbackServer {
 
 impl LoopbackServer {
     fn new(authority: &Authority, reply: &[u8]) -> Self {
-        Self::with_client_auth(authority, reply, false)
+        Self::build(authority, reply, false, rustls::DEFAULT_VERSIONS)
     }
 
     /// A server that demands a client certificate signed by the same authority.
     fn demanding_a_client_certificate(authority: &Authority, reply: &[u8]) -> Self {
-        Self::with_client_auth(authority, reply, true)
+        Self::build(authority, reply, true, rustls::DEFAULT_VERSIONS)
     }
 
-    fn with_client_auth(authority: &Authority, reply: &[u8], client_auth: bool) -> Self {
+    /// A server that speaks exactly `versions` and nothing else — the way a cluster whose API
+    /// server was pinned to one protocol version does.
+    fn speaking(
+        authority: &Authority,
+        reply: &[u8],
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> Self {
+        Self::build(authority, reply, false, versions)
+    }
+
+    /// A server that speaks exactly `versions` and demands a client certificate.
+    fn speaking_and_demanding_a_client_certificate(
+        authority: &Authority,
+        reply: &[u8],
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> Self {
+        Self::build(authority, reply, true, versions)
+    }
+
+    fn build(
+        authority: &Authority,
+        reply: &[u8],
+        client_auth: bool,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> Self {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
-            .with_safe_default_protocol_versions()
-            .expect("the ring provider supports the default versions");
+            .with_protocol_versions(versions)
+            .expect("the ring provider supports the requested versions");
         let builder = if client_auth {
             let mut roots = rustls::RootCertStore::empty();
             for certificate in
@@ -141,6 +165,11 @@ impl LoopbackServer {
     /// What the server decrypted out of the session.
     fn received(&self) -> &[u8] {
         &self.received
+    }
+
+    /// The protocol version the session settled on, once the handshake is over.
+    fn protocol_version(&self) -> Option<rustls::ProtocolVersion> {
+        self.connection.protocol_version()
     }
 
     /// The certificate the client presented, where the server asked for one.
@@ -571,4 +600,167 @@ fn should_present_the_client_certificate_to_a_server_that_asks_for_one() {
         1,
         "the server should have been shown the context's client certificate"
     );
+}
+
+// --- protocol versions -------------------------------------------------------------------------
+
+/// Verifying settings pinned to `authority`, the ordinary path every test below starts from.
+fn verifying(authority: &Authority, identity: Option<&ClientIdentity>) -> TlsSettings {
+    let anchors = Anchors::for_trust(&Trust::CertificateAuthority(
+        authority.ca_pem.clone().into_bytes(),
+    ))
+    .expect("the CA is usable");
+    TlsSettings::verifying(&anchors, identity).expect("the settings build")
+}
+
+/// Sends one request and reads back exactly `reply` through the session.
+fn exchange(session: &mut TlsStream<LoopbackServer>, reply: &[u8]) {
+    session
+        .write_all(b"GET /api HTTP/1.1\r\nHost: cluster.test\r\n\r\n")
+        .expect("the request goes out encrypted");
+    let mut received = vec![0_u8; reply.len()];
+    let mut filled = 0;
+    while filled < reply.len() {
+        let read = session
+            .read(&mut received[filled..])
+            .expect("the answer arrives");
+        assert_ne!(read, 0, "the session ended before the answer was complete");
+        filled += read;
+    }
+    assert_eq!(received, reply);
+}
+
+#[test]
+fn should_negotiate_tls_1_3_with_a_server_that_offers_only_tls_1_3() {
+    // Every current API server negotiates TLS 1.3, and enabling 1.2 beside it must not change
+    // that: a server offering only 1.3 still gets 1.3, with the same anchors and the same check.
+    let authority = authority("cluster.test");
+    let reply = b"ok";
+    let server = LoopbackServer::speaking(&authority, reply, &[&rustls::version::TLS13]);
+    let settings = verifying(&authority, None);
+
+    let mut session = TlsStream::connect(server, "cluster.test", &settings)
+        .expect("the server certificate chains to the pinned authority");
+    exchange(&mut session, reply);
+    assert_eq!(
+        session.get_ref().protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_3)
+    );
+}
+
+#[test]
+fn should_negotiate_tls_1_2_with_a_server_that_offers_only_tls_1_2() {
+    // §8.4 with ADR-0063: a cluster whose API server is pinned to TLS 1.2 is a reachable cluster,
+    // not a handshake failure. The certificate is verified the same way — same anchors, same
+    // name — because the version decides the record layer and never the trust decision.
+    let authority = authority("cluster.test");
+    let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let server = LoopbackServer::speaking(&authority, reply, &[&rustls::version::TLS12]);
+    let settings = verifying(&authority, None);
+
+    let mut session = TlsStream::connect(server, "cluster.test", &settings)
+        .expect("a TLS 1.2-only server is reachable with certificate verification on");
+    exchange(&mut session, reply);
+    assert_eq!(
+        session.get_ref().protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_2),
+        "the session settled on the only version the server offers"
+    );
+    assert!(
+        String::from_utf8_lossy(session.get_ref().received()).starts_with("GET /api"),
+        "the server decrypted the request"
+    );
+}
+
+#[test]
+fn should_refuse_an_unknown_issuer_over_tls_1_2_exactly_as_over_tls_1_3() {
+    // The refusal that matters most, on the older version: an authority the kubeconfig does not
+    // pin is refused at the handshake whichever protocol version carried the certificate.
+    let cluster = authority("cluster.test");
+    let stranger = authority("cluster.test");
+    let server = LoopbackServer::speaking(&cluster, b"never sent", &[&rustls::version::TLS12]);
+    let settings = verifying(&stranger, None);
+
+    let error = TlsStream::connect(server, "cluster.test", &settings)
+        .expect_err("an unknown issuer is refused over TLS 1.2 too");
+
+    assert!(matches!(error, TlsError::Handshake(_)), "{error:?}");
+}
+
+#[test]
+fn should_refuse_a_name_mismatch_over_tls_1_2() {
+    let authority = authority("cluster.test");
+    let server = LoopbackServer::speaking(&authority, b"never sent", &[&rustls::version::TLS12]);
+    let settings = verifying(&authority, None);
+
+    let error = TlsStream::connect(server, "other.test", &settings)
+        .expect_err("a certificate for one name does not vouch for another over TLS 1.2");
+
+    assert!(matches!(error, TlsError::Handshake(_)), "{error:?}");
+}
+
+#[test]
+fn should_reach_an_unverifiable_tls_1_2_server_only_through_the_named_insecure_constructor() {
+    // ADR-0009's discipline survives the second protocol version: the verifying path refuses the
+    // unknown authority, and only `without_certificate_verification` reaches it.
+    let cluster = authority("cluster.test");
+    let stranger = authority("cluster.test");
+    let reply = b"ok";
+
+    let refused = TlsStream::connect(
+        LoopbackServer::speaking(&cluster, reply, &[&rustls::version::TLS12]),
+        "cluster.test",
+        &verifying(&stranger, None),
+    );
+    assert!(
+        refused.is_err(),
+        "the verifying path never reaches an unknown authority"
+    );
+
+    let insecure = TlsSettings::without_certificate_verification(None).expect("the settings build");
+    let mut session = TlsStream::connect(
+        LoopbackServer::speaking(&cluster, reply, &[&rustls::version::TLS12]),
+        "cluster.test",
+        &insecure,
+    )
+    .expect("verification is off, so an unknown authority is not an obstacle");
+    exchange(&mut session, reply);
+    assert_eq!(
+        session.get_ref().protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_2)
+    );
+}
+
+#[test]
+fn should_present_the_client_certificate_over_tls_1_2_and_over_tls_1_3() {
+    // §7.1 on both versions. TLS 1.2 sends the client certificate in the second flight rather
+    // than with the first, so the server has seen it by the time it decrypts application data.
+    let authority = authority("cluster.test");
+    let reply = b"ok";
+    let identity = ClientIdentity::new(
+        authority.client_certificate_pem.as_bytes(),
+        &Secret::new(authority.client_key_pem.clone()),
+    )
+    .expect("the identity is usable");
+    let settings = verifying(&authority, Some(&identity));
+
+    for (version, expected) in [
+        (&rustls::version::TLS12, rustls::ProtocolVersion::TLSv1_2),
+        (&rustls::version::TLS13, rustls::ProtocolVersion::TLSv1_3),
+    ] {
+        let server = LoopbackServer::speaking_and_demanding_a_client_certificate(
+            &authority,
+            reply,
+            &[version],
+        );
+        let mut session = TlsStream::connect(server, "cluster.test", &settings)
+            .expect("both ends trust the same authority");
+        exchange(&mut session, reply);
+        assert_eq!(session.get_ref().protocol_version(), Some(expected));
+        assert_eq!(
+            session.get_ref().peer_certificates(),
+            1,
+            "the server was shown the context's client certificate over {expected:?}"
+        );
+    }
 }

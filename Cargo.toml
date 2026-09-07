@@ -29,7 +29,12 @@ base64 = "0.22"
 # introduced a second TLS implementation into the tree it plugs into would widen the supply chain
 # for no gain. §8.4's validation is this package's obligation, because the host brokers bytes and
 # not requests (core ADR-0573, and ADR-0002 here).
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+#
+# `tls12` beside 1.3 (ADR-0063): an API server pinned to TLS 1.2 is a reachable cluster rather
+# than a handshake failure. The feature adds a record layer and no trust decision — the same
+# anchors, the same name check and the same named insecure constructor apply to both versions,
+# and nothing older than 1.2 exists in `rustls` to enable.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustls-pemfile = "2"
 # The hash behind the cluster fingerprint of specification §10.2. `ring` rather than a second
 # digest crate because `rustls` above is already built on it: one supply chain, not two.
