@@ -327,7 +327,31 @@ fn document(path: &str) -> Option<Json> {
             "name": "apps",
             "versions": [{"groupVersion": "apps/v1", "version": "v1"}],
             "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"},
+        }, {
+            "name": "batch",
+            "versions": [{"groupVersion": "batch/v1", "version": "v1"}],
+            "preferredVersion": {"groupVersion": "batch/v1", "version": "v1"},
         }]}),
+        // Every kind that carries the `workload` role is served, so that a search by role asks
+        // each of them and answers from the ones that hold something (`ADR-0596 (core)`).
+        "/apis/batch/v1" => json!({
+            "kind": "APIResourceList", "groupVersion": "batch/v1", "resources": [
+                {"name": "jobs", "singularName": "job", "namespaced": true,
+                 "kind": "Job", "verbs": ["get", "list"]},
+                {"name": "cronjobs", "singularName": "cronjob", "namespaced": true,
+                 "kind": "CronJob", "verbs": ["get", "list"]},
+            ],
+        }),
+        "/apis/batch/v1/namespaces/shop/jobs" => collection("Job", "batch/v1", Vec::new()),
+        "/apis/batch/v1/namespaces/shop/cronjobs" => collection("CronJob", "batch/v1", Vec::new()),
+        "/apis/apps/v1/namespaces/shop/statefulsets" => {
+            collection("StatefulSet", "apps/v1", Vec::new())
+        }
+        "/apis/apps/v1/namespaces/shop/daemonsets" => {
+            collection("DaemonSet", "apps/v1", Vec::new())
+        }
+        "/version" => json!({"major": "1", "minor": "37", "gitVersion": "v1.37.0",
+                             "platform": "linux/amd64"}),
         "/api/v1" => json!({"kind": "APIResourceList", "groupVersion": "v1", "resources": [
             {"name": "pods", "singularName": "pod", "namespaced": true, "kind": "Pod",
              "verbs": ["get", "list", "watch"], "shortNames": ["po"]},
@@ -346,6 +370,10 @@ fn document(path: &str) -> Option<Json> {
                  "kind": "ReplicaSet", "verbs": ["get", "list"]},
                 {"name": "deployments", "singularName": "deployment", "namespaced": true,
                  "kind": "Deployment", "verbs": ["get", "list"]},
+                {"name": "statefulsets", "singularName": "statefulset", "namespaced": true,
+                 "kind": "StatefulSet", "verbs": ["get", "list"]},
+                {"name": "daemonsets", "singularName": "daemonset", "namespaced": true,
+                 "kind": "DaemonSet", "verbs": ["get", "list"]},
             ],
         }),
         "/api/v1/namespaces" => collection(
@@ -823,17 +851,17 @@ fn should_reach_the_namespace_a_pod_is_in_without_routing_it_through_the_owner()
 }
 
 #[test]
-fn should_say_why_up_has_nowhere_to_go_from_a_kubernetes_place() {
-    // The honest negative. `place.rs::up` computes the spatial parent and the shell has nowhere
-    // to put it: landing `up` on a place needs the plugin-defined aggregate space of §36.4, which
-    // `docs/contracts/kuang/contributions.v1.yaml` gives a package no way to declare
-    // (`ADR-0584 (core)`). What matters is that the refusal says *that* rather than claiming the
-    // user has reached the top of this host — a place in a cluster is not the top of a laptop.
+fn should_go_up_from_a_pod_to_its_namespace_and_from_there_to_the_cluster() {
+    // §35.2 and §35.6, and `ADR-0597 (core)`: `up` is the spatial hierarchy — Pod, namespace,
+    // provider instance — climbed along the containment edges this package contributes, and
+    // never the ownership that runs from the same Pod to its ReplicaSet. From the cluster there
+    // is nowhere further up in what this package contributes, and `up` says so rather than
+    // filing a cluster under a domain of the laptop the shell runs on (§2.17).
     let binary = match ono() {
         Ok(binary) => binary,
         Err(missing) => {
             return announce_skip(
-                "should_say_why_up_has_nowhere_to_go_from_a_kubernetes_place",
+                "should_go_up_from_a_pod_to_its_namespace_and_from_there_to_the_cluster",
                 "external_tool_unavailable",
                 &missing,
             );
@@ -844,16 +872,155 @@ fn should_say_why_up_has_nowhere_to_go_from_a_kubernetes_place() {
     let run = shell(
         &binary,
         &home,
-        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "up"),
+        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "up; look | to json"),
+    );
+    let place = &run.rows()[0]["place"];
+    assert_eq!(
+        place["object_type"].as_str(),
+        Some("io.github.godspeed-you.kubernetes.namespace/1"),
+        "one `up` from a Pod is its namespace, not its ReplicaSet, got {run:?}"
+    );
+    assert_eq!(place["identity"]["uid"].as_str(), Some("ns-uid-1"));
+
+    let run = shell(
+        &binary,
+        &home,
+        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "up; up; look | to json"),
+    );
+    let place = &run.rows()[0]["place"];
+    assert_eq!(
+        place["object_type"].as_str(),
+        Some("io.github.godspeed-you.kubernetes.cluster/1"),
+        "two `up`s from a Pod is the provider instance, got {run:?}"
+    );
+
+    let run = shell(
+        &binary,
+        &home,
+        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "up; up; up"),
     );
     let said = format!("{}{}", run.stdout, run.stderr);
     assert!(
-        said.contains("spatial.no_parent"),
-        "`up` refuses rather than inventing a parent, got {run:?}"
+        said.contains("spatial.no_parent") && said.contains("top of what its package contributes"),
+        "the cluster is the top of what this package contributes, got {run:?}"
+    );
+
+    // `back` walks the same steps in reverse: hierarchy and history are two questions (§6.6).
+    let run = shell(
+        &binary,
+        &home,
+        &standing_on_the_pod(
+            &cluster,
+            SPATIAL_GRANTS,
+            "up; up; back; back; look | to json",
+        ),
+    );
+    let place = &run.rows()[0]["place"];
+    assert_eq!(
+        place["identity"]["uid"].as_str(),
+        Some(SECOND_POD),
+        "`back` twice returns to the Pod `up` twice left, got {run:?}"
+    );
+}
+
+#[test]
+fn should_enter_the_cluster_and_find_its_namespaces_and_nodes_among_the_exits() {
+    // §35.2: the cluster is a place of this package's own, keyed on the provider instance
+    // (ADR-0011), and standing on it has exits — the kinds that sit directly in it. Entered
+    // from the record `get k8s-cluster` answers with, so that the root is reached the same way
+    // every other place is (§6.3, §28.2).
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_enter_the_cluster_and_find_its_namespaces_and_nodes_among_the_exits",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let cluster = RecordedCluster::start();
+    let home = plugin_home("cluster");
+    let run = shell(
+        &binary,
+        &home,
+        &format!(
+            "{}; get k8s-cluster --host 127.0.0.1 --port {} | enter; near | to json",
+            load(SPATIAL_GRANTS),
+            cluster.port
+        ),
+    );
+    let rows = run.rows();
+    let kinds: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["object_type"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"io.github.godspeed-you.kubernetes.namespace/1")
+            && kinds.contains(&"io.github.godspeed-you.kubernetes.node/1"),
+        "a namespace and a node are among the cluster's exits, got {run:?}"
+    );
+}
+
+#[test]
+fn should_find_workloads_by_role_across_the_kinds_that_carry_it() {
+    // §53.3's `find place --role workload`, and `ADR-0596 (core)`: the role a kind declares is
+    // what the search plans by, so a Pod and a ReplicaSet answer beside each other while a
+    // Service — a network endpoint — does not, and every place carries its native type
+    // untouched beside the role (§36.1, §36.3).
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_find_workloads_by_role_across_the_kinds_that_carry_it",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let cluster = RecordedCluster::start();
+    let home = plugin_home("roles");
+    let run = shell(
+        &binary,
+        &home,
+        &standing_on_the_pod(
+            &cluster,
+            SPATIAL_GRANTS,
+            "find place --role workload | to json",
+        ),
+    );
+    let rows = run.rows();
+    let mut kinds: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["object_type"].as_str())
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    assert_eq!(
+        kinds,
+        vec![
+            "io.github.godspeed-you.kubernetes.pod/1",
+            "io.github.godspeed-you.kubernetes.replicaset/1",
+        ],
+        "the two workload kinds the recorded cluster holds objects of, and no Service, got {run:?}"
+    );
+    for row in &rows {
+        assert_eq!(
+            row["roles"][0].as_str(),
+            Some("workload"),
+            "the role is on every place beside its native type, got {row}"
+        );
+    }
+    let refused = shell(
+        &binary,
+        &home,
+        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "find place --role nonsense"),
     );
     assert!(
-        said.contains("aggregate space"),
-        "and the refusal names what is missing, got {run:?}"
+        refused
+            .stderr
+            .contains("no loaded package answers for the role `nonsense`"),
+        "a role nobody declares is refused with the ones that exist, got {refused:?}"
     );
 }
 

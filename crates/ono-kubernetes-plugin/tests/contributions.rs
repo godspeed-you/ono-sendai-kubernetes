@@ -658,6 +658,48 @@ fn should_build_the_shell_from_the_revision_this_package_is_built_against() {
 }
 
 #[test]
+fn should_declare_the_same_roles_and_parents_in_the_document_and_across_the_handshake() {
+    // `ADR-0596 (core)` and `ADR-0597 (core)`: a target's semantic roles and the kind of place
+    // above it are read from disk before the package runs — the parent is settled against the
+    // manifest's shapes there — and from the handshake after. Two documents, one declaration.
+    let declared = document(TARGETS_DOCUMENT, "targets");
+    for target in TARGETS {
+        let entry = declared
+            .iter()
+            .find(|entry| text(entry, "name") == target.name)
+            .unwrap_or_else(|| panic!("`{}` is declared on disk", target.name));
+        let on_disk_roles: Vec<String> = match field(entry, "roles") {
+            Some(Value::List(roles)) => roles
+                .iter()
+                .map(|role| match role {
+                    Value::String(role) => role.to_string(),
+                    other => panic!("a role is a word, and it is {other:?}"),
+                })
+                .collect(),
+            None => Vec::new(),
+            other => panic!("`roles` is a list, and it is {other:?}"),
+        };
+        assert_eq!(
+            on_disk_roles,
+            target.roles(),
+            "`{}` declares the same roles on disk and across the handshake",
+            target.name
+        );
+        let on_disk_parent = match field(entry, "parent") {
+            Some(Value::String(parent)) => Some(parent.to_string()),
+            None => None,
+            other => panic!("`parent` is a schema id, and it is {other:?}"),
+        };
+        assert_eq!(
+            on_disk_parent,
+            target.parent(),
+            "`{}` declares the same parent on disk and across the handshake",
+            target.name
+        );
+    }
+}
+
+#[test]
 fn should_declare_the_same_boundedness_in_the_document_and_across_the_handshake() {
     // `ADR-0588 (core)`. The host decides whether to collect a contributed answer *before* it
     // reads the first record, from this declaration — so a document that disagreed with the
@@ -1204,12 +1246,21 @@ fn should_relate_only_kinds_the_contribution_actually_reads() {
     // resolve nothing and `follow` would arrive nowhere. Every schema a shape names is therefore
     // a target that reads a Kubernetes kind, rather than one of the eleven targets that answer a
     // *question about* an object (`k8s-relation`, `k8s-why`, `k8s-plan`, and the rest).
+    //
+    // One exception, and it is the root: `k8s-cluster` reads no kind because the cluster is not
+    // an object, and it is an end of the `in-cluster` shapes because the provider instance is the
+    // place above a namespace (§35.2; `ADR-0597 (core)`). Its far end binds to the instance id
+    // the record is keyed on (ADR-0011), which the host re-reads through `k8s-cluster`.
     for shape in SHAPES {
         for endpoint in [shape.from, shape.to] {
             let target = TARGETS
                 .iter()
                 .find(|target| target.schema == endpoint)
                 .unwrap_or_else(|| panic!("`{endpoint}` is a schema this package contributes"));
+            if endpoint == ono_kubernetes_plugin::contributions::CLUSTER_SCHEMA {
+                assert_eq!(shape.to, endpoint, "the cluster is only ever the far end");
+                continue;
+            }
             assert!(
                 matches!(target.reads, Reads::Kind { .. }),
                 "`{endpoint}` is answered by `{}`, which reads no Kubernetes kind, so no object \

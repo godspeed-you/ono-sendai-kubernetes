@@ -91,7 +91,17 @@ const PAGE_SIZE: u32 = 500;
 /// [`ono_provider_kubernetes::place::Waypoint`]: `shares-namespace` is that vocabulary's word for
 /// co-tenancy and its documentation says in as many words that it is not a relationship, so using
 /// it for containment would make one word mean two things.
-const IN_NAMESPACE: &str = "in-namespace";
+pub(crate) const IN_NAMESPACE: &str = "in-namespace";
+
+/// The contributor's word for the edge from a cluster-scoped object — or a namespace — to the
+/// provider instance that holds it: the top of the hierarchy `up` climbs (§35.2, §35.6;
+/// `ADR-0597 (core)`).
+///
+/// The cluster is a place of this package's own (`k8s-cluster`, keyed on the provider instance
+/// of §10.1 rather than on any object's uid), so the edge's far end is the instance id the
+/// standing endpoint resolved to, and the host re-reads the cluster place through `k8s-cluster`
+/// to bind it.
+pub(crate) const IN_CLUSTER: &str = "in-cluster";
 
 /// One kind of place this package relates to another, by the schema ids core keys them on.
 ///
@@ -345,7 +355,30 @@ pub const SHAPES: &[Shape] = &[
         schema!("namespace"),
         IN_NAMESPACE,
     ),
+    // §35.2's cluster root, reached from the kinds that sit directly in it: a namespace, and the
+    // cluster-scoped kinds of §15.2. These four cost no extra listing — every one of them is
+    // already read for a shape above — which is the bound this table keeps (`ADR-0585 (core)`).
+    Shape::new(schema!("namespace"), schema!("cluster"), IN_CLUSTER),
+    Shape::new(schema!("node"), schema!("cluster"), IN_CLUSTER),
+    Shape::new(schema!("persistentvolume"), schema!("cluster"), IN_CLUSTER),
+    Shape::new(schema!("storageclass"), schema!("cluster"), IN_CLUSTER),
 ];
+
+/// The kind of place above one of this package's kinds, for `up` (§35.6; `ADR-0597 (core)`).
+///
+/// Read off [`SHAPES`] rather than restated: the parent is the far end of the one containment
+/// shape a kind declares, and a kind that declares none is the top of what this package
+/// contributes — the cluster — or a kind whose containment this package has not declared, which
+/// `up` says rather than guessing.
+#[must_use]
+pub fn parent_of(schema: &str) -> Option<&'static str> {
+    SHAPES
+        .iter()
+        .find(|shape| {
+            shape.from == schema && (shape.carries == IN_NAMESPACE || shape.carries == IN_CLUSTER)
+        })
+        .map(|shape| shape.to)
+}
 
 /// The command contribution, as the handshake carries it (§31.22, §36.1).
 ///
@@ -378,6 +411,7 @@ pub fn contribution() -> CommandContribution {
             .map(crate::contributions::Parameter::contribution)
             .collect(),
         risk: None,
+        action: None,
         examples: vec![
             "get k8s-pod --context prod --namespace shop | enter; near".to_owned(),
             "follow io.github.godspeed-you.kubernetes.pod_to_node".to_owned(),
@@ -469,7 +503,7 @@ pub fn answer(sessions: &Sessions, ctx: &mut Ctx<'_>) -> Outcome {
         Ok(inventory) => inventory,
         Err(error) => return Outcome::Failed(error),
     };
-    emit(ctx, &schema, &inventory)
+    emit(ctx, &schema, &inventory, &endpoint.instance)
 }
 
 /// What one pass over the cluster read: the objects of every kind a declared shape names.
@@ -569,13 +603,18 @@ fn serving<S: ByteStream>(
 }
 
 /// Streams one record per edge whose two ends are kinds of place a declared shape runs between.
-fn emit(ctx: &mut Ctx<'_>, schema: &Arc<ono_value::Schema>, inventory: &Inventory) -> Outcome {
+fn emit(
+    ctx: &mut Ctx<'_>,
+    schema: &Arc<ono_value::Schema>,
+    inventory: &Inventory,
+    instance: &str,
+) -> Outcome {
     for (group, kind, source_schema) in kind_schemas() {
         for object in inventory.of(group, kind) {
             if ctx.cancelled() {
                 return Outcome::Cancelled;
             }
-            for asserted in edges_of(object, inventory, source_schema) {
+            for asserted in edges_of(object, inventory, source_schema, instance) {
                 let value = match asserted.record(schema) {
                     Ok(value) => value,
                     Err(error) => {
@@ -624,7 +663,12 @@ impl Asserted {
 }
 
 /// Every edge one object asserts, in §35.5's order, keyed on both ends' lifetime identities.
-fn edges_of(object: &Object, inventory: &Inventory, source_schema: &'static str) -> Vec<Asserted> {
+fn edges_of(
+    object: &Object,
+    inventory: &Inventory,
+    source_schema: &'static str,
+    instance: &str,
+) -> Vec<Asserted> {
     let Some(source_uid) = object.uid().map(str::to_owned) else {
         // §16.5: an object the server gave no UID has no lifetime identity, so there is nothing
         // for a place to bind to and no honest key for the end of an edge.
@@ -678,7 +722,37 @@ fn edges_of(object: &Object, inventory: &Inventory, source_schema: &'static str)
     if let Some(containment) = in_namespace(object, inventory, source_schema, &source_uid) {
         asserted.push(containment);
     }
+    if let Some(root) = in_cluster(object, source_schema, &source_uid, instance) {
+        asserted.push(root);
+    }
     asserted
+}
+
+/// The edge from a cluster-scoped object to the provider instance holding it (§35.2, §35.6).
+///
+/// Only for a kind whose shape names the cluster, and only for an object the server placed in
+/// no namespace — a namespaced object's parent is its namespace, and the cluster is one step
+/// further up. The far end is the provider instance of §10.1, which is what `k8s-cluster` is
+/// keyed on (ADR-0011), never a fingerprint: two instances reaching one cluster are two places.
+fn in_cluster(
+    object: &Object,
+    source_schema: &'static str,
+    source_uid: &str,
+    instance: &str,
+) -> Option<Asserted> {
+    let target_schema = crate::contributions::CLUSTER_SCHEMA;
+    if !declares(source_schema, target_schema) || object.namespace().is_some() {
+        return None;
+    }
+    Some(Asserted {
+        relation: IN_CLUSTER.to_owned(),
+        source_schema,
+        source_uid: source_uid.to_owned(),
+        target_schema,
+        target_uid: instance.to_owned(),
+        // Which instance an object was read from is the standing endpoint's own fact.
+        confidence: "exact",
+    })
 }
 
 /// The edge from an object to the namespace that holds it (§35.6).

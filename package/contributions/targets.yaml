@@ -65,6 +65,7 @@ targets:
     schema: io.github.godspeed-you.kubernetes.namespace/1
     summary: "Namespaces, the primary scope dimension of a cluster."
     identity_doc: "Two observations are the same namespace when their `metadata.uid` matches."
+    parent: io.github.godspeed-you.kubernetes.cluster/1
     options: &curated-kind
       - name: context
         type: string
@@ -109,91 +110,126 @@ targets:
     schema: io.github.godspeed-you.kubernetes.node/1
     summary: "Nodes, and the cloud instances underneath them."
     identity_doc: "Two observations are the same node when their `metadata.uid` matches; a name reused after deletion is a new node."
+    roles: [compute-node]
+    parent: io.github.godspeed-you.kubernetes.cluster/1
     options: *curated-kind
   - name: k8s-pod
     schema: io.github.godspeed-you.kubernetes.pod/1
     summary: "Pods, the workload that actually runs."
     identity_doc: "Two observations are the same pod when their `metadata.uid` matches. A recreated pod with the same name is a different pod."
+    roles: [workload]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-deployment
     schema: io.github.godspeed-you.kubernetes.deployment/1
     summary: "Deployments, and the ReplicaSets they control."
     identity_doc: "Two observations are the same deployment when their `metadata.uid` matches."
+    roles: [workload]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-replicaset
     schema: io.github.godspeed-you.kubernetes.replicaset/1
     summary: "ReplicaSets, which sit between a Deployment and its Pods."
     identity_doc: "Two observations are the same ReplicaSet when their `metadata.uid` matches."
+    roles: [workload]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-statefulset
     schema: io.github.godspeed-you.kubernetes.statefulset/1
     summary: "StatefulSets, and the claims their templates materialise."
     identity_doc: "Two observations are the same StatefulSet when their `metadata.uid` matches."
+    roles: [workload]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-daemonset
     schema: io.github.godspeed-you.kubernetes.daemonset/1
     summary: "DaemonSets, and their rollout across nodes."
     identity_doc: "Two observations are the same DaemonSet when their `metadata.uid` matches."
+    roles: [workload]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-service
     schema: io.github.godspeed-you.kubernetes.service/1
     summary: "Services, and the Pods their selectors reach."
     identity_doc: "Two observations are the same service when their `metadata.uid` matches."
+    roles: [network-endpoint]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-endpointslice
     schema: io.github.godspeed-you.kubernetes.endpointslice/1
     summary: "EndpointSlices, the endpoints a Service is represented by."
     identity_doc: "Two observations are the same slice when their `metadata.uid` matches."
+    roles: [service-endpoint]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-ingress
     schema: io.github.godspeed-you.kubernetes.ingress/1
     summary: "Ingresses, and the Services they route to."
     identity_doc: "Two observations are the same ingress when their `metadata.uid` matches."
+    roles: [network-endpoint]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-job
     schema: io.github.godspeed-you.kubernetes.job/1
     summary: "Jobs, and the Pods they own."
     identity_doc: "Two observations are the same job when their `metadata.uid` matches."
+    roles: [workload]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-cronjob
     schema: io.github.godspeed-you.kubernetes.cronjob/1
     summary: "CronJobs, and the Jobs they create."
     identity_doc: "Two observations are the same CronJob when their `metadata.uid` matches."
+    roles: [workload]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-configmap
     schema: io.github.godspeed-you.kubernetes.configmap/1
     summary: "ConfigMaps, and what consumes them."
     identity_doc: "Two observations are the same ConfigMap when their `metadata.uid` matches."
+    roles: [configuration]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-secret
     schema: io.github.godspeed-you.kubernetes.secret/1
     summary: "Secret metadata — which keys exist and what mounts them, never the values (specification section 22)."
     identity_doc: "Two observations are the same secret when their `metadata.uid` matches."
+    roles: [secret]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-serviceaccount
     schema: io.github.godspeed-you.kubernetes.serviceaccount/1
     summary: "ServiceAccounts, the identity a workload runs as."
     identity_doc: "Two observations are the same account when their `metadata.uid` matches."
+    roles: [identity]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-persistentvolumeclaim
     schema: io.github.godspeed-you.kubernetes.persistentvolumeclaim/1
     summary: "PersistentVolumeClaims, and the volumes they bind."
     identity_doc: "Two observations are the same claim when their `metadata.uid` matches."
+    roles: [storage]
+    parent: io.github.godspeed-you.kubernetes.namespace/1
     options: *curated-kind
   - name: k8s-persistentvolume
     schema: io.github.godspeed-you.kubernetes.persistentvolume/1
     summary: "PersistentVolumes, and the storage behind them."
     identity_doc: "Two observations are the same volume when their `metadata.uid` matches."
+    roles: [storage]
+    parent: io.github.godspeed-you.kubernetes.cluster/1
     options: *curated-kind
   - name: k8s-storageclass
     schema: io.github.godspeed-you.kubernetes.storageclass/1
     summary: "StorageClasses, and what they provision."
     identity_doc: "Two observations are the same class when their `metadata.uid` matches."
+    roles: [storage]
+    parent: io.github.godspeed-you.kubernetes.cluster/1
     options: *curated-kind
   - name: k8s-networkpolicy
     schema: io.github.godspeed-you.kubernetes.networkpolicy/1
     summary: "NetworkPolicies, and the Pods their selectors govern."
     identity_doc: "Two observations are the same policy when their `metadata.uid` matches."
+    roles: [policy]
 
     options: *curated-kind
   # --- §15.3's Tier 2: platform operation ------------------------------------------------------
@@ -214,6 +250,7 @@ targets:
       PodDisruptionBudgets, and how much voluntary disruption they currently allow.
     identity_doc: >-
       Two observations are the same budget when their `metadata.uid` matches.
+    roles: [policy]
     options: *curated-kind
   - name: k8s-resourcequota
     schema: io.github.godspeed-you.kubernetes.resourcequota/1
@@ -221,6 +258,7 @@ targets:
       ResourceQuotas: what a namespace may use, and what it has used.
     identity_doc: >-
       Two observations are the same quota when their `metadata.uid` matches.
+    roles: [policy]
     options: *curated-kind
   - name: k8s-limitrange
     schema: io.github.godspeed-you.kubernetes.limitrange/1
@@ -228,6 +266,7 @@ targets:
       LimitRanges, and the defaults and bounds they impose on a namespace.
     identity_doc: >-
       Two observations are the same range when their `metadata.uid` matches.
+    roles: [policy]
     options: *curated-kind
   - name: k8s-role
     schema: io.github.godspeed-you.kubernetes.role/1
@@ -235,6 +274,7 @@ targets:
       Roles, and the rules they grant inside one namespace.
     identity_doc: >-
       Two observations are the same role when their `metadata.uid` matches.
+    roles: [identity]
     options: *curated-kind
   - name: k8s-clusterrole
     schema: io.github.godspeed-you.kubernetes.clusterrole/1
@@ -242,6 +282,7 @@ targets:
       ClusterRoles, and the rules they grant across a cluster.
     identity_doc: >-
       Two observations are the same role when their `metadata.uid` matches.
+    roles: [identity]
     options: *curated-kind
   - name: k8s-rolebinding
     schema: io.github.godspeed-you.kubernetes.rolebinding/1
@@ -249,6 +290,7 @@ targets:
       RoleBindings: who holds which role in a namespace.
     identity_doc: >-
       Two observations are the same binding when their `metadata.uid` matches.
+    roles: [identity]
     options: *curated-kind
   - name: k8s-clusterrolebinding
     schema: io.github.godspeed-you.kubernetes.clusterrolebinding/1
@@ -256,6 +298,7 @@ targets:
       ClusterRoleBindings: who holds which role across the whole cluster.
     identity_doc: >-
       Two observations are the same binding when their `metadata.uid` matches.
+    roles: [identity]
     options: *curated-kind
   - name: k8s-lease
     schema: io.github.godspeed-you.kubernetes.lease/1

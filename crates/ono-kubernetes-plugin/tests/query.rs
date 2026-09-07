@@ -7965,6 +7965,19 @@ async fn should_key_both_ends_of_a_contributed_edge_on_a_lifetime_and_never_on_a
                 "`{key}` is a name and not a lifetime identity, on the `{}` edge",
                 edge.relation
             );
+            // The one end that is not a Kubernetes object: the provider instance, keyed on what
+            // the operator configured and never on a fingerprint (ADR-0011, ADR-0065). It is a
+            // lifetime identity of the place it names, and it is not a `metadata.uid`.
+            if edge.target_type == "io.github.godspeed-you.kubernetes.cluster/1"
+                && std::ptr::eq(key, &edge.target_key)
+            {
+                assert_eq!(
+                    key, "kubernetes:recorded",
+                    "the cluster's end is the provider instance, on the `{}` edge",
+                    edge.relation
+                );
+                continue;
+            }
             assert!(
                 key.len() == 36 && key.matches('-').count() == 4,
                 "`{key}` is not a `metadata.uid`, on the `{}` edge",

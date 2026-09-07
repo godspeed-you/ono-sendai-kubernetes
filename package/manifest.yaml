@@ -205,3 +205,10 @@ contributions:
     - "io.github.godspeed-you.kubernetes.configmap/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
     - "io.github.godspeed-you.kubernetes.secret/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
     - "io.github.godspeed-you.kubernetes.persistentvolumeclaim/1->io.github.godspeed-you.kubernetes.namespace/1"   # in-namespace
+    # §35.2's cluster root, and the top of the hierarchy `up` climbs (`ADR-0597 (core)`): a
+    # namespace and the cluster-scoped kinds sit directly in the provider instance, which is a
+    # place of this package's own (`k8s-cluster`). Declared beside `parent:` on the targets.
+    - "io.github.godspeed-you.kubernetes.namespace/1->io.github.godspeed-you.kubernetes.cluster/1"   # in-cluster
+    - "io.github.godspeed-you.kubernetes.node/1->io.github.godspeed-you.kubernetes.cluster/1"   # in-cluster
+    - "io.github.godspeed-you.kubernetes.persistentvolume/1->io.github.godspeed-you.kubernetes.cluster/1"   # in-cluster
+    - "io.github.godspeed-you.kubernetes.storageclass/1->io.github.godspeed-you.kubernetes.cluster/1"   # in-cluster

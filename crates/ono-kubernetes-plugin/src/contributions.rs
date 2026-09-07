@@ -23,6 +23,7 @@ use ono_kuang_sdk::protocol::{
     Answer, CommandContribution, ParameterContribution, SchemaContribution,
     SchemaFieldContribution, TargetContribution,
 };
+use ono_provider_kubernetes::discovery::Gvk;
 
 /// One argument a contribution declares, in the vocabulary a core command declares its own
 /// (`ADR-0587 (core)`).
@@ -532,7 +533,36 @@ impl Target {
             identity_doc: self.identity_doc.to_owned(),
             options: self.options().iter().map(Parameter::contribution).collect(),
             answer: self.answer(),
+            roles: self.roles(),
+            parent: self.parent(),
         }
+    }
+
+    /// The semantic roles objects of this target carry (§36.2; `ADR-0596 (core)`).
+    ///
+    /// The same overlay `place.rs` keeps for the edge's `target_roles`, so a role a Deployment
+    /// carries on a relationship record and the role its place is found by are one table.
+    #[must_use]
+    pub fn roles(&self) -> Vec<String> {
+        let Reads::Kind { group, kind } = self.reads else {
+            return Vec::new();
+        };
+        ono_provider_kubernetes::place::roles_of(&Gvk::new(group, "", kind))
+            .into_iter()
+            .map(|role| role.as_str().to_owned())
+            .collect()
+    }
+
+    /// The kind of place above this one, for `up` (§35.6; `ADR-0597 (core)`).
+    ///
+    /// The far end of the containment shape `spatial.rs` declares for this kind — the namespace
+    /// for a namespaced kind, the cluster for a namespace and the cluster-scoped kinds — and
+    /// nothing for a kind whose containment is not declared. The host settles this against the
+    /// manifest's shapes before the runtime is spawned, so a parent here without a shape there
+    /// is a package that does not load.
+    #[must_use]
+    pub fn parent(&self) -> Option<String> {
+        crate::spatial::parent_of(self.schema).map(str::to_owned)
     }
 
     /// Whether this target's answer ends by itself (`ADR-0588 (core)`).
@@ -763,6 +793,10 @@ const PLAN_OPTIONS: &[Parameter] = &[
          (specification section 45.2).",
     ),
 ];
+
+/// The schema of the one place this package contributes that is not a Kubernetes object: the
+/// provider instance itself, the root of the hierarchy `up` climbs (§35.2; ADR-0011, ADR-0065).
+pub const CLUSTER_SCHEMA: &str = "io.github.godspeed-you.kubernetes.cluster/1";
 
 /// The identity field of every Kubernetes schema, without exception.
 ///
@@ -2770,6 +2804,7 @@ impl Command {
             selectors: Vec::new(),
             options: self.options().iter().map(Parameter::contribution).collect(),
             risk: Some(self.risk.to_owned()),
+            action: None,
             examples: self
                 .examples
                 .iter()
