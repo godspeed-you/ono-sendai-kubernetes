@@ -122,8 +122,10 @@ the relations handler calls the registry directly. No test changed, which is wha
 - Proven by `tests/adapter.rs` (an unknown CRD works without an adapter; an adapted CRD gains
   roles and an evidenced edge; a listed version is adapted; an unlisted one falls back; the
   object is field-for-field what dynamic projection gave; an inference does not pass), by the
-  Gateway tests in `tests/workload.rs` unchanged, and by the relations handler's Gateway path in
-  the plugin's `tests/query.rs` unchanged.
+  Gateway tests in `tests/workload.rs` unchanged, and end to end through the relations handler by
+  the plugin's `should_carry_a_hostile_reference_read_by_an_adapter_as_data_and_not_as_shape` in
+  `tests/adversarial.rs` — an HTTPRoute whose references are attacker-chosen text, answered as
+  two evidenced edges and nothing else.
 
 ## Alternatives considered
 
