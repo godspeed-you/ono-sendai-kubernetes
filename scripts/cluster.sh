@@ -41,7 +41,8 @@
 #   a restricted identity, in a     Gate E (§62.5): a `403` on `ono-beta` is a denial and never an
 #   second kubeconfig context       empty result
 #   a Service and two bare Pods     §60.3: a selection that changes under a watch, on Pods no
-#   it selects                      controller will relabel or replace
+#   it selects, in `ono-beta`       controller will relabel or replace, in a namespace where
+#                                   nothing else moves
 #   two Deployments, `scaler`       §46.3: a scale and an image change, each verified by watching
 #   and `rollout`                   the controller converge rather than by one read
 #
@@ -341,23 +342,25 @@ JSON
 # Specification section 60.3's scenario, as objects: a Service selecting two Pods by one label.
 # The Pods are bare rather than made by a controller, because the test changes the label on one
 # of them and a ReplicaSet would release the relabelled Pod and replace it — an interesting
-# scenario, and a different one from the section's.
+# scenario, and a different one from the section's. They live in `ono-beta`, where no
+# controller makes or replaces Pods, so a bounded watch over that namespace's Pods observes the
+# label change and nothing else.
 install_selector_pair() {
   say "a Service and the two Pods it selects (section 60.3)"
   local pod
   for pod in pair-a pair-b; do
-    create "/api/v1/namespaces/$NS_ALPHA/pods" "Pod $NS_ALPHA/$pod" <<JSON
-{"apiVersion":"v1","kind":"Pod","metadata":{"name":"$pod","namespace":"$NS_ALPHA","labels":{"app":"pair"}},
+    create "/api/v1/namespaces/$NS_BETA/pods" "Pod $NS_BETA/$pod" <<JSON
+{"apiVersion":"v1","kind":"Pod","metadata":{"name":"$pod","namespace":"$NS_BETA","labels":{"app":"pair"}},
  "spec":{"terminationGracePeriodSeconds":1,
   "containers":[{"name":"pause","image":"registry.k8s.io/pause:3.10","imagePullPolicy":"IfNotPresent"}]}}
 JSON
   done
-  create "/api/v1/namespaces/$NS_ALPHA/services" "Service $NS_ALPHA/pair" <<JSON
-{"apiVersion":"v1","kind":"Service","metadata":{"name":"pair","namespace":"$NS_ALPHA"},
+  create "/api/v1/namespaces/$NS_BETA/services" "Service $NS_BETA/pair" <<JSON
+{"apiVersion":"v1","kind":"Service","metadata":{"name":"pair","namespace":"$NS_BETA"},
  "spec":{"selector":{"app":"pair"},"ports":[{"name":"http","port":80,"targetPort":8080,"protocol":"TCP"}]}}
 JSON
-  wait_for "both Pods of $NS_ALPHA/pair scheduled and addressed" \
-    "/api/v1/namespaces/$NS_ALPHA/pods?labelSelector=app%3Dpair" \
+  wait_for "both Pods of $NS_BETA/pair scheduled and addressed" \
+    "/api/v1/namespaces/$NS_BETA/pods?labelSelector=app%3Dpair" \
     '[.items[]? | select((.spec.nodeName // "") != "" and (.status.podIP // "") != "")] | length == 2'
 }
 

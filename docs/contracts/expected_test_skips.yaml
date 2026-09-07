@@ -82,7 +82,7 @@ declared:
     prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — the lines are CoreDNS's own, which every cluster prints on startup"
   - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_drop_a_selects_edge_once_a_real_watch_has_seen_the_label_change_that_took_it_away"
     category: external_tool_unavailable
-    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` installs the Service `pair` and the two bare Pods it selects; the label change is the harness's own merge patch"
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` installs the Service `pair` and the two bare Pods it selects in `ono-beta`; the label change is the harness's own merge patch"
   - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_verify_a_scale_by_watching_the_real_controller_converge"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` installs the Deployment `scaler` the test scales and watches converge"

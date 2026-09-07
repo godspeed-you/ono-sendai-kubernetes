@@ -1403,7 +1403,7 @@ fn should_drop_a_selects_edge_once_a_real_watch_has_seen_the_label_change_that_t
             &live,
             home,
             &format!(
-                "get k8s-relation {} --kind Service --namespace {ALPHA} --name pair \
+                "get k8s-relation {} --kind Service --namespace {BETA} --name pair \
                  | where relation == \"selects\" | to json",
                 as_admin(home)
             ),
@@ -1415,7 +1415,7 @@ fn should_drop_a_selects_edge_once_a_real_watch_has_seen_the_label_change_that_t
         names.sort();
         names
     };
-    let pod_b = format!("/api/v1/namespaces/{ALPHA}/pods/pair-b");
+    let pod_b = format!("/api/v1/namespaces/{BETA}/pods/pair-b");
     // The fixture as `scripts/cluster.sh` wrote it, restored first: a run that stopped between
     // the change and the restore below would otherwise leave the next run starting at step 3.
     live.patch(&pod_b, r#"{"metadata":{"labels":{"app":"pair"}}}"#);
@@ -1425,7 +1425,7 @@ fn should_drop_a_selects_edge_once_a_real_watch_has_seen_the_label_change_that_t
         &live,
         &home,
         &format!(
-            "get k8s-relation {} --kind Service --namespace {ALPHA} --name pair \
+            "get k8s-relation {} --kind Service --namespace {BETA} --name pair \
              | where relation == \"selects\" | to json",
             as_admin(&home)
         ),
@@ -1453,7 +1453,7 @@ fn should_drop_a_selects_edge_once_a_real_watch_has_seen_the_label_change_that_t
         &live,
         &home,
         &format!(
-            "get k8s-pod {} --namespace {ALPHA} | to json",
+            "get k8s-pod {} --namespace {BETA} | to json",
             as_admin(&home)
         ),
     )
@@ -1468,7 +1468,7 @@ fn should_drop_a_selects_edge_once_a_real_watch_has_seen_the_label_change_that_t
             &live,
             &home,
             &format!(
-                "get k8s-change {} --kind Pod --namespace {ALPHA} --max_changes {} | to json",
+                "get k8s-change {} --kind Pod --namespace {BETA} --max_changes {} | to json",
                 as_admin(&home),
                 held + 1
             ),
