@@ -393,7 +393,7 @@ fn shell(live: &Live, home: &Scratch, script: &str) -> Run {
     let root = home.path();
     let full = format!(
         "grant capability filesystem.read --plugin {PACKAGE} --scope 'paths={}/.kube/**' | count; \
-         load plugin {PACKAGE} --grant network.connect --grant clock.read --grant relation.write; \
+         load plugin {PACKAGE} --grant network.connect --grant provider.mutate --grant clock.read --grant relation.write; \
          {script}",
         root.join("home").display()
     );

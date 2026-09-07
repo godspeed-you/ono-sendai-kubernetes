@@ -99,7 +99,7 @@ note "installed at $HOME_DIR/plugins"
 # scope naming this operator's kubeconfig directory and nothing else. `relation.write` is never
 # granted by default (§35.5), which is why `near` is silent without it.
 GRANT="grant capability filesystem.read --plugin $PACKAGE --scope 'paths=$HOME_DIR/home/.kube/**' | count"
-LOAD="$GRANT; load plugin $PACKAGE --grant network.connect --grant clock.read --grant relation.write --grant secret.use --grant state.persist"
+LOAD="$GRANT; load plugin $PACKAGE --grant network.connect --grant provider.mutate --grant clock.read --grant relation.write --grant secret.use --grant state.persist"
 KUBE="--kubeconfig $HOME_DIR/home/.kube/config --context ono-admin"
 
 # --- §65's list, in its own order --------------------------------------------------------------
