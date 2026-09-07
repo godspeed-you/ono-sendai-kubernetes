@@ -307,7 +307,11 @@ impl IdentityEvidence {
     /// The decomposition is attached here rather than recomputed by a consumer, and only for the
     /// keys that carry an identifier some other system minted: an address is not a URI, and a
     /// scheme parsed out of one would be a shape nobody stated.
-    fn stated(
+    ///
+    /// Public so that an adapter (§33.8) can export what its ecosystem's objects state, with
+    /// the same pointer-cited evidence the built-in rules attach; the strength is the caller's
+    /// judgement, and [`Strength`] says what each word claims.
+    pub fn stated(
         subject: &Identity,
         key: &str,
         qualifier: Option<&str>,

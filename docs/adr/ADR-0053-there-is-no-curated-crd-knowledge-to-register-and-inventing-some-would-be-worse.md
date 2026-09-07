@@ -1,6 +1,6 @@
 # ADR-0053: There is no curated CRD knowledge to register, and inventing some would be worse
 
-- Status: accepted
+- Status: superseded by ADR-0062
 - Date: 2026-09-06
 - Spec refs: §13.5, §15.1, §15.4, §33.1, §33.5, §33.8, §55.2, §58.4, §66.2, §68; ADR-0010, ADR-0052
 - Decided by: agent (autonomous)

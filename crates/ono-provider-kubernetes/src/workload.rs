@@ -23,6 +23,10 @@
 //!   endpoint with no Pod behind it, and a cluster without the Gateway API installed are three
 //!   different silences, and none of them is filled in here.
 //!
+//! The Gateway API's own rules live in [`crate::adapter::gateway`], as the first member of
+//! §33.8's registry; [`Workload::gateway_edges`] and [`Workload::routed_from`] answer through
+//! it, so a route's edge is one decision wherever it is asked for.
+//!
 //! # Relation vocabulary
 //!
 //! One vocabulary, in [`crate::relationship`]. These relations — `owns`, `routes-to`,
@@ -34,6 +38,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as Json;
 
+use crate::adapter::{Adapter as _, Context, Registry, gateway::GatewayApi};
 use crate::object::{Identity, Object};
 use crate::relationship::{Edge, Evidence, Relation, Target, pod_spec_edges};
 
@@ -54,12 +59,6 @@ const POD_TEMPLATES: &[(&str, &str, &str)] = &[
 
 /// The well-known label by which an EndpointSlice names the Service it belongs to (§26.2).
 const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
-
-/// The API group the Gateway API is served under, when a cluster serves it at all (§27.3).
-const GATEWAY_GROUP: &str = "gateway.networking.k8s.io";
-
-/// The Gateway API versions whose field layout this adapter has actually seen (§27.3, §5.3).
-const KNOWN_GATEWAY_VERSIONS: [&str; 3] = ["v1alpha2", "v1beta1", "v1"];
 
 /// The outcome of evaluating a workload controller's selector (§23.3).
 ///
@@ -656,7 +655,9 @@ impl Workload {
             if router.gvk().group() == "networking.k8s.io" && router.gvk().kind() == "Ingress" {
                 stated.extend(Self::ingress_edges(router));
             }
-            stated.extend(Self::gateway_edges(router));
+            // Every registered adapter's routing edges (§33.8), not the Gateway API's alone: a
+            // router this provider learned about from an ecosystem answers here the same way.
+            stated.extend(Registry::builtin().relationships(router, &Context::default()));
             for edge in stated {
                 if edge.relation() != Relation::RoutesTo
                     || edge.target().kind() != "Service"
@@ -692,90 +693,17 @@ impl Workload {
     /// The Gateway API relationships an object states, when it is a Gateway API object at all
     /// (§27.3).
     ///
-    /// Nothing about this adapter is assumed to exist. A cluster without the Gateway API installed
-    /// simply never presents an object this function recognises, and every other relationship in
-    /// this module works unchanged — §27.3 forbids hard-coding its presence into the provider.
-    ///
-    /// A version this adapter has not seen yields no edges. The field names of a future version
-    /// are not known to mean what today's mean (§5.3), and the object stays fully available
-    /// through universal dynamic support (§15.1), which is where an unknown schema belongs.
+    /// Answered by the registry's Gateway API member (`crate::adapter::gateway`, §33.8), and
+    /// kept here as the entry the routing path uses. Nothing about that adapter is assumed to
+    /// exist: a cluster without the Gateway API installed simply never presents an object it
+    /// recognises, and a version it has not seen yields no edges — the object stays fully
+    /// available through universal dynamic support (§15.1, §5.3).
     #[must_use]
     pub fn gateway_edges(object: &Object) -> Vec<Edge> {
-        let gvk = object.gvk();
-        if gvk.group() != GATEWAY_GROUP || !KNOWN_GATEWAY_VERSIONS.contains(&gvk.version()) {
+        if !GatewayApi.supports(object.gvk()) {
             return Vec::new();
         }
-        let api_version = api_version_of(object);
-        let adapter = Evidence::Derived {
-            rule: format!("curated Gateway API adapter for {api_version}"),
-        };
-        let source = object.identity();
-        let namespace = object.namespace().map(str::to_owned);
-        let mut edges = Vec::new();
-
-        match gvk.kind() {
-            "Gateway" => {
-                if let Some(class) = object
-                    .field("/spec/gatewayClassName")
-                    .and_then(Json::as_str)
-                {
-                    edges.push(
-                        Edge::new(
-                            source,
-                            Relation::UsesGatewayClass,
-                            Target::new("GatewayClass", class).with_api_version(Some(&api_version)),
-                            Evidence::NativeField {
-                                path: "/spec/gatewayClassName".to_owned(),
-                                value: class.to_owned(),
-                            },
-                        )
-                        .with_supporting(vec![adapter]),
-                    );
-                }
-            }
-            "HTTPRoute" | "GRPCRoute" => {
-                if let Some(parents) = object.field("/spec/parentRefs").and_then(Json::as_array) {
-                    for (index, parent) in parents.iter().enumerate() {
-                        if let Some(edge) = reference_edge(
-                            &source,
-                            Relation::AttachesTo,
-                            parent,
-                            "Gateway",
-                            Some(&api_version),
-                            namespace.as_deref(),
-                            &format!("/spec/parentRefs/{index}"),
-                            vec![adapter.clone()],
-                        ) {
-                            edges.push(edge);
-                        }
-                    }
-                }
-                if let Some(rules) = object.field("/spec/rules").and_then(Json::as_array) {
-                    for (rule_index, rule) in rules.iter().enumerate() {
-                        let Some(backends) = rule.get("backendRefs").and_then(Json::as_array)
-                        else {
-                            continue;
-                        };
-                        for (backend_index, backend) in backends.iter().enumerate() {
-                            if let Some(edge) = reference_edge(
-                                &source,
-                                Relation::RoutesTo,
-                                backend,
-                                "Service",
-                                Some("v1"),
-                                namespace.as_deref(),
-                                &format!("/spec/rules/{rule_index}/backendRefs/{backend_index}"),
-                                vec![adapter.clone()],
-                            ) {
-                                edges.push(edge);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        edges
+        GatewayApi.relationships(object, &Context::default())
     }
 }
 
@@ -858,55 +786,8 @@ fn backend_edge(
     )
 }
 
-/// One Gateway API `*Ref`: a name, with kind, group and namespace defaulted the way the API
-/// defaults them.
-///
-/// The namespace default is the referring object's own, which is why it is passed in rather than
-/// assumed: a `parentRef` may name a Gateway in another namespace, and silently localising it
-/// would point the edge at a different Gateway that happens to share the name.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "each argument is a distinct fact the reference needs defaulted; bundling them into \
-              a struct used at two call sites would hide rather than clarify"
-)]
-fn reference_edge(
-    source: &Identity,
-    relation: Relation,
-    reference: &Json,
-    default_kind: &str,
-    default_api_version: Option<&str>,
-    default_namespace: Option<&str>,
-    pointer: &str,
-    supporting: Vec<Evidence>,
-) -> Option<Edge> {
-    let name = reference.get("name").and_then(Json::as_str)?;
-    let kind = reference
-        .get("kind")
-        .and_then(Json::as_str)
-        .unwrap_or(default_kind);
-    Some(
-        Edge::new(
-            source.clone(),
-            relation,
-            Target::new(kind, name)
-                .with_api_version(default_api_version)
-                .in_namespace(
-                    reference
-                        .get("namespace")
-                        .and_then(Json::as_str)
-                        .or(default_namespace),
-                ),
-            Evidence::NativeField {
-                path: format!("{pointer}/name"),
-                value: name.to_owned(),
-            },
-        )
-        .with_supporting(supporting),
-    )
-}
-
 /// The `apiVersion` string an object would carry, rebuilt from its GVK.
-fn api_version_of(object: &Object) -> String {
+pub(crate) fn api_version_of(object: &Object) -> String {
     let gvk = object.gvk();
     if gvk.group().is_empty() {
         gvk.version().to_owned()

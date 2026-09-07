@@ -307,7 +307,12 @@ pub(crate) fn stated_edges(object: &Object) -> Vec<Edge> {
     if is(object, "networking.k8s.io", "Ingress") {
         edges.extend(Workload::ingress_edges(object));
     }
-    edges.extend(Workload::gateway_edges(object));
+    edges.extend(
+        ono_provider_kubernetes::adapter::Registry::builtin().relationships(
+            object,
+            &ono_provider_kubernetes::adapter::Context::default(),
+        ),
+    );
     if is(object, "apps", "StatefulSet") {
         edges.extend(Workload::governing_service(object));
     }

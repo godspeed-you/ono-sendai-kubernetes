@@ -426,7 +426,7 @@ pub struct Place {
     uri: PlaceUri,
     gvk: Option<Gvk>,
     identity: Option<Identity>,
-    roles: &'static [SemanticRole],
+    roles: Vec<SemanticRole>,
 }
 
 impl Place {
@@ -437,7 +437,7 @@ impl Place {
             uri,
             gvk: None,
             identity: None,
-            roles: &[],
+            roles: Vec::new(),
         }
     }
 
@@ -594,7 +594,7 @@ impl Place {
     /// The generic roles this place also answers to (§36.2). Empty for a kind with no mapping.
     #[must_use]
     pub fn roles(&self) -> &[SemanticRole] {
-        self.roles
+        &self.roles
     }
 
     /// Whether the place carries a role.
@@ -682,12 +682,17 @@ impl fmt::Display for SemanticRole {
     }
 }
 
-/// The role overlay, as data (§36.2): group, kind, and the roles that kind also answers to.
+/// The role overlay for the built-in kinds, as data (§36.2): group, kind, and the roles that kind
+/// also answers to.
 ///
 /// A table rather than a rule, because there is no rule — the mapping is a curated judgement about
 /// each kind, and a heuristic over names would be the guessing §36.3 warns against. A kind absent
 /// from the table has no role: a wrong overlay is worse than none, since a cross-provider query
 /// would then act on it.
+///
+/// Built-in kinds only. An ecosystem's kinds — the Gateway API's, today — state their roles
+/// through §33.8's registry (`crate::adapter`), gated by the served versions their adapter has
+/// seen, and [`roles_of`] consults both.
 const ROLE_OVERLAY: &[(&str, &str, &[SemanticRole])] = &[
     ("", "Pod", &[SemanticRole::Workload]),
     ("apps", "Deployment", &[SemanticRole::Workload]),
@@ -701,16 +706,6 @@ const ROLE_OVERLAY: &[(&str, &str, &[SemanticRole])] = &[
     (
         "networking.k8s.io",
         "Ingress",
-        &[SemanticRole::NetworkEndpoint],
-    ),
-    (
-        "gateway.networking.k8s.io",
-        "Gateway",
-        &[SemanticRole::NetworkEndpoint],
-    ),
-    (
-        "gateway.networking.k8s.io",
-        "HTTPRoute",
         &[SemanticRole::NetworkEndpoint],
     ),
     ("", "Endpoints", &[SemanticRole::ServiceEndpoint]),
@@ -759,13 +754,17 @@ const ROLE_OVERLAY: &[(&str, &str, &[SemanticRole])] = &[
 ///
 /// Group and kind must both match. A `Widget` served by `acme.example.com` is not the `Widget` of
 /// some other group, and matching on kind alone is how an unrelated custom resource inherits an
-/// overlay that was never meant for it (§13.5).
+/// overlay that was never meant for it (§13.5). The built-in table answers first, then the
+/// registry's members for the kind's group — at this served version, so that a role cannot
+/// outlive the schema it was judged on (§5.3).
 #[must_use]
-pub fn roles_of(gvk: &Gvk) -> &'static [SemanticRole] {
-    ROLE_OVERLAY
+pub fn roles_of(gvk: &Gvk) -> Vec<SemanticRole> {
+    let mut roles: Vec<SemanticRole> = ROLE_OVERLAY
         .iter()
         .find(|(group, kind, _)| *group == gvk.group() && *kind == gvk.kind())
-        .map_or(&[], |(_, _, roles)| *roles)
+        .map_or_else(Vec::new, |(_, _, roles)| roles.to_vec());
+    roles.extend(crate::adapter::Registry::builtin().semantic_roles(gvk));
+    roles
 }
 
 /// A named relationship you can walk along with `follow` (§35.7).

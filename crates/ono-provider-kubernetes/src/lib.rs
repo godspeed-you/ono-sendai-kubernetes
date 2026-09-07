@@ -17,6 +17,7 @@
 //! evidence      what a Node states about the machine under it, for someone else to resolve
 //! events        best-effort observations, and everything they are not
 //! workload      curated controller, service and routing relationships
+//! adapter       curated ecosystem knowledge beside the record, keyed by group, kind and version
 //! condition     desired versus observed, cited from the fields it depends on
 //! redaction     Secret payloads, destroyed at the boundary rather than filtered
 //! place         resources as addresses, and what is near them
@@ -34,6 +35,7 @@
 //! causal        what `why` may say about a link, and the rung above which it cannot climb
 //! ```
 
+pub mod adapter;
 pub mod budget;
 pub mod causal;
 pub mod condition;
