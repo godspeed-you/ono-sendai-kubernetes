@@ -31,6 +31,9 @@
 //!
 //! **A path is possibility.** [`Claim::DependencyPathExists`] says influence *could* have
 //! travelled along edges `relationship.rs` already derived. Whether it did is not in the graph.
+//! The edges reach this module through a [`Walk`], which is bounded twice — in hops, which is
+//! the question, and in reads, which is the cost — and which visits every object once, so a
+//! cycle in the graph is a path that stops rather than one that never ends.
 //!
 //! **Kubernetes does assert some things, and they stay separable.** An ownerReference, an
 //! `observedGeneration` that has caught up, an Event's `regarding` — §23.4 permits exposing
@@ -42,13 +45,14 @@
 //! rung answers `insufficient evidence`, which the specification calls preferable to a plausible
 //! invented explanation.
 
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::condition::Condition;
-use crate::coverage::Coverage;
+use crate::coverage::{Coverage, Gap, Outcome, Scope};
 use crate::events::Event;
 use crate::object::{Identity, Object};
-use crate::relationship::{Edge, Evidence};
+use crate::relationship::{Edge, Evidence, Target};
 use crate::temporal::{ClockSource, Observation, Order, Undecidable};
 
 /// The strongest thing this provider may say about a link between two facts.
@@ -162,6 +166,9 @@ pub enum Unproven {
     NoPath,
     /// Kubernetes states nothing here; whatever is known was derived by this provider (§23.3).
     NotAsserted,
+    /// A selector this provider does not evaluate left part of the neighbourhood undetermined
+    /// (ADR-0007, §23.3), so a path through it can neither be reported nor ruled out.
+    NotEvaluated,
     /// Nothing was gathered at all (§40.5).
     NoEvidence,
 }
@@ -177,6 +184,10 @@ impl Unproven {
             Self::NotInThatOrder => "the observations are not in that order",
             Self::NoPath => "no relationship path connects them",
             Self::NotAsserted => "Kubernetes states no such link",
+            Self::NotEvaluated => {
+                "a selector this provider does not evaluate leaves part of the neighbourhood \
+                 undetermined"
+            }
             Self::NoEvidence => "nothing was gathered",
         }
     }
@@ -217,15 +228,19 @@ impl Support {
                 clock,
                 apart_millis,
             } => format!("{apart_millis}ms apart on {clock}"),
+            // Each hop names its evidence class beside it, because a path is only as strong as
+            // its weakest hop and a reader deciding how much to trust it has to be able to see
+            // which hop that is (Gate D, §23).
             Self::Path(edges) => {
                 let hops: Vec<String> = edges
                     .iter()
                     .map(|edge| {
                         format!(
-                            "{} {}/{}",
+                            "{} {}/{} [{}]",
                             edge.relation().as_str(),
                             edge.target().kind(),
-                            edge.target().name()
+                            edge.target().name(),
+                            edge.evidence().class()
                         )
                     })
                     .collect();
@@ -488,7 +503,16 @@ impl Why {
     ///
     /// The empty ones are kept on purpose: a refusal is evidence about the search, and an answer
     /// with them dropped looks like one where nobody looked (§4 invariant 13).
+    ///
+    /// A finding already made is not made twice. Its identity is the object, the claim and what
+    /// the claim rests on — which is how the record it becomes is keyed — and two Pod conditions
+    /// that each carry no `observedGeneration` are one fact about the object, not two. Counting
+    /// it twice would be the summation [`Self::strongest_claim`] refuses, arriving by another
+    /// door.
     pub fn add(&mut self, finding: Finding) {
+        if self.findings.contains(&finding) {
+            return;
+        }
         self.findings.push(finding);
     }
 
@@ -549,6 +573,397 @@ impl Why {
         parts.push(format!("{}: {}", strongest.as_str(), strongest.means()));
         parts.join("; ")
     }
+}
+
+// --- a bounded walk over the relationship graph (§40.3) -------------------------------------------
+
+/// How far a dependency walk may go, and how much it may read on the way (§40.3, §49.1, §50.1).
+///
+/// Two bounds rather than one, because they stop different things. **Hops** is the question —
+/// how many edges away from the subject a path may reach — and the caller sets it. **Reads** is
+/// the cost — how many objects at the far ends of those edges the walk may fetch to learn the
+/// next hop — and it is the bound §49.1 asks for: a walk that reads until the graph runs out is
+/// the load generator that section forbids. A walk stopped by the second says so as a coverage
+/// gap rather than by coming back shorter, which is §18.3's rule restated for a graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkBounds {
+    hops: usize,
+    reads: usize,
+}
+
+impl WalkBounds {
+    /// How many hops a walk follows when nobody says: the subject's own edges, and no further.
+    ///
+    /// One, because the subject's edges cost nothing beyond what answering about that object
+    /// already spends, and every further hop is a read of somebody else's object.
+    pub const DEFAULT_HOPS: usize = 1;
+
+    /// The most hops a walk may be asked for.
+    ///
+    /// Three reaches a Deployment from one of its Pods with a hop to spare, and matches the
+    /// default the shell's own `trace` stops at. A deeper question is answered by asking it of
+    /// the object the third hop reached, which keeps every answer's cost in proportion to what
+    /// was typed.
+    pub const MAX_HOPS: usize = 3;
+
+    /// How many far-end objects a walk may read when nobody says.
+    pub const DEFAULT_READS: usize = 32;
+
+    /// A walk of this many hops, under the default read bound.
+    ///
+    /// # Errors
+    ///
+    /// [`WalkError::TooDeep`] above [`Self::MAX_HOPS`]. Refused rather than clamped, because a
+    /// question silently answered for a shallower depth than it asked is a wrong answer that
+    /// looks right.
+    pub fn new(hops: usize) -> Result<Self, WalkError> {
+        if hops > Self::MAX_HOPS {
+            return Err(WalkError::TooDeep {
+                asked: hops,
+                allowed: Self::MAX_HOPS,
+            });
+        }
+        Ok(Self {
+            hops,
+            reads: Self::DEFAULT_READS,
+        })
+    }
+
+    /// The same walk, allowed this many far-end reads.
+    #[must_use]
+    pub fn with_reads(mut self, reads: usize) -> Self {
+        self.reads = reads;
+        self
+    }
+
+    /// How many hops the walk follows.
+    #[must_use]
+    pub fn hops(self) -> usize {
+        self.hops
+    }
+
+    /// How many far-end objects it may read.
+    #[must_use]
+    pub fn reads(self) -> usize {
+        self.reads
+    }
+}
+
+impl Default for WalkBounds {
+    fn default() -> Self {
+        Self {
+            hops: Self::DEFAULT_HOPS,
+            reads: Self::DEFAULT_READS,
+        }
+    }
+}
+
+/// Why a walk was refused before it began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkError {
+    /// More hops were asked for than [`WalkBounds::MAX_HOPS`] allows.
+    TooDeep {
+        /// What was asked for.
+        asked: usize,
+        /// The most that is allowed.
+        allowed: usize,
+    },
+}
+
+impl fmt::Display for WalkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self::TooDeep { asked, allowed } = self;
+        write!(
+            f,
+            "a dependency walk of {asked} hops was asked for, and at most {allowed} are followed"
+        )
+    }
+}
+
+impl std::error::Error for WalkError {}
+
+/// What the far end of an edge yielded when the walk asked about it.
+///
+/// The walk owns the traversal and nothing else: which edges an object has is decided by the
+/// same rules that answer `k8s-relation`, supplied by the caller, so that a path a user reads
+/// hop by hop and one they are shown whole cannot disagree.
+#[derive(Debug, Clone)]
+pub enum Expansion {
+    /// The object was read, and these are its edges, with whatever the derivation could not see.
+    Edges {
+        /// Every edge the object states or this provider derives about it.
+        edges: Vec<Edge>,
+        /// The scopes a derivation could not read (§21.4).
+        gaps: Vec<Gap>,
+        /// The selectors a derivation declined to evaluate, in its own words (ADR-0007).
+        unevaluated: Vec<String>,
+    },
+    /// It is not there (§21.4 `absent`): the edge that named it stands, and nothing lies beyond.
+    Absent,
+    /// It could not be read, and this is what became of the attempt (§21.4).
+    Unread(Gap),
+}
+
+/// The paths a bounded walk found from one object, and what it could not see (§40.3).
+///
+/// Every object is visited once, in a fixed order, and the walk stops at the hop bound and at
+/// the read bound. Four things follow, each pinned by a test rather than remembered:
+///
+/// - **a cycle is a path that stops.** A ReplicaSet owns the Pod the walk started from; the edge
+///   back to the subject is seen and not followed, and the walk ends;
+/// - **an object reached twice is reported once**, along the first path found, which is a
+///   shortest one because the walk is breadth-first;
+/// - **an edge Kubernetes asserts is reported as the assertion** at the first hop, not as a
+///   weaker path beside it — one fact, one finding, on the rung it earned;
+/// - **the read bound is a coverage gap.** The far ends it left unread are recorded as
+///   [`Outcome::NotQueried`] in their scopes, so a walk cut short is distinguishable from one
+///   that reached the edge of the graph (§4 invariant 13).
+#[derive(Debug, Clone)]
+pub struct Walk {
+    findings: Vec<Finding>,
+    gaps: Vec<Gap>,
+    unevaluated: Vec<String>,
+    reads: usize,
+    unexpanded: usize,
+    stopped_by_reads: bool,
+}
+
+impl Walk {
+    /// Walks outward from `subject` along `edges` and whatever `expand` learns beyond them.
+    ///
+    /// `edges` are the subject's own, already derived. `expand` is asked once per object the
+    /// walk decides to read, in a fixed order, and never for the subject or for an object
+    /// already reached.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `expand` fails with. A failure is the connection under every remaining read
+    /// breaking, which no walk continues past; a far end that merely could not be read is an
+    /// [`Expansion::Unread`] and the walk goes on.
+    pub fn explore<E>(
+        subject: &Identity,
+        bounds: WalkBounds,
+        edges: Vec<Edge>,
+        mut expand: impl FnMut(&Target) -> Result<Expansion, E>,
+    ) -> Result<Self, E> {
+        let mut walk = Self {
+            findings: Vec::new(),
+            gaps: Vec::new(),
+            unevaluated: Vec::new(),
+            reads: 0,
+            unexpanded: 0,
+            stopped_by_reads: false,
+        };
+        let mut seen = Seen::of(subject);
+        let mut frontier: VecDeque<(Target, Vec<Edge>)> = VecDeque::new();
+
+        // The first hop: every edge is a finding of its own, on the rung it earned. An edge
+        // whose far end is the subject itself is a fact about the object and not a path anywhere.
+        for edge in ordered(edges) {
+            if seen.is_subject(edge.target()) {
+                continue;
+            }
+            let finding = if edge.evidence().is_asserted_by_provider() {
+                Finding::asserted(subject.clone(), &edge)
+            } else {
+                Finding::dependency_path(subject.clone(), vec![edge.clone()])
+            };
+            walk.findings.push(finding);
+            if seen.mark(edge.target()) {
+                frontier.push_back((edge.target().clone(), vec![edge]));
+            }
+        }
+
+        // Every further hop costs a read, and is a path only where it reaches something new.
+        while let Some((target, path)) = frontier.pop_front() {
+            if path.len() >= bounds.hops {
+                walk.unexpanded += 1;
+                continue;
+            }
+            if walk.reads >= bounds.reads {
+                walk.stopped_by_reads = true;
+                walk.unexpanded += 1;
+                walk.not_queried(&target);
+                continue;
+            }
+            walk.reads += 1;
+            match expand(&target)? {
+                Expansion::Absent => {}
+                Expansion::Unread(gap) => walk.gaps.push(gap),
+                Expansion::Edges {
+                    edges,
+                    gaps,
+                    unevaluated,
+                } => {
+                    walk.gaps.extend(gaps);
+                    walk.unevaluated.extend(unevaluated);
+                    for edge in ordered(edges) {
+                        // The subject, or something already reached — a cycle, or a second
+                        // route to one object. Either way it is not a new place influence could
+                        // have reached, and following it is how a walk fails to end.
+                        if !seen.mark(edge.target()) {
+                            continue;
+                        }
+                        let mut extended = path.clone();
+                        extended.push(edge.clone());
+                        walk.findings
+                            .push(Finding::dependency_path(subject.clone(), extended.clone()));
+                        frontier.push_back((edge.target().clone(), extended));
+                    }
+                }
+            }
+        }
+        Ok(walk)
+    }
+
+    /// Records a far end the read bound left unread, in its own scope (§18.3, §21.4).
+    fn not_queried(&mut self, target: &Target) {
+        let scope = target
+            .namespace()
+            .map_or_else(Scope::cluster, Scope::in_namespace);
+        let gap = Gap::new(scope, Outcome::NotQueried);
+        if !self.gaps.contains(&gap) {
+            self.gaps.push(gap);
+        }
+    }
+
+    /// Every finding, in the order the walk made it: the first hop, then each further hop.
+    #[must_use]
+    pub fn findings(&self) -> &[Finding] {
+        &self.findings
+    }
+
+    /// The findings, for an answer that takes them.
+    #[must_use]
+    pub fn into_findings(self) -> Vec<Finding> {
+        self.findings
+    }
+
+    /// What the walk could not read: far ends past the read bound, and the scopes a derivation
+    /// along the way could not see (§21.4).
+    #[must_use]
+    pub fn gaps(&self) -> &[Gap] {
+        &self.gaps
+    }
+
+    /// The selectors a derivation along the way declined to evaluate (ADR-0007).
+    #[must_use]
+    pub fn unevaluated(&self) -> &[String] {
+        &self.unevaluated
+    }
+
+    /// How many far-end objects were read.
+    #[must_use]
+    pub fn reads(&self) -> usize {
+        self.reads
+    }
+
+    /// How many reached objects were not asked for their edges — at the hop bound, or past the
+    /// read bound.
+    #[must_use]
+    pub fn unexpanded(&self) -> usize {
+        self.unexpanded
+    }
+
+    /// Whether the read bound, rather than the hop bound or the graph, ended the walk.
+    #[must_use]
+    pub fn was_cut_short(&self) -> bool {
+        self.stopped_by_reads
+    }
+}
+
+/// The objects a walk has already reached, so that none is reached twice.
+///
+/// Keyed on the lifetime identity where a reference carries one, and on the locator where it
+/// does not (§16.1, §16.2): a `spec.nodeName` names a Node and no uid, and a walk that could
+/// not recognise that Node when an owner reference later named it with one would visit it twice.
+struct Seen {
+    subject_uid: Option<String>,
+    subject_locator: (Option<String>, String, Option<String>, String),
+    uids: BTreeSet<String>,
+    locators: BTreeSet<(Option<String>, String, Option<String>, String)>,
+}
+
+impl Seen {
+    fn of(subject: &Identity) -> Self {
+        let locator = (
+            Some(subject.gvk().group().to_owned()),
+            subject.gvk().kind().to_owned(),
+            subject.namespace().map(str::to_owned),
+            subject.name().to_owned(),
+        );
+        let mut seen = Self {
+            subject_uid: subject.uid().map(str::to_owned),
+            subject_locator: locator.clone(),
+            uids: BTreeSet::new(),
+            locators: BTreeSet::new(),
+        };
+        if let Some(uid) = &seen.subject_uid {
+            seen.uids.insert(uid.clone());
+        }
+        seen.locators.insert(locator);
+        seen
+    }
+
+    fn locator_of(target: &Target) -> (Option<String>, String, Option<String>, String) {
+        let group = target.api_version().map(|api_version| {
+            api_version
+                .split_once('/')
+                .map_or("", |(group, _)| group)
+                .to_owned()
+        });
+        (
+            group,
+            target.kind().to_owned(),
+            target.namespace().map(str::to_owned),
+            target.name().to_owned(),
+        )
+    }
+
+    /// Whether a reference names the object the walk started from.
+    fn is_subject(&self, target: &Target) -> bool {
+        match (target.uid(), &self.subject_uid) {
+            (Some(uid), Some(subject)) => uid == subject,
+            _ => Self::locator_of(target) == self.subject_locator,
+        }
+    }
+
+    /// Marks a reference as reached, and says whether it was new.
+    fn mark(&mut self, target: &Target) -> bool {
+        if self.is_subject(target) {
+            return false;
+        }
+        let locator = Self::locator_of(target);
+        let known_uid = target.uid().is_some_and(|uid| self.uids.contains(uid));
+        let known_locator = self.locators.contains(&locator);
+        if known_uid || known_locator {
+            return false;
+        }
+        if let Some(uid) = target.uid() {
+            self.uids.insert(uid.to_owned());
+        }
+        self.locators.insert(locator);
+        true
+    }
+}
+
+/// The edges in a fixed order, so that an answer is the same answer whatever order a listing
+/// came back in.
+fn ordered(mut edges: Vec<Edge>) -> Vec<Edge> {
+    edges.sort_by(|left, right| {
+        let key = |edge: &Edge| {
+            (
+                edge.relation().as_str(),
+                edge.target().kind().to_owned(),
+                edge.target().namespace().map(str::to_owned),
+                edge.target().name().to_owned(),
+                edge.evidence().class(),
+                edge.evidence().describe(),
+            )
+        };
+        key(left).cmp(&key(right))
+    });
+    edges
 }
 
 /// Which refusal a failed temporal comparison deserves.

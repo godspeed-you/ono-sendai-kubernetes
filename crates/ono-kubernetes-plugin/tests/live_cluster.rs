@@ -1127,6 +1127,110 @@ fn should_reach_the_pod_behind_a_service_through_the_endpointslice_the_cluster_w
 }
 
 #[test]
+fn should_walk_a_pod_to_its_deployment_as_a_dependency_path_over_objects_a_control_plane_produced()
+{
+    // §40.3, over a graph nobody wrote down: the ReplicaSet between the Pod and the Deployment
+    // was made by a controller, so the two-hop path `why` reports rests on two owner references
+    // the API server itself wrote. The first hop is reported as the assertion it is; the object
+    // two hops away is `DEPENDENCY_PATH_EXISTS` — influence was possible along that path, and
+    // nothing more — and the ReplicaSet owning the Pod back is a cycle the walk does not follow.
+    let live = match Live::open() {
+        Ok(live) => live,
+        Err(missing) => {
+            return announce_skip(
+                "should_walk_a_pod_to_its_deployment_as_a_dependency_path_over_objects_a_control_plane_produced",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let home = plugin_home(&live, "why-path");
+    let owns_pod = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-relation {} --kind Deployment --group apps --namespace {ALPHA} \
+             --name checkout | where relation == \"controls\" | to json",
+            as_admin(&home)
+        ),
+    )
+    .rows();
+    let replicaset = owns_pod[0]["target_name"]
+        .as_str()
+        .expect("the Deployment controls a ReplicaSet")
+        .to_owned();
+    let pods = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-relation {} --kind ReplicaSet --group apps --namespace {ALPHA} \
+             --name {replicaset} | where relation == \"controls\" | to json",
+            as_admin(&home)
+        ),
+    )
+    .rows();
+    let pod = pods[0]["target_name"]
+        .as_str()
+        .expect("the ReplicaSet controls a Pod")
+        .to_owned();
+
+    let findings = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-why {} --kind Pod --namespace {ALPHA} --name {pod} --depth 2 | to json",
+            as_admin(&home)
+        ),
+    )
+    .rows();
+    let paths: Vec<&str> = findings
+        .iter()
+        .filter(|finding| finding["claim"].as_str() == Some("DEPENDENCY_PATH_EXISTS"))
+        .filter_map(|finding| finding["support"].as_str())
+        .collect();
+    let expected = format!(
+        "controlled-by ReplicaSet/{replicaset} [owner-reference] -> controlled-by \
+         Deployment/checkout [owner-reference]"
+    );
+    assert!(
+        paths.contains(&expected.as_str()),
+        "the Deployment is two owner references away, both written by a controller: {paths:?}"
+    );
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.contains(&format!("Pod/{pod}"))),
+        "the ReplicaSet owns the Pod back, and the walk does not go round: {paths:?}"
+    );
+    let first_hop = findings
+        .iter()
+        .find(|finding| {
+            finding["claim"].as_str() == Some("ASSERTED_BY_KUBERNETES")
+                && finding["support"]
+                    .as_str()
+                    .is_some_and(|support| support.starts_with("controlled-by ReplicaSet/"))
+        })
+        .expect("the first hop is the assertion the API server makes, not a path");
+    assert_eq!(
+        first_hop["evidence_class"].as_str(),
+        Some("owner-reference"),
+        "got {first_hop}"
+    );
+    for finding in &findings {
+        assert_eq!(
+            finding["strongest_claim"].as_str(),
+            Some("ASSERTED_BY_KUBERNETES"),
+            "the ceiling of the whole answer is on every record, got {finding}"
+        );
+        assert_ne!(
+            finding["claim"].as_str(),
+            Some("CAUSED_BY"),
+            "there is no sixth rung"
+        );
+    }
+}
+
+#[test]
 fn should_observe_a_real_create_on_a_watch_of_a_kind_invented_for_the_test() {
     // Gate A's "watched", and §19.1's list-then-watch as one sequence. The watch is bounded with
     // `max_changes` at one more than the collection holds, so the run ends after the *create*

@@ -89,6 +89,9 @@ declared:
   - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_verify_an_image_change_by_watching_the_real_rollout_converge"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` installs the Deployment `rollout`; the image alternates between two pause tags the node image holds"
+  - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_walk_a_pod_to_its_deployment_as_a_dependency_path_over_objects_a_control_plane_produced"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — `scripts/cluster.sh up` waits for the ReplicaSet and the Pod the Deployment `checkout` produces"
   - id: "crates/ono-kubernetes-plugin/tests/live_cluster.rs::should_answer_a_live_read_on_a_machine_with_no_kubectl"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary, a kubeconfig named by `ONO_K8S_KUBECONFIG`, and `curl` — and a machine with no `kubectl` on `PATH`, which the test asserts rather than assumes (Gate M)"
@@ -133,5 +136,8 @@ declared:
     category: external_tool_unavailable
     prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
   - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_open_no_exit_from_a_kubernetes_place_without_the_relation_write_grant"
+    category: external_tool_unavailable
+    prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_refuse_trace_on_a_kubernetes_noun_by_name_rather_than_answer_an_empty_graph"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"

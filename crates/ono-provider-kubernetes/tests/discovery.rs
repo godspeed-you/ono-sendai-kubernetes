@@ -311,7 +311,7 @@ const AGGREGATED_GROUPS: &str = r#"{
        {"version":"v1","freshness":"Current",
         "resources":[
           {"resource":"deployments","singularResource":"deployment",
-           "responseKind":{"group":"apps","version":"v1","kind":"Deployment"},
+           "responseKind":{"group":"","version":"","kind":"Deployment"},
            "scope":"Namespaced","verbs":["get","list","watch","create","update","patch","delete"],
            "shortNames":["deploy"],
            "subresources":[{"subresource":"scale",
@@ -385,6 +385,17 @@ fn should_read_the_whole_served_inventory_from_one_aggregated_discovery_document
         .resource("apps/v1", "deployments")
         .expect("a named group's resources arrive in the same document");
     assert_eq!(deployments.kind(), "Deployment");
+    // A real API server writes `responseKind: {group: "", version: "", kind: "Deployment"}` in
+    // aggregated discovery — empty meaning "the group-version this is listed under". The
+    // identity is `apps/v1`, not the core group, so a query naming `--group apps` resolves it.
+    assert_eq!(
+        deployments.group(),
+        "apps",
+        "an empty responseKind group inherits the enclosing group, never the core one"
+    );
+    assert_eq!(deployments.version(), "v1");
+    // Its `scale` subresource genuinely names another group (`autoscaling/v1/Scale`), and that
+    // one is not empty, so it is kept rather than inherited — the fallback is for empty alone.
     assert_eq!(deployments.subresources(), ["scale"]);
     assert_eq!(discovery.preferred_version("apps"), Some("v1"));
     assert_eq!(discovery.preferred_version(""), Some("v1"));

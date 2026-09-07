@@ -113,35 +113,14 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
     }
 }
 
-/// Resolve the object, read it, and read the Events of its scope.
-pub(crate) struct Observed<'a> {
-    pub(crate) endpoint: &'a Endpoint,
-    pub(crate) selector: &'a Selector,
-    pub(crate) name: &'a str,
-    pub(crate) session: &'a mut Session,
-}
-
-impl Conversation for Observed<'_> {
-    type Answer = Option<(Subject, Reported)>;
-
-    fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
-        read(
-            self.session,
-            client,
-            self.endpoint,
-            self.selector,
-            self.name,
-        )
-    }
-}
-
 /// The same read, and then whatever the session's watch witnessed of the object's collection.
 ///
-/// A conversation of its own rather than a flag on [`Observed`], because the two answer different
-/// questions: `why.rs` asks what is *stated* about an object and reasons over that, while this
-/// target asks what is *known to have happened* to it — and only the second may take the watch
-/// into the answer. The stream is read after the conversation's I/O and before the session lock is
-/// released, which is the only point at which both the object and the session are in hand.
+/// `why.rs` reads the same object and the same Events through its own conversation, because the
+/// two answer different questions: `why` asks what is *stated* about an object and walks its
+/// relationships, while this target asks what is *known to have happened* to it — and only the
+/// second may take the watch into the answer. The stream is read after the conversation's I/O and
+/// before the session lock is released, which is the only point at which both the object and the
+/// session are in hand.
 pub(crate) struct Composed<'a> {
     pub(crate) endpoint: &'a Endpoint,
     pub(crate) selector: &'a Selector,

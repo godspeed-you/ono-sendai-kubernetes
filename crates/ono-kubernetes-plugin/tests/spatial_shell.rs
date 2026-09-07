@@ -1025,6 +1025,67 @@ fn should_find_workloads_by_role_across_the_kinds_that_carry_it() {
 }
 
 #[test]
+fn should_refuse_trace_on_a_kubernetes_noun_by_name_rather_than_answer_an_empty_graph() {
+    // The boundary of what this package can reach, pinned so that it cannot drift into an
+    // ambiguity. `trace` is the shell's relationship-exploration verb (core's v0.2 §22, v0.4
+    // §31) and it walks the kernel's relationship providers; a contributed target has no
+    // `trace` route in core — `ADR-0585 (core)` opened `near`, `follow` and `map` to contributed
+    // relations and nothing else — so the graph this package contributes is reached through
+    // `near`, `follow`, `get k8s-relation` and `k8s-why`'s dependency walk, and never through
+    // `trace`. What matters here is the *shape* of that limit: the shell refuses by name,
+    // pointing at what does exist, and never answers an empty graph that would read as "this
+    // Pod is related to nothing" (§4 invariant 13). Opening `trace` to contributed relations is
+    // a generic increment in core, not a Kubernetes one (ADR-0069).
+    let binary = match ono() {
+        Ok(binary) => binary,
+        Err(missing) => {
+            return announce_skip(
+                "should_refuse_trace_on_a_kubernetes_noun_by_name_rather_than_answer_an_empty_graph",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let cluster = RecordedCluster::start();
+    let home = plugin_home("trace");
+    let run = shell(
+        &binary,
+        &home,
+        &format!(
+            "{}; trace k8s-pod --host 127.0.0.1 --port {} --namespace shop --name checkout \
+             | to json",
+            load(SPATIAL_GRANTS),
+            cluster.port
+        ),
+    );
+    assert!(
+        !run.stdout.contains("ono.graph"),
+        "no graph value is answered for a verb that has no route to this package: {run:?}"
+    );
+    let said = format!("{}{}", run.stdout, run.stderr);
+    assert!(
+        said.contains("resolve.target_not_found") && said.contains("`trace` has no target"),
+        "the refusal names the verb and the missing binding rather than answering nothing: \
+         {run:?}"
+    );
+    assert!(
+        said.contains("help trace"),
+        "and points at the targets `trace` does have: {run:?}"
+    );
+
+    // The same object, the same grants, and the graph is there for the verbs that reach it.
+    let run = shell(
+        &binary,
+        &home,
+        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "near | to json"),
+    );
+    assert!(
+        !run.rows().is_empty(),
+        "what `trace` cannot reach, `near` does: {run:?}"
+    );
+}
+
+#[test]
 fn should_open_no_exit_from_a_kubernetes_place_without_the_relation_write_grant() {
     // §35.5 puts the capability filter before the merge, and §31.19 never grants
     // `relation.write` by default. So the same `near` that answered above answers with nothing

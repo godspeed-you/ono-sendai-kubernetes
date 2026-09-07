@@ -1687,6 +1687,28 @@ fn relations_document(path: &str) -> Option<Json> {
             "networking.k8s.io/v1",
             "Ingress",
         ),
+        // The far end of the Pod's owner reference, read by name when a dependency walk asks
+        // what lies beyond it (§40.3). It names its own owner, so a walk of two hops reaches
+        // the Deployment — and it owns the Pod back, so a walk that followed every edge would
+        // never end.
+        "/apis/apps/v1/namespaces/default/replicasets/api-7d9f" => standalone(
+            json!({
+                "metadata": {
+                    "name": "api-7d9f", "namespace": "default",
+                    "uid": "a1a1a1a1-0000-0000-0000-000000000001",
+                    "generation": 3,
+                    "creationTimestamp": "2026-08-20T08:00:00Z",
+                    "ownerReferences": [
+                        {"apiVersion": "apps/v1", "kind": "Deployment", "name": "api",
+                         "uid": "66666666-6666-6666-6666-666666666666", "controller": true},
+                    ],
+                },
+                "spec": {"replicas": 3, "selector": {"matchLabels": {"app": "api"}}},
+                "status": {"replicas": 3, "readyReplicas": 2, "observedGeneration": 3},
+            }),
+            "apps/v1",
+            "ReplicaSet",
+        ),
         "/apis/apps/v1/namespaces/default/deployments/api" => standalone(
             json!({
                 "metadata": {
@@ -2153,7 +2175,7 @@ fn aggregated_reply(head: &str, path: &str, cluster: &RecordedCluster) -> Option
                     "freshness": "Current",
                     "resources": [{
                         "resource": "deployments", "singularResource": "deployment",
-                        "responseKind": {"group": "apps", "version": "v1", "kind": "Deployment"},
+                        "responseKind": {"group": "", "version": "", "kind": "Deployment"},
                         "scope": "Namespaced",
                         "verbs": ["get", "list", "watch"], "shortNames": ["deploy"],
                     }],
@@ -4362,6 +4384,39 @@ async fn should_resolve_a_short_name_the_cluster_offers_once_the_group_settles_i
     let (events, result) = invocation.collect().await;
     assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
     assert_eq!(records(&events).len(), 2);
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_resolve_a_kind_in_a_named_group_over_aggregated_discovery() {
+    // §11.2 and §13.1 together: naming the group beside the kind narrows the search to one
+    // group-version, and against a server that answers aggregated discovery that group-version
+    // is already in the snapshot — so the search adopts it rather than re-reading it. The kind
+    // has to resolve either way; a cluster that serves `apps/v1` does not stop serving
+    // Deployments because the caller said which group they are in.
+    // Naming the group is also what keeps the fixture's stale `metrics.example` group out of the
+    // search: an unqualified search reaches it and honestly refuses over the gap (§34.2), which
+    // is a different test.
+    let cluster = RecordedCluster::offering_aggregated_discovery();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    for extra in [
+        vec![("kind", json!("Deployment")), ("group", json!("apps"))],
+        vec![
+            ("kind", json!("Deployment")),
+            ("group", json!("apps")),
+            ("version", json!("v1")),
+        ],
+    ] {
+        let (records, result) = asked(&plugin, "k8s-resource", &extra).await;
+        assert_eq!(
+            result.status,
+            InvokeStatus::Completed,
+            "{extra:?}: {:?}",
+            result.error
+        );
+        assert_eq!(records.len(), 1, "{extra:?}: one Deployment is served");
+        assert_eq!(text_of(&records[0], "kind").as_deref(), Some("Deployment"));
+    }
     plugin.shutdown(ShutdownReason::Unload).await;
 }
 
@@ -8166,6 +8221,192 @@ async fn should_answer_insufficient_evidence_where_nothing_rose_above_the_bottom
     assert_eq!(
         text_of(nothing, "strongest_claim").as_deref(),
         Some("CAUSALITY_NOT_PROVEN")
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_reach_the_dependency_path_rung_through_the_edges_the_relation_target_derives() {
+    // §40.3 and §23: the graph around the object is walked by the one rule set that answers
+    // `get k8s-relation`, so a path `why` reports is a path `k8s-relation` would show one hop at
+    // a time. The Pod's owner reference and its `spec.nodeName` are things the API server
+    // states and arrive as `ASSERTED_BY_KUBERNETES`; the Service whose selector it satisfies is
+    // something this provider derived, and that is `DEPENDENCY_PATH_EXISTS` — influence was
+    // possible along it, and nothing more. Neither rung is claimed twice for one fact.
+    let cluster = RecordedCluster::with_observations();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let records = completed(&plugin, "k8s-why", WHY_SCHEMA, &about_a_pod()).await;
+
+    let paths: Vec<&Arc<RecordValue>> = records
+        .iter()
+        .filter(|record| text_of(record, "claim").as_deref() == Some("DEPENDENCY_PATH_EXISTS"))
+        .collect();
+    assert!(
+        !paths.is_empty(),
+        "the rung is reachable: the Pod satisfies a Service's selector"
+    );
+    let selected = paths
+        .iter()
+        .find(|record| {
+            text_of(record, "support")
+                .unwrap_or_default()
+                .starts_with("selected-by Service/api")
+        })
+        .expect("the selector edge is a path, not an assertion (§23.3)");
+    assert_eq!(text_of(selected, "support_class").as_deref(), Some("path"));
+    assert!(
+        text_of(selected, "support")
+            .unwrap_or_default()
+            .contains("[selector]"),
+        "each hop names the evidence class it rests on: {selected:?}"
+    );
+    assert!(
+        text_of(selected, "claim_means")
+            .unwrap_or_default()
+            .contains("possible"),
+        "the word carries its own limit"
+    );
+    assert_eq!(text_of(selected, "not_proven"), None);
+    assert!(
+        !paths.iter().any(|record| {
+            text_of(record, "support")
+                .unwrap_or_default()
+                .contains("ReplicaSet/api-7d9f")
+        }),
+        "an owner reference is reported as the assertion it is, never also as a weaker path"
+    );
+    assert!(
+        records.iter().any(|record| {
+            text_of(record, "claim").as_deref() == Some("ASSERTED_BY_KUBERNETES")
+                && text_of(record, "support")
+                    .unwrap_or_default()
+                    .starts_with("controlled-by ReplicaSet/api-7d9f")
+        }),
+        "and the assertion is there"
+    );
+
+    // No two findings say the same thing: the identity of a finding is the object, the claim
+    // and what the claim rests on, and a duplicate would be one fact counted twice.
+    let mut seen = std::collections::BTreeSet::new();
+    for record in &records {
+        let key = (
+            text_of(record, "claim").unwrap_or_default(),
+            text_of(record, "support").unwrap_or_default(),
+        );
+        assert!(seen.insert(key.clone()), "a finding appears twice: {key:?}");
+    }
+    // One hop reads no far end: the walk's cost is what `k8s-relation` already spends.
+    let heads = cluster.heads();
+    assert!(
+        !heads
+            .iter()
+            .any(|head| head.contains("/replicasets/api-7d9f ")),
+        "the default depth reads nothing beyond the object's own edges: {heads:?}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_walk_two_hops_to_the_deployment_and_never_back_to_the_pod() {
+    // §40.3's shape over a real cycle: the ReplicaSet owns the Pod the walk started from, and
+    // the walk reads it once, reports the Deployment beyond it as a two-hop path with the
+    // evidence of both hops, and never follows the edge back. Every hop is a read `k8s-resource`
+    // would make and an edge `k8s-relation` would derive.
+    let cluster = RecordedCluster::with_observations();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let records = completed(
+        &plugin,
+        "k8s-why",
+        WHY_SCHEMA,
+        &[
+            ("kind", json!("Pod")),
+            ("name", json!("api-7d9f-abc")),
+            ("depth", json!(2)),
+        ],
+    )
+    .await;
+    let paths: Vec<String> = records
+        .iter()
+        .filter(|record| text_of(record, "claim").as_deref() == Some("DEPENDENCY_PATH_EXISTS"))
+        .filter_map(|record| text_of(record, "support"))
+        .collect();
+    assert!(
+        paths.contains(
+            &"controlled-by ReplicaSet/api-7d9f [owner-reference] -> controlled-by \
+              Deployment/api [owner-reference]"
+                .to_owned()
+        ),
+        "the Deployment is two owner references away, and both are on the path: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|path| path.contains("Pod/api-7d9f-abc")),
+        "the ReplicaSet owns the Pod back, and the walk does not go round: {paths:?}"
+    );
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.ends_with("Deployment/api [owner-reference]"))
+            .count(),
+        1,
+        "one object, one path, however many owner references reach it: {paths:?}"
+    );
+    let heads = cluster.heads();
+    assert_eq!(
+        heads
+            .iter()
+            .filter(|head| head
+                .starts_with("GET /apis/apps/v1/namespaces/default/replicasets/api-7d9f "))
+            .count(),
+        1,
+        "the far end is read once, by name, at its own endpoint (§17.1): {heads:?}"
+    );
+    for record in &records {
+        assert_eq!(
+            text_of(record, "strongest_claim").as_deref(),
+            Some("ASSERTED_BY_KUBERNETES"),
+            "a two-hop path does not out-rank what the API server states"
+        );
+    }
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_a_dependency_walk_deeper_than_the_bound_rather_than_clamp_it() {
+    // §49.1 and §50.1: the walk has a bound, and a question past it is refused by name rather
+    // than answered for a shallower depth — an answer that looks complete and is not would be
+    // worse than no answer.
+    let plugin = loaded_with_observations().await;
+    let (records, result) = asked(
+        &plugin,
+        "k8s-why",
+        &[
+            ("kind", json!("Pod")),
+            ("name", json!("api-7d9f-abc")),
+            ("depth", json!(4)),
+        ],
+    )
+    .await;
+    assert!(records.is_empty());
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let said = refusal(&result);
+    assert!(
+        said.contains("4 hops") && said.contains("at most 3"),
+        "the refusal names what was asked and what is allowed: {said}"
+    );
+    let (_, zero) = asked(
+        &plugin,
+        "k8s-why",
+        &[
+            ("kind", json!("Pod")),
+            ("name", json!("api-7d9f-abc")),
+            ("depth", json!(0)),
+        ],
+    )
+    .await;
+    assert_eq!(
+        zero.status,
+        InvokeStatus::Failed,
+        "no hop at all is not a walk"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

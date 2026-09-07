@@ -643,13 +643,25 @@ impl Builder {
                     subresources.sort();
                     subresources.dedup();
                     // §13.1 again: the kind comes from `responseKind` and the collection name
-                    // from `resource`, and the group and version of the *identity* are the ones
-                    // the server wrote beside the kind rather than the ones the envelope implies.
+                    // from `resource`. The group and version of the *identity* are the ones the
+                    // server wrote beside the kind — but an aggregated `responseKind` leaves them
+                    // *empty* to mean "the group-version this resource is listed under", which is
+                    // what a real API server writes for `apps/v1`'s Deployment (its `responseKind`
+                    // is `{group: "", version: "", kind: "Deployment"}`). Empty is that default,
+                    // not the core group: falling back to the enclosing `name`/`version` keeps the
+                    // core group's genuinely-empty group empty (its enclosing name is empty too)
+                    // and gives `apps` back to a Deployment the envelope, not the field, placed
+                    // there. The client-go discovery aggregator resolves it the same way.
+                    let identity_group = if raw.response_kind.group.is_empty() {
+                        name.clone()
+                    } else {
+                        raw.response_kind.group.clone()
+                    };
                     entry.insert(
                         raw.resource.clone(),
                         Resource {
                             gvk: Gvk::new(
-                                raw.response_kind.group.clone(),
+                                identity_group,
                                 if raw.response_kind.version.is_empty() {
                                     version.version.clone()
                                 } else {

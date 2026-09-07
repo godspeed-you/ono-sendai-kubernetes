@@ -188,43 +188,84 @@ impl Conversation for Related<'_> {
                 "This is a defect in the Kubernetes provider, not in the cluster.",
             )
         })?;
-        let mut derived = Derived {
-            edges: Vec::new(),
-            unevaluated: Vec::new(),
-            coverage: ono_provider_kubernetes::coverage::Coverage::complete(scope.clone()),
-            source: guarded,
-            freshness,
-            sources: Vec::new(),
-            listings: BTreeMap::new(),
-        };
-        // §34.2's second sentence: the failed group/version is reported separately, beside the
-        // gaps the derivations record for themselves.
-        for gap in unread {
-            derived.coverage.record(gap);
-        }
-        stated(&mut derived);
-        two_sided(
+        Ok(Some(derive(
             session,
             client,
             self.endpoint,
             &served,
             &scope,
-            &mut derived,
-        )?;
-        Ok(Some(derived))
+            guarded,
+            freshness,
+            unread,
+            Listings::new(),
+        )?))
     }
 }
 
+/// Every edge of one object, by the rules this provider has and no others (§23 to §32).
+///
+/// The one place a relationship is decided, so that `get k8s-relation`, a `near` in the shell
+/// and the dependency walk `k8s-why` makes all say the same thing about the same object: the
+/// edges it states about itself, then the ones that need a second reading — each of which is
+/// asked for through `listings`, so that a caller deriving the edges of several objects in one
+/// invocation reads each collection once (§17.6).
+///
+/// # Errors
+///
+/// A transport failure, or an object that could not be taken across the redaction boundary. A
+/// collection a rule could not read is a gap on the answer rather than an error.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one fact of the read, and a struct of them would be built at every call site from exactly these"
+)]
+pub(crate) fn derive<S: ByteStream>(
+    session: &mut Session,
+    client: &mut Client<S>,
+    endpoint: &Endpoint,
+    served: &Discovery,
+    scope: &Scope,
+    source: Guarded,
+    freshness: Freshness,
+    unread: Vec<Gap>,
+    listings: Listings,
+) -> Result<Derived, WireError> {
+    let mut derived = Derived {
+        edges: Vec::new(),
+        unevaluated: Vec::new(),
+        coverage: ono_provider_kubernetes::coverage::Coverage::complete(scope.clone()),
+        source,
+        freshness,
+        sources: Vec::new(),
+        listings,
+    };
+    // §34.2's second sentence: the failed group/version is reported separately, beside the
+    // gaps the derivations record for themselves.
+    for gap in unread {
+        derived.coverage.record(gap);
+    }
+    stated(&mut derived);
+    two_sided(session, client, endpoint, served, scope, &mut derived)?;
+    Ok(derived)
+}
+
+/// Every collection one invocation read, by collection, scope and the selector it was narrowed
+/// by, so a second rule — or a second object — wanting the same one reads it once (§17.6,
+/// ADR-0058).
+///
+/// `None` is a read that came back short: the rule that first wanted it recorded the gap, and
+/// the next one must not ask the API server again for a listing it would refuse again.
+pub(crate) type Listings = BTreeMap<(String, String, Option<String>), Option<Vec<Object>>>;
+
 /// What one object's relationships came to, and what the derivation could not see.
-struct Derived {
-    edges: Vec<Edge>,
+pub(crate) struct Derived {
+    pub(crate) edges: Vec<Edge>,
     /// The selectors a rule declined to evaluate, in the words of the field that stopped it.
     ///
     /// Beside the coverage rather than inside it, because [`Gap`] says which *scope* did not
     /// answer and this is a scope that answered in full and a selector this provider does not
     /// evaluate (ADR-0007). Both end the invocation; only one of them is about the cluster.
-    unevaluated: Vec<String>,
-    coverage: ono_provider_kubernetes::coverage::Coverage,
+    pub(crate) unevaluated: Vec<String>,
+    pub(crate) coverage: ono_provider_kubernetes::coverage::Coverage,
     source: Guarded,
     freshness: Freshness,
     /// Every *second* read a derivation drew on, in the order it was made (§23.6).
@@ -235,12 +276,8 @@ struct Derived {
     /// *every* source fact, and because Appendix C.2 shows each source's `resourceVersion` on the
     /// edge it produced.
     sources: Vec<SourceRead>,
-    /// Every collection this invocation read, by collection, scope and the selector it was
-    /// narrowed by, so a second rule wanting the same one reads it once (§17.6, ADR-0058).
-    ///
-    /// `None` is a read that came back short: the rule that first wanted it recorded the gap,
-    /// and the next one must not ask the API server again for a listing it would refuse again.
-    listings: BTreeMap<(String, String, Option<String>), Option<Vec<Object>>>,
+    /// The collections this invocation has read so far, for the next object's derivation.
+    pub(crate) listings: Listings,
 }
 
 /// One collection a derivation read, and what it was worth.

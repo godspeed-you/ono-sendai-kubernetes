@@ -777,9 +777,11 @@ targets:
         doc: "One object, read at its own endpoint rather than filtered out of the collection. A different request with different permissions (specification section 17.1)."
   # What may be said about the state one object is in (§40). Options are the object's, plus
   # `within_ms` — how far apart two observations on one clock may be and still be reported as
-  # correlated. The strongest thing a record carries is one of five claims, none of which says that
-  # one thing brought about another, and `strongest_claim` travels on every record so that a reader
-  # who sees one finding still sees the ceiling. §40.5's `insufficient evidence` is an answer.
+  # correlated — and `depth`, how many hops the dependency walk follows along the edges
+  # `k8s-relation` derives (§40.3). The strongest thing a record carries is one of five claims,
+  # none of which says that one thing brought about another, and `strongest_claim` travels on
+  # every record so that a reader who sees one finding still sees the ceiling. §40.5's
+  # `insufficient evidence` is an answer.
   - name: k8s-why
     schema: io.github.godspeed-you.kubernetes.why/1
     summary: >-
@@ -826,6 +828,9 @@ targets:
       - name: within_ms
         type: int
         doc: "How close in time two observations must be before they are considered together. Never a claim that one caused the other (specification section 40)."
+      - name: depth
+        type: int
+        doc: "How many relationship hops the dependency walk follows from the object: 1 is its own edges, and at most 3, each further hop reading the objects the last one reached. A path is influence that was possible, never a cause (specification section 40.3)."
   # The structured observations an object's controllers wrote about it (§37.1). Options are the
   # object's. One record per condition, because a Deployment can be `Available=True` on its old
   # replicas while `Progressing=False` because the new ones never came up. `observedGeneration`

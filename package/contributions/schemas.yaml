@@ -5032,7 +5032,9 @@ schemas:
         doc: >-
           What was actually read to make the claim. A claim without its support is an opinion, and
           Gate D's rule for relationships applies here for the same reason: an answer a user
-          cannot check is one they have to trust.
+          cannot check is one they have to trust. For a path, every hop with the evidence class
+          it rests on — `selected-by Service/api [selector] -> routed-from Ingress/public
+          [native-field]` — because a path is as strong as its weakest hop.
       not_proven:
         type: string
         nullable: true
@@ -5040,9 +5042,10 @@ schemas:
           Why a finding established nothing, where it established nothing: different clocks wrote
           the two timestamps, a timestamp could not be read, the two are further apart than the
           window asked about, they are not in that order, no relationship path connects them,
-          Kubernetes states no such link, or nothing was gathered. A refusal that names its reason
-          is actionable where a bare "unknown" sends the reader back to guessing (§40.5). Null
-          where the finding established something.
+          Kubernetes states no such link, a selector this provider does not evaluate leaves part
+          of the neighbourhood undetermined, or nothing was gathered. A refusal that names its
+          reason is actionable where a bare "unknown" sends the reader back to guessing (§40.5).
+          Null where the finding established something.
       clock:
         type: string
         nullable: true

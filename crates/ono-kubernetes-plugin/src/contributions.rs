@@ -709,6 +709,14 @@ impl Target {
                      together. Never a claim that one caused the other \
                      (specification section 40).",
                 ));
+                options.push(Parameter::new(
+                    "depth",
+                    "int",
+                    "How many relationship hops the dependency walk follows from the object: 1 \
+                     is its own edges, and at most 3, each further hop reading the objects the \
+                     last one reached. A path is influence that was possible, never a cause \
+                     (specification section 40.3).",
+                ));
             }
             Reads::Plan => {
                 options.extend_from_slice(SCOPE);
