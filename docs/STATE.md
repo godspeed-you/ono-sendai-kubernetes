@@ -29,8 +29,8 @@ the last two that were not, reach a reader through `changes.rs` and `query.rs`.
 | Specification | `docs/architecture/kubernetes-provider.md` — canonical here, immutable, checksummed |
 | Domain layer | `crates/ono-provider-kubernetes`, twenty-four modules, no host and no cluster |
 | Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations, audit, spatial |
-| Contributions | 47 targets, 2 commands, 48 schemas, 60 relation shapes, **zero verbs of this package's own** |
-| Tests | 946 across the workspace, all green; 22 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
+| Contributions | 47 targets, 2 commands, 48 schemas, 64 relation shapes, **zero verbs of this package's own** |
+| Tests | 1055 across the workspace, all green; 27 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
 | Live proof | 14 tests in `live_cluster.rs` against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine. Thirteen of them announce a skip without one; the fourteenth is a static source scan that never does |
 | Transport | HTTP/1.1 over a `rustls` session over the host's brokered `network.connect` |
 | Conformance level reached | **none claimed.** §0.1 binds a claim to the gates; see `docs/coverage.md` for the requirement-by-requirement map |
@@ -222,34 +222,48 @@ plain HTTP. What it establishes is that the route exists and the contracts hold 
 
 ## In progress
 
-Nothing. The audit of 2026-09-06 and the coverage re-derivation of 2026-09-07 both closed
-completely: all five unmet `MUST`s that audit found are met, and every gap that map named as
-closable is closed. **All fourteen acceptance gates of §62 are met**, with the live half run
-against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`.
+Nothing. The follow-up completion pass of 2026-09-07 closed the whole of the previous gap list bar
+the one item that is a reserved conditional capability rather than a gap. **All fourteen acceptance
+gates of §62 are met**, and the live suite — now 17 tests — was run against `kind` at v1.35.8,
+v1.36.4 and v1.37.0 on a machine with no `kubectl`, and `scripts/demo.sh` was driven end to end at
+v1.37.0. The workspace is **1055 tests, all green**.
+
+### The follow-up completion pass (2026-09-07)
+
+Nine generic deficiencies were fixed in Ono core, because each was a boundary an external-system
+provider needed and none carries a Kubernetes concept — `ADR-0591 (core)` through
+`ADR-0599 (core)`: load-time schema-reference validation, the provider error taxonomy
+(`provider.inconclusive`, `provider.authentication_failed`, `provider.authorization_denied`,
+`provider.rate_limited`), host-resolved `~` in a path scope, the `provider.mutate` capability
+family, the provider-action contract, semantic roles on a place, a contributed place's `up`, the
+handshake-only-target report, and the remote-session assessment. The provider's pinned core
+revision moved to `e207b9a` and every manifest and the CI matrix moved with it.
+
+Twelve provider-local decisions, ADR-0055 through ADR-0067, took the matching `SHOULD`s: credential
+lifecycle and refresh, `KUBECONFIG` merge, the server path prefix, the relationship index and
+selector pushdown, watch-capability negotiation, mutation convergence through the watch, schema
+freshness, the semantic adapter registry with the Gateway API as its first member, TLS 1.2, the
+verified peer-certificate fingerprint, spatial `up` to the cluster root, the `provider.mutate`
+migration with the action contract, and the error-code migration.
 
 ### What is left, and why each is left
 
-Four things, none of them a `MUST` that is unmet, and each with a reason rather than a backlog
-position. They are the gap list in [`coverage.md`](coverage.md), in the same order.
+Two things, each a reservation with a reason rather than a backlog position, and both in
+[`coverage.md`](coverage.md)'s "What is left":
 
-1. **Credential refresh (§8.3).** §8.2 and §8.3 are met — a managed cloud's kubeconfig connects,
-   under a `process.exec` grant the operator makes deliberately (ADR-0054) — except that a
-   credential is fetched once per endpoint resolution. One that expires mid-invocation produces the
-   API server's `401` rather than a second run of the helper, which §8.3 makes a `SHOULD`. Doing it
-   properly means a credential outliving the resolution that fetched it, and the session is keyed
-   on what the operator configured (ADR-0021): a cached credential is the first thing that would
-   want to be keyed on something else. **This is the next task.**
-2. **No relationship index and no query plan (§50.4, §17.6).** Both are `SHOULD`s or `MAY`s whose
-   `MUST`s hold vacuously. Server-side selectors now exist but no *derivation* uses one, because a
-   rule's selector is not the caller's.
-3. **§60.3 has no test, and roles reach no object record.** A Service's selection changing under a
-   watch is the one canonical scenario untested, and it is where watch and relationships would have
-   to compose. `ROLE_OVERLAY` reaches a user only on an edge, so §53.3's `find place --role
-   workload` has nothing to match.
-4. **§15.4's Tier 3 ecosystems, behind the registry ADR-0053 declined to build.** Not built because
-   it governs curated CRD knowledge and this provider curates none; inventing an ecosystem's
-   semantics would be a claim about what somebody else's controller means by its fields. The
-   decision expires when a maintainer with that expertise contributes one.
+1. **The three remote sessions (§42.3–§42.5).** Exec, attach and port-forward stay refusals that
+   name what is missing (ADR-0018). `ADR-0599 (core)` records the assessment: a provider
+   remote-session capability must integrate with core's v0.8 terminal-ownership and job-control
+   contract, which is specified and not yet implemented, and building it now would either invent
+   that contract (forbidden by §0.4) or bypass terminal ownership (forbidden by v0.8 §14.1). This
+   is a conditional non-capability in §42's own "if supported" terms — the exact missing generic
+   pieces are named in the ADR — not unfinished code. It becomes an implementation when core's v0.8
+   lands.
+2. **§15.4's Tier 3 ecosystems.** This provider curates no ecosystem's semantics, because a wrong
+   claim about another controller's fields is the fabrication §4 forbids (ADR-0053). §33.8's
+   registry now exists (ADR-0062, Gateway API as its first member), so the reservation is "no
+   member yet" rather than "no mechanism"; it expires when a maintainer with that expertise
+   contributes an adapter.
 
 ## The transport decision, and what it costs
 
@@ -273,6 +287,18 @@ both halves:
 [ADR-0002](adr/ADR-0002-the-package-is-a-native-process-and-owns-its-http.md).
 
 ## Found, not yet filed
+
+**The 2026-09-07 completion pass closed most of what stood here.** The following findings below
+are now resolved and are kept struck-through-in-prose for the record rather than deleted, because
+a finding list that silently loses its entries teaches a later reader nothing: the `~/.kube/config`
+real-host boundary (`ADR-0593 (core)`); the missing `provider.mutate` capability family
+(`ADR-0594 (core)`, ADR-0066); the error registry having no code for an empty-not-absence answer
+or a credential refusal (`ADR-0592 (core)`, ADR-0067); a target's schema id unchecked at load
+(`ADR-0591 (core)`); the plugin partial-coverage path having no end-to-end test (now driven through
+the boundary); TLS 1.2 disabled (ADR-0063); a kubeconfig `server` path prefix refused (ADR-0057);
+the peer certificate modelled and not obtained (ADR-0064); and the `KUBECONFIG` single-file limit
+(ADR-0056). The two that remain open below are `current-context` as a default (a deliberate choice,
+§7.4) and the `docs/contracts/`/`MAINTAINERS.md` questions, which are process rather than code.
 
 - **A package cannot read `~/.kube/config` through a real host.** The supervisor sets a package's
   `HOME` to its sandbox working directory (`sandbox.rs`), and the host matches a `filesystem.read`
@@ -922,7 +948,7 @@ workflow's three legs, the README's compatibility row and `scripts/cluster.sh`'s
 claim. A sibling pins the core revision CI builds the shell from against *every* manifest, after a
 bump that touched only the workspace left two revisions of `ono-kuang-protocol` in one graph.
 
-Counts, so the next re-derivation has something to disagree with: 946 tests, 47 targets, 2
+Counts, so the next re-derivation has something to disagree with: 1055 tests, 47 targets, 2
 commands, 48 schemas, 24 of 24 domain modules imported, 22 declared skips, 54 ADRs, 31 sections
 implemented and 35 partial, 22 of 22 invariants, **14 of 14 gates**.
 

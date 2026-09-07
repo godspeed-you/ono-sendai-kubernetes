@@ -8,41 +8,49 @@ This is not [`STATE.md`](STATE.md). The board says what the last session did and
 should do. This document says where the whole surface stands, including the parts nobody has
 started, and it is the only place the untouched sections are counted.
 
-Read as a **snapshot taken on 2026-09-07**, against `implementation` at `0cf2bfb`, re-derived from
-the tree. The previous reading was taken at `ee181b2`, and every gap it named as closable has been
-closed; the two things it could not have found were found by *running* the provider rather than by
-testing it, and both were real. Every verdict below was checked against the code; **the line
-numbers in the citations were not re-derived**, so read a `file.rs:NNN` as "near here" and the
-symbol name beside it as the thing that matters — a review found several of them drifted by a line
-or two and one pointing at unrelated code, which is what a stale line number does within an hour of
-being written. A coverage map that does not date itself is the second way to be dishonest about
-state; one that implies a precision it does not have is the third.
+Read as a **snapshot taken on 2026-09-07**, against `implementation` at `3bcc594`, re-derived from
+the tree after a follow-up pass that closed the whole of the previous snapshot's gap list except
+the one it could not: remote exec/attach/port-forward, which is now a documented conditional
+non-capability rather than an open gap (`ADR-0599 (core)`, ADR-0018). That pass reached into Ono
+core for nine generic changes an external-system provider needed — `ADR-0591 (core)` through
+`ADR-0599 (core)` — and took twelve provider-local decisions, ADR-0055 through ADR-0067. The
+citations name a module, a test or an ADR; **line numbers are deliberately not cited**, because a
+`file.rs:NNN` drifts within an hour of being written and the symbol name beside it is what a
+reader should follow.
 
 ---
 
 ## The headline
 
-Of the **70 numbered sections**, 31 are implemented, 35 are partial, **none is built-and-unreachable
-and none is without code**, and 4 are advisory with nothing to implement. Of the **7 appendices**,
-2 are implemented, 4 are partial and 1 is advisory. Of the **22 core invariants of §4**, all 22
-hold.
+Of the **70 numbered sections**, the follow-up pass moved a further band from partial to
+implemented as their standing `SHOULD`s were taken — credential refresh (§8), `KUBECONFIG` merge
+(§7), relationship indexes and query-grouping (§17, §50), the selector-change watch scenario
+(§60), semantic roles reaching a record (§36, §53), the adapter registry (§33), TLS 1.2 and the
+verified peer-certificate fingerprint (§8.4, §10), watch-capability negotiation (§19), schema
+freshness (§12), spatial `up` and the cluster root (§35), and the provider mutation boundary with
+its action contract (§43, §51). All **22 core invariants of §4** hold, and all **fourteen
+acceptance gates of §62** are met with the live half run at all three declared versions.
 
-*Partial* is the largest class and stays that way on purpose: it means every `MUST` of the section
-is met and a `SHOULD` or a `MAY` in it is not, and the classification rule below refuses to round
-that up. A section moves to *implemented* only when there is nothing left in it to take.
+*Partial* still means every `MUST` of the section is met and some `SHOULD` or `MAY` in it is not,
+and the classification refuses to round that up; the largest remaining partials are §42's three
+remote sessions (a conditional non-capability, `ADR-0599 (core)`) and §15.4's Tier 3 ecosystems
+(reserved: this provider curates no ecosystem, ADR-0053), each with a reason below rather than a
+backlog position.
 
 `ono-kubernetes-plugin` imports **twenty-four of the twenty-four** domain modules. There is no
 module a user cannot cause to run.
 
-The package contributes **47 targets, 2 commands, 48 schemas and 60 relation shapes**, and still
-**zero verbs of its own** — `set` and `remove` are core's, and
+The package contributes **47 targets, 2 commands, 48 schemas and 64 relation shapes** — four more
+than the previous snapshot, the `in-cluster` edges that make the provider instance the top of the
+spatial hierarchy `up` climbs (ADR-0065) — and still **zero verbs of its own**: `set` and `remove`
+are core's, and
 `should_write_only_through_a_verb_that_says_so` asserts the list is exactly those two. A third
 handler, `spatial-relations`, is registered at handshake and is not a command: it answers the
 host's request for the relation shapes the manifest declares (`ADR-0585 (core)`), and it is
 counted in the sixty rather than in the two.
 
-**946 tests across the workspace, all green**, over 84,000 lines of source. Twenty-two announce a
-skip when there is no cluster and no `ono` binary, and every one of them is declared in
+**1055 tests across the workspace, all green.** Twenty-seven announce a skip when there is no
+cluster and no `ono` binary, and every one of them is declared in
 [`docs/contracts/expected_test_skips.yaml`](contracts/expected_test_skips.yaml), checked in both
 directions by the gate.
 
@@ -246,62 +254,75 @@ run at all three declared versions on 2026-09-07.
 
 ---
 
-## The largest gaps, in the order they block each other
+## What is left, and why each is left
 
-Eleven of the twelve entries the previous snapshot carried are gone, and the list is short enough
-now that its shape has changed: what is left is not capability but *breadth* — sections whose
-`MUST`s are met and whose `SHOULD`s and `MAY`s reach further than the tree does.
+The follow-up pass closed every capability gap the previous snapshot carried. What remains is not
+capability but two deliberate reservations and the ordinary breadth of a large surface.
 
-**1. Credential refresh, and the session question behind it.** §8.2 and §8.3 are met — a managed
-cloud's kubeconfig connects under a `process.exec` grant — except for §8.3's `SHOULD` that refresh
-"occur before a request when the credential is expired". A credential is fetched once per endpoint
-resolution, so one expiring mid-invocation produces the API server's `401` rather than a second
-run of the helper. Doing it properly means the credential outliving the resolution that fetched
-it, which is a session question rather than a credential one, and the session is deliberately
-keyed on what the *operator configured* (ADR-0021) — a cached credential is the first thing that
-would want to be keyed on something else.
+**1. The three remote sessions — a conditional non-capability.** §42.3 to §42.5 — exec, attach,
+port-forward — remain refusals that name what is missing
+([ADR-0018](adr/ADR-0018-a-remote-session-that-cannot-be-opened-is-a-refusal-that-names-what-is-missing.md)),
+and `CapabilityStatement` reports them `unavailable in any session`. This is now backed by a core
+decision rather than only by this package's reading of its own limits: `ADR-0599 (core)` records
+the assessment that a provider remote-session capability must integrate with the terminal-ownership
+and job-control contract of core's v0.8 specification, which is specified and **not yet
+implemented**. Building it now would either invent that contract (forbidden by §0.4) or bypass
+terminal ownership (forbidden by v0.8 §14.1). The transport is buildable; the contract it must plug
+into is not, so this is a reserved conditional capability in the specification's own "if supported"
+terms, not unfinished code. Logs, which need none of it, are retrieved and followed.
 
-**2. No relationship index, and no query plan.** §50.4's indexes over active caches are a `MAY`
-and are not built, so its two `MUST`s — track sync state, never present an incomplete index as a
-complete graph — hold vacuously. §17.6's query planner is a `SHOULD`: breadth is *bounded* by
-`max_scopes` and estimated before the first request — `search()` builds an `Estimate` from the
-resolved search space and asks `Budget::admits` before anything is sent. What §17.6 also offers and
-this provider does not take is the *grouping* half: a planner that batches requests by GVR and
-namespace. `relations.rs` still lists a namespace's Pods per invocation to evaluate one
-selector; server-side label selectors now exist (ADR-0049) but no derivation uses one, because a
-selector evaluated server-side would have to be the rule's own selector rather than the caller's.
-
-**3. §60.3 has no test, and roles reach no record.** §60.3 — a Service's selection changing under
-a watch — is the one canonical scenario with no test, and it is the one place watch and
-relationships would have to compose. Separately, `ROLE_OVERLAY` reaches a user only as
-`target_roles` on an edge, so §53.3's `find place --role workload` has nothing to match on an
-object record.
-
-**4. §15.4's Tier 3 ecosystems, and the adapter registry that would carry them.**
+**2. §15.4's Tier 3 ecosystems — reserved, and now with a mechanism waiting for a member.**
 [ADR-0053](adr/ADR-0053-there-is-no-curated-crd-knowledge-to-register-and-inventing-some-would-be-worse.md)
-records why §33.8's registry is not built: it governs curated *CRD* knowledge and this provider
-curates none, so an empty registry would be a mechanism with no members and inventing an
-ecosystem's semantics would be a claim about what somebody else's controller means by its fields.
-The decision is testable in the direction that matters —
-`should_key_curated_semantics_rather_than_branch_on_a_kind_in_query_code` allows exactly one kind
-branch across fourteen handler modules and names it. What would make the decision expire is a
-maintainer with that expertise contributing an ecosystem, which is the path §66.4 asks the review
-policy to value.
+records why this provider curates no ecosystem's semantics: a wrong claim about what somebody
+else's controller means by its fields is exactly the fabrication §4's invariants exist against.
+What changed is that §33.8's registry now **exists** — the semantic adapter registry of ADR-0062,
+keyed by group/kind/served-version, with the Gateway API as its first genuine member — so a
+maintainer with ecosystem expertise adds an adapter beside the dynamically discovered
+representation without touching the parser, the query handlers or the core shell (§66.2). The
+reservation is now "no member yet", not "no mechanism".
 
-**5. `KUBECONFIG` merge.** A conditional `SHOULD` whose `MUST` is discharged: the deviation is
-surfaced in `get k8s-cluster`'s capability report rather than only written down, so an operator
-whose `KUBECONFIG` names several files is told that only the first was read.
+**Everything the previous snapshot listed as a gap is closed:**
 
-**6. The three remote sessions.** §42.3 to §42.5 — exec, attach, port-forward — are implemented as
-refusals that name what is missing, which
-[ADR-0018](adr/ADR-0018-a-remote-session-that-cannot-be-opened-is-a-refusal-that-names-what-is-missing.md) argues is the honest
-state for a package with no terminal capability to ask for. `CapabilityStatement` reports them
-`unavailable in any session`.
-
-**Two thin spots that are not gaps but are worth writing down.** Gate I's navigation leg is proven
-at library level only — no protocol-level test walks a Secret edge and asserts nothing on the wire.
-And three listing routes buffer whole collections rather than streaming: `events.rs` because
-§38.6's `Found::NotObserved` is a question about the whole bag, `spatial.rs` because a neighbour
-inventory is decided against every candidate, and `changes.rs` because §19.4 step 1's acquisition
-is the baseline a watch reports against. Each says so where it does it, and each stays bounded by
-`max_pages` and the query budget.
+- **credential refresh (§8.3)** — a credential now outlives the resolution that fetched it in a
+  store keyed on the source and never on the token, refreshed before expiry, with a bounded 401
+  retry and one helper run under concurrency (ADR-0055);
+- **`KUBECONFIG` merge (§7.2)** — a colon-separated list is merged the way client-go merges one,
+  first-wins, relative paths resolved against the defining file (ADR-0056);
+- **the real-host `~/.kube/config` boundary** — the host resolves a leading `~/` against the
+  operator's home before the canonical scope check, so the manifest's declared scope reaches the
+  operator's kubeconfig with no absolute path (`ADR-0593 (core)`), proven by the demo connecting
+  with no `--kubeconfig`;
+- **relationship indexes and query grouping (§17.6, §50.4)** — a rule's own selector is pushed to
+  the API server as upstream spells it, an index over a live watch answers a relation with
+  `origin=cache`, and the request counts dropped, all with sync/freshness/coverage on every index
+  (ADR-0058);
+- **§60.3** — the selector-change scenario is a canonical test, deterministic and live, through the
+  provider boundary with a watch held open (ADR-0058);
+- **semantic roles (§36, §53.3)** — every kind declares its roles, `find place --role workload`
+  finds them across kinds, and each place record carries them beside its native type
+  (`ADR-0596 (core)`, ADR-0065);
+- **the adapter registry (§33.8, §58.4)** — built, with the Gateway API refactored into it
+  (ADR-0062);
+- **the mutation security boundary (§51)** — `provider.mutate` (`ADR-0594 (core)`) is a capability
+  distinct from `network.connect`, so a read-only grant cannot write and a mutation grant cannot
+  reach a cluster; the two mutating commands declare both and an action contract
+  (`ADR-0595 (core)`, ADR-0066);
+- **the error taxonomy (§48)** — `provider.inconclusive` and `provider.authentication_failed`
+  (`ADR-0592 (core)`) replaced the misleading codes on the empty-not-absence and credential
+  refusals (ADR-0067);
+- **load-time schema validation** — a contribution naming an uncontributed schema is refused at
+  load rather than at the first record (`ADR-0591 (core)`);
+- **TLS 1.2 (§8.4)** — spoken beside 1.3 without weakening verification (ADR-0063);
+- **the server path prefix** — carried on every request (ADR-0057);
+- **the verified peer-certificate fingerprint (§10.2)** — the fingerprint is the SPKI hash of the
+  certificate the TLS session actually verified (ADR-0064);
+- **CRD schema freshness (§12.4, §33.2)** — a schema is current only while the `/openapi/v3` root
+  hash vouches for it, invalidated by window, hash and CRD watch (ADR-0061);
+- **watch bookmarks and streaming lists (§19.2)** — negotiated from what the server answered, with
+  a clean list-then-watch fallback (ADR-0059);
+- **spatial `up` (§35.6)** — climbs the declared containment from Pod to namespace to the provider
+  instance, with ownership kept as a separate relation (ADR-0065, `ADR-0597 (core)`);
+- **the two protocol-level thin spots** — the Secret navigation leg is now proven over the whole
+  stream at the provider boundary (`should_navigate_a_pod_to_its_secret_without_a_payload_anywhere_in_the_stream`),
+  and the partial-coverage failure path is driven through the boundary
+  (`should_keep_the_records_of_a_page_that_crossed_when_a_later_page_is_refused`).
