@@ -489,6 +489,14 @@ pub struct WatchStream {
     /// gaps, so that a trim in this period can never be mistaken for the trim in the last one.
     trim_gap: Option<usize>,
     discarded: usize,
+    /// Objects this session wrote to and has not yet seen the event for (§20.5, §16.5 core).
+    ///
+    /// A write this session made reaches a live stream's cache through the event the API
+    /// server sends for it, not through anything this session puts there. Until that event
+    /// arrives the cached object is known-stale, so it is neither served nor reported absent:
+    /// the key is quarantined, [`Self::find`] answers nothing for it, and the next event that
+    /// names it — the write's own, or a later one — lifts the quarantine.
+    pending_writes: BTreeSet<CacheKey>,
     /// The initial events of a streaming list, held until the bookmark that ends them (§19.2).
     ///
     /// `Some` only between [`Self::begin_streaming_list`] and the terminating bookmark. The
@@ -517,6 +525,7 @@ impl WatchStream {
             trim_gap: None,
             discarded: 0,
             staging: None,
+            pending_writes: BTreeSet::new(),
         }
     }
 
@@ -549,6 +558,8 @@ impl WatchStream {
     /// arrive.
     pub fn listed(&mut self, objects: Vec<Object>, collection_version: ResourceVersion) {
         self.staging = None;
+        // A fresh acquisition observed every object, the written ones included.
+        self.pending_writes.clear();
         self.close_open_segment();
 
         let has_open_gap = self.gaps.last().is_some_and(|gap| !gap.is_closed());
@@ -715,10 +726,44 @@ impl WatchStream {
     }
 
     /// One cached object by the namespace and name a human looks it up with.
+    ///
+    /// Nothing for an object this session wrote to and has not yet seen the event for: what the
+    /// cache holds is known-stale, and §16.5 of the generic contract forbids serving that as
+    /// confirmed. Whether that nothing may be read as absence is [`Self::is_pending_write`]'s
+    /// question, and the answer is no.
     #[must_use]
     pub fn find(&self, namespace: Option<&str>, name: &str) -> Option<&Object> {
-        self.objects
-            .get(&(namespace.map(str::to_owned), name.to_owned()))
+        let key = (namespace.map(str::to_owned), name.to_owned());
+        if self.pending_writes.contains(&key) {
+            return None;
+        }
+        self.objects.get(&key)
+    }
+
+    /// Quarantines an object this session has just written to, until its event arrives (§20.5).
+    ///
+    /// Only a live stream quarantines: it is the one that will receive the event. Returns
+    /// whether it did, so a caller can drop a cache that no stream is keeping true instead.
+    pub fn written(&mut self, namespace: Option<&str>, name: &str) -> bool {
+        if !self.absence_is_conclusive() {
+            return false;
+        }
+        self.pending_writes
+            .insert((namespace.map(str::to_owned), name.to_owned()));
+        true
+    }
+
+    /// Whether this object was written by this session and its event has not arrived (§20.5).
+    #[must_use]
+    pub fn is_pending_write(&self, namespace: Option<&str>, name: &str) -> bool {
+        self.pending_writes
+            .contains(&(namespace.map(str::to_owned), name.to_owned()))
+    }
+
+    /// How many written objects are awaiting their event.
+    #[must_use]
+    pub fn pending_writes(&self) -> usize {
+        self.pending_writes.len()
     }
 
     /// Every cached object.
@@ -812,6 +857,9 @@ impl WatchStream {
             self.checkpoint = Some(ResourceVersion::new(version));
         }
         let key = key_of(&object);
+        // The event for a written object is the observation that ends its quarantine, whatever
+        // it says: the object as the server now holds it, or its departure.
+        self.pending_writes.remove(&key);
         match class {
             ChangeClass::Added | ChangeClass::Modified => {
                 self.objects.insert(key, object);

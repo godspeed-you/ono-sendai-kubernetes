@@ -993,7 +993,7 @@ fn should_stop_answering_from_a_cache_the_write_it_made_moved_past() {
         Lookup::Cached(_)
     ));
 
-    session.mutated(&pods(), Some("shop"));
+    session.mutated(&pods(), Some("shop"), "checkout-1");
 
     assert_eq!(
         session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
@@ -1016,7 +1016,7 @@ fn should_not_read_an_invalidated_cache_as_an_absence_or_fill_it_with_what_the_w
         .synchronise(&pods(), &shop(), one_pod_listing())
         .expect("a complete listing seeds the cache");
 
-    session.mutated(&pods(), Some("shop"));
+    session.mutated(&pods(), Some("shop"), "checkout-1");
 
     let after = session.lookup(&pods(), &shop(), Some("shop"), "checkout-1");
     assert!(
@@ -1047,7 +1047,7 @@ fn should_leave_a_cache_the_write_could_not_have_reached_alone() {
             .expect("a complete listing seeds the cache");
     }
 
-    session.mutated(&pods(), Some("shop"));
+    session.mutated(&pods(), Some("shop"), "one");
 
     assert_eq!(
         session.lookup(&pods(), &shop(), Some("shop"), "one"),
@@ -1094,7 +1094,7 @@ fn should_re_read_what_the_cluster_serves_after_it_wrote_a_custom_resource_defin
     session.cache_discovery_document("/apis", APIS_WITH_WIDGETS);
     assert_eq!(session.discovery_document("/apis"), Some(APIS_WITH_WIDGETS));
 
-    session.mutated(&crds(), None);
+    session.mutated(&crds(), None, "widgets.example.io");
 
     assert_eq!(
         session.discovery_document("/apis"),
@@ -1111,7 +1111,7 @@ fn should_not_invalidate_what_the_cluster_serves_for_an_ordinary_write() {
     let mut session = session("dev");
     session.cache_discovery_document("/apis", APIS_WITH_WIDGETS);
 
-    session.mutated(&pods(), Some("shop"));
+    session.mutated(&pods(), Some("shop"), "checkout-1");
 
     assert_eq!(session.discovery_document("/apis"), Some(APIS_WITH_WIDGETS));
 }
@@ -1458,11 +1458,11 @@ fn should_refuse_to_answer_from_an_index_whose_stream_is_not_live() {
         state.describe()
     );
 
-    session.mutated(&pods(), Some("shop"));
+    session.mutated(&pods(), Some("shop"), "checkout-1");
     assert_eq!(
         session.indexed(&pods(), &shop()).err(),
         Some(IndexMiss::NotWatched),
-        "a write drops the cache and the index with it (§20.5)"
+        "a write drops a cache no stream is keeping true, and the index with it (§20.5)"
     );
 }
 
@@ -1592,4 +1592,65 @@ fn should_remember_a_refused_capability_until_the_cluster_is_replaced() {
         !session.is_refused(Capability::StreamingLists),
         "a refusal was the previous cluster's, and the new one is asked afresh"
     );
+}
+
+// --- §20.5 on a live stream: the written object is quarantined, the rest stays true (ADR-0060) --
+
+#[test]
+fn should_quarantine_only_the_written_object_of_a_live_cache_until_its_event_arrives() {
+    // §20.5 and §16.5 of the generic contract, on a cache a live watch is keeping true. The event
+    // the API server sends for the write is the refresh, and it reaches a live stream on its
+    // own — so the stream is kept and the one object is quarantined: served neither as itself
+    // nor as absent until its event arrives, while its neighbours go on being answered. The
+    // index over the collection declines to answer meanwhile, because a selector evaluated over a
+    // cache with a hole in it would answer a subset that looks whole (§50.4).
+    use ono_provider_kubernetes::index::Unusable;
+    use ono_provider_kubernetes::session::IndexMiss;
+
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), two_pod_listing())
+        .expect("a complete listing seeds the cache");
+
+    session.mutated(&pods(), Some("shop"), "checkout-1");
+
+    assert_eq!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::NotWatched,
+        "the written object is neither served stale nor reported absent"
+    );
+    assert!(
+        matches!(
+            session.lookup(&pods(), &shop(), Some("shop"), "worker-1"),
+            Lookup::Cached(_)
+        ),
+        "its neighbour is still an observation the live stream keeps true"
+    );
+    assert_eq!(
+        session.watched().len(),
+        1,
+        "the stream is kept, because the event for the write is coming on it"
+    );
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::Unusable(Unusable::PendingWrite))
+    );
+
+    let observed = frame(
+        "MODIFIED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-1","namespace":"shop","uid":"uid-1","resourceVersion":"18020","labels":{"app":"checkout"}}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), observed.as_bytes())
+        .expect("the frame decodes");
+
+    let Lookup::Cached(read) = session.lookup(&pods(), &shop(), Some("shop"), "checkout-1") else {
+        panic!("the write's own event lifts the quarantine");
+    };
+    assert_eq!(
+        read.freshness().resource_version(),
+        Some("18020"),
+        "and what is served is what the server sent, never what the write asked for"
+    );
+    assert!(session.indexed(&pods(), &shop()).is_ok());
 }

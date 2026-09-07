@@ -1506,6 +1506,167 @@ fn should_drop_a_selects_edge_once_a_real_watch_has_seen_the_label_change_that_t
 }
 
 #[test]
+fn should_verify_a_scale_by_watching_the_real_controller_converge() {
+    // §46.3's first worked example against a real control plane: `set k8s-resource --replicas`
+    // is accepted by the API server (forced with a reason, because `curl` wrote the fixture and
+    // owns the field — §44.4's explicit choice, made here by the test), the Deployment controller observes the generation and
+    // brings the replica counts to the requested number, and the verification says so because
+    // it watched that happen — not because the write was accepted (Gate G, §20.4). ADR-0060.
+    let live = match Live::open() {
+        Ok(live) => live,
+        Err(missing) => {
+            return announce_skip(
+                "should_verify_a_scale_by_watching_the_real_controller_converge",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let home = plugin_home(&live, "scale");
+    // Whatever an earlier run left, the change below is a change: alternate between two and one.
+    let current = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-deployment {} --namespace {ALPHA} --name scaler | to json",
+            as_admin(&home)
+        ),
+    )
+    .only();
+    let wanted = if current["desired_replicas"].as_i64() == Some(2) {
+        1
+    } else {
+        2
+    };
+    let outcome = shell(
+        &live,
+        &home,
+        &format!(
+            "set k8s-resource {} --kind Deployment --namespace {ALPHA} --name scaler \
+             --replicas {wanted} --dry_run false \
+             --force_because 'the fixture was written by curl, which owns the field' | to json",
+            as_admin(&home)
+        ),
+    )
+    .only();
+    assert_eq!(
+        outcome["acceptance"].as_str(),
+        Some("persisted"),
+        "got {outcome}"
+    );
+    assert_eq!(
+        outcome["verdict"].as_str(),
+        Some("confirmed"),
+        "the watch observed the controller converge, got {outcome}"
+    );
+    assert_eq!(
+        outcome["reconciliation"]["verified_convergence"].as_bool(),
+        Some(true),
+        "and convergence was verified by the Deployment rule rather than assumed, got {outcome}"
+    );
+    let detail = outcome["verification_detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a verification detail, got {outcome}"));
+    assert!(
+        detail.contains("confirmed") && detail.contains("status converged"),
+        "got `{detail}`"
+    );
+    let settled = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-deployment {} --namespace {ALPHA} --name scaler | to json",
+            as_admin(&home)
+        ),
+    )
+    .only();
+    assert_eq!(
+        settled["desired_replicas"].as_i64(),
+        Some(wanted),
+        "got {settled}"
+    );
+    assert_eq!(
+        settled["available_replicas"].as_i64(),
+        Some(wanted),
+        "and the controller brought the replicas to it, got {settled}"
+    );
+}
+
+#[test]
+fn should_verify_an_image_change_by_watching_the_real_rollout_converge() {
+    // §46.3's second worked example: the pod template changes, the controller makes a new
+    // ReplicaSet, its Pods become ready and the old one scales down. The verdict rests on the
+    // Deployment's own status as the watch delivered it, and on nothing this provider assumed
+    // about what an accepted write would go on to do (Gate G). ADR-0060.
+    let live = match Live::open() {
+        Ok(live) => live,
+        Err(missing) => {
+            return announce_skip(
+                "should_verify_an_image_change_by_watching_the_real_rollout_converge",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let home = plugin_home(&live, "rollout");
+    // The template's image is read through the dynamic projection, which carries the whole
+    // `spec`; the curated Deployment record summarises status and does not repeat the template.
+    let template_image = |home: &Scratch| -> String {
+        shell(
+            &live,
+            home,
+            &format!(
+                "get k8s-resource {} --kind Deployment --namespace {ALPHA} --name rollout \
+                 | to json",
+                as_admin(home)
+            ),
+        )
+        .only()["spec"]["template"]["spec"]["containers"][0]["image"]
+            .as_str()
+            .expect("the template names an image")
+            .to_owned()
+    };
+    // Two tags of an image, so the rollout is a real rollout: whichever one is running, the
+    // other is the change.
+    let image = if template_image(&home) == "registry.k8s.io/pause:3.9" {
+        "registry.k8s.io/pause:3.10"
+    } else {
+        "registry.k8s.io/pause:3.9"
+    };
+    let outcome = shell(
+        &live,
+        &home,
+        &format!(
+            "set k8s-resource {} --kind Deployment --namespace {ALPHA} --name rollout \
+             --image pause={image} --dry_run false \
+             --force_because 'the fixture was written by curl, which owns the field' | to json",
+            as_admin(&home)
+        ),
+    )
+    .only();
+    assert_eq!(
+        outcome["acceptance"].as_str(),
+        Some("persisted"),
+        "got {outcome}"
+    );
+    assert_eq!(
+        outcome["verdict"].as_str(),
+        Some("confirmed"),
+        "the watch observed the rollout converge, got {outcome}"
+    );
+    assert_eq!(
+        outcome["reconciliation"]["verified_convergence"].as_bool(),
+        Some(true),
+        "got {outcome}"
+    );
+    assert_eq!(
+        template_image(&home),
+        image,
+        "the template carries the new image"
+    );
+}
+
+#[test]
 fn should_answer_a_live_read_on_a_machine_with_no_kubectl() {
     // Gate M (§62.13): "core conformance works on a machine where `kubectl` is absent". Asserted
     // rather than assumed — the test looks for the binary on `PATH` itself and fails the run when

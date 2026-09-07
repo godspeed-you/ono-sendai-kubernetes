@@ -279,6 +279,9 @@ pub enum Unusable {
     NotSynced(SyncState),
     /// The cache holds more objects than [`INDEX_CAPACITY`], so nothing was indexed.
     OverCapacity,
+    /// This session wrote to an object of the collection and has not seen its event yet, so
+    /// the cache is missing an object it will hold again in a moment (§20.5).
+    PendingWrite,
 }
 
 impl fmt::Display for Unusable {
@@ -286,6 +289,10 @@ impl fmt::Display for Unusable {
         match self {
             Self::NotSynced(state) => write!(f, "the watch behind the index is {state}"),
             Self::OverCapacity => f.write_str("the cache holds more objects than the index bound"),
+            Self::PendingWrite => f.write_str(
+                "an object of the collection was written by this session and its event has not \
+                 arrived",
+            ),
         }
     }
 }
@@ -515,11 +522,18 @@ impl RelationshipIndex {
 
     /// The observable state of this index over a stream in `sync_state` (§30.5 core, §50.4).
     #[must_use]
-    pub fn state(&self, sync_state: SyncState, gap_free: bool) -> IndexState {
+    pub fn state(
+        &self,
+        sync_state: SyncState,
+        gap_free: bool,
+        pending_writes: usize,
+    ) -> IndexState {
         let unusable = if self.over_capacity {
             Some(Unusable::OverCapacity)
         } else if sync_state != SyncState::Live {
             Some(Unusable::NotSynced(sync_state))
+        } else if pending_writes > 0 {
+            Some(Unusable::PendingWrite)
         } else {
             None
         };

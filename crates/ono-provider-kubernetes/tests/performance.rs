@@ -936,7 +936,7 @@ fn should_declare_an_index_over_a_cache_past_its_bound_unusable_rather_than_answ
         0,
         "nothing is kept past the bound, not a prefix"
     );
-    let state = index.state(SyncState::Live, true);
+    let state = index.state(SyncState::Live, true, 0);
     assert!(!state.usable());
     assert_eq!(state.capacity(), 1_000);
     assert!(
@@ -957,7 +957,7 @@ fn should_declare_an_index_over_a_cache_past_its_bound_unusable_rather_than_answ
     within.rebuild(objects.iter().take(1_000));
     assert!(!within.is_over_capacity());
     assert_eq!(within.len(), 1_000);
-    assert!(within.state(SyncState::Live, true).usable());
+    assert!(within.state(SyncState::Live, true, 0).usable());
     println!(
         "index bound: {INDEX_CAPACITY} objects by default; {} postings for 1 000 Pods here",
         within.len()

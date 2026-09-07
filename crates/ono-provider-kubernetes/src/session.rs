@@ -349,6 +349,7 @@ impl Indexed<'_> {
         self.watched.index.state(
             self.watched.stream.state(),
             self.watched.stream.is_gap_free(),
+            self.watched.stream.pending_writes(),
         )
     }
 
@@ -923,7 +924,14 @@ impl<C: Clock> Session<C> {
     /// That is §33.2's "CRD added" and "CRD deleted" observed at the one place a provider can be
     /// certain of them, and it marks the discovery documents stale rather than dropping them, so
     /// that the refreshed ones can still be compared against what they replace.
-    pub fn mutated(&mut self, gvr: &Gvr, namespace: Option<&str>) -> Invalidation {
+    ///
+    /// **A live stream keeps its cache and quarantines the one object** (ADR-0060). The event
+    /// the API server sends for the write is the refresh §20.5 asks for, and it reaches a live
+    /// stream on its own; dropping that stream would discard every other object it was keeping
+    /// true and silently restart the view that was reading it. Until the event arrives the
+    /// written object is served neither as itself nor as absent — [`Self::lookup`] answers
+    /// [`Lookup::NotWatched`] for it — and the index over the collection declines to answer.
+    pub fn mutated(&mut self, gvr: &Gvr, namespace: Option<&str>, name: &str) -> Invalidation {
         let collections: Vec<(Gvr, Scope)> = self
             .watches
             .keys()
@@ -931,7 +939,19 @@ impl<C: Clock> Session<C> {
             .cloned()
             .collect();
         for key in &collections {
-            self.watches.remove(key);
+            let quarantined = self
+                .watches
+                .get_mut(key)
+                .is_some_and(|watched| watched.stream.written(namespace, name));
+            if quarantined {
+                if let Some(watched) = self.watches.get_mut(key) {
+                    watched
+                        .index
+                        .remove(&(namespace.map(str::to_owned), name.to_owned()));
+                }
+            } else {
+                self.watches.remove(key);
+            }
         }
         let serves = defines_resources(gvr);
         if serves {
@@ -1238,9 +1258,11 @@ impl<C: Clock> Session<C> {
         let Some(watched) = self.watches.get(&(gvr.clone(), scope.clone())) else {
             return Err(IndexMiss::NotWatched);
         };
-        let state = watched
-            .index
-            .state(watched.stream.state(), watched.stream.is_gap_free());
+        let state = watched.index.state(
+            watched.stream.state(),
+            watched.stream.is_gap_free(),
+            watched.stream.pending_writes(),
+        );
         if let Some(reason) = state.unusable() {
             return Err(IndexMiss::Unusable(reason));
         }
@@ -1267,9 +1289,11 @@ impl<C: Clock> Session<C> {
         self.watches
             .get(&(gvr.clone(), scope.clone()))
             .map(|watched| {
-                watched
-                    .index
-                    .state(watched.stream.state(), watched.stream.is_gap_free())
+                watched.index.state(
+                    watched.stream.state(),
+                    watched.stream.is_gap_free(),
+                    watched.stream.pending_writes(),
+                )
             })
     }
 
@@ -1291,6 +1315,11 @@ impl<C: Clock> Session<C> {
             // they were true once, but a value served from it would claim to be a current
             // observation of a stream that has stopped (§19.4 step 2).
             return Lookup::NotSynced(watched.stream.state());
+        }
+        if watched.stream.is_pending_write(namespace, name) {
+            // Written by this session and not yet observed: the session knows nothing current
+            // about it, and the next read goes to the API server (§20.5, ADR-0060).
+            return Lookup::NotWatched;
         }
         match watched.stream.find(namespace, name) {
             None => Lookup::ConfirmedAbsent,
@@ -1415,7 +1444,11 @@ impl<C: Clock> fmt::Debug for Session<C> {
                     .map(|watched| {
                         watched
                             .index
-                            .state(watched.stream.state(), watched.stream.is_gap_free())
+                            .state(
+                                watched.stream.state(),
+                                watched.stream.is_gap_free(),
+                                watched.stream.pending_writes(),
+                            )
                             .describe()
                     })
                     .collect::<Vec<_>>(),

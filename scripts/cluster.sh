@@ -42,6 +42,8 @@
 #   second kubeconfig context       empty result
 #   a Service and two bare Pods     §60.3: a selection that changes under a watch, on Pods no
 #   it selects                      controller will relabel or replace
+#   two Deployments, `scaler`       §46.3: a scale and an image change, each verified by watching
+#   and `rollout`                   the controller converge rather than by one read
 #
 # **Derived objects are waited for, not assumed.** A Pod that has not been scheduled has no node
 # to be related to and no address to appear in an EndpointSlice, so `up` polls for each derived
@@ -359,6 +361,30 @@ JSON
     '[.items[]? | select((.spec.nodeName // "") != "" and (.status.podIP // "") != "")] | length == 2'
 }
 
+# Two Deployments the mutation gates change and then watch converge (section 46.3): one is
+# scaled, one has its image set. Separate from `checkout`, whose ReplicaSet, Pods and
+# EndpointSlices the relationship gates read, so a rollout in one test cannot move the objects
+# another test is walking.
+install_convergence_targets() {
+  say "workloads the mutation gates change and watch converge (section 46.3)"
+  local name
+  for name in scaler rollout; do
+    create "/apis/apps/v1/namespaces/$NS_ALPHA/deployments" "Deployment $NS_ALPHA/$name" <<JSON
+{"apiVersion":"apps/v1","kind":"Deployment",
+ "metadata":{"name":"$name","namespace":"$NS_ALPHA","labels":{"app":"$name"}},
+ "spec":{"replicas":1,"selector":{"matchLabels":{"app":"$name"}},
+  "template":{"metadata":{"labels":{"app":"$name"}},
+   "spec":{"terminationGracePeriodSeconds":1,
+    "containers":[{"name":"pause","image":"registry.k8s.io/pause:3.10","imagePullPolicy":"IfNotPresent"}]}}}}
+JSON
+  done
+  for name in scaler rollout; do
+    wait_for "Deployment $NS_ALPHA/$name available" \
+      "/apis/apps/v1/namespaces/$NS_ALPHA/deployments/$name" \
+      '(.status.observedGeneration // 0) == .metadata.generation and (.status.availableReplicas // 0) == .spec.replicas'
+  done
+}
+
 install_storage() {
   say "storage"
   create "/apis/storage.k8s.io/v1/storageclasses" "StorageClass ono-manual" <<'JSON'
@@ -525,6 +551,7 @@ up() {
   install_custom_resources
   install_workload
   install_selector_pair
+  install_convergence_targets
   install_storage
   install_restricted_identity
 
