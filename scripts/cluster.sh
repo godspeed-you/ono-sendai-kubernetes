@@ -40,6 +40,8 @@
 #                                   on
 #   a restricted identity, in a     Gate E (§62.5): a `403` on `ono-beta` is a denial and never an
 #   second kubeconfig context       empty result
+#   a Service and two bare Pods     §60.3: a selection that changes under a watch, on Pods no
+#   it selects                      controller will relabel or replace
 #
 # **Derived objects are waited for, not assumed.** A Pod that has not been scheduled has no node
 # to be related to and no address to appear in an EndpointSlice, so `up` polls for each derived
@@ -334,6 +336,29 @@ JSON
     '[.items[]? | select([.endpoints[]? | select(.targetRef != null)] | length > 0)] | length > 0'
 }
 
+# Specification section 60.3's scenario, as objects: a Service selecting two Pods by one label.
+# The Pods are bare rather than made by a controller, because the test changes the label on one
+# of them and a ReplicaSet would release the relabelled Pod and replace it — an interesting
+# scenario, and a different one from the section's.
+install_selector_pair() {
+  say "a Service and the two Pods it selects (section 60.3)"
+  local pod
+  for pod in pair-a pair-b; do
+    create "/api/v1/namespaces/$NS_ALPHA/pods" "Pod $NS_ALPHA/$pod" <<JSON
+{"apiVersion":"v1","kind":"Pod","metadata":{"name":"$pod","namespace":"$NS_ALPHA","labels":{"app":"pair"}},
+ "spec":{"terminationGracePeriodSeconds":1,
+  "containers":[{"name":"pause","image":"registry.k8s.io/pause:3.10","imagePullPolicy":"IfNotPresent"}]}}
+JSON
+  done
+  create "/api/v1/namespaces/$NS_ALPHA/services" "Service $NS_ALPHA/pair" <<JSON
+{"apiVersion":"v1","kind":"Service","metadata":{"name":"pair","namespace":"$NS_ALPHA"},
+ "spec":{"selector":{"app":"pair"},"ports":[{"name":"http","port":80,"targetPort":8080,"protocol":"TCP"}]}}
+JSON
+  wait_for "both Pods of $NS_ALPHA/pair scheduled and addressed" \
+    "/api/v1/namespaces/$NS_ALPHA/pods?labelSelector=app%3Dpair" \
+    '[.items[]? | select((.spec.nodeName // "") != "" and (.status.podIP // "") != "")] | length == 2'
+}
+
 install_storage() {
   say "storage"
   create "/apis/storage.k8s.io/v1/storageclasses" "StorageClass ono-manual" <<'JSON'
@@ -499,6 +524,7 @@ up() {
   install_crds
   install_custom_resources
   install_workload
+  install_selector_pair
   install_storage
   install_restricted_identity
 

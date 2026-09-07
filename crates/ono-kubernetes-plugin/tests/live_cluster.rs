@@ -163,6 +163,25 @@ impl Live {
     /// *second* object of a name has to make one some other way. It uses the same endpoint, the
     /// same trust anchor and the same client certificate the kubeconfig names.
     fn create(&self, path: &str, body: &str) -> String {
+        let document = self.request("POST", "application/json", path, body);
+        document["metadata"]["uid"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the API server did not create the object: {document}"))
+            .to_owned()
+    }
+
+    /// Changes one object with a JSON merge patch, and answers with the object as the API server
+    /// returned it.
+    ///
+    /// The harness's work again, for §60.3's step 2: the label change is the *cluster* changing
+    /// under a watch, which is a different thing from this provider changing it — a change the
+    /// provider made would have invalidated its own caches (§20.5), and the scenario is about a
+    /// change nobody told it about.
+    fn patch(&self, path: &str, body: &str) -> Json {
+        self.request("PATCH", "application/merge-patch+json", path, body)
+    }
+
+    fn request(&self, method: &str, content_type: &str, path: &str, body: &str) -> Json {
         let scratch = Scratch::new("credential");
         let write = |name: &str, key: &str| -> PathBuf {
             let at = scratch.path().join(name);
@@ -184,19 +203,15 @@ impl Live {
             .arg(&certificate)
             .arg("--key")
             .arg(&key)
-            .args(["--header", "Content-Type: application/json"])
-            .args(["--request", "POST"])
+            .args(["--header", &format!("Content-Type: {content_type}")])
+            .args(["--request", method])
             .args(["--data-binary", body])
             .arg(format!("{}{path}", self.field("server")))
             .output()
             .expect("curl runs");
         let answered = String::from_utf8_lossy(&output.stdout).into_owned();
-        let document: Json = serde_json::from_str(&answered)
-            .unwrap_or_else(|error| panic!("the API server answered `{answered}`: {error}"));
-        document["metadata"]["uid"]
-            .as_str()
-            .unwrap_or_else(|| panic!("the API server did not create the object: {document}"))
-            .to_owned()
+        serde_json::from_str(&answered)
+            .unwrap_or_else(|error| panic!("the API server answered `{answered}`: {error}"))
     }
 }
 
@@ -1362,6 +1377,132 @@ fn should_read_the_lines_a_real_container_wrote_through_the_log_subresource() {
         );
     }
     assert_eq!(lines.len(), 2, "and the tail was honoured: {run:?}");
+}
+
+#[test]
+fn should_drop_a_selects_edge_once_a_real_watch_has_seen_the_label_change_that_took_it_away() {
+    // §60.3 against a real API server, through the real binary: a Service selects Pods A and B;
+    // the harness changes B's label while a watch this provider opened is running; the watch
+    // reports the change; and the relationship answered afterwards no longer reaches B while it
+    // still reaches A. The recorded version of the scenario in `tests/watch_scenarios.rs` proves
+    // the composition inside one session; this proves the cluster delivers what that composition
+    // is built on, with `| where relation == "selects"` doing the narrowing a reader would do.
+    let live = match Live::open() {
+        Ok(live) => live,
+        Err(missing) => {
+            return announce_skip(
+                "should_drop_a_selects_edge_once_a_real_watch_has_seen_the_label_change_that_took_it_away",
+                "external_tool_unavailable",
+                &missing,
+            );
+        }
+    };
+    let home = plugin_home(&live, "selector-change");
+    let selection = |home: &Scratch| -> Vec<String> {
+        let mut names: Vec<String> = shell(
+            &live,
+            home,
+            &format!(
+                "get k8s-relation {} --kind Service --namespace {ALPHA} --name pair \
+                 | where relation == \"selects\" | to json",
+                as_admin(home)
+            ),
+        )
+        .rows()
+        .iter()
+        .filter_map(|edge| edge["target_name"].as_str().map(str::to_owned))
+        .collect();
+        names.sort();
+        names
+    };
+    let pod_b = format!("/api/v1/namespaces/{ALPHA}/pods/pair-b");
+    // The fixture as `scripts/cluster.sh` wrote it, restored first: a run that stopped between
+    // the change and the restore below would otherwise leave the next run starting at step 3.
+    live.patch(&pod_b, r#"{"metadata":{"labels":{"app":"pair"}}}"#);
+
+    // (1) The Service selects A and B, and (2) the evidence names the selector and the labels.
+    let before = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-relation {} --kind Service --namespace {ALPHA} --name pair \
+             | where relation == \"selects\" | to json",
+            as_admin(&home)
+        ),
+    )
+    .rows();
+    let mut selected: Vec<&str> = before
+        .iter()
+        .filter_map(|edge| edge["target_name"].as_str())
+        .collect();
+    selected.sort_unstable();
+    assert_eq!(selected, vec!["pair-a", "pair-b"], "got {before:?}");
+    for edge in &before {
+        assert_eq!(edge["evidence_class"].as_str(), Some("selector"));
+        assert_eq!(
+            edge["evidence"].as_str(),
+            Some("selector {app=pair} matched labels {app=pair}"),
+            "got {edge}"
+        );
+    }
+
+    // (3) B's label changes while (4) a watch this provider opened is running, and the watch
+    // reports it. The bound is every Pod of the namespace plus the one change, as the create
+    // test does: a watch covers a collection, and the selector is the Service's, not the watch's.
+    let held = shell(
+        &live,
+        &home,
+        &format!(
+            "get k8s-pod {} --namespace {ALPHA} | to json",
+            as_admin(&home)
+        ),
+    )
+    .rows()
+    .len();
+    let (patched, run) = std::thread::scope(|scope| {
+        let change = scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            live.patch(&pod_b, r#"{"metadata":{"labels":{"app":"pair-off"}}}"#)
+        });
+        let run = shell(
+            &live,
+            &home,
+            &format!(
+                "get k8s-change {} --kind Pod --namespace {ALPHA} --max_changes {} | to json",
+                as_admin(&home),
+                held + 1
+            ),
+        );
+        (change.join().expect("the patch finishes"), run)
+    });
+    assert_eq!(
+        patched["metadata"]["labels"]["app"].as_str(),
+        Some("pair-off"),
+        "the API server took the label change: {patched}"
+    );
+    let changes = run.rows();
+    let observed = changes
+        .iter()
+        .find(|change| change["change"].as_str() != Some("listed"))
+        .unwrap_or_else(|| panic!("a change observed on the watch, got {run:?}"));
+    assert_eq!(observed["name"].as_str(), Some("pair-b"), "got {observed}");
+    assert_eq!(
+        observed["continuous"].as_bool(),
+        Some(true),
+        "and nothing was missed between the list and the change (§19.4), got {observed}"
+    );
+
+    // (5)–(9) The edge to B is gone, A remains, and the answer is complete rather than partial.
+    let after = selection(&home);
+    assert_eq!(
+        after,
+        vec!["pair-a"],
+        "the edge to B was once observed, and that is not a reason for it to survive"
+    );
+
+    // The fixture is put back, so the scenario can be run again against the same cluster.
+    live.patch(&pod_b, r#"{"metadata":{"labels":{"app":"pair"}}}"#);
+    assert_eq!(selection(&home), vec!["pair-a", "pair-b"]);
 }
 
 #[test]
