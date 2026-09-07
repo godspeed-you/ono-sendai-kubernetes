@@ -379,6 +379,26 @@ impl Request {
         format!("{}?{}", self.path, query.join("&"))
     }
 
+    /// The same request with `base` prepended to its path (ADR-0057, §7.1).
+    ///
+    /// A kubeconfig `server` may carry a path — `https://host/k8s/clusters/c-m-xxxxx` is how
+    /// Rancher and other API-server proxies address a cluster — and every request this package
+    /// sends then travels *under* that path rather than at the API server's root. The prefix is
+    /// applied once, here, so no handler string-concatenates it and none can forget to: the
+    /// connection that owns the base path prepends it to whatever request it is asked to send.
+    ///
+    /// An empty `base` returns the request unchanged, so a cluster addressed at the root pays
+    /// nothing for the mechanism.
+    #[must_use]
+    pub fn with_base_path(&self, base: &str) -> Request {
+        if base.is_empty() {
+            return self.clone();
+        }
+        let mut prefixed = self.clone();
+        prefixed.path = format!("{base}{}", self.path);
+        prefixed
+    }
+
     /// The request as an HTTP/1.1 message.
     ///
     /// CRLF everywhere and an empty line before the body: an API server answers nothing else, and
@@ -486,6 +506,10 @@ struct Head {
 pub struct HttpConnection<S: ByteStream> {
     stream: S,
     host: String,
+    /// A path every request travels under, or empty for a cluster addressed at the root
+    /// (ADR-0057, §7.1). Applied at the one point every request passes through — see
+    /// [`Self::write_and_read_head`] — so nothing above it prepends the prefix by hand.
+    base_path: String,
     buffer: Vec<u8>,
 }
 
@@ -496,8 +520,16 @@ impl<S: ByteStream> HttpConnection<S> {
         Self {
             stream,
             host: host.into(),
+            base_path: String::new(),
             buffer: Vec::new(),
         }
+    }
+
+    /// Puts every request this connection sends under `base_path` (ADR-0057, §7.1).
+    #[must_use]
+    pub fn under_base_path(mut self, base_path: impl Into<String>) -> Self {
+        self.base_path = base_path.into();
+        self
     }
 
     /// The stream underneath, for a fixture to be inspected.
@@ -566,7 +598,17 @@ impl<S: ByteStream> HttpConnection<S> {
     }
 
     fn write_and_read_head(&mut self, request: &Request) -> Result<Head, ApiError> {
-        let wire = request.serialise(&self.host);
+        // ADR-0057: the base path is applied here, at the one seam every request — a discovery
+        // read, a list, a watch, a mutation, a log — passes through. A request built anywhere in
+        // this workspace carries the API server's own path and this connection puts it under the
+        // prefix the operator's `server` URL named, so nothing above concatenates a path by hand.
+        let wire = if self.base_path.is_empty() {
+            request.serialise(&self.host)
+        } else {
+            request
+                .with_base_path(&self.base_path)
+                .serialise(&self.host)
+        };
         self.stream
             .write_all(&wire)
             .map_err(|error| ApiError::Stream(error.message().to_owned()))?;
@@ -2307,6 +2349,17 @@ impl<S: ByteStream, C: Clock> Client<S, C> {
             default_headers: vec![("Accept".to_owned(), "application/json".to_owned())],
             ledger: Ledger::new(Budget::unlimited(), SystemClock),
         }
+    }
+
+    /// Puts every request this client sends under `base_path` (ADR-0057, §7.1).
+    ///
+    /// The path a kubeconfig `server` URL carries, threaded to the one connection that owns the
+    /// wire. Empty for a cluster addressed at its root, which is every cluster but one behind an
+    /// API-server proxy.
+    #[must_use]
+    pub fn under_base_path(mut self, base_path: impl Into<String>) -> Self {
+        self.connection = self.connection.under_base_path(base_path);
+        self
     }
 
     /// Puts everything this client does from now on under `budget`, counting from now (§49.1).

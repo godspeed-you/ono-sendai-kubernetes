@@ -131,7 +131,9 @@ pub(crate) const CLUSTER: &[Parameter] = &[
     Parameter::new(
         "kubeconfig",
         "string",
-        "Which kubeconfig file to read the context from. An absolute path; default `~/.kube/config`.",
+        "Which kubeconfig to read the context from. One path, or a `KUBECONFIG` list \
+         (colon-separated) merged in order; pass `--kubeconfig $KUBECONFIG` to hand over the \
+         operator's list. Default `~/.kube/config`.",
     ),
     Parameter::new(
         "host",

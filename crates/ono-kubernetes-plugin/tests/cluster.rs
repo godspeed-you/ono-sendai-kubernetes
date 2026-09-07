@@ -965,10 +965,11 @@ async fn should_record_what_the_broker_cannot_see_in_the_audit_trail() {
 #[tokio::test]
 async fn should_surface_the_kubeconfig_deviation_rather_than_only_documenting_it() {
     // §7.2's unconditional half: "any intentional deviation MUST be documented and surfaced by
-    // `explain provider` or equivalent diagnostics". This provider reads one kubeconfig file and
-    // does not merge a `KUBECONFIG` list, which is a deviation from what a `kubectl` user
-    // expects — and a deviation a reader has to find in a document is one they find after it has
-    // surprised them.
+    // `explain provider` or equivalent diagnostics". This provider now merges a `KUBECONFIG` list
+    // (§7.2, ADR-0056), so the deviation that survives is that it cannot read the `KUBECONFIG`
+    // environment variable — the supervisor sanitises the environment — and the operator hands
+    // the list over as `--kubeconfig $KUBECONFIG`. A deviation a reader has to find in a document
+    // is one they find after it has surprised them.
     //
     // It rides on §57.1's report rather than on a mechanism of its own, because the question is
     // the same question: what does this provider support, and what did this session find.
@@ -985,8 +986,11 @@ async fn should_surface_the_kubeconfig_deviation_rather_than_only_documenting_it
 
     assert_eq!(
         capability_of(&record, "kubeconfig merge"),
-        "not supported by provider, unavailable in any session",
-        "a `kubectl` user reading this finds out here rather than by losing a context"
+        "supported by provider, deviates from kubectl: this package cannot read the `KUBECONFIG` \
+         environment variable, so a multi-file list is passed explicitly as `--kubeconfig \
+         $KUBECONFIG`",
+        "the merge is implemented now (§7.2, ADR-0056); the deviation a `kubectl` user reads here \
+         is that the list is passed explicitly"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }

@@ -2042,6 +2042,13 @@ pub(crate) struct Endpoint {
     /// the first as a fact about the configuration and never the second, because a scope one
     /// invocation chose has no business surviving into the next (§6.5).
     pub(crate) default_namespace: Option<String>,
+    /// A path every request travels under, from the kubeconfig `server` URL (ADR-0057, §7.1).
+    ///
+    /// Empty for a cluster addressed at the API server's root, which is every cluster but one
+    /// behind an API-server proxy such as Rancher. It is part of [`Self::server_url`] — and so of
+    /// the session key — because two clusters at one host and port distinguished only by their
+    /// path are two clusters, not one.
+    pub(crate) base_path: String,
 }
 
 impl fmt::Debug for Endpoint {
@@ -2148,6 +2155,9 @@ impl Endpoint {
             // saying nothing: the API server decides what an anonymous request means.
             credential: Credential::Anonymous,
             default_namespace: None,
+            // An explicitly named `host` addresses the API server at its root: §7.3's endpoint is
+            // a host and a port, and a path prefix belongs to a kubeconfig `server` URL.
+            base_path: String::new(),
         })
     }
 
@@ -2164,31 +2174,65 @@ impl Endpoint {
         options: &JsonMap<String, Json>,
         context: Option<&str>,
     ) -> Result<Self, WireError> {
-        let path = options
+        // §7.2, ADR-0056: the `kubeconfig` option accepts a `KUBECONFIG` list — the same
+        // colon-separated syntax `kubectl` reads from the environment, which the supervisor
+        // sanitises away before this package runs (core `sandbox.rs`), so an operator hands it
+        // over with `--kubeconfig $KUBECONFIG`. The files are read in list order and merged with
+        // client-go's rules; a single path is just a list of one.
+        let raw = options
             .get("kubeconfig")
             .and_then(Json::as_str)
             .filter(|path| !path.is_empty())
             .unwrap_or(DEFAULT_KUBECONFIG)
             .to_owned();
-        let document = match read_file(ctx, &path, "the kubeconfig") {
-            Ok(document) => document,
-            Err(error) if context.is_none() => return Err(no_endpoint_and_no_kubeconfig(&error)),
-            Err(error) => return Err(error),
+        let paths: Vec<&str> = raw.split(':').filter(|path| !path.is_empty()).collect();
+
+        // Each file, read in order. A *missing* file is skipped — client-go ignores nonexistent
+        // entries in the list — while a denied read is reported, because "you did not grant this
+        // path" and "this path is not there" are different states with different fixes (§21.4).
+        let mut documents: Vec<(String, String)> = Vec::new();
+        for path in &paths {
+            match read_kubeconfig_file(ctx, path) {
+                Ok(Some(bytes)) => {
+                    let text = String::from_utf8(bytes).map_err(|error| {
+                        failure(
+                            UNAVAILABLE_CODE,
+                            UNAVAILABLE,
+                            format!("`{path}` is not text: {error}"),
+                            "A kubeconfig is YAML.",
+                        )
+                    })?;
+                    documents.push(((*path).to_owned(), text));
+                }
+                Ok(None) => {}
+                Err(error) if context.is_none() => {
+                    return Err(no_endpoint_and_no_kubeconfig(&error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if documents.is_empty() {
+            // Every listed file was missing (or the list was empty): no cluster could be
+            // resolved, which is not "the cluster is empty" but "there was no kubeconfig to read".
+            let cause = file_not_found(paths.first().copied().unwrap_or(DEFAULT_KUBECONFIG));
+            if context.is_none() {
+                return Err(no_endpoint_and_no_kubeconfig(&cause));
+            }
+            return Err(cause);
+        }
+        let sources = || {
+            documents
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        let text = String::from_utf8(document).map_err(|error| {
+        let config = Kubeconfig::merge(&documents).map_err(|error| {
             failure(
                 UNAVAILABLE_CODE,
                 UNAVAILABLE,
-                format!("`{path}` is not text: {error}"),
-                "A kubeconfig is YAML.",
-            )
-        })?;
-        let config = Kubeconfig::parse(&text).map_err(|error| {
-            failure(
-                UNAVAILABLE_CODE,
-                UNAVAILABLE,
-                format!("`{path}` did not read: {error}"),
-                "The file was read; what is in it is not a kubeconfig this provider understands.",
+                format!("the kubeconfig ({}) did not read: {error}", sources()),
+                "The files were read; what is in them is not a kubeconfig this provider understands.",
             )
         })?;
         let contexts = |config: &Kubeconfig| -> String {
@@ -2211,14 +2255,16 @@ impl Endpoint {
                         UNAVAILABLE_CODE,
                         UNAVAILABLE,
                         format!(
-                            "the query named neither a kubeconfig `context` nor a `host`, and \
-                             `{path}` elects no `current-context` to fall back to"
+                            "the query named neither a kubeconfig `context` nor a `host`, and the \
+                             kubeconfig ({}) elects no `current-context` to fall back to",
+                            sources()
                         ),
                         &format!(
-                            "`{path}` defines these contexts: {}. Pass one as `context`, or pass \
-                             `host` (and `port`, which defaults to 8001) to name an endpoint \
-                             directly, which speaks plain HTTP/1.1 and so reaches an API server \
-                             through `kubectl proxy` rather than over TLS.",
+                            "the kubeconfig ({}) defines these contexts: {}. Pass one as \
+                             `context`, or pass `host` (and `port`, which defaults to 8001) to \
+                             name an endpoint directly, which speaks plain HTTP/1.1 and so reaches \
+                             an API server through `kubectl proxy` rather than over TLS.",
+                            sources(),
                             contexts(&config)
                         ),
                     ));
@@ -2232,14 +2278,15 @@ impl Endpoint {
                 UNAVAILABLE,
                 format!("{error}"),
                 &format!(
-                    "`{path}` defines these contexts: {}. Naming one that is not there is a \
-                     different answer from connecting to the wrong one.",
+                    "the kubeconfig ({}) defines these contexts: {}. Naming one that is not there \
+                     is a different answer from connecting to the wrong one.",
+                    sources(),
                     contexts(&config)
                 ),
             )
         })?;
 
-        let (secure, host, port) = parse_server(connection.server()).map_err(|detail| {
+        let (secure, host, port, base_path) = parse_server(connection.server()).map_err(|detail| {
             failure(
                 UNAVAILABLE_CODE,
                 UNAVAILABLE,
@@ -2305,6 +2352,7 @@ impl Endpoint {
             authorization,
             credential: connection.credential(),
             default_namespace: connection.namespace().map(str::to_owned),
+            base_path,
         })
     }
 
@@ -2342,14 +2390,19 @@ impl Endpoint {
     }
 
     /// The API server as a URL, which is how §6.3 records an endpoint.
+    ///
+    /// The base path is part of it (ADR-0057): two clusters at one host and port distinguished
+    /// only by their path are two clusters, so the URL that keys the session and names the
+    /// endpoint in the diagnostic carries the whole address the operator wrote.
     fn server_url(&self) -> String {
         let scheme = if self.tls.is_some() { "https" } else { "http" };
-        format!("{scheme}://{}:{}", self.host, self.port)
+        format!("{scheme}://{}:{}{}", self.host, self.port, self.base_path)
     }
 
     /// A client over `stream`, carrying whatever credential the context resolved to.
     pub(crate) fn client<S: ByteStream>(&self, stream: S) -> Client<S> {
-        let client = Client::new(stream, self.authority.clone(), self.instance.clone());
+        let client = Client::new(stream, self.authority.clone(), self.instance.clone())
+            .under_base_path(self.base_path.clone());
         match &self.authorization {
             None => client,
             Some(token) => {
@@ -2538,8 +2591,16 @@ fn tls_settings(
         .map_err(|error| tls_configuration_failure(context, &error))
 }
 
-/// Splits a kubeconfig `server` URL into whether it is TLS, its host and its port.
-fn parse_server(server: &str) -> Result<(bool, String, u16), String> {
+/// Splits a kubeconfig `server` URL into whether it is TLS, its host, its port and its base path.
+///
+/// The base path is the fourth element and it is usually empty: most clusters are addressed at
+/// the API server's root. A `server` such as `https://host/k8s/clusters/c-m-xxxxx` — how Rancher
+/// and other API-server proxies address a cluster — carries a path, and this provider prepends it
+/// to every request rather than dropping it (ADR-0057, §7.1). Dropping it would send every
+/// request to a path the operator did not name, and the answers would look like a different
+/// cluster's rather than like an error. The returned base path has a leading `/` and no trailing
+/// one, or is empty.
+fn parse_server(server: &str) -> Result<(bool, String, u16, String), String> {
     let (scheme, rest) = server
         .split_once("://")
         .ok_or_else(|| "it names no scheme".to_owned())?;
@@ -2549,14 +2610,16 @@ fn parse_server(server: &str) -> Result<(bool, String, u16), String> {
         other => return Err(format!("`{other}` is not a scheme this provider speaks")),
     };
     let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-    if !path.is_empty() {
-        // Dropping the prefix would send every request to a path the operator did not name, and
-        // the answers would look like a different cluster's rather than like an error.
-        return Err(format!(
-            "it names the path prefix `/{path}`, and this provider does not yet prepend one to \
-             its requests"
-        ));
-    }
+    // Kept and prepended rather than refused (ADR-0057). A trailing slash is dropped so the
+    // prefix joins the API server's own leading-slash paths without doubling one.
+    let base_path = {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("/{trimmed}")
+        }
+    };
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         // An IPv6 literal: `[::1]:6443`.
         let (host, tail) = rest
@@ -2584,7 +2647,7 @@ fn parse_server(server: &str) -> Result<(bool, String, u16), String> {
             .parse()
             .map_err(|_| format!("`{port}` is not a port number"))?,
     };
-    Ok((secure, host, port))
+    Ok((secure, host, port, base_path))
 }
 
 /// Reads one file through the host, in chunks, under the `filesystem.read` capability.
@@ -2594,15 +2657,27 @@ fn parse_server(server: &str) -> Result<(bool, String, u16), String> {
 /// package declares the paths it needs and the operator grants them, and a package that opened
 /// the file itself would be making that decision on its own.
 fn read_file(ctx: &mut Ctx<'_>, path: &str, what: &str) -> Result<Vec<u8>, WireError> {
-    let path = expand_home(path)?;
+    host_read_all(ctx, path).map_err(|error| file_failure(path, what, &error))
+}
+
+/// Reads one file through the host, in chunks, returning the host's own error unwrapped.
+///
+/// The raw `filesystem.read` error travels back so a caller can tell a *missing* file
+/// (`io.not_found`) from a *denied* one (`capability.denied`) — a `KUBECONFIG` list skips the
+/// first (client-go ignores nonexistent files) and reports the second. [`read_file`] wraps
+/// whatever this returns for the callers that want one file or nothing.
+///
+/// **`~/` is passed through verbatim.** The host resolves a leading `~/` against the operator's
+/// own home (core ADR-0593); this package no longer expands it, because the only home it could
+/// read is the sandbox working directory the supervisor set as `HOME`, which is the wrong one
+/// (ADR-0056).
+fn host_read_all(ctx: &mut Ctx<'_>, path: &str) -> Result<Vec<u8>, WireError> {
     let mut bytes: Vec<u8> = Vec::new();
     loop {
-        let answer = ctx
-            .host_call(
-                method::FILESYSTEM_READ,
-                json!({"path": path, "offset": bytes.len(), "length": READ_CHUNK}),
-            )
-            .map_err(|error| file_failure(&path, what, &error))?;
+        let answer = ctx.host_call(
+            method::FILESYSTEM_READ,
+            json!({"path": path, "offset": bytes.len(), "length": READ_CHUNK}),
+        )?;
         let hex = answer
             .get("content")
             .and_then(|content| content.get("$bytes"))
@@ -2625,31 +2700,37 @@ fn read_file(ctx: &mut Ctx<'_>, path: &str, what: &str) -> Result<Vec<u8>, WireE
             return Err(failure(
                 UNAVAILABLE_CODE,
                 UNAVAILABLE,
-                format!("`{path}` is larger than {MAX_KUBECONFIG} bytes, which {what} is not"),
+                format!(
+                    "`{path}` is larger than {MAX_KUBECONFIG} bytes, which a configuration file this provider reads is not"
+                ),
                 "The path was read; what is at it is not the file this provider expected.",
             ));
         }
     }
 }
 
-/// Resolves a leading `~/`, which the host does not.
+/// Reads one file of a `KUBECONFIG` list, skipping a missing one (§7.2, ADR-0056).
 ///
-/// The host checks the *resolved* path against the granted scope, so an unexpanded `~` would be
-/// checked as a literal directory name and denied for a reason that has nothing to do with the
-/// operator's decision.
-fn expand_home(path: &str) -> Result<String, WireError> {
-    let Some(rest) = path.strip_prefix("~/") else {
-        return Ok(path.to_owned());
-    };
-    let home = std::env::var("HOME").map_err(|_| {
-        failure(
-            UNAVAILABLE_CODE,
-            UNAVAILABLE,
-            format!("`{path}` starts at a home directory, and `HOME` is not set"),
-            "Pass `kubeconfig` with an absolute path.",
-        )
-    })?;
-    Ok(format!("{}/{rest}", home.trim_end_matches('/')))
+/// [`Ok(None)`] is a file that is not there — client-go ignores a nonexistent entry in the list,
+/// so it is skipped rather than failing the merge. A denied read is still an error, because "you
+/// did not grant this path" and "this path is not there" are different states (§21.4).
+fn read_kubeconfig_file(ctx: &mut Ctx<'_>, path: &str) -> Result<Option<Vec<u8>>, WireError> {
+    match host_read_all(ctx, path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.name == "io.not_found" => Ok(None),
+        Err(error) => Err(file_failure(path, "the kubeconfig", &error)),
+    }
+}
+
+/// No kubeconfig existed at the path a query named or defaulted to.
+fn file_not_found(path: &str) -> WireError {
+    failure(
+        UNAVAILABLE_CODE,
+        UNAVAILABLE,
+        format!("no kubeconfig was read; `{path}` does not exist"),
+        "Pass `kubeconfig` with a path to a file that exists — a `KUBECONFIG` list is accepted, \
+         colon-separated — or pass `host` to name an API server without a kubeconfig.",
+    )
 }
 
 /// A file the host would not or could not read.

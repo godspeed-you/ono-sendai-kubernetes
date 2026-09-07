@@ -275,6 +275,11 @@ struct RecordedCluster {
     /// Every request head the server received, so a test can assert what travelled — including
     /// the `Authorization` header, which is the only proof that a credential left the package.
     heads: Arc<std::sync::Mutex<Vec<String>>>,
+    /// A path prefix this server is addressed under, or empty for the API server's root
+    /// (ADR-0057). When set, the head is recorded with the prefix on it — that is what the test
+    /// asserts travelled — and the prefix is stripped before routing, so the recorded documents
+    /// answer the API server's own paths.
+    prefix: String,
 }
 
 impl std::fmt::Debug for RecordedCluster {
@@ -491,6 +496,32 @@ impl RecordedCluster {
         Arc::new(Self {
             pods,
             apps: true,
+            ..Self::default()
+        })
+    }
+
+    /// A server serving discovery, a list and a container log, addressed under `prefix`
+    /// (ADR-0057). Every request it records carries the prefix, and its documents answer the
+    /// API server's own paths beneath it.
+    fn serving_observations_under(prefix: &str) -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            tier_one: true,
+            relations: true,
+            observations: true,
+            prefix: prefix.to_owned(),
+            ..Self::default()
+        })
+    }
+
+    /// A server that serves a watch on its Pod collection, addressed under `prefix` (ADR-0057).
+    fn watching_under(script: Watching, prefix: &str) -> Arc<Self> {
+        Arc::new(Self {
+            pods: 1,
+            apps: true,
+            watch: script,
+            prefix: prefix.to_owned(),
             ..Self::default()
         })
     }
@@ -2440,6 +2471,14 @@ impl HostServices for RecordedCluster {
                     if let Ok(mut heads) = cluster.heads.lock() {
                         heads.push(head.clone());
                     }
+                    // ADR-0057: the head is recorded with the prefix on it — that is the proof
+                    // it travelled — and the prefix is stripped here so the recorded documents
+                    // answer the API server's own paths. A request that arrived *without* the
+                    // prefix does not strip and 404s downstream, so the omission cannot pass.
+                    let path = match path.strip_prefix(cluster.prefix.as_str()) {
+                        Some(stripped) if !cluster.prefix.is_empty() => stripped.to_owned(),
+                        _ => path,
+                    };
                     // §18.5's gate: the second page does not go on the wire until the test
                     // has taken the record the first one produced.
                     if cluster.paging == Paging::Paced && path.contains("continue=") {
@@ -3595,6 +3634,333 @@ contexts:
         error.message.contains("exec"),
         "the refusal names what it will not do, got {}",
         error.message
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// The path prefix a kubeconfig `server` URL carries in this suite (ADR-0057).
+const SERVER_PREFIX: &str = "/k8s/clusters/c-m-n4b8s";
+
+#[tokio::test]
+async fn should_send_every_request_under_the_server_path_prefix() {
+    // ADR-0057, §7.1: a kubeconfig `server` may carry a path — Rancher and other API-server
+    // proxies address a cluster as `https://host/k8s/clusters/c-...`. Every request this package
+    // sends then travels under it. This asserts it on the request heads the server recorded
+    // rather than on the mechanism: discovery, a list and a log all arrive prefixed, and the
+    // watch below arrives prefixed too.
+    let (directory, path) = kubeconfig_at(
+        "prefix",
+        &format!(
+            r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {{name: proxied, cluster: {{server: http://cluster.test:8001{SERVER_PREFIX}}}}}
+users:
+  - {{name: operator, user: {{token: t}}}}
+contexts:
+  - {{name: proxied, context: {{cluster: proxied, user: operator}}}}
+"#
+        ),
+    );
+    let via = |extra: &[(&str, Json)]| {
+        let mut map = options(&[
+            ("context", json!("proxied")),
+            ("kubeconfig", json!(path.display().to_string())),
+        ]);
+        for (key, value) in extra {
+            map.insert((*key).to_owned(), value.clone());
+        }
+        map
+    };
+
+    let reads = RecordedCluster::serving_observations_under(SERVER_PREFIX);
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(Arc::clone(&reads) as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads");
+
+    let (_, listed) = plugin
+        .query("k8s-pod", via(&[]))
+        .await
+        .expect("the list starts")
+        .collect()
+        .await;
+    assert_eq!(listed.status, InvokeStatus::Completed, "{:?}", listed.error);
+    let (_, logged) = plugin
+        .query(
+            "k8s-log",
+            via(&[("name", json!("api-7d9f-abc")), ("container", json!("api"))]),
+        )
+        .await
+        .expect("the log read starts")
+        .collect()
+        .await;
+    assert_eq!(logged.status, InvokeStatus::Completed, "{:?}", logged.error);
+
+    let heads = reads.heads();
+    for head in &heads {
+        let target = head.split_whitespace().nth(1).expect("a request line");
+        assert!(
+            target.starts_with(SERVER_PREFIX),
+            "a request did not travel under the prefix: {head}"
+        );
+    }
+    assert!(
+        heads
+            .iter()
+            .any(|head| head.starts_with(&format!("GET {SERVER_PREFIX}/api "))),
+        "discovery of the core group travelled under the prefix: {heads:?}"
+    );
+    assert!(
+        heads.iter().any(|head| head.contains(&format!(
+            "{SERVER_PREFIX}/api/v1/namespaces/default/pods?limit=500"
+        ))),
+        "the Pod list travelled under the prefix: {heads:?}"
+    );
+    assert!(
+        heads.iter().any(|head| head.contains(&format!(
+            "{SERVER_PREFIX}/api/v1/namespaces/default/pods/api-7d9f-abc/log"
+        ))),
+        "the log read travelled under the prefix: {heads:?}"
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+
+    // A watch, whose fixture answers a held stream the list above does not.
+    let watched = RecordedCluster::watching_under(Watching::Changes, SERVER_PREFIX);
+    let watcher = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(Arc::clone(&watched) as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads");
+    // `max_changes` bounds the watch so `collect` returns: it lists, watches from the version the
+    // listing gave, takes the two changes the `Changes` script sends, and completes.
+    let (_, _observed) = watcher
+        .query(
+            "k8s-change",
+            via(&[("kind", json!("Pod")), ("max_changes", json!(5))]),
+        )
+        .await
+        .expect("the watch starts")
+        .collect()
+        .await;
+    let watch_heads = watched.heads();
+    for head in &watch_heads {
+        let target = head.split_whitespace().nth(1).expect("a request line");
+        assert!(
+            target.starts_with(SERVER_PREFIX),
+            "a watch request did not travel under the prefix: {head}"
+        );
+    }
+    assert!(
+        watch_heads.iter().any(|head| head
+            .contains(&format!("{SERVER_PREFIX}/api/v1/namespaces/default/pods"))
+            && head.contains("watch=true")),
+        "the watch travelled under the prefix: {watch_heads:?}"
+    );
+    watcher.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+// --- the KUBECONFIG multi-file list (§7.2, ADR-0056) -------------------------------------------
+
+/// A fresh temporary directory of this test's own, for a `KUBECONFIG` list to live in.
+fn kubeconfig_directory(name: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "ono-kubernetes-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&directory).expect("the test may write a temporary directory");
+    directory
+}
+
+#[tokio::test]
+async fn should_resolve_a_context_a_second_kubeconfig_of_a_colon_list_defines() {
+    // §7.2, ADR-0056: the `kubeconfig` option accepts a `KUBECONFIG` list (colon-separated). A
+    // context defined only in the second file resolves, which is the whole point of a list.
+    let directory = kubeconfig_directory("list");
+    std::fs::write(
+        directory.join("first"),
+        r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: a, cluster: {server: http://cluster.test:8001}}
+users:
+  - {name: a, user: {token: a-token}}
+contexts:
+  - {name: first, context: {cluster: a, user: a}}
+"#,
+    )
+    .expect("the first kubeconfig is written");
+    std::fs::write(
+        directory.join("second"),
+        r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: b, cluster: {server: http://cluster.test:8001}}
+users:
+  - {name: b, user: {token: b-token}}
+contexts:
+  - {name: second, context: {cluster: b, user: b}}
+"#,
+    )
+    .expect("the second kubeconfig is written");
+    let list = format!(
+        "{}:{}",
+        directory.join("first").display(),
+        directory.join("second").display()
+    );
+
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(RecordedCluster::with_pods(2))
+        .load()
+        .await
+        .expect("the package loads");
+    let (events, result) = plugin
+        .query(
+            "k8s-pod",
+            options(&[("context", json!("second")), ("kubeconfig", json!(list))]),
+        )
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records(&events).len(),
+        2,
+        "the context from the second file resolved and its cluster answered"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
+async fn should_skip_a_missing_first_kubeconfig_and_read_the_next() {
+    // §7.2, ADR-0056: client-go ignores a nonexistent file in the list. A missing first file is
+    // skipped rather than failing, and the second supplies the context.
+    let directory = kubeconfig_directory("skip-missing");
+    std::fs::write(
+        directory.join("real"),
+        r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - {name: c, cluster: {server: http://cluster.test:8001}}
+users:
+  - {name: u, user: {token: t}}
+contexts:
+  - {name: only, context: {cluster: c, user: u}}
+"#,
+    )
+    .expect("the real kubeconfig is written");
+    // The first entry is a path within the granted directory that does not exist — a missing
+    // file (`io.not_found`), which is skipped, not a denied one.
+    let list = format!(
+        "{}:{}",
+        directory.join("not-there").display(),
+        directory.join("real").display()
+    );
+
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(RecordedCluster::with_pods(2))
+        .load()
+        .await
+        .expect("the package loads");
+    let (events, result) = plugin
+        .query(
+            "k8s-pod",
+            options(&[("context", json!("only")), ("kubeconfig", json!(list))]),
+        )
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records(&events).len(),
+        2,
+        "the missing first file was skipped and the second answered"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[tokio::test]
+async fn should_read_a_relative_certificate_authority_against_its_own_file_s_directory() {
+    // §7.2, ADR-0056: a relative `certificate-authority` resolves against the directory of the
+    // file that named it. The proof is a real TLS handshake: the CA is written beside the
+    // kubeconfig, referenced relatively, and the session only verifies if the package read it
+    // from the resolved absolute path.
+    let authority = Authority::issuing("cluster.test");
+    let directory = kubeconfig_directory("relative-ca");
+    std::fs::write(directory.join("ca.crt"), authority.ca_pem.as_bytes())
+        .expect("the CA is written beside the kubeconfig");
+    std::fs::write(
+        directory.join("config"),
+        r#"
+apiVersion: v1
+kind: Config
+clusters:
+  - name: c
+    cluster:
+      server: https://cluster.test:6443
+      certificate-authority: ca.crt
+users:
+  - {name: u, user: {token: recorded-token}}
+contexts:
+  - {name: ctx, context: {cluster: c, user: u, namespace: default}}
+"#,
+    )
+    .expect("the kubeconfig is written");
+
+    let cluster = RecordedCluster::over_tls(&authority);
+    let plugin = TestHost::new(PLUGIN, MANIFEST)
+        .grant(Capability::NetworkConnect)
+        .grant_scoped(Capability::FilesystemRead, readable(&directory))
+        .host(Arc::clone(&cluster) as Arc<dyn HostServices>)
+        .load()
+        .await
+        .expect("the package loads");
+    let (_, result) = plugin
+        .query(
+            "k8s-pod",
+            options(&[
+                ("context", json!("ctx")),
+                (
+                    "kubeconfig",
+                    json!(directory.join("config").display().to_string()),
+                ),
+            ]),
+        )
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(
+        result.status,
+        InvokeStatus::Completed,
+        "the TLS session verified against the CA read from the resolved relative path: {:?}",
+        result.error
     );
 
     plugin.shutdown(ShutdownReason::Unload).await;

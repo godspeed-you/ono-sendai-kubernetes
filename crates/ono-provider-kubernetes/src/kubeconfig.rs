@@ -283,48 +283,143 @@ impl fmt::Debug for Connection {
     }
 }
 
-/// A parsed kubeconfig.
+/// One kubeconfig entry, with the file that supplied it (§7.2, §7.4, ADR-0056).
+///
+/// The origin is two facts about the same file: the *directory* it lives in, against which its
+/// own relative `certificate-authority`, `client-certificate`, `client-key` and `exec` paths
+/// resolve (client-go's rule), and the *path* itself, so a diagnostic can say which file of a
+/// merged set a name came from. In a single-document parse both are empty, and relative paths
+/// then stay relative — there is no file to resolve them against.
+#[derive(Debug, Clone)]
+struct Sourced<T> {
+    spec: T,
+    /// The directory of the file that defined this entry, or empty for a document with no path.
+    dir: String,
+    /// The path of the file that defined this entry, or empty likewise.
+    source: String,
+}
+
+/// A parsed kubeconfig, or a merge of several (§7.2, ADR-0056).
 #[derive(Debug, Clone)]
 pub struct Kubeconfig {
     current_context: Option<String>,
-    clusters: HashMap<String, ClusterSpec>,
-    users: HashMap<String, UserSpec>,
-    contexts: HashMap<String, ContextSpec>,
+    clusters: HashMap<String, Sourced<ClusterSpec>>,
+    users: HashMap<String, Sourced<UserSpec>>,
+    contexts: HashMap<String, Sourced<ContextSpec>>,
     order: Vec<String>,
 }
 
 impl Kubeconfig {
-    /// Reads a kubeconfig document.
+    /// Reads a single kubeconfig document.
+    ///
+    /// A document with no path on disk: relative `certificate-authority`, `client-certificate`,
+    /// `client-key` and `exec` paths stay relative, because there is no file directory to resolve
+    /// them against. [`Self::merge`] is the entry point that has one.
     ///
     /// # Errors
     ///
     /// [`ConfigError::Malformed`] when the document is not YAML this provider can read.
     pub fn parse(yaml: &str) -> Result<Self, ConfigError> {
-        let raw: RawConfig = serde_yaml_ng::from_str(yaml)
-            .map_err(|error| ConfigError::Malformed(error.to_string()))?;
+        Self::from_documents(&[(None, yaml)])
+    }
 
-        let order = raw
-            .contexts
+    /// Merges several kubeconfig documents the way `KUBECONFIG` asks for (§7.2, ADR-0056).
+    ///
+    /// Each element is a `(path, text)` pair, in `KUBECONFIG` list order. The merge follows
+    /// client-go's loading rules:
+    ///
+    /// - files are loaded in list order, and for `clusters`, `users` and `contexts` **the first
+    ///   file to define a name wins**;
+    /// - `current-context` is the **first non-empty** one across the list;
+    /// - a document whose text is empty is skipped — a missing file that a caller chose to omit
+    ///   contributes nothing rather than failing the merge;
+    /// - relative `certificate-authority`, `client-certificate`, `client-key` and `exec` paths
+    ///   resolve against the directory of the file that defined them, resolved when a context is
+    ///   turned into a [`Connection`];
+    /// - each entry remembers which file supplied it, so [`Self::source_of_context`] and its
+    ///   siblings can say so in a diagnostic.
+    ///
+    /// A *missing* file is the caller's to skip before it reaches here (client-go ignores
+    /// nonexistent files in the list); an existing file that does not parse is the caller's to
+    /// pass in, and it becomes a [`ConfigError::Malformed`] naming the file.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Malformed`], naming the file, when one of the documents is not YAML this
+    /// provider can read.
+    pub fn merge(documents: &[(String, String)]) -> Result<Self, ConfigError> {
+        let prepared: Vec<(Option<&str>, &str)> = documents
             .iter()
-            .map(|entry| entry.name.clone())
+            .map(|(path, text)| (Some(path.as_str()), text.as_str()))
             .collect();
+        Self::from_documents(&prepared)
+    }
+
+    /// The merge itself, over documents that each may or may not know their own path.
+    fn from_documents(documents: &[(Option<&str>, &str)]) -> Result<Self, ConfigError> {
+        let mut current_context: Option<String> = None;
+        let mut clusters: HashMap<String, Sourced<ClusterSpec>> = HashMap::new();
+        let mut users: HashMap<String, Sourced<UserSpec>> = HashMap::new();
+        let mut contexts: HashMap<String, Sourced<ContextSpec>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+
+        for (path, text) in documents {
+            // An empty document is skipped rather than parsed: an empty `KUBECONFIG` list entry
+            // and a file a caller decided to omit both arrive as empty text, and neither is a
+            // kubeconfig to fail over.
+            if text.trim().is_empty() {
+                continue;
+            }
+            let raw: RawConfig = serde_yaml_ng::from_str(text).map_err(|error| {
+                // An existing file that does not parse names itself, because a merged set may have
+                // many and "one of them is broken" is not a fix anyone can act on.
+                match path {
+                    Some(source) => {
+                        ConfigError::Malformed(format!("`{source}` cannot be read: {error}"))
+                    }
+                    None => ConfigError::Malformed(error.to_string()),
+                }
+            })?;
+            let dir = path.map(directory_of).unwrap_or_default();
+            let source = (*path).unwrap_or_default().to_owned();
+
+            // First non-empty wins.
+            if current_context.is_none()
+                && let Some(named) = raw.current_context.filter(|name| !name.is_empty())
+            {
+                current_context = Some(named);
+            }
+            for NamedCluster { name, cluster } in raw.clusters {
+                clusters.entry(name).or_insert_with(|| Sourced {
+                    spec: cluster,
+                    dir: dir.clone(),
+                    source: source.clone(),
+                });
+            }
+            for NamedUser { name, user } in raw.users {
+                users.entry(name).or_insert_with(|| Sourced {
+                    spec: user,
+                    dir: dir.clone(),
+                    source: source.clone(),
+                });
+            }
+            for NamedContext { name, context } in raw.contexts {
+                if let std::collections::hash_map::Entry::Vacant(slot) = contexts.entry(name) {
+                    order.push(slot.key().clone());
+                    slot.insert(Sourced {
+                        spec: context,
+                        dir: dir.clone(),
+                        source: source.clone(),
+                    });
+                }
+            }
+        }
+
         Ok(Self {
-            current_context: raw.current_context,
-            clusters: raw
-                .clusters
-                .into_iter()
-                .map(|entry| (entry.name, entry.cluster))
-                .collect(),
-            users: raw
-                .users
-                .into_iter()
-                .map(|entry| (entry.name, entry.user))
-                .collect(),
-            contexts: raw
-                .contexts
-                .into_iter()
-                .map(|entry| (entry.name, entry.context))
-                .collect(),
+            current_context,
+            clusters,
+            users,
+            contexts,
             order,
         })
     }
@@ -338,6 +433,25 @@ impl Kubeconfig {
     /// Every context the file defines, in the order it defines them.
     pub fn contexts(&self) -> impl Iterator<Item = &str> {
         self.order.iter().map(String::as_str)
+    }
+
+    /// Which file of a merged set supplied a context, where one did (§7.2, ADR-0056).
+    ///
+    /// Empty string for an entry from a single-document parse, which knew no path. `None` when no
+    /// such context exists.
+    #[must_use]
+    pub fn source_of_context(&self, context: &str) -> Option<&str> {
+        self.contexts
+            .get(context)
+            .map(|sourced| sourced.source.as_str())
+    }
+
+    /// Which file of a merged set supplied a cluster, where one did (§7.2, ADR-0056).
+    #[must_use]
+    pub fn source_of_cluster(&self, cluster: &str) -> Option<&str> {
+        self.clusters
+            .get(cluster)
+            .map(|sourced| sourced.source.as_str())
     }
 
     /// Resolves one context into a connection.
@@ -356,13 +470,13 @@ impl Kubeconfig {
 
         let cluster =
             self.clusters
-                .get(&entry.cluster)
+                .get(&entry.spec.cluster)
                 .ok_or_else(|| ConfigError::NoSuchCluster {
                     context: context.to_owned(),
-                    cluster: entry.cluster.clone(),
+                    cluster: entry.spec.cluster.clone(),
                 })?;
 
-        let user = match entry.user.as_deref() {
+        let user = match entry.spec.user.as_deref() {
             None => None,
             Some(name) => Some(
                 self.users
@@ -373,8 +487,15 @@ impl Kubeconfig {
                     })?,
             ),
         };
+        // The directory each half was defined in, for resolving that half's own relative paths
+        // (§7, ADR-0056). A merged set may take its cluster from one file and its user from
+        // another, so the two dirs are looked up separately.
+        let cluster_dir = cluster.dir.as_str();
+        let user_dir = user.map(|user| user.dir.as_str()).unwrap_or_default();
+        let user_spec = user.map(|user| &user.spec);
 
         let server = cluster
+            .spec
             .server
             .clone()
             .ok_or_else(|| ConfigError::Incomplete {
@@ -382,34 +503,60 @@ impl Kubeconfig {
                 detail: "its cluster declares no `server`".to_owned(),
             })?;
 
-        let (credential, material) = classify(user);
-        let (client_certificate, client_certificate_files) = client_certificate_of(user)?;
+        let (credential, material) = classify(user_spec);
+        let (client_certificate, client_certificate_files) =
+            client_certificate_of(user_spec, user_dir)?;
         // §8.2's block, read but not run. A block this provider refuses — an unknown contract, an
         // unknown interaction mode — is a *configuration* error and is reported here rather than
         // at connection time, because an operator fixes it in the file they can see.
-        let exec = match user.and_then(|user| user.exec.as_ref()) {
+        let exec = match user_spec.and_then(|user| user.exec.as_ref()) {
             None => None,
-            Some(block) => {
-                Some(
-                    ExecPlugin::parse(block).map_err(|refusal| ConfigError::Incomplete {
+            Some(block) => Some(
+                ExecPlugin::parse(block)
+                    // client-go resolves an `exec` command against the file's directory only when
+                    // the command names a path — a bare `aws` stays a `PATH` lookup (§8.2).
+                    .map(|plugin| plugin.resolve_command_against(user_dir))
+                    .map_err(|refusal| ConfigError::Incomplete {
                         context: context.to_owned(),
                         detail: format!("its credential plugin cannot be run: {refusal}"),
                     })?,
-                )
-            }
+            ),
         };
 
         Ok(Connection {
             context: context.to_owned(),
             server,
-            namespace: entry.namespace.clone(),
+            namespace: entry.spec.namespace.clone(),
             credential,
             material,
             client_certificate,
             client_certificate_files,
-            trust: trust_of(cluster)?,
+            trust: trust_of(&cluster.spec, cluster_dir)?,
             exec,
         })
+    }
+}
+
+/// Resolves a kubeconfig-relative path against the directory of the file that named it (§7).
+///
+/// An absolute path and a `~/`-anchored one pass through unchanged: the first is already
+/// resolved, and the second is the host's to expand against the operator's home (core ADR-0593),
+/// not this provider's. An empty directory — a single-document parse that knew no file — also
+/// leaves the path unchanged, because there is nothing to resolve it against.
+fn resolve_path(dir: &str, path: &str) -> String {
+    if dir.is_empty() || path.starts_with('/') || path.starts_with("~/") {
+        path.to_owned()
+    } else {
+        format!("{}/{path}", dir.trim_end_matches('/'))
+    }
+}
+
+/// The directory a file path lives in, or empty where it names no directory.
+fn directory_of(path: &str) -> String {
+    match path.rfind('/') {
+        Some(0) => "/".to_owned(),
+        Some(at) => path[..at].to_owned(),
+        None => String::new(),
     }
 }
 
@@ -443,7 +590,10 @@ fn classify(user: Option<&UserSpec>) -> (Credential, Option<Secret>) {
 /// identity would fail at the handshake for a reason nothing here had recorded.
 type ClientCertificate = (Option<(Vec<u8>, Secret)>, Vec<String>);
 
-fn client_certificate_of(user: Option<&UserSpec>) -> Result<ClientCertificate, ConfigError> {
+fn client_certificate_of(
+    user: Option<&UserSpec>,
+    dir: &str,
+) -> Result<ClientCertificate, ConfigError> {
     let Some(user) = user else {
         return Ok((None, Vec::new()));
     };
@@ -464,11 +614,14 @@ fn client_certificate_of(user: Option<&UserSpec>) -> Result<ClientCertificate, C
             files,
         ));
     }
+    // The file paths are resolved against the file that named them (§7, ADR-0056), because a
+    // caller reads them through its own capability against the real filesystem and a relative
+    // path there means "beside this kubeconfig".
     if let Some(path) = &user.client_certificate {
-        files.push(path.clone());
+        files.push(resolve_path(dir, path));
     }
     if let Some(path) = &user.client_key {
-        files.push(path.clone());
+        files.push(resolve_path(dir, path));
     }
     Ok((None, files))
 }
@@ -488,7 +641,7 @@ fn decode(encoded: Option<&str>, field: &str) -> Result<Option<Vec<u8>>, ConfigE
 ///
 /// `insecure-skip-tls-verify` wins where it is set, because it is the only field a human sets
 /// deliberately; everything else resolves to verification against something (§8.4).
-fn trust_of(cluster: &ClusterSpec) -> Result<Trust, ConfigError> {
+fn trust_of(cluster: &ClusterSpec, dir: &str) -> Result<Trust, ConfigError> {
     if cluster.insecure_skip_tls_verify.unwrap_or(false) {
         return Ok(Trust::Insecure);
     }
@@ -503,7 +656,9 @@ fn trust_of(cluster: &ClusterSpec) -> Result<Trust, ConfigError> {
         return Ok(Trust::CertificateAuthority(decoded));
     }
     if let Some(path) = &cluster.certificate_authority {
-        return Ok(Trust::CertificateAuthorityFile(path.clone()));
+        // Resolved against the file that named it (§7, ADR-0056): a relative
+        // `certificate-authority` means "beside this kubeconfig", and the caller reads it there.
+        return Ok(Trust::CertificateAuthorityFile(resolve_path(dir, path)));
     }
     Ok(Trust::SystemRoots)
 }
