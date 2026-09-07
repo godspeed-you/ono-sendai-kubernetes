@@ -29,6 +29,7 @@ the last two that were not, reach a reader through `changes.rs` and `query.rs`.
 | Specification | `docs/architecture/kubernetes-provider.md` — canonical here, immutable, checksummed |
 | Domain layer | `crates/ono-provider-kubernetes`, twenty-four modules, no host and no cluster |
 | Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations, audit, spatial |
+| Core revision | **`864602a7f0194ad1fc5b3096ebf3d3050cf9d7e4`** — the one every `Cargo.toml`, `Cargo.lock` and `.github/workflows/ci.yml` resolves to, carrying `ADR-0582 (core)` through `ADR-0599 (core)`; `should_build_the_shell_from_the_revision_this_package_is_built_against` fails if any of them diverge |
 | Contributions | 47 targets, 2 commands, 48 schemas, 64 relation shapes, **zero verbs of this package's own** |
 | Tests | 1072 across the workspace, all green; 29 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
 | Live proof | 18 tests in `live_cluster.rs` against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine. Seventeen announce a skip without one; the eighteenth is a static source scan that never does |
@@ -262,7 +263,9 @@ provider needed and none carries a Kubernetes concept — `ADR-0591 (core)` thro
 `provider.rate_limited`), host-resolved `~` in a path scope, the `provider.mutate` capability
 family, the provider-action contract, semantic roles on a place, a contributed place's `up`, the
 handshake-only-target report, and the remote-session assessment. The provider's pinned core
-revision moved to `e207b9a` and every manifest and the CI matrix moved with it.
+revision moved with them, and its final value for this pass is `864602a` — the child of `e207b9a`
+that adds only a core README refresh, and the one every manifest, `Cargo.lock` and the CI matrix
+resolve to (`chore: repin core to 864602a`).
 
 Twelve provider-local decisions, ADR-0055 through ADR-0067, took the matching `SHOULD`s: credential
 lifecycle and refresh, `KUBECONFIG` merge, the server path prefix, the relationship index and
@@ -972,4 +975,8 @@ review of this document and the coverage map found nine things overstated, every
 corrected in the commits above. Two of its findings were tests weaker than the rows citing them,
 including one that had no failing input at all.
 
-Next: §8.3's credential refresh, which is a session question rather than a credential one.
+What came next, in the completion passes recorded above under *In progress*: §8.3's credential
+refresh landed as a session-keyed credential store with a bounded 401 retry (ADR-0055), the rest
+of the `SHOULD` band closed (ADR-0055 through ADR-0067), and the dependency-path causal finding was
+wired (ADR-0068). This is the last of the dated session records; the current state is at the top of
+this document, not here.
