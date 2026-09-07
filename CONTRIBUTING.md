@@ -25,7 +25,8 @@ it stops, and it is the honest place to look for something to work on:
 - a section it marks partial, with the gap named;
 - a `SHOULD` nothing implements yet — §15.3's Tier 2 kinds are readable dynamically and none is
   curated, which is the largest well-defined piece of work on the board;
-- a curated CRD ecosystem (§15.4), which is what the adapter surface exists for;
+- a curated CRD ecosystem (§15.4), through the adapter registry of §33.8 —
+  [`docs/adapters.md`](docs/adapters.md) is the guide, fixture first, with a template;
 - the §68 open questions, which are explicitly reserved for later specifications or ADRs;
 - reading [`docs/architecture/kubernetes-provider.md`](docs/architecture/kubernetes-provider.md)
   against real clusters you operate, and opening an issue where a requirement is wrong,
@@ -50,6 +51,12 @@ workload relationships    watch/cache              CRD adapters
 network relationships     Events/temporal          fixtures/version compatibility
 storage relationships
 ```
+
+**CRD adapters** are the surface with the narrowest footprint: one module under
+`crates/ono-provider-kubernetes/src/adapter/`, one registration line, and the fixtures that prove
+it. An adapter is handed the dynamically discovered object and returns roles, evidenced edges and
+views beside it; the types give it no way to replace the record (§33.8). Read
+[`docs/adapters.md`](docs/adapters.md) before writing one.
 
 ## The rules that are not negotiable
 
