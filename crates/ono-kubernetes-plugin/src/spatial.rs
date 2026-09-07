@@ -536,6 +536,15 @@ impl Conversation for InventoryOf<'_> {
                 continue;
             }
             let scope = query::scope_for(self.endpoint, &resource);
+            // §50.4: a live watch this session holds over exactly this collection and scope is
+            // the same listing, kept true, and its index answers the whole scope in one call.
+            // The same rule `relations.rs` reads by (ADR-0058), so a neighbour drawn by `near`
+            // and an edge read by `get k8s-relation` come from one cache rather than two reads.
+            if let Ok(indexed) = session.indexed(resource.gvr(), &scope) {
+                let held = indexed.in_namespace(scope.namespace());
+                objects.insert((group.to_owned(), kind.to_owned()), held);
+                continue;
+            }
             let mut options = ListOptions::new().limit(PAGE_SIZE);
             if let Some(pages) = self.endpoint.max_pages {
                 options = options.max_pages(pages);

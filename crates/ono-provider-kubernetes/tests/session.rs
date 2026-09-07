@@ -1256,3 +1256,212 @@ fn should_learn_nothing_from_a_document_that_is_the_first_of_its_path() {
 
     assert!(session.schema(&widget_gvk()).is_some());
 }
+
+// --- §50.4 and §30.5 (core): relationship indexes over a watched cache (ADR-0058) ---------------
+
+/// A listing of two Pods, one of which a `app=checkout` selector reaches and one it does not.
+fn two_pod_listing() -> Listing {
+    listing_of(&[ok(&format!(
+        r#"{{"apiVersion":"v1","kind":"PodList","metadata":{{"resourceVersion":"18010"}},
+            "items":[{},{}]}}"#,
+        labelled_pod_item("checkout-1", "uid-1", "18005", r#"{"app":"checkout"}"#),
+        labelled_pod_item("worker-1", "uid-2", "18006", r#"{"app":"worker"}"#),
+    ))])
+}
+
+fn labelled_pod_item(name: &str, uid: &str, resource_version: &str, labels: &str) -> String {
+    format!(
+        r#"{{"metadata":{{"name":"{name}","namespace":"shop","uid":"{uid}","resourceVersion":"{resource_version}","labels":{labels},"ownerReferences":[{{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"checkout-6ac1","uid":"rs-1","controller":true}}]}}}}"#
+    )
+}
+
+fn checkout_selector() -> ono_provider_kubernetes::index::LabelSelector {
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("app".to_owned(), "checkout".to_owned());
+    ono_provider_kubernetes::index::LabelSelector::equalities(&labels)
+}
+
+#[test]
+fn should_answer_a_selector_from_the_index_of_a_live_watch_as_a_cached_observation() {
+    // §50.4: "Selector and owner-reference relationships MAY use indexes maintained over active
+    // caches." §20.2: what the index answers is a cached observation and says so — the moment of
+    // the read that filled the cache, the collection's continuity token, `origin=cache`.
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), two_pod_listing())
+        .expect("a complete listing seeds the cache");
+
+    let indexed = session
+        .indexed(&pods(), &shop())
+        .expect("a live, synchronised stream has a usable index");
+    let selected: Vec<&str> = indexed
+        .matching(Some("shop"), &checkout_selector())
+        .iter()
+        .map(|object| object.name().to_owned())
+        .collect::<Vec<_>>()
+        .leak()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(selected, vec!["checkout-1"]);
+    assert_eq!(
+        indexed
+            .children_of("rs-1")
+            .iter()
+            .map(ono_provider_kubernetes::object::Object::name)
+            .collect::<Vec<_>>(),
+        vec!["checkout-1", "worker-1"],
+        "the owner table answers what a listing filtered by owner reference would"
+    );
+    assert_eq!(indexed.in_namespace(Some("shop")).len(), 2);
+    assert!(indexed.in_namespace(Some("elsewhere")).is_empty());
+
+    let freshness = indexed.freshness();
+    assert_eq!(freshness.origin(), Origin::Cache);
+    assert_eq!(freshness.observed_at().unix_millis(), OBSERVED);
+    assert_eq!(
+        freshness.resource_version(),
+        Some("18010"),
+        "the collection's token, which is what a listing's freshness carries too"
+    );
+    assert_eq!(freshness.watch_synced(), Some(true));
+    let state = indexed.state();
+    assert!(state.usable());
+    assert_eq!(state.objects(), 2);
+    assert_eq!(
+        state.capacity(),
+        ono_provider_kubernetes::index::INDEX_CAPACITY
+    );
+    assert_eq!(state.sync_state(), SyncState::Live);
+}
+
+#[test]
+fn should_update_the_index_as_the_watch_delivers_changes() {
+    // §60.3 at the index: a label changes on one Pod, the watch says so, and the selector's
+    // answer changes with it. Nothing about the index is rebuilt; the one posting moves.
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), two_pod_listing())
+        .expect("a complete listing seeds the cache");
+
+    let relabelled = frame(
+        "MODIFIED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-1","namespace":"shop","uid":"uid-1","resourceVersion":"18011","labels":{"app":"retired"}}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), relabelled.as_bytes())
+        .expect("the frame decodes");
+    assert!(
+        session
+            .indexed(&pods(), &shop())
+            .expect("still live")
+            .matching(Some("shop"), &checkout_selector())
+            .is_empty(),
+        "the selector no longer reaches the relabelled Pod"
+    );
+    assert!(
+        session
+            .indexed(&pods(), &shop())
+            .expect("still live")
+            .children_of("rs-1")
+            .iter()
+            .all(|object| object.name() == "worker-1"),
+        "and the owner posting the new version no longer states is retracted"
+    );
+
+    let arrived = frame(
+        "ADDED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-2","namespace":"shop","uid":"uid-3","resourceVersion":"18012","labels":{"app":"checkout"}}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), arrived.as_bytes())
+        .expect("the frame decodes");
+    let names: Vec<String> = session
+        .indexed(&pods(), &shop())
+        .expect("still live")
+        .matching(Some("shop"), &checkout_selector())
+        .iter()
+        .map(|object| object.name().to_owned())
+        .collect();
+    assert_eq!(names, vec!["checkout-2"]);
+
+    let gone = frame(
+        "DELETED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-2","namespace":"shop","uid":"uid-3","resourceVersion":"18013","labels":{"app":"checkout"}}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), gone.as_bytes())
+        .expect("the frame decodes");
+    assert!(
+        session
+            .indexed(&pods(), &shop())
+            .expect("still live")
+            .matching(Some("shop"), &checkout_selector())
+            .is_empty()
+    );
+    assert_eq!(
+        session
+            .index_state(&pods(), &shop())
+            .expect("the watch is held")
+            .objects(),
+        2
+    );
+}
+
+#[test]
+fn should_refuse_to_answer_from_an_index_whose_stream_is_not_live() {
+    // §50.4's `MUST`: "An incomplete index MUST not return an unqualified complete-looking
+    // graph." The index answers exactly when the cache under it may call an absence an absence
+    // (§20.3), and every other state is a named reason to read the API server instead.
+    use ono_provider_kubernetes::index::Unusable;
+    use ono_provider_kubernetes::session::IndexMiss;
+
+    let mut session = session("dev");
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::NotWatched)
+    );
+
+    session.watch(&pods(), &shop());
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::Unusable(Unusable::NotSynced(SyncState::Syncing))),
+        "before the initial list, a selector over the cache would answer from nothing"
+    );
+
+    session
+        .synchronise(&pods(), &shop(), two_pod_listing())
+        .expect("a complete listing seeds the cache");
+    assert!(session.indexed(&pods(), &shop()).is_ok());
+
+    let expiry = frame(
+        "ERROR",
+        r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 18010 (18700)","reason":"Expired","code":410}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), expiry.as_bytes())
+        .expect("the ERROR frame decodes");
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::Unusable(Unusable::NotSynced(
+            SyncState::GapDetected
+        ))),
+        "past a gap the index still holds postings and is entitled to answer with none of them"
+    );
+    let state = session
+        .index_state(&pods(), &shop())
+        .expect("the watch is held");
+    assert!(!state.usable());
+    assert!(
+        state.describe().contains("gap detected"),
+        "the state names the word §41.4 gives the stream: {}",
+        state.describe()
+    );
+
+    session.mutated(&pods(), Some("shop"));
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::NotWatched),
+        "a write drops the cache and the index with it (§20.5)"
+    );
+}

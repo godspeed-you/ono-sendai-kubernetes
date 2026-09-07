@@ -28,17 +28,19 @@
 //! a verified relationship. The class travels on the record so that a reader can check rather
 //! than trust (§4 invariant 20).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ono_kuang_sdk::protocol::WireError;
 use ono_kuang_sdk::{Ctx, EmitError, Outcome};
 use ono_provider_kubernetes::coverage::{Gap, Outcome as CoverageOutcome, Scope};
 use ono_provider_kubernetes::discovery::{self, Discovery, Resource, Verb};
+use ono_provider_kubernetes::index::LabelSelector;
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::place::Place;
 use ono_provider_kubernetes::redaction::{self, Guarded};
 use ono_provider_kubernetes::relationship::{Edge, Graph, Relation};
-use ono_provider_kubernetes::session::Session;
+use ono_provider_kubernetes::session::{Indexed, Session};
 use ono_provider_kubernetes::transport::{ByteStream, Client, Freshness, ListOptions};
 use ono_provider_kubernetes::workload::{SelectorMatch, Workload};
 use ono_value::Schema;
@@ -193,6 +195,7 @@ impl Conversation for Related<'_> {
             source: guarded,
             freshness,
             sources: Vec::new(),
+            listings: BTreeMap::new(),
         };
         // §34.2's second sentence: the failed group/version is reported separately, beside the
         // gaps the derivations record for themselves.
@@ -232,6 +235,12 @@ struct Derived {
     /// *every* source fact, and because Appendix C.2 shows each source's `resourceVersion` on the
     /// edge it produced.
     sources: Vec<SourceRead>,
+    /// Every collection this invocation read, by collection, scope and the selector it was
+    /// narrowed by, so a second rule wanting the same one reads it once (§17.6, ADR-0058).
+    ///
+    /// `None` is a read that came back short: the rule that first wanted it recorded the gap,
+    /// and the next one must not ask the API server again for a listing it would refuse again.
+    listings: BTreeMap<(String, String, Option<String>), Option<Vec<Object>>>,
 }
 
 /// One collection a derivation read, and what it was worth.
@@ -335,6 +344,11 @@ pub(crate) fn is(object: &Object, group: &str, kind: &str) -> bool {
 }
 
 /// The edges that need a second object read, each recording its own gap where it could not.
+///
+/// Every collection a rule needs is asked for through [`collection`], which decides *how* it is
+/// read: from the session's relationship index where a live watch covers it (§50.4), or from
+/// the API server with the rule's own selector pushed down (§17.3) — and never the caller's,
+/// which ADR-0049 keeps verbatim. ADR-0058 records both.
 fn two_sided<S: ByteStream>(
     session: &mut Session,
     client: &mut Client<S>,
@@ -343,23 +357,41 @@ fn two_sided<S: ByteStream>(
     scope: &Scope,
     derived: &mut Derived,
 ) -> Result<(), WireError> {
+    let mut reads = Reads {
+        session,
+        client,
+        endpoint,
+        served,
+        scope,
+    };
     if is(derived.source.object(), "", "Service") {
-        // §26.1: the Service's selector against the labels of the Pods in its own namespace.
-        if let Some(pods) =
-            collection(session, client, endpoint, served, scope, "", "Pod", derived)?
+        // §26.1: the Service's selector against the labels of the Pods in its own namespace. The
+        // selector is an equality map, which is the one selector shape whose pushdown is exact
+        // by construction: `app=api` means the same thing to the API server, to the index and to
+        // `Graph::selects`. An empty or absent selector selects nothing (§26.1), so nothing is
+        // read for it — a listing that could not contribute an edge is a request that could only
+        // widen the answer's coverage claim for nothing.
+        let selector =
+            LabelSelector::equalities(&string_map(derived.source.object().field("/spec/selector")));
+        if !selector.is_empty()
+            && let Some(pods) =
+                reads.collection("", "Pod", &Wanted::Selected(&selector), derived)?
         {
             let edges = Graph::selects(derived.source.object(), &pods);
             derived.edges.extend(edges);
         }
-        // §26.2: the slices that carry the standard service-name label.
-        if let Some(slices) = collection(
-            session,
-            client,
-            endpoint,
-            served,
-            scope,
+        // §26.2: the slices that carry the standard service-name label — one label, one value,
+        // pushed as such.
+        let mut by_service = BTreeMap::new();
+        by_service.insert(
+            SERVICE_NAME_LABEL.to_owned(),
+            derived.source.object().name().to_owned(),
+        );
+        let named = LabelSelector::equalities(&by_service);
+        if let Some(slices) = reads.collection(
             "discovery.k8s.io",
             "EndpointSlice",
+            &Wanted::Selected(&named),
             derived,
         )? {
             let edges = Workload::endpoint_slices(derived.source.object(), &slices);
@@ -367,36 +399,49 @@ fn two_sided<S: ByteStream>(
         }
     }
     // §31.1, from the policy's end: the Pods of its own namespace, evaluated against
-    // `spec.podSelector`. The policy is the object an operator names during an outage, and until
-    // this derivation existed a NetworkPolicy had no relationship at all.
+    // `spec.podSelector`. The rule is probed against no candidates first: a selector it will not
+    // evaluate (ADR-0007) is refused before any Pod is read, because the listing could not have
+    // produced an edge and the reason is the same either way.
     if is(
         derived.source.object(),
         "networking.k8s.io",
         "NetworkPolicy",
-    ) && let Some(pods) =
-        collection(session, client, endpoint, served, scope, "", "Pod", derived)?
-    {
-        let reached = Graph::policy_selects(derived.source.object(), &pods);
-        evaluated(derived, reached);
+    ) {
+        match Graph::policy_selects(derived.source.object(), &[]) {
+            SelectorMatch::NotEvaluated { reason } => derived.unevaluated.push(reason),
+            SelectorMatch::Evaluated(_) => {
+                // An empty `spec.podSelector` is every Pod of the namespace, which is the whole
+                // collection and no `labelSelector` at all — `to_query` says so.
+                let selector = LabelSelector::equalities(&string_map(
+                    derived
+                        .source
+                        .object()
+                        .field("/spec/podSelector")
+                        .and_then(|selector| selector.get("matchLabels")),
+                ));
+                if let Some(pods) =
+                    reads.collection("", "Pod", &Wanted::Selected(&selector), derived)?
+                {
+                    let reached = Graph::policy_selects(derived.source.object(), &pods);
+                    evaluated(derived, reached);
+                }
+            }
+        }
     }
     if is(derived.source.object(), "", "Pod") {
         // Appendix B's `selected-by`: §26.1 read from the Pod's end, which is where an operator
-        // stands when one Pod is missing from a Service's endpoints.
-        if let Some(services) = collection(
-            session, client, endpoint, served, scope, "", "Service", derived,
-        )? {
+        // stands when one Pod is missing from a Service's endpoints. The selectors live on the
+        // Services, so nothing narrows this listing: no field of a Service says what it selects
+        // in a form the API server filters on.
+        if let Some(services) = reads.collection("", "Service", &Wanted::Everything, derived)? {
             let edges = Graph::selected_by(derived.source.object(), &services);
             derived.edges.extend(edges);
         }
-        // Appendix B's `protected-by`: §31.1 read from the Pod's end.
-        if let Some(policies) = collection(
-            session,
-            client,
-            endpoint,
-            served,
-            scope,
+        // Appendix B's `protected-by`: §31.1 read from the Pod's end, likewise.
+        if let Some(policies) = reads.collection(
             "networking.k8s.io",
             "NetworkPolicy",
+            &Wanted::Everything,
             derived,
         )? {
             let reached = Graph::protected_by(derived.source.object(), &policies);
@@ -406,16 +451,8 @@ fn two_sided<S: ByteStream>(
     // Appendix B's `routed-from`: §27.1 read from the backend's end, where an operator stands
     // when a Service has healthy endpoints and the URL in front of it does not answer.
     if is(derived.source.object(), "", "Service")
-        && let Some(routers) = collection(
-            session,
-            client,
-            endpoint,
-            served,
-            scope,
-            "networking.k8s.io",
-            "Ingress",
-            derived,
-        )?
+        && let Some(routers) =
+            reads.collection("networking.k8s.io", "Ingress", &Wanted::Everything, derived)?
     {
         let edges = Workload::routed_from(derived.source.object(), &routers);
         derived.edges.extend(edges);
@@ -423,14 +460,74 @@ fn two_sided<S: ByteStream>(
     if let Some((.., group, child)) = CHILDREN_OF
         .iter()
         .find(|(owner_group, owner_kind, ..)| is(derived.source.object(), owner_group, owner_kind))
-        && let Some(children) = collection(
-            session, client, endpoint, served, scope, group, child, derived,
-        )?
+        && let Some(uid) = derived.source.object().uid().map(str::to_owned)
     {
-        let edges = Workload::owns(derived.source.object(), &children);
-        derived.edges.extend(edges);
+        // §25's children, proven by `ownerReferences` and *pre-filtered* by the controller's
+        // own `spec.selector` where it states one. The evidence class stays owner-reference:
+        // `Workload::owns` still reads every candidate's owner references, and the selector
+        // only decides which candidates are fetched. That is exact because a controller adopts
+        // only what its selector matches and releases what stops matching (ADR-0058 argues the
+        // one lag it admits). A selector this provider cannot read as upstream reads it is not
+        // pushed at all, so the fallback is the unfiltered listing rather than an approximation.
+        let prefilter = derived
+            .source
+            .object()
+            .field("/spec/selector")
+            .and_then(|selector| LabelSelector::from_json(selector).ok())
+            .filter(|selector| !selector.is_empty());
+        let wanted = Wanted::OwnedBy {
+            uid: &uid,
+            prefilter: prefilter.as_ref(),
+        };
+        if let Some(children) = reads.collection(group, child, &wanted, derived)? {
+            let edges = Workload::owns(derived.source.object(), &children);
+            derived.edges.extend(edges);
+        }
     }
     Ok(())
+}
+
+/// The label by which an EndpointSlice says which Service it represents (§26.2).
+const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
+
+/// What a rule wants from a collection, which decides how the collection is asked for.
+///
+/// The selector here is always the *rule's* — a Service's `spec.selector`, a controller's, a
+/// policy's `spec.podSelector` — and never the caller's. ADR-0049 keeps the caller's verbatim
+/// because a translation of somebody else's question can change its meaning; a rule's selector
+/// is this provider's own question, read from the object by this provider's own code, and its
+/// translation is upstream's (`LabelSelectorAsSelector`), pinned by tests for every operator.
+enum Wanted<'a> {
+    /// Every object of the scope: the rule reads each object's own fields to decide.
+    Everything,
+    /// The objects whose labels satisfy the rule's selector, in full (§23.3).
+    Selected(&'a LabelSelector),
+    /// The objects whose `ownerReferences` name this owner (§24.1), narrowed on the wire by the
+    /// owner's own selector where it states one.
+    OwnedBy {
+        uid: &'a str,
+        prefilter: Option<&'a LabelSelector>,
+    },
+}
+
+impl Wanted<'_> {
+    /// The `labelSelector` this asks the API server for, where one narrows the listing exactly.
+    fn query(&self) -> Option<String> {
+        match self {
+            Self::Everything => None,
+            Self::Selected(selector) => selector.to_query(),
+            Self::OwnedBy { prefilter, .. } => prefilter.and_then(LabelSelector::to_query),
+        }
+    }
+
+    /// The same question, answered from an index over a live cache (§50.4).
+    fn answered_by(&self, indexed: &Indexed<'_>, namespace: Option<&str>) -> Vec<Object> {
+        match self {
+            Self::Everything => indexed.in_namespace(namespace),
+            Self::Selected(selector) => indexed.matching(namespace, selector),
+            Self::OwnedBy { uid, .. } => indexed.children_of(uid),
+        }
+    }
 }
 
 /// Takes the edges of an evaluated selector, or records why one was not evaluated (ADR-0007).
@@ -446,62 +543,124 @@ fn evaluated(derived: &mut Derived, reached: SelectorMatch) {
     }
 }
 
-/// One collection a derivation needs, or [`None`] with a gap recorded against the answer.
-///
-/// Three ways this reads nothing, and all three are gaps rather than empty results (§21.4): the
-/// cluster serves no such API, it serves it without `list`, or the listing itself came back
-/// short. The rule that wanted the objects is then not evaluated at all, which is ADR-0007's
-/// position: an unevaluated selector says so rather than returning the subset it could evaluate.
-fn collection<S: ByteStream>(
-    session: &mut Session,
-    client: &mut Client<S>,
-    endpoint: &Endpoint,
-    served: &Discovery,
-    scope: &Scope,
-    group: &str,
-    kind: &str,
-    derived: &mut Derived,
-) -> Result<Option<Vec<Object>>, WireError> {
-    let Some(resource) = serving(session, client, endpoint, served, group, kind)? else {
-        derived
-            .coverage
-            .record(Gap::new(scope.clone(), CoverageOutcome::TypeNotServed));
-        return Ok(None);
-    };
-    if !resource.supports(Verb::List) {
-        derived
-            .coverage
-            .record(Gap::new(scope.clone(), CoverageOutcome::TypeNotServed));
-        return Ok(None);
+/// Everything a collection read needs, carried once rather than in eight arguments per rule.
+struct Reads<'a, S: ByteStream> {
+    session: &'a mut Session,
+    client: &'a mut Client<S>,
+    endpoint: &'a Endpoint,
+    served: &'a Discovery,
+    scope: &'a Scope,
+}
+
+impl<S: ByteStream> Reads<'_, S> {
+    /// One collection a derivation needs, or [`None`] with a gap recorded against the answer.
+    ///
+    /// Three ways this reads nothing, and all three are gaps rather than empty results (§21.4):
+    /// the cluster serves no such API, it serves it without `list`, or the listing itself came
+    /// back short. The rule that wanted the objects is then not evaluated at all, which is
+    /// ADR-0007's position: an unevaluated selector says so rather than returning the subset it
+    /// could evaluate.
+    ///
+    /// Where the collection is read from is decided here, in this order (ADR-0058):
+    ///
+    /// 1. **this invocation already read it** — one listing per collection, scope and selector,
+    ///    however many rules want it (§17.6's grouping);
+    /// 2. **the session's index over a live watch** — the question is answered from the cache
+    ///    with `origin=cache` and the watch's sync state on the answer (§50.4, §20.2), and only
+    ///    while absence in that cache is conclusive (§20.3);
+    /// 3. **the API server**, with the rule's selector pushed down as `labelSelector` (§17.3).
+    fn collection(
+        &mut self,
+        group: &str,
+        kind: &str,
+        wanted: &Wanted<'_>,
+        derived: &mut Derived,
+    ) -> Result<Option<Vec<Object>>, WireError> {
+        let Some(resource) = serving(
+            self.session,
+            self.client,
+            self.endpoint,
+            self.served,
+            group,
+            kind,
+        )?
+        else {
+            derived
+                .coverage
+                .record(Gap::new(self.scope.clone(), CoverageOutcome::TypeNotServed));
+            return Ok(None);
+        };
+        if !resource.supports(Verb::List) {
+            derived
+                .coverage
+                .record(Gap::new(self.scope.clone(), CoverageOutcome::TypeNotServed));
+            return Ok(None);
+        }
+        let scope = match resource.scope() {
+            discovery::Scope::Cluster => Scope::cluster(),
+            discovery::Scope::Namespaced => self.scope.clone(),
+        };
+        let role = kind.to_lowercase();
+        let selector = wanted.query();
+        let key = (
+            resource.gvr().to_string(),
+            scope.to_string(),
+            selector.clone(),
+        );
+        if let Some(read) = derived.listings.get(&key) {
+            return Ok(read.clone());
+        }
+
+        // §50.4: a live watch this session holds over exactly this collection and scope answers
+        // the question from its index. The answer is a cached observation and its freshness says
+        // so; a stream that is not live, or an index past its bound, is a named reason to go to
+        // the API server instead, and never a subset.
+        if let Ok(indexed) = self.session.indexed(resource.gvr(), &scope) {
+            let objects = wanted.answered_by(&indexed, scope.namespace());
+            derived.sources.push(SourceRead {
+                role,
+                freshness: indexed.freshness().clone(),
+            });
+            let held = guard_all(objects)?;
+            derived.listings.insert(key, Some(held.clone()));
+            return Ok(Some(held));
+        }
+
+        let mut options = ListOptions::new().limit(PAGE_SIZE);
+        if let Some(pages) = self.endpoint.max_pages {
+            options = options.max_pages(pages);
+        }
+        if let Some(selector) = &selector {
+            options = options.label_selector(selector.clone());
+        }
+        let listing = self.client.list(resource.gvr(), &scope, &options);
+        // §23.6, recorded at the one moment it is knowable: this listing is the second source of
+        // every edge the rule about to run derives, and once the objects are unwrapped the read
+        // that produced them is gone.
+        derived.sources.push(SourceRead {
+            role,
+            freshness: listing.freshness().clone(),
+        });
+        let complete = listing.coverage().is_complete() && listing.continuity().is_intact();
+        for gap in listing.coverage().gaps() {
+            derived.coverage.record(gap.clone());
+        }
+        let objects = listing.into_objects();
+        if !complete {
+            // The rule needs every candidate: a selector evaluated against half the Pods reports
+            // the other half as unselected, which is a wrong answer rather than a partial one.
+            derived.listings.insert(key, None);
+            return Ok(None);
+        }
+        let held = guard_all(objects)?;
+        derived.listings.insert(key, Some(held.clone()));
+        Ok(Some(held))
     }
-    let scope = match resource.scope() {
-        discovery::Scope::Cluster => Scope::cluster(),
-        discovery::Scope::Namespaced => scope.clone(),
-    };
-    let mut options = ListOptions::new().limit(PAGE_SIZE);
-    if let Some(pages) = endpoint.max_pages {
-        options = options.max_pages(pages);
-    }
-    let listing = client.list(resource.gvr(), &scope, &options);
-    // §23.6, recorded at the one moment it is knowable: this listing is the second source of every
-    // edge the rule about to run derives, and once the objects are unwrapped the read that
-    // produced them is gone.
-    derived.sources.push(SourceRead {
-        role: kind.to_lowercase(),
-        freshness: listing.freshness().clone(),
-    });
-    let complete = listing.coverage().is_complete() && listing.continuity().is_intact();
-    for gap in listing.coverage().gaps() {
-        derived.coverage.record(gap.clone());
-    }
-    let objects = listing.into_objects();
-    if !complete {
-        // The rule needs every candidate: a selector evaluated against half the Pods reports the
-        // other half as unselected, which is a wrong answer rather than a partial one.
-        return Ok(None);
-    }
-    // §22 and Gate I again: every object a derivation reads crosses the same boundary as the
-    // source, so there is one door into the emission path rather than two.
+}
+
+/// §22 and Gate I: every object a derivation reads crosses the same boundary as the source, so
+/// there is one door into the emission path rather than two.
+fn guard_all(objects: Vec<Object>) -> Result<Vec<Object>, WireError> {
     let guarded = Guarded::hold_all(objects).map_err(|error| {
         failure(
             UNAVAILABLE_CODE,
@@ -510,12 +669,22 @@ fn collection<S: ByteStream>(
             "This is a defect in the Kubernetes provider, not in the cluster.",
         )
     })?;
-    Ok(Some(
-        guarded
-            .into_iter()
-            .map(|held| held.object().clone())
-            .collect(),
-    ))
+    Ok(guarded
+        .into_iter()
+        .map(|held| held.object().clone())
+        .collect())
+}
+
+/// A JSON object of strings as a label map, and nothing for anything else.
+fn string_map(value: Option<&Json>) -> BTreeMap<String, String> {
+    value
+        .and_then(Json::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The resource serving one kind, or [`None`] where this cluster serves none.

@@ -31,13 +31,17 @@ use std::time::Duration;
 use crate::coverage::Scope;
 use crate::diagnostics::{Alias, ClusterDiagnostic, Fingerprint, Identity, TlsPosture};
 use crate::discovery::{Discovery, Gvk, Gvr};
+use crate::index::{IndexState, LabelSelector, RelationshipIndex, Unusable};
 use crate::kubeconfig::{Connection, Credential, Secret};
+use crate::object::Object;
 use crate::schema::{Schema, SchemaCache};
 use crate::tls::TlsSettings;
 use crate::transport::{
     Clock, EndpointCategory, Freshness, Listing, ObservedAt, Read, SystemClock,
 };
-use crate::watch::{FrameError, Reception, ResourceVersion, SyncState, WatchDecoder, WatchStream};
+use crate::watch::{
+    FrameError, Reception, ResourceVersion, SyncState, WatchDecoder, WatchEvent, WatchStream,
+};
 
 /// An optional server behaviour this session agreed with the cluster it is connected to (§6.3).
 ///
@@ -286,6 +290,92 @@ struct Watched {
     /// unchanged object look stale and a changed one look fresher than its neighbours, when in
     /// fact they are known to the same instant (§20.2, §20.3).
     observed_at: ObservedAt,
+    /// The relationship tables over this cache (§50.4), rebuilt on every synchronisation and
+    /// updated by every event the stream applies, so they are never truer or staler than the
+    /// cache they index.
+    index: RelationshipIndex,
+}
+
+impl Watched {
+    fn new(gvr: &Gvr, scope: &Scope, instance: String, observed_at: ObservedAt) -> Self {
+        Self {
+            stream: WatchStream::new(gvr.clone(), scope.clone()),
+            decoder: WatchDecoder::new(instance),
+            observed_at,
+            index: RelationshipIndex::new(),
+        }
+    }
+}
+
+/// Why a derivation could not answer from an index (§50.4, §20.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMiss {
+    /// No watch covers this collection and scope, so there is nothing to index.
+    NotWatched,
+    /// A watch covers it and its index is not entitled to answer; the reason says why.
+    Unusable(Unusable),
+}
+
+impl fmt::Display for IndexMiss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotWatched => f.write_str("no watch covers the collection in this scope"),
+            Self::Unusable(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+/// One usable index, with the cache it answers from and the freshness its answers carry.
+///
+/// Borrowed from the session for the length of one derivation, so nothing can be answered from
+/// an index the session has since dropped or a stream that has since broken.
+#[derive(Debug)]
+pub struct Indexed<'a> {
+    watched: &'a Watched,
+    freshness: Freshness,
+}
+
+impl Indexed<'_> {
+    /// What every answer from this index is worth: a cached observation, at the moment the
+    /// stream last observed the collection, carrying the collection's continuity token (§20.2).
+    #[must_use]
+    pub fn freshness(&self) -> &Freshness {
+        &self.freshness
+    }
+
+    /// The observable state of the index (§30.5 core).
+    #[must_use]
+    pub fn state(&self) -> IndexState {
+        self.watched.index.state(
+            self.watched.stream.state(),
+            self.watched.stream.is_gap_free(),
+        )
+    }
+
+    /// Every cached object of one namespace, or of the whole collection for `None`.
+    #[must_use]
+    pub fn in_namespace(&self, namespace: Option<&str>) -> Vec<Object> {
+        self.resolve(self.watched.index.in_namespace(namespace))
+    }
+
+    /// The cached objects of one namespace whose labels satisfy the selector in full (§23.3).
+    #[must_use]
+    pub fn matching(&self, namespace: Option<&str>, selector: &LabelSelector) -> Vec<Object> {
+        self.resolve(self.watched.index.matching(namespace, selector))
+    }
+
+    /// The cached objects whose owner references name `owner_uid` (§24.1).
+    #[must_use]
+    pub fn children_of(&self, owner_uid: &str) -> Vec<Object> {
+        self.resolve(self.watched.index.children_of(owner_uid))
+    }
+
+    fn resolve(&self, keys: Vec<crate::index::ObjectKey>) -> Vec<Object> {
+        keys.iter()
+            .filter_map(|(namespace, name)| self.watched.stream.find(namespace.as_deref(), name))
+            .cloned()
+            .collect()
+    }
 }
 
 /// The live state of one provider instance (§6.3).
@@ -872,17 +962,16 @@ impl<C: Clock> Session<C> {
     /// GVR in a large cluster is expensive and not required, and a session that opened one per
     /// discovered resource would be the most expensive thing this provider does.
     pub fn watch(&mut self, gvr: &Gvr, scope: &Scope) -> &mut WatchStream {
+        &mut self.entry_for(gvr, scope).stream
+    }
+
+    /// The watched entry for one collection and scope, opened on demand.
+    fn entry_for(&mut self, gvr: &Gvr, scope: &Scope) -> &mut Watched {
         let instance = self.instance.clone();
         let now = self.clock.now();
-        &mut self
-            .watches
+        self.watches
             .entry((gvr.clone(), scope.clone()))
-            .or_insert_with(|| Watched {
-                stream: WatchStream::new(gvr.clone(), scope.clone()),
-                decoder: WatchDecoder::new(instance),
-                observed_at: now,
-            })
-            .stream
+            .or_insert_with(|| Watched::new(gvr, scope, instance, now))
     }
 
     /// The watch over one collection and scope, where this session holds one.
@@ -984,14 +1073,58 @@ impl<C: Clock> Session<C> {
         let watched = self
             .watches
             .entry((gvr.clone(), scope.clone()))
-            .or_insert_with(|| Watched {
-                stream: WatchStream::new(gvr.clone(), scope.clone()),
-                decoder: WatchDecoder::new(instance),
-                observed_at,
-            });
+            .or_insert_with(|| Watched::new(gvr, scope, instance, observed_at));
         watched.stream.listed(objects, version);
         watched.observed_at = observed_at;
+        // §50.4: the index is a function of the cache, so a re-acquired cache is a rebuilt index
+        // and never a merge of two observation periods.
+        watched.index.rebuild(watched.stream.objects());
         Ok(())
+    }
+
+    /// Feeds one decoded event to the cache it belongs to, and to the index over it (§19.3).
+    ///
+    /// The one door through which an event reaches a stream this session holds, so that what an
+    /// event does to the cache and what it does to the index cannot drift apart: an object the
+    /// stream applied is posted, one it deleted is retracted, and one it discarded touches
+    /// neither.
+    pub fn observe_event(&mut self, gvr: &Gvr, scope: &Scope, event: WatchEvent) -> Reception {
+        let now = self.clock.now();
+        let watched = self.entry_for(gvr, scope);
+        Self::apply_event(watched, now, event)
+    }
+
+    fn apply_event(watched: &mut Watched, now: ObservedAt, event: WatchEvent) -> Reception {
+        // What the event names, read before the stream takes the object, so the index can be
+        // told which entry to retract without a second copy of the object.
+        let key = match &event {
+            WatchEvent::Added(object)
+            | WatchEvent::Modified(object)
+            | WatchEvent::Deleted(object) => Some((
+                object.namespace().map(str::to_owned),
+                object.name().to_owned(),
+            )),
+            WatchEvent::Bookmark(_) | WatchEvent::Error(_) => None,
+        };
+        let reception = watched.stream.observe(event);
+        if reception != Reception::Discarded {
+            // The cache is current as of the moment this provider read the event, never as of
+            // any timestamp inside the object: §14.3 keeps `resourceVersion` from being a
+            // clock, and `creationTimestamp` is about the object rather than the observation.
+            watched.observed_at = now;
+        }
+        if reception == Reception::Applied
+            && let Some(key) = key
+        {
+            match watched.stream.find(key.0.as_deref(), &key.1) {
+                Some(object) => {
+                    let object = object.clone();
+                    watched.index.insert(&object);
+                }
+                None => watched.index.remove(&key),
+            }
+        }
+        reception
     }
 
     /// Applies the bytes of a watch response to the cache they belong to (§19.3).
@@ -1013,28 +1146,60 @@ impl<C: Clock> Session<C> {
         chunk: &[u8],
     ) -> Result<Vec<Reception>, FrameError> {
         let now = self.clock.now();
-        let instance = self.instance.clone();
-        let watched = self
-            .watches
-            .entry((gvr.clone(), scope.clone()))
-            .or_insert_with(|| Watched {
-                stream: WatchStream::new(gvr.clone(), scope.clone()),
-                decoder: WatchDecoder::new(instance),
-                observed_at: now,
-            });
+        let watched = self.entry_for(gvr, scope);
         let events = watched.decoder.decode(chunk)?;
         let mut receptions = Vec::with_capacity(events.len());
         for event in events {
-            let reception = watched.stream.observe(event);
-            if reception != Reception::Discarded {
-                // The cache is current as of the moment this provider read the event, never as of
-                // any timestamp inside the object: §14.3 keeps `resourceVersion` from being a
-                // clock, and `creationTimestamp` is about the object rather than the observation.
-                watched.observed_at = now;
-            }
-            receptions.push(reception);
+            receptions.push(Self::apply_event(watched, now, event));
         }
         Ok(receptions)
+    }
+
+    /// The relationship index over one watched collection, where it is entitled to answer
+    /// (§50.4, §20.3).
+    ///
+    /// # Errors
+    ///
+    /// [`IndexMiss`] naming why not: no watch covers the collection in this scope, the stream is
+    /// not live so absence in it is unobserved rather than observed, or the cache outgrew the
+    /// index bound. Each is a reason to read the API server instead, and the caller says which.
+    pub fn indexed(&self, gvr: &Gvr, scope: &Scope) -> Result<Indexed<'_>, IndexMiss> {
+        let Some(watched) = self.watches.get(&(gvr.clone(), scope.clone())) else {
+            return Err(IndexMiss::NotWatched);
+        };
+        let state = watched
+            .index
+            .state(watched.stream.state(), watched.stream.is_gap_free());
+        if let Some(reason) = state.unusable() {
+            return Err(IndexMiss::Unusable(reason));
+        }
+        Ok(Indexed {
+            watched,
+            freshness: Freshness::cached(
+                watched.observed_at,
+                watched
+                    .stream
+                    .checkpoint()
+                    .map(|version| version.as_str().to_owned()),
+                &self.instance,
+                scope.clone(),
+                EndpointCategory::of(gvr),
+                watched.stream.has_synced(),
+            ),
+        })
+    }
+
+    /// The observable state of the index over one watched collection, where one exists
+    /// (§30.5 core).
+    #[must_use]
+    pub fn index_state(&self, gvr: &Gvr, scope: &Scope) -> Option<IndexState> {
+        self.watches
+            .get(&(gvr.clone(), scope.clone()))
+            .map(|watched| {
+                watched
+                    .index
+                    .state(watched.stream.state(), watched.stream.is_gap_free())
+            })
     }
 
     /// What this session's caches can say about one namespace and name (§20.2, §20.3).
@@ -1171,6 +1336,19 @@ impl<C: Clock> fmt::Debug for Session<C> {
             .field("discovery_documents", &self.discovery_documents())
             .field("schemas", &self.schemas.len())
             .field("watches", &self.watches.len())
+            .field(
+                "indexes",
+                &self
+                    .watches
+                    .values()
+                    .map(|watched| {
+                        watched
+                            .index
+                            .state(watched.stream.state(), watched.stream.is_gap_free())
+                            .describe()
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .field("capabilities", &self.capabilities)
             .finish()
     }
