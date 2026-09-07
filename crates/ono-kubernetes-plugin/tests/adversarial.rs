@@ -66,6 +66,10 @@ enum Answers {
     /// The Gateway API is served, and its one HTTPRoute names a Gateway and a Service whose
     /// every human-readable field was chosen by whoever created the route.
     WithAHostileRoute,
+    /// A Pod that mounts a Secret by name, and that Secret served at its own endpoint with a
+    /// payload — so that walking the Pod's `references-secret` edge has a payload to leak if the
+    /// navigation ever read the Secret's body (§22.4, Gate I).
+    WithASecretReferencingPod,
 }
 
 /// One recorded API server, and the request heads it received.
@@ -140,6 +144,28 @@ impl Cluster {
         })
     }
 
+    /// A ServiceAccount that carries a Secret in its `secrets` list (§22.4, §32.1). Walking its
+    /// `uses-secret` edge names the Secret from the account's own spec; it does not read the
+    /// Secret's body, and this fixture is what proves that — the body is served at the Secret's
+    /// own endpoint with a payload the navigation never fetches. A ServiceAccount rather than a
+    /// Pod because a Pod's edges also need the namespace's Services and policies listed, and this
+    /// test is about the Secret leg alone.
+    fn secret_referencing_account() -> Json {
+        json!({
+            "apiVersion": "v1", "kind": "ServiceAccount",
+            "metadata": {
+                "name": "consumer", "namespace": "shop",
+                "uid": "ffffffff-6666-6666-6666-666666666666",
+                "resourceVersion": "9101",
+                "creationTimestamp": "2026-09-01T09:00:00Z",
+                // A hostile annotation on the referencing object too: §22 is about the payload,
+                // and a payload could hide in an annotation the navigation carries.
+                "annotations": {"acme.example.com/note": CIPHERTEXT},
+            },
+            "secrets": [{"name": "db-creds"}],
+        })
+    }
+
     /// An HTTPRoute whose parent, backend and namespace references are attacker-chosen text.
     ///
     /// The curated Gateway API adapter reads these fields (§27.3, §33.8), and what it reads is
@@ -169,7 +195,8 @@ impl Cluster {
             Answers::Honestly
             | Answers::WithBrokenFraming
             | Answers::WithAContinueTokenThatNeverAdvances
-            | Answers::WithAHostileRoute => None,
+            | Answers::WithAHostileRoute
+            | Answers::WithASecretReferencingPod => None,
         };
         let mut item = json!({
             "metadata": {
@@ -243,6 +270,8 @@ impl Cluster {
                      "verbs": ["get", "list", "watch"]},
                     {"name": "secrets", "kind": "Secret", "namespaced": true,
                      "verbs": ["get", "list", "watch"]},
+                    {"name": "serviceaccounts", "kind": "ServiceAccount", "namespaced": true,
+                     "verbs": ["get", "list", "watch"]},
                 ],
             }),
             ("GET", "/api/v1/namespaces/kube-system") => json!({
@@ -254,6 +283,27 @@ impl Cluster {
                 },
                 "status": {"phase": "Active"},
             }),
+            ("GET", "/api/v1/namespaces/shop/serviceaccounts/consumer")
+                if self.answers == Answers::WithASecretReferencingPod =>
+            {
+                Self::secret_referencing_account()
+            }
+            // The Secret at its own endpoint, payload and all: if navigating an edge ever GET the
+            // Secret body, this is where the plaintext would come from — and the test proves it
+            // does not arrive.
+            ("GET", "/api/v1/namespaces/shop/secrets/db-creds")
+                if self.answers == Answers::WithASecretReferencingPod =>
+            {
+                json!({
+                    "kind": "Secret", "apiVersion": "v1",
+                    "metadata": {"name": "db-creds", "namespace": "shop",
+                                 "uid": "eeeeeeee-5555-5555-5555-555555555555",
+                                 "resourceVersion": "9100",
+                                 "creationTimestamp": "2026-09-01T09:00:00Z"},
+                    "type": "Opaque",
+                    "data": {"password": CIPHERTEXT},
+                })
+            }
             ("GET", "/api/v1/namespaces/shop/pods") => {
                 if self.answers == Answers::WithBrokenFraming {
                     // A server lying about its own framing: the head promises chunked transfer
@@ -539,6 +589,53 @@ async fn should_answer_a_secret_query_with_no_payload_anywhere_in_the_stream() {
     assert!(
         keys.contains("password") && keys.contains("token"),
         "§22.2 keeps which keys are present, from `data` and `stringData` both: {keys}"
+    );
+}
+
+#[tokio::test]
+async fn should_navigate_a_pod_to_its_secret_without_a_payload_anywhere_in_the_stream() {
+    // Gate I's navigation leg (§62.9, §22.4), through the real provider boundary rather than at
+    // the library level. A Pod mounts `db-creds`, and `k8s-relation --kind Pod` answers the
+    // `references-secret` edge that names it. The Secret's body is served at its own endpoint
+    // with a payload, so if walking the edge ever read that body the plaintext would be here —
+    // and it is not, on any field, because a relationship carries identity and never an object.
+    let cluster = Cluster::new(Answers::WithASecretReferencingPod);
+    let mut options = at("shop");
+    options.insert("kind".to_owned(), json!("ServiceAccount"));
+    options.insert("name".to_owned(), json!("consumer"));
+    let answer = ask(&cluster, "k8s-relation", options).await;
+
+    assert_eq!(answer.status, InvokeStatus::Completed, "{}", answer.error);
+    let everything = answer.everything();
+    assert!(
+        !everything.contains(CIPHERTEXT),
+        "the encoded payload reached the stream while walking a Secret edge"
+    );
+    assert!(
+        !everything.contains(PLAINTEXT),
+        "the decoded payload reached the stream while walking a Secret edge"
+    );
+    // And the edge is genuinely there — this is redaction of a followed reference, not a refusal
+    // to follow it (§22.4).
+    let edge = answer
+        .records()
+        .into_iter()
+        .find(|record| text_of(record, "relation").as_deref() == Some("uses-secret"))
+        .expect("the account's reference to its Secret is an edge a user can walk");
+    assert_eq!(
+        text_of(&edge, "target_name").as_deref(),
+        Some("db-creds"),
+        "the edge names the Secret it references"
+    );
+    // The Secret's own endpoint was never fetched: navigation names the reference from the Pod's
+    // spec and reads no Secret body.
+    assert!(
+        !cluster
+            .request_lines()
+            .iter()
+            .any(|line| line.contains("/secrets/db-creds")),
+        "walking the edge read the Secret's body, which it must never do to name a reference: {:?}",
+        cluster.request_lines()
     );
 }
 
