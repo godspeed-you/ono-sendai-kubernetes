@@ -31,13 +31,19 @@ use std::time::Duration;
 use crate::coverage::Scope;
 use crate::diagnostics::{Alias, ClusterDiagnostic, Fingerprint, Identity, TlsPosture};
 use crate::discovery::{Discovery, Gvk, Gvr};
+use crate::index::{IndexState, LabelSelector, RelationshipIndex, Unusable};
 use crate::kubeconfig::{Connection, Credential, Secret};
-use crate::schema::{Schema, SchemaCache};
+use crate::object::Object;
+use crate::schema::{
+    Schema, SchemaCache, SchemaProvenance, group_version_path, schema_root_hashes,
+};
 use crate::tls::TlsSettings;
 use crate::transport::{
     Clock, EndpointCategory, Freshness, Listing, ObservedAt, Read, SystemClock,
 };
-use crate::watch::{FrameError, Reception, ResourceVersion, SyncState, WatchDecoder, WatchStream};
+use crate::watch::{
+    FrameError, Reception, ResourceVersion, SyncState, WatchDecoder, WatchEvent, WatchStream,
+};
 
 /// An optional server behaviour this session agreed with the cluster it is connected to (§6.3).
 ///
@@ -206,6 +212,15 @@ impl Lookup {
 /// (§19.6's rule about work nobody asked for, applied to discovery).
 pub const DISCOVERY_VALIDITY: Duration = Duration::from_secs(30);
 
+/// How long a cached schema may answer without the server having vouched for it (§12.4, §33.2).
+///
+/// The same window as discovery's, because the two answer the same question — has the cluster
+/// changed what it serves — on the same clock. A schema entry is vouched for either by the
+/// `/openapi/v3` root document read within this window naming the hash it was loaded under, or,
+/// failing a root document, by having been loaded within it. Past that, [`Session::schema`]
+/// answers nothing and the next projection loads the document again (ADR-0061).
+pub const SCHEMA_VALIDITY: Duration = DISCOVERY_VALIDITY;
+
 /// One discovery document, and what this session knows about how true it still is.
 ///
 /// The text is kept even once it may no longer be served, which is the difference between
@@ -286,6 +301,93 @@ struct Watched {
     /// unchanged object look stale and a changed one look fresher than its neighbours, when in
     /// fact they are known to the same instant (§20.2, §20.3).
     observed_at: ObservedAt,
+    /// The relationship tables over this cache (§50.4), rebuilt on every synchronisation and
+    /// updated by every event the stream applies, so they are never truer or staler than the
+    /// cache they index.
+    index: RelationshipIndex,
+}
+
+impl Watched {
+    fn new(gvr: &Gvr, scope: &Scope, instance: String, observed_at: ObservedAt) -> Self {
+        Self {
+            stream: WatchStream::new(gvr.clone(), scope.clone()),
+            decoder: WatchDecoder::new(instance),
+            observed_at,
+            index: RelationshipIndex::new(),
+        }
+    }
+}
+
+/// Why a derivation could not answer from an index (§50.4, §20.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMiss {
+    /// No watch covers this collection and scope, so there is nothing to index.
+    NotWatched,
+    /// A watch covers it and its index is not entitled to answer; the reason says why.
+    Unusable(Unusable),
+}
+
+impl fmt::Display for IndexMiss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotWatched => f.write_str("no watch covers the collection in this scope"),
+            Self::Unusable(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+/// One usable index, with the cache it answers from and the freshness its answers carry.
+///
+/// Borrowed from the session for the length of one derivation, so nothing can be answered from
+/// an index the session has since dropped or a stream that has since broken.
+#[derive(Debug)]
+pub struct Indexed<'a> {
+    watched: &'a Watched,
+    freshness: Freshness,
+}
+
+impl Indexed<'_> {
+    /// What every answer from this index is worth: a cached observation, at the moment the
+    /// stream last observed the collection, carrying the collection's continuity token (§20.2).
+    #[must_use]
+    pub fn freshness(&self) -> &Freshness {
+        &self.freshness
+    }
+
+    /// The observable state of the index (§30.5 core).
+    #[must_use]
+    pub fn state(&self) -> IndexState {
+        self.watched.index.state(
+            self.watched.stream.state(),
+            self.watched.stream.is_gap_free(),
+            self.watched.stream.pending_writes(),
+        )
+    }
+
+    /// Every cached object of one namespace, or of the whole collection for `None`.
+    #[must_use]
+    pub fn in_namespace(&self, namespace: Option<&str>) -> Vec<Object> {
+        self.resolve(self.watched.index.in_namespace(namespace))
+    }
+
+    /// The cached objects of one namespace whose labels satisfy the selector in full (§23.3).
+    #[must_use]
+    pub fn matching(&self, namespace: Option<&str>, selector: &LabelSelector) -> Vec<Object> {
+        self.resolve(self.watched.index.matching(namespace, selector))
+    }
+
+    /// The cached objects whose owner references name `owner_uid` (§24.1).
+    #[must_use]
+    pub fn children_of(&self, owner_uid: &str) -> Vec<Object> {
+        self.resolve(self.watched.index.children_of(owner_uid))
+    }
+
+    fn resolve(&self, keys: Vec<crate::index::ObjectKey>) -> Vec<Object> {
+        keys.iter()
+            .filter_map(|(namespace, name)| self.watched.stream.find(namespace.as_deref(), name))
+            .cloned()
+            .collect()
+    }
 }
 
 /// The live state of one provider instance (§6.3).
@@ -310,6 +412,12 @@ pub struct Session<C: Clock = SystemClock> {
     schemas: SchemaCache,
     watches: BTreeMap<(Gvr, Scope), Watched>,
     capabilities: BTreeSet<Capability>,
+    /// The optional behaviours this cluster refused when they were asked for (§19.2, §29.4 core).
+    ///
+    /// Kept apart from the negotiated set rather than as its complement: a capability that was
+    /// never asked for is neither, and a session that treated "not negotiated" as "refused"
+    /// would never try, while one that treated it as "available" would ask on every watch.
+    refused: BTreeSet<Capability>,
     clock: C,
 }
 
@@ -356,6 +464,7 @@ impl Session<SystemClock> {
             schemas: SchemaCache::new(""),
             watches: BTreeMap::new(),
             capabilities: BTreeSet::new(),
+            refused: BTreeSet::new(),
             clock: SystemClock,
         }
     }
@@ -383,6 +492,7 @@ impl<C: Clock> Session<C> {
             schemas: SchemaCache::new(""),
             watches: BTreeMap::new(),
             capabilities: BTreeSet::new(),
+            refused: BTreeSet::new(),
             clock,
         }
     }
@@ -524,6 +634,7 @@ impl<C: Clock> Session<C> {
             self.watches.clear();
             self.identity = Identity::unknown();
             self.capabilities.clear();
+            self.refused.clear();
         }
         if matches!(
             change,
@@ -746,15 +857,81 @@ impl<C: Clock> Session<C> {
         &self.schemas
     }
 
-    /// One cached schema, where it is still valid.
+    /// One cached schema, where it is still valid (§12.4, ADR-0061).
+    ///
+    /// Valid means vouched for: the entry's instant is within [`SCHEMA_VALIDITY`], and that
+    /// instant is either when it was loaded or when a root document last named its hash. A
+    /// schema nobody has vouched for in that long is not served as current — the next dynamic
+    /// projection loads it again, under the hash the root then publishes.
     #[must_use]
     pub fn schema(&self, gvk: &Gvk) -> Option<&Schema> {
-        self.schemas.get(gvk)
+        let provenance = self.schemas.provenance(gvk)?;
+        match provenance.observed_at() {
+            Some(observed_at) if self.expired(observed_at) => None,
+            _ => self.schemas.get(gvk),
+        }
     }
 
-    /// Remembers a schema for this cluster.
+    /// What a cached schema was loaded under: the root hash and the instant (§12.4, ADR-0061).
+    #[must_use]
+    pub fn schema_provenance(&self, gvk: &Gvk) -> Option<&SchemaProvenance> {
+        self.schemas.provenance(gvk)
+    }
+
+    /// Remembers a schema for this cluster, under the root hash this session knows for its
+    /// group-version, if any, and the instant it was loaded.
     pub fn cache_schema(&mut self, gvk: Gvk, schema: Schema) {
-        self.schemas.insert(gvk, schema);
+        let hash = self
+            .schemas
+            .root_hash(&group_version_path(&gvk))
+            .map(str::to_owned);
+        let now = self.clock.now();
+        self.schemas.insert_under(gvk, schema, hash, Some(now));
+    }
+
+    /// The `/openapi/v3` root document, where this session read one within the window.
+    ///
+    /// `None` is "read it": the root is small, it names every group-version's document with the
+    /// hash that changes when the schema does, and re-reading it within the window is what lets
+    /// every cached schema stay vouched for without any of their documents being downloaded
+    /// again (§50.2, ADR-0061).
+    #[must_use]
+    pub fn schema_root_is_current(&self) -> bool {
+        self.schemas
+            .root_observed_at()
+            .is_some_and(|observed_at| !self.expired(observed_at))
+    }
+
+    /// Takes a freshly read `/openapi/v3` root document (§12.4, §33.2, ADR-0061).
+    ///
+    /// Every held schema whose group-version's hash the root still publishes is vouched for
+    /// until the window runs out again; every one whose hash changed, vanished, or was never
+    /// recorded is forgotten, so the next projection loads the document the root now names.
+    /// Returns the kinds forgotten.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::schema::SchemaError`] when the bytes are not a root document.
+    pub fn cache_schema_root(
+        &mut self,
+        document: &str,
+    ) -> Result<Vec<Gvk>, crate::schema::SchemaError> {
+        let hashes = schema_root_hashes(document)?;
+        let now = self.clock.now();
+        Ok(self.schemas.root_refreshed(hashes, now))
+    }
+
+    /// Where one kind's schema document lives, with the root's hash on it where known.
+    ///
+    /// The hashed URL is the one the API server marks immutable and caches indefinitely; the
+    /// bare one is what a session that has not read the root asks for.
+    #[must_use]
+    pub fn schema_document_path(&self, gvk: &Gvk) -> String {
+        let path = group_version_path(gvk);
+        match self.schemas.root_hash(&path) {
+            Some(hash) => format!("/openapi/v3/{path}?hash={hash}"),
+            None => format!("/openapi/v3/{path}"),
+        }
     }
 
     /// Forgets a kind's schema, for a CRD whose structural schema changed (§12.4, §33.2).
@@ -824,7 +1001,14 @@ impl<C: Clock> Session<C> {
     /// That is §33.2's "CRD added" and "CRD deleted" observed at the one place a provider can be
     /// certain of them, and it marks the discovery documents stale rather than dropping them, so
     /// that the refreshed ones can still be compared against what they replace.
-    pub fn mutated(&mut self, gvr: &Gvr, namespace: Option<&str>) -> Invalidation {
+    ///
+    /// **A live stream keeps its cache and quarantines the one object** (ADR-0060). The event
+    /// the API server sends for the write is the refresh §20.5 asks for, and it reaches a live
+    /// stream on its own; dropping that stream would discard every other object it was keeping
+    /// true and silently restart the view that was reading it. Until the event arrives the
+    /// written object is served neither as itself nor as absent — [`Self::lookup`] answers
+    /// [`Lookup::NotWatched`] for it — and the index over the collection declines to answer.
+    pub fn mutated(&mut self, gvr: &Gvr, namespace: Option<&str>, name: &str) -> Invalidation {
         let collections: Vec<(Gvr, Scope)> = self
             .watches
             .keys()
@@ -832,12 +1016,30 @@ impl<C: Clock> Session<C> {
             .cloned()
             .collect();
         for key in &collections {
-            self.watches.remove(key);
+            let quarantined = self
+                .watches
+                .get_mut(key)
+                .is_some_and(|watched| watched.stream.written(namespace, name));
+            if quarantined {
+                if let Some(watched) = self.watches.get_mut(key) {
+                    watched
+                        .index
+                        .remove(&(namespace.map(str::to_owned), name.to_owned()));
+                }
+            } else {
+                self.watches.remove(key);
+            }
         }
         let serves = defines_resources(gvr);
         if serves {
             self.discovery = None;
             self.mark_documents_stale();
+            // §12.4's first bullet at the one place a CRD write is certain: the definition named
+            // `<plural>.<group>` changed, so every schema of that group is a claim about a
+            // definition that has moved on.
+            if let Some((_, group)) = name.split_once('.') {
+                self.schemas.invalidate_group(group);
+            }
         }
         Invalidation {
             collections,
@@ -849,7 +1051,27 @@ impl<C: Clock> Session<C> {
 
     /// Records that the server offers a capability, and this session may use it (§19.2).
     pub fn negotiate(&mut self, capability: Capability) {
+        self.refused.remove(&capability);
         self.capabilities.insert(capability);
+    }
+
+    /// Records that the server refused a capability it was asked for, so this session stops
+    /// asking (§19.2, §29.4 of the generic contract).
+    pub fn refuse(&mut self, capability: Capability) {
+        self.capabilities.remove(&capability);
+        self.refused.insert(capability);
+    }
+
+    /// Whether the cluster currently connected refused a capability this session asked for.
+    #[must_use]
+    pub fn is_refused(&self, capability: Capability) -> bool {
+        self.refused.contains(&capability)
+    }
+
+    /// Every capability the cluster refused, in a fixed order.
+    #[must_use]
+    pub fn refused(&self) -> Vec<Capability> {
+        self.refused.iter().copied().collect()
     }
 
     /// Whether a capability was negotiated with the cluster currently connected.
@@ -872,17 +1094,16 @@ impl<C: Clock> Session<C> {
     /// GVR in a large cluster is expensive and not required, and a session that opened one per
     /// discovered resource would be the most expensive thing this provider does.
     pub fn watch(&mut self, gvr: &Gvr, scope: &Scope) -> &mut WatchStream {
+        &mut self.entry_for(gvr, scope).stream
+    }
+
+    /// The watched entry for one collection and scope, opened on demand.
+    fn entry_for(&mut self, gvr: &Gvr, scope: &Scope) -> &mut Watched {
         let instance = self.instance.clone();
         let now = self.clock.now();
-        &mut self
-            .watches
+        self.watches
             .entry((gvr.clone(), scope.clone()))
-            .or_insert_with(|| Watched {
-                stream: WatchStream::new(gvr.clone(), scope.clone()),
-                decoder: WatchDecoder::new(instance),
-                observed_at: now,
-            })
-            .stream
+            .or_insert_with(|| Watched::new(gvr, scope, instance, now))
     }
 
     /// The watch over one collection and scope, where this session holds one.
@@ -984,14 +1205,119 @@ impl<C: Clock> Session<C> {
         let watched = self
             .watches
             .entry((gvr.clone(), scope.clone()))
-            .or_insert_with(|| Watched {
-                stream: WatchStream::new(gvr.clone(), scope.clone()),
-                decoder: WatchDecoder::new(instance),
-                observed_at,
-            });
+            .or_insert_with(|| Watched::new(gvr, scope, instance, observed_at));
         watched.stream.listed(objects, version);
         watched.observed_at = observed_at;
+        // §50.4: the index is a function of the cache, so a re-acquired cache is a rebuilt index
+        // and never a merge of two observation periods.
+        watched.index.rebuild(watched.stream.objects());
         Ok(())
+    }
+
+    /// Feeds one decoded event to the cache it belongs to, and to the index over it (§19.3).
+    ///
+    /// The one door through which an event reaches a stream this session holds, so that what an
+    /// event does to the cache and what it does to the index cannot drift apart: an object the
+    /// stream applied is posted, one it deleted is retracted, and one it discarded touches
+    /// neither.
+    pub fn observe_event(&mut self, gvr: &Gvr, scope: &Scope, event: WatchEvent) -> Reception {
+        let now = self.clock.now();
+        let watched = self.entry_for(gvr, scope);
+        let changed_definition = if defines_resources(gvr) {
+            definition_named(&event)
+        } else {
+            None
+        };
+        let reception = Self::apply_event(watched, now, event);
+        // §33.2's "relevant watches where active": a CRD changing under a watch this session
+        // holds is a schema change observed the moment it happened, and every version of the
+        // kind it defines is forgotten before anything is projected through it again (§12.4).
+        if reception == Reception::Applied
+            && let Some(gvks) = changed_definition
+        {
+            for gvk in gvks {
+                self.crd_updated(&gvk);
+            }
+            self.discovery = None;
+            self.mark_documents_stale();
+        }
+        // §19.2 and §19.5: a capability is negotiated from what the server *did*, never from
+        // what was asked for. A bookmark received is a server that sends bookmarks; a streaming
+        // list that ended is a server that serves them.
+        match reception {
+            Reception::Checkpointed => self.negotiate(Capability::WatchBookmarks),
+            Reception::Synchronised => {
+                self.negotiate(Capability::StreamingLists);
+                self.negotiate(Capability::WatchBookmarks);
+            }
+            _ => {}
+        }
+        reception
+    }
+
+    /// Begins a streaming list over one collection and scope (§19.2).
+    ///
+    /// The cache is not touched until the terminating bookmark arrives: the initial events are
+    /// staged on the stream, and [`Self::observe_event`] seeds the cache and its index from them
+    /// at the version the bookmark carries, which is what a listing's version would have been.
+    ///
+    /// # Errors
+    ///
+    /// What [`WatchStream::begin_streaming_list`] refuses.
+    pub fn begin_streaming_list(
+        &mut self,
+        gvr: &Gvr,
+        scope: &Scope,
+    ) -> Result<(), crate::watch::ResumeError> {
+        self.entry_for(gvr, scope).stream.begin_streaming_list()
+    }
+
+    /// Abandons a streaming list whose initial events never ended, so the ordinary list/watch
+    /// acquisition can take its place (§19.2's fallback). Returns whether one was in progress.
+    pub fn abandon_streaming_list(&mut self, gvr: &Gvr, scope: &Scope) -> bool {
+        self.watches
+            .get_mut(&(gvr.clone(), scope.clone()))
+            .is_some_and(|watched| watched.stream.abandon_streaming_list())
+    }
+
+    fn apply_event(watched: &mut Watched, now: ObservedAt, event: WatchEvent) -> Reception {
+        // What the event names, read before the stream takes the object, so the index can be
+        // told which entry to retract without a second copy of the object.
+        let key = match &event {
+            WatchEvent::Added(object)
+            | WatchEvent::Modified(object)
+            | WatchEvent::Deleted(object) => Some((
+                object.namespace().map(str::to_owned),
+                object.name().to_owned(),
+            )),
+            WatchEvent::Bookmark(_) | WatchEvent::InitialEventsEnd(_) | WatchEvent::Error(_) => {
+                None
+            }
+        };
+        let reception = watched.stream.observe(event);
+        if reception != Reception::Discarded {
+            // The cache is current as of the moment this provider read the event, never as of
+            // any timestamp inside the object: §14.3 keeps `resourceVersion` from being a
+            // clock, and `creationTimestamp` is about the object rather than the observation.
+            watched.observed_at = now;
+        }
+        if reception == Reception::Synchronised {
+            // A streaming list synchronised the cache the way a listing does, and the index is
+            // rebuilt from it the same way (§50.4).
+            watched.index.rebuild(watched.stream.objects());
+        }
+        if reception == Reception::Applied
+            && let Some(key) = key
+        {
+            match watched.stream.find(key.0.as_deref(), &key.1) {
+                Some(object) => {
+                    let object = object.clone();
+                    watched.index.insert(&object);
+                }
+                None => watched.index.remove(&key),
+            }
+        }
+        reception
     }
 
     /// Applies the bytes of a watch response to the cache they belong to (§19.3).
@@ -1012,29 +1338,63 @@ impl<C: Clock> Session<C> {
         scope: &Scope,
         chunk: &[u8],
     ) -> Result<Vec<Reception>, FrameError> {
-        let now = self.clock.now();
-        let instance = self.instance.clone();
-        let watched = self
-            .watches
-            .entry((gvr.clone(), scope.clone()))
-            .or_insert_with(|| Watched {
-                stream: WatchStream::new(gvr.clone(), scope.clone()),
-                decoder: WatchDecoder::new(instance),
-                observed_at: now,
-            });
-        let events = watched.decoder.decode(chunk)?;
+        let events = self.entry_for(gvr, scope).decoder.decode(chunk)?;
         let mut receptions = Vec::with_capacity(events.len());
         for event in events {
-            let reception = watched.stream.observe(event);
-            if reception != Reception::Discarded {
-                // The cache is current as of the moment this provider read the event, never as of
-                // any timestamp inside the object: §14.3 keeps `resourceVersion` from being a
-                // clock, and `creationTimestamp` is about the object rather than the observation.
-                watched.observed_at = now;
-            }
-            receptions.push(reception);
+            receptions.push(self.observe_event(gvr, scope, event));
         }
         Ok(receptions)
+    }
+
+    /// The relationship index over one watched collection, where it is entitled to answer
+    /// (§50.4, §20.3).
+    ///
+    /// # Errors
+    ///
+    /// [`IndexMiss`] naming why not: no watch covers the collection in this scope, the stream is
+    /// not live so absence in it is unobserved rather than observed, or the cache outgrew the
+    /// index bound. Each is a reason to read the API server instead, and the caller says which.
+    pub fn indexed(&self, gvr: &Gvr, scope: &Scope) -> Result<Indexed<'_>, IndexMiss> {
+        let Some(watched) = self.watches.get(&(gvr.clone(), scope.clone())) else {
+            return Err(IndexMiss::NotWatched);
+        };
+        let state = watched.index.state(
+            watched.stream.state(),
+            watched.stream.is_gap_free(),
+            watched.stream.pending_writes(),
+        );
+        if let Some(reason) = state.unusable() {
+            return Err(IndexMiss::Unusable(reason));
+        }
+        Ok(Indexed {
+            watched,
+            freshness: Freshness::cached(
+                watched.observed_at,
+                watched
+                    .stream
+                    .checkpoint()
+                    .map(|version| version.as_str().to_owned()),
+                &self.instance,
+                scope.clone(),
+                EndpointCategory::of(gvr),
+                watched.stream.has_synced(),
+            ),
+        })
+    }
+
+    /// The observable state of the index over one watched collection, where one exists
+    /// (§30.5 core).
+    #[must_use]
+    pub fn index_state(&self, gvr: &Gvr, scope: &Scope) -> Option<IndexState> {
+        self.watches
+            .get(&(gvr.clone(), scope.clone()))
+            .map(|watched| {
+                watched.index.state(
+                    watched.stream.state(),
+                    watched.stream.is_gap_free(),
+                    watched.stream.pending_writes(),
+                )
+            })
     }
 
     /// What this session's caches can say about one namespace and name (§20.2, §20.3).
@@ -1055,6 +1415,11 @@ impl<C: Clock> Session<C> {
             // they were true once, but a value served from it would claim to be a current
             // observation of a stream that has stopped (§19.4 step 2).
             return Lookup::NotSynced(watched.stream.state());
+        }
+        if watched.stream.is_pending_write(namespace, name) {
+            // Written by this session and not yet observed: the session knows nothing current
+            // about it, and the next read goes to the API server (§20.5, ADR-0060).
+            return Lookup::NotWatched;
         }
         match watched.stream.find(namespace, name) {
             None => Lookup::ConfirmedAbsent,
@@ -1142,6 +1507,28 @@ fn could_hold(scope: &Scope, namespace: Option<&str>) -> bool {
     }
 }
 
+/// The kinds a CRD event defines, one per version it names (§33.2).
+fn definition_named(event: &WatchEvent) -> Option<Vec<Gvk>> {
+    let object = match event {
+        WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
+            object
+        }
+        WatchEvent::Bookmark(_) | WatchEvent::InitialEventsEnd(_) | WatchEvent::Error(_) => {
+            return None;
+        }
+    };
+    let group = object.field("/spec/group")?.as_str()?.to_owned();
+    let kind = object.field("/spec/names/kind")?.as_str()?.to_owned();
+    let versions = object
+        .field("/spec/versions")?
+        .as_array()?
+        .iter()
+        .filter_map(|version| version.get("name")?.as_str())
+        .map(|version| Gvk::new(group.clone(), version, kind.clone()))
+        .collect();
+    Some(versions)
+}
+
 /// Whether writing to this collection changes what the cluster serves (§33.2).
 ///
 /// Matched on group and resource and never on version: §5.3 forbids assuming which version of an
@@ -1171,7 +1558,25 @@ impl<C: Clock> fmt::Debug for Session<C> {
             .field("discovery_documents", &self.discovery_documents())
             .field("schemas", &self.schemas.len())
             .field("watches", &self.watches.len())
+            .field(
+                "indexes",
+                &self
+                    .watches
+                    .values()
+                    .map(|watched| {
+                        watched
+                            .index
+                            .state(
+                                watched.stream.state(),
+                                watched.stream.is_gap_free(),
+                                watched.stream.pending_writes(),
+                            )
+                            .describe()
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .field("capabilities", &self.capabilities)
+            .field("refused", &self.refused)
             .finish()
     }
 }

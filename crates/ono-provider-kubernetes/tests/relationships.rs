@@ -1226,3 +1226,132 @@ fn should_read_a_service_from_the_pod_s_end_as_selected_by() {
         "the record lives on the Service; this edge reads it the other way round and says so"
     );
 }
+
+// --- §17.3, §23.3, §25.1, §50.4: the rule's selector, pushed down exactly (ADR-0058) -------------
+
+mod pushdown {
+    use std::collections::BTreeMap;
+
+    use ono_provider_kubernetes::index::{LabelSelector, SelectorError};
+    use serde_json::json;
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn should_render_a_controller_selector_the_way_upstream_does() {
+        // §17.3 permits pushing a selector only "when Ono query semantics map exactly", and the
+        // one translation that is exact by definition is upstream's own: `LabelSelectorAsSelector`
+        // in apimachinery, which every controller runs its `spec.selector` through before it
+        // decides what to adopt. This pins that rendering — `matchLabels` as equalities, then the
+        // four operators in their upstream spelling — so the string an API server receives is
+        // the one a client-go controller would have sent it.
+        let selector = LabelSelector::from_json(&json!({
+            "matchLabels": {"tier": "web", "app": "api"},
+            "matchExpressions": [
+                {"key": "env", "operator": "In", "values": ["staging", "prod"]},
+                {"key": "region", "operator": "NotIn", "values": ["eu"]},
+                {"key": "canary", "operator": "Exists"},
+                {"key": "legacy", "operator": "DoesNotExist"},
+            ],
+        }))
+        .expect("a selector upstream accepts is read");
+
+        assert_eq!(
+            selector.to_query().as_deref(),
+            Some("app=api,tier=web,env in (prod,staging),region notin (eu),canary,!legacy"),
+            "equalities first and sorted, then each operator as upstream renders it"
+        );
+    }
+
+    #[test]
+    fn should_evaluate_each_operator_as_the_api_server_does() {
+        // The predicate half of the same translation, pinned per operator, because the index
+        // evaluates what the API server would otherwise have evaluated and the two must agree on
+        // every case — including the one that trips implementations up: `notin` and
+        // `DoesNotExist` are satisfied by an object that lacks the key altogether.
+        let in_prod = LabelSelector::from_json(&json!({
+            "matchExpressions": [{"key": "env", "operator": "In", "values": ["prod"]}],
+        }))
+        .expect("reads");
+        assert!(in_prod.matches(&labels(&[("env", "prod")])));
+        assert!(!in_prod.matches(&labels(&[("env", "staging")])));
+        assert!(
+            !in_prod.matches(&labels(&[])),
+            "`in` needs the key to be present"
+        );
+
+        let not_in_eu = LabelSelector::from_json(&json!({
+            "matchExpressions": [{"key": "region", "operator": "NotIn", "values": ["eu"]}],
+        }))
+        .expect("reads");
+        assert!(!not_in_eu.matches(&labels(&[("region", "eu")])));
+        assert!(not_in_eu.matches(&labels(&[("region", "us")])));
+        assert!(
+            not_in_eu.matches(&labels(&[])),
+            "`notin` is satisfied by an object that lacks the key, as upstream defines it"
+        );
+
+        let canary = LabelSelector::from_json(&json!({
+            "matchExpressions": [{"key": "canary", "operator": "Exists"}],
+        }))
+        .expect("reads");
+        assert!(canary.matches(&labels(&[("canary", "")])));
+        assert!(!canary.matches(&labels(&[("app", "api")])));
+
+        let not_legacy = LabelSelector::from_json(&json!({
+            "matchExpressions": [{"key": "legacy", "operator": "DoesNotExist"}],
+        }))
+        .expect("reads");
+        assert!(not_legacy.matches(&labels(&[("app", "api")])));
+        assert!(!not_legacy.matches(&labels(&[("legacy", "true")])));
+
+        let equalities = LabelSelector::equalities(&labels(&[("app", "api"), ("tier", "web")]));
+        assert!(equalities.matches(&labels(&[("app", "api"), ("tier", "web"), ("x", "y")])));
+        assert!(
+            !equalities.matches(&labels(&[("app", "api")])),
+            "every equality has to hold, exactly as `Graph::selects` requires"
+        );
+    }
+
+    #[test]
+    fn should_refuse_a_selector_upstream_would_refuse_rather_than_approximate_it() {
+        // ADR-0007's rule for the pushdown: a selector that cannot be read in full is not pushed
+        // as the part that could be. Upstream refuses these three shapes, and so does this.
+        assert_eq!(
+            LabelSelector::from_json(&json!({
+                "matchExpressions": [{"key": "env", "operator": "Like", "values": ["prod"]}],
+            })),
+            Err(SelectorError::UnknownOperator("Like".to_owned()))
+        );
+        assert_eq!(
+            LabelSelector::from_json(&json!({
+                "matchExpressions": [{"key": "env", "operator": "In"}],
+            })),
+            Err(SelectorError::NoValues("env".to_owned()))
+        );
+        assert_eq!(
+            LabelSelector::from_json(&json!({
+                "matchExpressions": [{"key": "env", "operator": "Exists", "values": ["x"]}],
+            })),
+            Err(SelectorError::UnexpectedValues("env".to_owned()))
+        );
+    }
+
+    #[test]
+    fn should_send_no_label_selector_at_all_for_an_empty_one() {
+        // ADR-0049: an API server reads an absent `labelSelector` and an empty one identically,
+        // and `labelSelector=` in a request log looks like a filter somebody chose.
+        let empty = LabelSelector::from_json(&json!({})).expect("reads");
+        assert!(empty.is_empty());
+        assert_eq!(empty.to_query(), None);
+        assert!(
+            empty.matches(&labels(&[("anything", "at-all")])),
+            "an empty selector states no requirement; what that means is the rule's to decide"
+        );
+    }
+}

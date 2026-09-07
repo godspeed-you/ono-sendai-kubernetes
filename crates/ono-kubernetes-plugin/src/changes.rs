@@ -44,13 +44,13 @@ use ono_provider_kubernetes::discovery::{self, Gvr, Resource, Verb};
 use ono_provider_kubernetes::live::{LiveView, ViewState};
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::redaction::Guarded;
-use ono_provider_kubernetes::session::{Session, SyncRefused};
+use ono_provider_kubernetes::session::{Capability, Session, SyncRefused};
 use ono_provider_kubernetes::transport::{
-    ApiError, ByteStream, Client, Clock, Freshness, ListOptions, Listing, ObservedAt, SystemClock,
-    watch_request,
+    ApiError, ByteStream, Client, Clock, EndpointCategory, Freshness, ListOptions, Listing,
+    ObservedAt, SystemClock, watch_request,
 };
 use ono_provider_kubernetes::watch::{
-    Backoff, Reception, SyncState, WatchDecoder, WatchEvent, WatchFailure,
+    Backoff, Reception, SyncState, WatchDecoder, WatchEvent, WatchFailure, WatchStream,
 };
 use ono_value::Schema;
 use serde_json::Value as Json;
@@ -63,7 +63,7 @@ use crate::query::{
     converse_on, failure,
 };
 use crate::records::{Change, change_record};
-use crate::sessions::Sessions;
+use crate::sessions::{Key, Sessions};
 
 /// How many objects the initial listing asks the API server for per page.
 const PAGE_SIZE: u32 = 500;
@@ -147,35 +147,57 @@ pub fn answer(target: &'static Target, sessions: &Sessions, ctx: &mut Ctx<'_>) -
         return Outcome::Cancelled;
     }
 
-    sessions.with(
-        &endpoint.session_key(),
-        || endpoint.start_session(),
-        |session| {
-            // From here on the context is lent rather than held: a read borrows it, gives it
-            // back, and the emission between two reads borrows it again (ADR-0023).
-            let lease = Lease::new(ctx);
-            let mut emitter = Emitter {
-                target,
-                schema,
-                budget,
-                emitted: 0,
-                view: None,
-                rows_refreshed_at: None,
-                clock: SystemClock,
-                stale_after,
-            };
-            observe(
-                &lease,
-                session,
-                &mut emitter,
-                &Watched {
-                    endpoint: &endpoint,
-                    selector: &selector,
-                    reacquire,
-                },
-            )
+    // The session is *reached* for each step and never *held* for the invocation (ADR-0058). A
+    // watch lives for as long as the operator watches, and an invocation that kept the session
+    // locked for that long would make every other question about the same cluster wait for the
+    // watch to end — including the relationship query whose whole reason to exist beside a live
+    // watch is to answer from the cache that watch keeps true (§50.4, §19.7).
+    let held = Held {
+        sessions,
+        key: endpoint.session_key(),
+        endpoint: &endpoint,
+    };
+    // From here on the context is lent rather than held: a read borrows it, gives it back, and
+    // the emission between two reads borrows it again (ADR-0023).
+    let lease = Lease::new(ctx);
+    let mut emitter = Emitter {
+        target,
+        schema,
+        budget,
+        emitted: 0,
+        view: None,
+        rows_refreshed_at: None,
+        clock: SystemClock,
+        stale_after,
+    };
+    observe(
+        &lease,
+        &held,
+        &mut emitter,
+        &Watched {
+            endpoint: &endpoint,
+            selector: &selector,
+            reacquire,
         },
     )
+}
+
+/// The session this watch feeds, reached one step at a time.
+///
+/// Every step that reads or writes the session takes it through [`Self::with`] and gives it
+/// back before the next chunk is waited for, so the lock is held while an event is applied and
+/// never while the socket is quiet — which is where a watch spends its life.
+struct Held<'a> {
+    sessions: &'a Sessions,
+    key: Key,
+    endpoint: &'a Endpoint,
+}
+
+impl Held<'_> {
+    fn with<T>(&self, work: impl FnOnce(&mut Session) -> T) -> T {
+        self.sessions
+            .with(&self.key, || self.endpoint.start_session(), work)
+    }
 }
 
 /// Everything one `k8s-change` invocation was asked for, beyond what it emits with.
@@ -202,40 +224,42 @@ enum Step {
 /// Acquires the collection, then watches it until the operator stops it (§19.1, §19.4, §19.5).
 fn observe(
     lease: &Lease<'_, '_>,
-    session: &mut Session,
+    held: &Held<'_>,
     emitter: &mut Emitter,
     watched: &Watched<'_>,
 ) -> Outcome {
-    let acquired = match converse_on(
-        lease,
-        watched.endpoint,
-        Acquire {
-            endpoint: watched.endpoint,
-            selector: watched.selector,
-            session,
-        },
-    ) {
+    let acquired = held.with(|session| {
+        converse_on(
+            lease,
+            watched.endpoint,
+            Acquire {
+                endpoint: watched.endpoint,
+                selector: watched.selector,
+                session,
+            },
+        )
+    });
+    let (resource, acquired) = match acquired {
         Ok(acquired) => acquired,
         Err(error) => return refused(lease, error),
     };
-    let (resource, listing) = acquired;
     let gvr = resource.gvr().clone();
     let scope = scope_of(watched.endpoint, &resource);
     let outcome = live(
         lease,
-        session,
+        held,
         emitter,
         watched,
         gvr.clone(),
         scope.clone(),
-        listing,
+        acquired,
     );
     // §19.7: the view is closing, so the watch behind it is released unless the session's own
     // object cache is still entitled to answer from it — which is the "another active consumer"
     // §19.7 names, and the only one this provider has. `Session::close_view` asks that question,
     // so a watch quarantined by a `410` stops costing a checkpoint the server has already
     // discarded, and a healthy one stays where §20.2's `origin=cache` can still reach it.
-    session.close_view(&gvr, &scope);
+    held.with(|session| session.close_view(&gvr, &scope));
     outcome
 }
 
@@ -246,36 +270,70 @@ fn observe(
 /// having to remember it.
 fn live(
     lease: &Lease<'_, '_>,
-    session: &mut Session,
+    held: &Held<'_>,
     emitter: &mut Emitter,
     watched: &Watched<'_>,
     gvr: Gvr,
     scope: Scope,
-    listing: Listing,
+    acquired: Acquired,
 ) -> Outcome {
-    let mut freshness = listing.freshness().clone();
-
-    // §19.1 and §20.3: the listing becomes the cache the watch keeps true, or it becomes nothing.
-    if let Err(refusal) = session.synchronise(&gvr, &scope, listing) {
-        return Outcome::Failed(unacquirable(&refusal));
-    }
-    if let Step::Stopped(outcome) = acquisition(lease, session, emitter, &gvr, &scope, &freshness) {
-        return outcome;
-    }
+    let mut freshness = match acquired {
+        Acquired::Listed(listing) => {
+            let freshness = listing.freshness().clone();
+            // §19.1 and §20.3: the listing becomes the cache the watch keeps true, or it
+            // becomes nothing.
+            if let Err(refusal) = held.with(|session| session.synchronise(&gvr, &scope, *listing)) {
+                return Outcome::Failed(unacquirable(&refusal));
+            }
+            if let Step::Stopped(outcome) =
+                acquisition(lease, held, emitter, &gvr, &scope, &freshness)
+            {
+                return outcome;
+            }
+            freshness
+        }
+        // §19.2: the initial state arrives on the watch itself. The stream stages the initial
+        // events and the cache is seeded when the terminating bookmark arrives, inside the first
+        // round below; the freshness the `listed` records carry is decided there too, because
+        // until then nothing has been observed.
+        Acquired::Streaming => {
+            if let Err(refusal) = held.with(|session| session.begin_streaming_list(&gvr, &scope)) {
+                return Outcome::Failed(failure(
+                    UNAVAILABLE_CODE,
+                    UNAVAILABLE,
+                    format!("a streaming list could not begin: {refusal}"),
+                    "The stream is not in a state a fresh acquisition may start from.",
+                ));
+            }
+            Freshness::direct_read(
+                SystemClock.now(),
+                None,
+                watched.endpoint.instance.clone(),
+                scope.clone(),
+                EndpointCategory::of(&gvr),
+            )
+        }
+    };
 
     let mut backoff = Backoff::new(RECONNECT_FLOOR, RECONNECT_CEILING);
     // What the last record told a reader the view was. A notice is emitted when this stops being
     // true and nothing else is going to say so (§41.4).
-    let mut announced = emitter.observed_state(session, &gvr, &scope);
+    let mut announced = held.with(|session| emitter.observed_state(session, &gvr, &scope));
     loop {
         if lease.cancelled() {
             return Outcome::Cancelled;
         }
         let delivered = emitter.emitted;
-        let from = session.watch_stream(&gvr, &scope).and_then(|stream| {
-            stream
-                .checkpoint()
-                .map(|version| version.as_str().to_owned())
+        let (from, streaming) = held.with(|session| {
+            let stream = session.watch_stream(&gvr, &scope);
+            (
+                stream.and_then(|stream| {
+                    stream
+                        .checkpoint()
+                        .map(|version| version.as_str().to_owned())
+                }),
+                stream.is_some_and(WatchStream::is_streaming_list),
+            )
         });
         let round = converse_on(
             lease,
@@ -286,8 +344,9 @@ fn live(
                 gvr: &gvr,
                 scope: &scope,
                 from: from.as_deref(),
-                freshness: &freshness,
-                session,
+                streaming,
+                freshness: &mut freshness,
+                held,
                 emitter,
             },
         );
@@ -296,8 +355,47 @@ fn live(
             Ok(Step::Reading | Step::Ended) => {}
             Err(error) => return refused(lease, error),
         }
+        // A round that delivered a record has already told the reader where the view stands —
+        // and on the streaming path the acquisition itself happens inside the round, so this is
+        // where the reader's last word is learnt rather than before the loop.
+        if emitter.emitted > delivered {
+            announced = held.with(|session| emitter.observed_state(session, &gvr, &scope));
+        }
 
-        match session.watch(&gvr, &scope).state() {
+        // §19.2's fallback. A streaming list that did not reach its terminating bookmark — the
+        // server refused the request, or closed the body before the initial state was complete
+        // — is abandoned, and the collection is acquired the way §19.1 spells out: a listing,
+        // then a watch from its version. The refusal is remembered for the session, so the
+        // capability is asked for once per cluster and never on every watch.
+        if held.with(|session| session.abandon_streaming_list(&gvr, &scope)) {
+            held.with(|session| session.refuse(Capability::StreamingLists));
+            let listed = match converse_on(
+                lease,
+                watched.endpoint,
+                Relist {
+                    gvr: &gvr,
+                    scope: &scope,
+                },
+            ) {
+                Ok(listed) => listed,
+                Err(error) => return refused(lease, error),
+            };
+            freshness = listed.freshness().clone();
+            if let Err(refusal) = held.with(|session| session.synchronise(&gvr, &scope, listed)) {
+                return Outcome::Failed(unacquirable(&refusal));
+            }
+            if let Step::Stopped(outcome) =
+                acquisition(lease, held, emitter, &gvr, &scope, &freshness)
+            {
+                return outcome;
+            }
+            // The acquisition's records told the reader where the view stands; a notice for
+            // the same movement would say it twice.
+            announced = held.with(|session| emitter.observed_state(session, &gvr, &scope));
+            continue;
+        }
+
+        match held.with(|session| session.watch(&gvr, &scope).state()) {
             // The server closed a healthy watch, which is what a server does when its own
             // timeout expires. Nothing was missed: the next request opens at the checkpoint.
             SyncState::Live => {}
@@ -305,7 +403,10 @@ fn live(
             // server holds, so this is a reconnect rather than a break, and re-listing here
             // would record a gap that observation had not actually lost.
             SyncState::Reconnecting => {
-                if session.watch(&gvr, &scope).reconnected().is_err() {
+                if held
+                    .with(|session| session.watch(&gvr, &scope).reconnected())
+                    .is_err()
+                {
                     return Outcome::Completed;
                 }
             }
@@ -328,14 +429,18 @@ fn live(
                     Err(error) => return refused(lease, error),
                 };
                 freshness = listed.freshness().clone();
-                if let Err(refusal) = session.synchronise(&gvr, &scope, listed) {
+                if let Err(refusal) = held.with(|session| session.synchronise(&gvr, &scope, listed))
+                {
                     return Outcome::Failed(unacquirable(&refusal));
                 }
                 if let Step::Stopped(outcome) =
-                    acquisition(lease, session, emitter, &gvr, &scope, &freshness)
+                    acquisition(lease, held, emitter, &gvr, &scope, &freshness)
                 {
                     return outcome;
                 }
+                // The re-acquisition's records carried the view's state; a notice for the same
+                // movement would say it twice.
+                announced = held.with(|session| emitter.observed_state(session, &gvr, &scope));
             }
             // Authorization refused the stream. Asking again is not evidence, and a listing
             // would be refused by the same decision (§21.4).
@@ -347,11 +452,10 @@ fn live(
         // reconnecting, or the window passed with no live observation — the last thing the reader
         // was told is now false. That is precisely the frozen table §41.4 forbids, so the notice
         // goes out before the backoff rather than after the next arrival, which may never come.
-        let now = emitter.observed_state(session, &gvr, &scope);
+        let now = held.with(|session| emitter.observed_state(session, &gvr, &scope));
         if now != announced {
             announced = now;
-            if let Step::Stopped(outcome) = emitter.notice(lease, session, &gvr, &scope, &freshness)
-            {
+            if let Step::Stopped(outcome) = emitter.notice(lease, held, &gvr, &scope, &freshness) {
                 return outcome;
             }
         }
@@ -359,7 +463,7 @@ fn live(
         // A round that carried nothing and ended at once is the one shape that could spin.
         if emitter.emitted > delivered {
             backoff.reset();
-            announced = emitter.observed_state(session, &gvr, &scope);
+            announced = held.with(|session| emitter.observed_state(session, &gvr, &scope));
         } else {
             std::thread::sleep(backoff.next_delay());
         }
@@ -372,21 +476,28 @@ fn live(
 /// and §19.3's classes are different claims and the word is what keeps them apart.
 fn acquisition(
     lease: &Lease<'_, '_>,
-    session: &mut Session,
+    held: &Held<'_>,
     emitter: &mut Emitter,
     gvr: &Gvr,
     scope: &Scope,
     freshness: &Freshness,
 ) -> Step {
-    let objects: Vec<Object> = session
-        .watch_stream(gvr, scope)
-        .map(|stream| stream.objects().cloned().collect())
-        .unwrap_or_default();
+    let objects: Vec<Object> = held.with(|session| {
+        session
+            .watch_stream(gvr, scope)
+            .map(|stream| stream.objects().cloned().collect())
+            .unwrap_or_default()
+    });
     for object in objects {
-        let view = emitter.refresh(session, gvr, scope);
+        let (view, continuity) = held.with(|session| {
+            (
+                emitter.refresh(session, gvr, scope),
+                continuity(session, gvr, scope),
+            )
+        });
         match emitter.deliver(
             lease,
-            session,
+            &continuity,
             gvr,
             scope,
             freshness,
@@ -449,7 +560,7 @@ impl Emitter {
     fn deliver(
         &mut self,
         lease: &Lease<'_, '_>,
-        session: &Session,
+        continuity: &Continuity,
         gvr: &Gvr,
         scope: &Scope,
         freshness: &Freshness,
@@ -486,7 +597,6 @@ impl Emitter {
         } else {
             freshness.as_watch_event()
         };
-        let (segment, continuous, state, gap) = continuity(session, gvr, scope);
         let (view_state, withheld) = view;
         let collection = gvr.to_string();
         let asked_about = scope.to_string();
@@ -494,13 +604,13 @@ impl Emitter {
             class,
             resource: &collection,
             scope: &asked_about,
-            segment,
-            continuous,
-            sync_state: state.as_str(),
+            segment: continuity.segment,
+            continuous: continuity.continuous,
+            sync_state: continuity.state.as_str(),
             view_state: view_state.as_str(),
             withheld,
-            gap_reason: gap.as_ref().map(|(reason, _)| *reason),
-            gap_detail: gap.map(|(_, detail)| detail),
+            gap_reason: continuity.gap.as_ref().map(|(reason, _)| *reason),
+            gap_detail: continuity.gap.as_ref().map(|(_, detail)| detail.clone()),
             object: guarded.as_ref(),
         };
         let value = match change_record(self.target, &self.schema, &change, &stamped) {
@@ -594,17 +704,42 @@ impl Emitter {
     fn notice(
         &mut self,
         lease: &Lease<'_, '_>,
-        session: &Session,
+        held: &Held<'_>,
         gvr: &Gvr,
         scope: &Scope,
         freshness: &Freshness,
     ) -> Step {
-        let view = (
-            self.observed_state(session, gvr, scope),
-            self.view.as_ref().map_or(0, |view| view.withheld().len()),
-        );
-        self.deliver(lease, session, gvr, scope, freshness, "notice", None, view)
+        let (view, continuity) = held.with(|session| {
+            (
+                (
+                    self.observed_state(session, gvr, scope),
+                    self.view.as_ref().map_or(0, |view| view.withheld().len()),
+                ),
+                continuity(session, gvr, scope),
+            )
+        });
+        self.deliver(
+            lease,
+            &continuity,
+            gvr,
+            scope,
+            freshness,
+            "notice",
+            None,
+            view,
+        )
     }
+}
+
+/// Which observation period the stream is in, and what it has failed to observe.
+///
+/// Read from the stream under the session lock and carried out of it, so a record can be built
+/// and emitted — which blocks on the consumer — without the session being held meanwhile.
+struct Continuity {
+    segment: usize,
+    continuous: bool,
+    state: SyncState,
+    gap: Option<(&'static str, String)>,
 }
 
 /// Which observation period the stream is in, and what it has failed to observe.
@@ -613,13 +748,14 @@ impl Emitter {
 /// stream that has never broken says `1` and the first record after a `410` says `2`. Nothing
 /// here reads the *contents* of a segment: what a reader needs is which period a record belongs
 /// to, and handing over the changes inside one would offer the concatenation §19.4 forbids.
-fn continuity(
-    session: &Session,
-    gvr: &Gvr,
-    scope: &Scope,
-) -> (usize, bool, SyncState, Option<(&'static str, String)>) {
+fn continuity(session: &Session, gvr: &Gvr, scope: &Scope) -> Continuity {
     let Some(stream) = session.watch_stream(gvr, scope) else {
-        return (0, false, SyncState::Syncing, None);
+        return Continuity {
+            segment: 0,
+            continuous: false,
+            state: SyncState::Syncing,
+            gap: None,
+        };
     };
     // The reason word comes from `GapReason::as_str` rather than from a table here, so Appendix
     // D.4's vocabulary is spelled in one place and a reason added there cannot go unreported.
@@ -627,15 +763,29 @@ fn continuity(
         .gaps()
         .last()
         .map(|gap| (gap.reason().as_str(), gap.describe()));
-    (
-        stream.segments().len(),
-        stream.is_gap_free(),
-        stream.state(),
+    Continuity {
+        segment: stream.segments().len(),
+        continuous: stream.is_gap_free(),
+        state: stream.state(),
         gap,
-    )
+    }
 }
 
-/// The initial acquisition: discover what serves the kind, then list it (§19.1).
+/// How the initial state of the collection is acquired (§19.1, §19.2).
+enum Acquired {
+    /// A listing, from whose version the watch opens (§19.1).
+    ///
+    /// Boxed because a listing carries its coverage, continuity and freshness beside its
+    /// objects, and the variant that carries nothing should not be sized by the one that
+    /// carries everything.
+    Listed(Box<Listing>),
+    /// Nothing yet: the watch itself will deliver the initial state as a streaming list, or be
+    /// refused and fall back to a listing (§19.2).
+    Streaming,
+}
+
+/// The initial acquisition: discover what serves the kind, then list it (§19.1) — or decide to
+/// let the watch itself deliver the initial state (§19.2).
 struct Acquire<'a> {
     endpoint: &'a Endpoint,
     selector: &'a Selector,
@@ -643,7 +793,7 @@ struct Acquire<'a> {
 }
 
 impl Conversation for Acquire<'_> {
-    type Answer = (Resource, Listing);
+    type Answer = (Resource, Acquired);
 
     fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
         let session = self.session;
@@ -671,12 +821,19 @@ impl Conversation for Acquire<'_> {
             ));
         }
         let scope = scope_of(self.endpoint, &resource);
+        // §19.2: a streaming list is asked for unless this cluster has already refused one. It
+        // is *asked for* rather than assumed — the capability is negotiated from the answer,
+        // and a server that refuses it is remembered so the question costs one round trip per
+        // session rather than one per watch (ADR-0059).
+        if !session.is_refused(Capability::StreamingLists) {
+            return Ok((resource, Acquired::Streaming));
+        }
         // §19.4 step 1's acquisition: the state the watch will report changes *against*, and the
         // `resourceVersion` it resumes from. It is one whole listing on purpose — a watch opened
         // against a checkpoint from a half-read collection would report a change to an object it
         // never established a baseline for, which is a change against nothing.
         let listing = client.list(resource.gvr(), &scope, &ListOptions::new().limit(PAGE_SIZE));
-        Ok((resource, listing))
+        Ok((resource, Acquired::Listed(Box::new(listing))))
     }
 }
 
@@ -708,8 +865,13 @@ struct Live<'a, 'ctx, 'io> {
     gvr: &'a Gvr,
     scope: &'a Scope,
     from: Option<&'a str>,
-    freshness: &'a Freshness,
-    session: &'a mut Session,
+    /// Whether this round asks the server for the initial state as well (§19.2).
+    streaming: bool,
+    /// What the records of this round carry. Mutable because a streaming list decides it in the
+    /// middle of the round: the moment the terminating bookmark arrives is the moment the
+    /// collection was observed, and the version it carries is the collection's.
+    freshness: &'a mut Freshness,
+    held: &'a Held<'a>,
     emitter: &'a mut Emitter,
 }
 
@@ -727,14 +889,22 @@ impl Conversation for Live<'_, '_, '_> {
             gvr,
             scope,
             from,
+            streaming,
             freshness,
-            session,
+            held,
             emitter,
         } = self;
-        let request = endpoint.authorise(
-            watch_request(gvr, scope, &ListOptions::new(), from)
-                .header("Accept", "application/json"),
-        );
+        let mut request = watch_request(gvr, scope, &ListOptions::new(), from);
+        if streaming {
+            // §19.2, in upstream's own words: `sendInitialEvents=true` with
+            // `resourceVersionMatch=NotOlderThan` and no `resourceVersion` asks for the current
+            // state as `ADDED` events, terminated by a bookmark annotated
+            // `k8s.io/initial-events-end`, and then the changes since it on the same body.
+            request = request
+                .query("sendInitialEvents", "true")
+                .query("resourceVersionMatch", "NotOlderThan");
+        }
+        let request = endpoint.authorise(request.header("Accept", "application/json"));
         let instance = client.provider_instance().to_owned();
         let mut decoder = WatchDecoder::new(instance);
         let mut stream = client
@@ -747,8 +917,14 @@ impl Conversation for Live<'_, '_, '_> {
         // discarded, or as an error frame inside a perfectly successful `200` stream, when it
         // expires while the stream is open. Both are the same expiry and neither is a transport
         // failure, so both become the event the state machine reads.
+        //
+        // §19.2's negotiation happens here too: a `400` or a `403` answering a streaming-list
+        // request is the server declining the feature — a `WatchList` gate that is off, or a
+        // policy that forbids it — and the answer is the list-then-watch fallback rather than a
+        // failed watch. The loop above reads the abandoned attempt and does the listing.
         let opening = match stream.status() {
             200 => None,
+            400 | 403 if streaming => return Ok(Step::Ended),
             410 => Some(WatchEvent::Error(WatchFailure::Expired)),
             403 => Some(WatchEvent::Error(WatchFailure::Denied)),
             other => {
@@ -763,14 +939,14 @@ impl Conversation for Live<'_, '_, '_> {
         };
         if let Some(event) = opening {
             return Ok(
-                match apply(event, lease, session, emitter, gvr, scope, freshness) {
+                match apply(event, lease, held, emitter, gvr, scope, freshness) {
                     Step::Stopped(outcome) => Step::Stopped(outcome),
                     Step::Reading | Step::Ended => Step::Ended,
                 },
             );
         }
 
-        let mut announced = emitter.observed_state(session, gvr, scope);
+        let mut announced = held.with(|session| emitter.observed_state(session, gvr, scope));
         loop {
             // §62.12: between two chunks, which is where a live watch spends its life. The read
             // itself watches for it too, because a quiet watch is quiet for minutes at a time.
@@ -782,12 +958,10 @@ impl Conversation for Live<'_, '_, '_> {
             // last thing the reader was told is `live` and nothing is coming to correct it. That
             // is the frozen table §41.4 forbids, so the correction is emitted rather than waited
             // for.
-            let now = emitter.observed_state(session, gvr, scope);
+            let now = held.with(|session| emitter.observed_state(session, gvr, scope));
             if now != announced {
                 announced = now;
-                if let Step::Stopped(outcome) =
-                    emitter.notice(lease, session, gvr, scope, freshness)
-                {
+                if let Step::Stopped(outcome) = emitter.notice(lease, held, gvr, scope, freshness) {
                     return Ok(Step::Stopped(outcome));
                 }
             }
@@ -819,7 +993,7 @@ impl Conversation for Live<'_, '_, '_> {
                 }
             };
             for event in events {
-                match apply(event, lease, session, emitter, gvr, scope, freshness) {
+                match apply(event, lease, held, emitter, gvr, scope, freshness) {
                     Step::Reading => {}
                     Step::Ended => return Ok(Step::Ended),
                     Step::Stopped(outcome) => return Ok(Step::Stopped(outcome)),
@@ -827,7 +1001,7 @@ impl Conversation for Live<'_, '_, '_> {
             }
             // Whatever arrived carried the state on its own record, so that is what the reader
             // was last told.
-            announced = emitter.observed_state(session, gvr, scope);
+            announced = held.with(|session| emitter.observed_state(session, gvr, scope));
         }
 
         let rest = match decoder.finish() {
@@ -835,7 +1009,7 @@ impl Conversation for Live<'_, '_, '_> {
             Err(error) => interrupted(&error.to_string()),
         };
         for event in rest {
-            match apply(event, lease, session, emitter, gvr, scope, freshness) {
+            match apply(event, lease, held, emitter, gvr, scope, freshness) {
                 Step::Reading | Step::Ended => {}
                 Step::Stopped(outcome) => return Ok(Step::Stopped(outcome)),
             }
@@ -849,6 +1023,10 @@ impl Conversation for Live<'_, '_, '_> {
 /// The state machine decides what may be claimed; this only reports what it decided. An event
 /// handed to a stream that is not receiving is discarded rather than filed inside a history it
 /// does not belong to (§19.4), and a discarded event must not reach a reader as an observation.
+///
+/// The session is taken for the length of the decision and given back before the record is
+/// emitted: emission blocks on the consumer's credit, and a session locked while a reader is
+/// slow would be a session no other invocation could reach.
 #[allow(
     clippy::too_many_arguments,
     reason = "the same list `Emitter::deliver` carries, plus the event and the state machine it \
@@ -857,49 +1035,85 @@ impl Conversation for Live<'_, '_, '_> {
 fn apply(
     event: WatchEvent,
     lease: &Lease<'_, '_>,
-    session: &mut Session,
+    held: &Held<'_>,
     emitter: &mut Emitter,
     gvr: &Gvr,
     scope: &Scope,
-    freshness: &Freshness,
+    freshness: &mut Freshness,
 ) -> Step {
     let class = event.class();
     let object = match &event {
         WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
             Some(object.clone())
         }
-        WatchEvent::Bookmark(_) | WatchEvent::Error(_) => None,
+        WatchEvent::Bookmark(_) | WatchEvent::InitialEventsEnd(_) | WatchEvent::Error(_) => None,
     };
-    match session.watch(gvr, scope).observe(event) {
-        Reception::Applied => {
+    let version = match &event {
+        WatchEvent::InitialEventsEnd(version) => Some(version.as_str().to_owned()),
+        _ => None,
+    };
+    let (reception, decided) = held.with(|session| {
+        let reception = session.observe_event(gvr, scope, event);
+        let decided = match reception {
+            Reception::Applied | Reception::ContinuityBroken => Some((
+                emitter.refresh(session, gvr, scope),
+                continuity(session, gvr, scope),
+            )),
+            // A checkpoint moved and nothing else did; a bookmark is not a change and reporting
+            // it as one is how a cache picks up a change the cluster never made (§19.3).
+            //
+            // It *is* evidence the stream is alive, though, which is the one thing §41.4's
+            // `stale` is measured against — so the view is refreshed and no record is emitted.
+            // A healthy watch that nothing is happening in stays `live` because its bookmarks
+            // say so, and a connected watch whose server has gone silent goes `stale` because
+            // nothing does.
+            Reception::Checkpointed | Reception::Discarded | Reception::Staged => {
+                emitter.refresh(session, gvr, scope);
+                None
+            }
+            Reception::Suspended | Reception::Synchronised => None,
+        };
+        (reception, decided)
+    });
+    // §19.2: the initial events ended, the cache is seeded, and the collection was observed at
+    // this moment and at the bookmark's version — which is what the `listed` records say.
+    if reception == Reception::Synchronised {
+        *freshness = Freshness::direct_read(
+            SystemClock.now(),
+            version,
+            freshness.provider_instance().to_owned(),
+            scope.clone(),
+            EndpointCategory::of(gvr),
+        );
+        return acquisition(lease, held, emitter, gvr, scope, freshness);
+    }
+    match (reception, decided) {
+        (Reception::Applied, Some((view, continuity))) => {
             let word = match class {
                 "ADDED" => "added",
                 "DELETED" => "deleted",
                 _ => "modified",
             };
-            let view = emitter.refresh(session, gvr, scope);
-            emitter.deliver(lease, session, gvr, scope, freshness, word, object, view)
+            emitter.deliver(
+                lease,
+                &continuity,
+                gvr,
+                scope,
+                freshness,
+                word,
+                object,
+                view,
+            )
         }
-        // A checkpoint moved and nothing else did; a bookmark is not a change and reporting it
-        // as one is how a cache picks up a change the cluster never made (§19.3).
-        //
-        // It *is* evidence the stream is alive, though, which is the one thing §41.4's `stale`
-        // is measured against — so the view is refreshed and no record is emitted. A healthy
-        // watch that nothing is happening in stays `live` because its bookmarks say so, and a
-        // connected watch whose server has gone silent goes `stale` because nothing does.
-        Reception::Checkpointed | Reception::Discarded => {
-            emitter.refresh(session, gvr, scope);
-            Step::Reading
-        }
-        // The body is over as far as observation goes, and the checkpoint survives it.
-        Reception::Suspended => Step::Ended,
-        Reception::ContinuityBroken => {
-            let view = emitter.refresh(session, gvr, scope);
-            match emitter.deliver(lease, session, gvr, scope, freshness, "gap", None, view) {
+        (Reception::ContinuityBroken, Some((view, continuity))) => {
+            match emitter.deliver(lease, &continuity, gvr, scope, freshness, "gap", None, view) {
                 Step::Reading | Step::Ended => Step::Ended,
                 Step::Stopped(outcome) => Step::Stopped(outcome),
             }
         }
+        // The body is over as far as observation goes, and the checkpoint survives it.
+        (Reception::Suspended, _) => Step::Ended,
+        _ => Step::Reading,
     }
 }
 

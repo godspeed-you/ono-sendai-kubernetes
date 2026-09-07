@@ -153,6 +153,20 @@ enum Scenario {
     /// One namespaced collection refuses to be listed, so a namespace-deletion inventory has a
     /// hole in it that must be reported as a hole (§55.2, §55.4, §21.4).
     DeniedInventory,
+    /// The Deployment applies, the read after it shows a controller that has not caught up, and
+    /// the watch the verification opens delivers the controller converging (§46.3, ADR-0060).
+    Converges,
+    /// The verification watch expires with a `410` before the controller says anything (Gate F).
+    GapDuringVerification,
+    /// The target is deleted while the verification watch is open (§16.3).
+    TargetGoneDuringVerification,
+    /// The verification watch is held open and never delivers anything — the state a
+    /// cancellation has to be prompt in once the immediate read is over (§62.12).
+    HeldVerificationWatch,
+    /// Another invocation of the same session watches the Deployment collection; the change is
+    /// verified through that watch's cache, and the frame that converges it is released by the
+    /// test (§20.3, §50.4, ADR-0060).
+    SessionWatch,
 }
 
 /// What the recorded API server's `SelfSubjectAccessReview` says, and whether it serves one.
@@ -197,6 +211,9 @@ struct RecordedCluster {
     held_verification: bool,
     /// Signalled when a held verification read may be answered. Never, in the test that holds one.
     release: Arc<tokio::sync::Notify>,
+    /// The gate the `SessionWatch` scenario's collection watch waits at before it delivers the
+    /// frame that converges the Deployment.
+    frame: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for RecordedCluster {
@@ -303,6 +320,76 @@ fn deployment(applied: bool) -> Json {
         },
         "status": {"readyReplicas": 3, "replicas": 3, "observedGeneration": 7},
     })
+}
+
+/// The Deployment once its controller has caught up with the scale to one replica: the
+/// generation is observed, every replica count is the requested one, and `Progressing` is true.
+fn converged_deployment() -> Json {
+    let mut object = deployment(true);
+    object["metadata"]["resourceVersion"] = json!("4720");
+    object["status"] = json!({
+        "observedGeneration": 8, "replicas": 1, "updatedReplicas": 1, "availableReplicas": 1,
+        "readyReplicas": 1,
+        "conditions": [{"type": "Progressing", "status": "True", "reason": "NewReplicaSetAvailable"}],
+    });
+    object
+}
+
+fn watch_frame(class: &str, object: &Json) -> String {
+    format!("{}\n", json!({"type": class, "object": object}))
+}
+
+fn chunk_of(frame: &str) -> String {
+    format!("{:x}\r\n{frame}\r\n", frame.len())
+}
+
+/// A chunked `200 OK` carrying `frames`, terminated where `ends` says so.
+fn watch_body(frames: &[String], ends: bool) -> Vec<u8> {
+    let mut wire = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+    );
+    for frame in frames {
+        wire.push_str(&chunk_of(frame));
+    }
+    if ends {
+        wire.push_str("0\r\n\r\n");
+    }
+    wire.into_bytes()
+}
+
+fn expired_frame() -> String {
+    watch_frame(
+        "ERROR",
+        &json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "message": "too old resource version", "reason": "Expired", "code": 410}),
+    )
+}
+
+/// What the recorded server answers a watch on the Deployment collection with, by scenario.
+fn deployment_watch(cluster: &RecordedCluster, query: &str) -> Vec<u8> {
+    // This server predates streaming lists (ADR-0059): the other invocation's acquisition is
+    // refused the way an API server without the feature refuses it, and it lists instead.
+    if query.contains("sendInitialEvents=true") {
+        return http(
+            "400 Bad Request",
+            &json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "message": "sendInitialEvents is forbidden for watch unless the WatchList feature gate is enabled",
+                    "reason": "BadRequest", "code": 400})
+            .to_string(),
+        );
+    }
+    match cluster.scenario {
+        Scenario::Converges => {
+            watch_body(&[watch_frame("MODIFIED", &converged_deployment())], true)
+        }
+        Scenario::GapDuringVerification => watch_body(&[expired_frame()], true),
+        Scenario::TargetGoneDuringVerification => {
+            watch_body(&[watch_frame("DELETED", &deployment(true))], true)
+        }
+        // The head only: the body stays open and nothing ever arrives on it.
+        Scenario::HeldVerificationWatch | Scenario::SessionWatch => watch_body(&[], false),
+        _ => not_found("/apis/apps/v1/namespaces/default/deployments"),
+    }
 }
 
 /// The Deployment as a mutating webhook returned it: an admission policy clamped the replica
@@ -472,7 +559,20 @@ fn conflict() -> Vec<u8> {
 /// What the recorded server answers one request with.
 fn document(method: &str, path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let dry_run = path.contains("dryRun=All");
-    let path_only = path.split('?').next().unwrap_or(path);
+    let (path_only, query) = path.split_once('?').unwrap_or((path, ""));
+    // Read before the query is dropped: `watch=true` lives nowhere else (§19).
+    if method == "GET"
+        && path_only == "/apis/apps/v1/namespaces/default/deployments"
+        && query.contains("watch=true")
+    {
+        return deployment_watch(cluster, query);
+    }
+    if method == "GET" && path_only == "/apis/apps/v1/namespaces/default/deployments" {
+        // The other invocation's acquisition in the `SessionWatch` scenario: the collection as
+        // it stands before anything was written to it.
+        let seen = cluster.reads.load(std::sync::atomic::Ordering::Relaxed);
+        return collection("apps/v1", "Deployment", vec![deployment(seen > 0)]);
+    }
     const DEPLOYMENT: &str = "/apis/apps/v1/namespaces/default/deployments/api";
     const CLAIM: &str = "/api/v1/namespaces/default/persistentvolumeclaims/data";
     const CONFIGMAP: &str = "/api/v1/namespaces/default/configmaps/settings";
@@ -750,6 +850,24 @@ impl HostServices for RecordedCluster {
                         cluster.release.notified().await;
                     }
                     replies.push(document(&method, &path, &cluster));
+                    // The `SessionWatch` scenario's collection watch delivers its one frame when
+                    // the test releases it, so the change is verified through a cache another
+                    // invocation is feeding and never through a read of this invocation's own.
+                    if cluster.scenario == Scenario::SessionWatch
+                        && path.contains("watch=true")
+                        && !path.contains("fieldSelector")
+                        && !path.contains("sendInitialEvents")
+                    {
+                        let sender = inbound.clone();
+                        let gate = Arc::clone(&cluster.frame);
+                        tokio::spawn(async move {
+                            gate.notified().await;
+                            let frame = watch_frame("MODIFIED", &converged_deployment());
+                            let bytes = chunk_of(&frame).into_bytes();
+                            let chunk = json!({"bytes": {"$bytes": encode_hex(&bytes)}});
+                            let _ = sender.send(Ok(chunk)).await;
+                        });
+                    }
                 }
                 if replies.is_empty() {
                     continue;
@@ -2428,4 +2546,300 @@ async fn should_terminate_a_verification_within_seconds_of_being_cancelled() {
         "and nothing was rolled back: {:?}",
         cluster.heads()
     );
+}
+
+// --- §46.3, §46.4: convergence observed through a watch (ADR-0060) ------------------------------
+
+/// The heads of every request for `path`, with their query strings.
+fn requests_for(cluster: &RecordedCluster, path: &str) -> Vec<String> {
+    cluster
+        .heads()
+        .iter()
+        .filter_map(|head| head.split_whitespace().nth(1).map(str::to_owned))
+        .filter(|target| target.split('?').next() == Some(path))
+        .collect()
+}
+
+const DEPLOYMENTS: &str = "/apis/apps/v1/namespaces/default/deployments";
+
+/// The watch requests the verification opened over the target alone.
+fn verification_watches(cluster: &RecordedCluster) -> Vec<String> {
+    requests_for(cluster, DEPLOYMENTS)
+        .into_iter()
+        .filter(|target| target.contains("watch=true") && target.contains("fieldSelector="))
+        .collect()
+}
+
+#[tokio::test]
+async fn should_confirm_a_scale_once_the_watch_observed_the_controller_converge() {
+    // §46.3's first worked example, end to end: the API server accepts `replicas=1`, the read
+    // after it shows a generation the controller has not observed, and the verification opens a
+    // watch on the target — from the version that read observed, narrowed to the one object —
+    // and consumes it until the controller reports the generation observed and every replica
+    // count at the requested number. Only then is the rollout confirmed (Gate G, §20.4).
+    let cluster = RecordedCluster::playing(Scenario::Converges);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+
+    assert_eq!(text(outcome, "acceptance"), "persisted");
+    assert_eq!(
+        text(outcome, "verdict"),
+        "confirmed",
+        "the controller was observed converging: {}",
+        text(outcome, "verification_detail")
+    );
+    let reconciliation = rendered(outcome, "reconciliation");
+    assert!(
+        reconciliation.contains("verified_convergence") && reconciliation.contains("true"),
+        "convergence was verified by the Deployment rule rather than assumed: {reconciliation}"
+    );
+    let statement = text(outcome, "statement");
+    assert!(
+        statement.contains("status converged"),
+        "the statement says what was observed: {statement}"
+    );
+    let watches = verification_watches(&cluster);
+    assert_eq!(watches.len(), 1, "one bounded watch: {:?}", cluster.heads());
+    assert!(
+        watches[0].contains("fieldSelector=metadata.name%3Dapi")
+            && watches[0].contains("resourceVersion=4712"),
+        "narrowed to the target and opened at the version the read observed, so nothing between \
+         the read and the watch is missed (§19.1): {}",
+        watches[0]
+    );
+    assert_eq!(
+        cluster.requests("PATCH").len(),
+        1,
+        "and the verification wrote nothing: {:?}",
+        cluster.heads()
+    );
+}
+
+#[tokio::test]
+async fn should_report_a_gap_in_the_verification_watch_as_incomplete_rather_than_as_either_verdict()
+{
+    // Gate F inside a verification: the watch answers `410 Gone`, so what the controller did
+    // after the read is unobserved. §46.4 makes that an incomplete verification with a name, and
+    // never a failed change — the API server took the write and the controller may well have
+    // converged in the period nobody observed.
+    let cluster = RecordedCluster::playing(Scenario::GapDuringVerification);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+
+    assert_eq!(text(outcome, "acceptance"), "persisted");
+    assert_eq!(text(outcome, "verdict"), "inconclusive");
+    let detail = text(outcome, "verification_detail");
+    assert!(
+        detail.contains("[watch_gap]") && detail.contains("410"),
+        "the reason is named: {detail}"
+    );
+    assert!(
+        detail.contains("not evidence that the change failed"),
+        "§46.4: {detail}"
+    );
+    assert!(
+        detail.contains("controller not yet observed"),
+        "and the last observation is kept beside the reason: {detail}"
+    );
+    let statement = text(outcome, "statement");
+    for forbidden in ["rolled out", "converged by", "healthy", "refuted"] {
+        assert!(
+            !statement.contains(forbidden),
+            "`{forbidden}` in {statement}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_report_a_target_deleted_during_verification_as_incomplete() {
+    // §16.3 and §46.4: the object the change was made to left the collection while the change
+    // was being verified. Nothing about it can be observed any more, which is neither the change
+    // failing nor the change succeeding, and the reason says what happened.
+    let cluster = RecordedCluster::playing(Scenario::TargetGoneDuringVerification);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+
+    assert_eq!(text(outcome, "verdict"), "inconclusive");
+    let detail = text(outcome, "verification_detail");
+    assert!(detail.contains("[target_gone]"), "{detail}");
+    assert!(detail.contains("left the collection"), "{detail}");
+}
+
+#[tokio::test]
+async fn should_name_an_unopenable_verification_watch_rather_than_wait_for_it() {
+    // §21.4 on the verification path: the recorded server of every earlier test serves no watch
+    // on the Deployment collection, and the verdict says so — `watch_unavailable`, with the
+    // outcome's own word — instead of waiting a window for events that cannot come.
+    let cluster = RecordedCluster::playing(Scenario::Accepted);
+    let plugin = loaded(&cluster).await;
+    let started = Instant::now();
+    let invocation = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect("it runs");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+
+    assert_eq!(text(outcome, "verdict"), "inconclusive");
+    let detail = text(outcome, "verification_detail");
+    assert!(
+        detail.contains("[watch_unavailable]") && detail.contains("not served"),
+        "{detail}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "a watch that cannot be opened is not waited for: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn should_terminate_a_verification_watch_within_seconds_of_being_cancelled() {
+    // Gate L (§62.12) on the second half of a verification. The earlier measurement cancels
+    // while the immediate read is outstanding; this one cancels while the *watch* that follows
+    // it is open on a server that delivers nothing — which is where a verification spends most of
+    // its window against a controller that is taking its time.
+    let cluster = RecordedCluster::playing(Scenario::HeldVerificationWatch);
+    let plugin = loaded(&cluster).await;
+    let invocation = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect("the change runs");
+    let waiting = Instant::now();
+    loop {
+        if !verification_watches(&cluster).is_empty() {
+            break;
+        }
+        assert!(
+            waiting.elapsed() < Duration::from_secs(10),
+            "the verification watch never opened: {:?}",
+            cluster.heads()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let started = Instant::now();
+    invocation.cancel().await;
+    let result = tokio::time::timeout(Duration::from_secs(30), invocation.finish())
+        .await
+        .expect("a cancelled verification terminates rather than hanging on a silent watch");
+    let elapsed = started.elapsed();
+    println!("cancelled verification watch terminated in {elapsed:?}");
+    assert_eq!(result.status, InvokeStatus::Cancelled);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a cancelled verification watch terminates within a read window, not at the end of the \
+         verification window: {elapsed:?}"
+    );
+    assert_eq!(cluster.requests("PATCH").len(), 1, "{:?}", cluster.heads());
+    assert!(
+        cluster.requests("DELETE").is_empty(),
+        "{:?}",
+        cluster.heads()
+    );
+}
+
+#[tokio::test]
+async fn should_verify_through_the_session_s_own_watch_rather_than_open_a_second_one() {
+    // §20.3 and §50.4 on the verification path: another invocation of the same provider instance
+    // is watching the Deployment collection, so the change is verified against the cache that
+    // watch keeps true — the convergence arrives on *that* watch, and this invocation opens none
+    // of its own. The frame that converges the Deployment goes on the wire only when the test
+    // releases it, after the write has been accepted.
+    let cluster = RecordedCluster::playing(Scenario::SessionWatch);
+    let plugin = loaded(&cluster).await;
+    let mut watch = plugin
+        .query(
+            "k8s-change",
+            at_cluster(&[
+                ("kind", json!("Deployment")),
+                ("namespace", json!("default")),
+            ]),
+        )
+        .await
+        .expect("the watch starts");
+    let listed = tokio::time::timeout(Duration::from_secs(20), watch.next())
+        .await
+        .expect("the acquisition arrives")
+        .expect("the stream is open");
+    assert!(matches!(listed, StreamEvent::Value(Value::Record(_))));
+    let opened = Instant::now();
+    loop {
+        let open = requests_for(&cluster, DEPLOYMENTS)
+            .iter()
+            .any(|target| target.contains("watch=true") && !target.contains("sendInitialEvents"));
+        if open {
+            break;
+        }
+        assert!(
+            opened.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            cluster.heads()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let change = plugin
+        .invoke(SET, scale_down(&[("dry_run", json!(false))]))
+        .await
+        .expect("the change runs");
+    let written = Instant::now();
+    while cluster.requests("PATCH").is_empty() {
+        assert!(
+            written.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            cluster.heads()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A moment for the immediate read to land pending, then the controller converges — on the
+    // other invocation's watch.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cluster.frame.notify_one();
+    let converged = tokio::time::timeout(Duration::from_secs(20), watch.next())
+        .await
+        .expect("the change arrives on the open watch")
+        .expect("the stream is open");
+    assert!(matches!(converged, StreamEvent::Value(Value::Record(_))));
+
+    let (events, result) = change.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let outcome = &records(&events)[0];
+    assert_eq!(
+        text(outcome, "verdict"),
+        "confirmed",
+        "{} — requests: {:?}",
+        text(outcome, "verification_detail"),
+        cluster.heads()
+    );
+    assert!(
+        verification_watches(&cluster).is_empty(),
+        "no watch of the verification's own was opened; the session's served it: {:?}",
+        cluster.heads()
+    );
+
+    watch.cancel().await;
+    let ended = tokio::time::timeout(Duration::from_secs(20), watch.finish())
+        .await
+        .expect("a cancelled watch terminates");
+    assert_eq!(ended.status, InvokeStatus::Cancelled);
 }

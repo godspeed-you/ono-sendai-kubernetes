@@ -103,6 +103,10 @@ struct Cluster {
     watch: bool,
     /// Whether a followed log is served, one line per release, over a body that never ends.
     logs: bool,
+    /// Whether the server also serves what a relationship derivation reads beside the Pods: a
+    /// Service, a Deployment and its ReplicaSet, an EndpointSlice and a NetworkPolicy, each of
+    /// them keyed on `app=api` — so every one of §17.3's pushdowns has something to select.
+    relating: bool,
     /// Every request head the server received, so a test can count what travelled (§50.2).
     heads: Arc<std::sync::Mutex<Vec<String>>>,
     /// The gate a paced page, watch frame or log line waits at.
@@ -126,8 +130,26 @@ impl Cluster {
             paced: false,
             watch: false,
             logs: false,
+            relating: false,
             heads: Arc::default(),
             release: Arc::default(),
+        })
+    }
+
+    /// The same collection beside the objects a relationship derivation reads.
+    fn relating(pages: usize, per_page: usize) -> Arc<Self> {
+        Arc::new(Self {
+            relating: true,
+            ..Self::listing(pages, per_page).as_ref().clone()
+        })
+    }
+
+    /// The relating collection, watched over a body that never ends.
+    fn relating_and_watched(pages: usize, per_page: usize) -> Arc<Self> {
+        Arc::new(Self {
+            relating: true,
+            watch: true,
+            ..Self::listing(pages, per_page).as_ref().clone()
         })
     }
 
@@ -180,7 +202,18 @@ impl Cluster {
 
 const PODS: &str = "/api/v1/namespaces/default/pods";
 
+/// Every how-manyeth Pod carries `app=api`; the rest carry `app=worker`.
+///
+/// One per page, so that a selector pushed to the server answers in one page what an unfiltered
+/// walk answers in every page of the namespace — which is the whole difference §17.3 makes.
+const SELECTED_EVERY: usize = 100;
+
 fn pod(index: usize) -> Json {
+    let app = if index.is_multiple_of(SELECTED_EVERY) {
+        "api"
+    } else {
+        "worker"
+    };
     json!({
         "metadata": {
             "name": format!("api-{index:06}"),
@@ -188,7 +221,7 @@ fn pod(index: usize) -> Json {
             "uid": format!("00000000-0000-0000-0000-{index:012}"),
             "resourceVersion": format!("{}", 100_000 + index),
             "creationTimestamp": "2026-09-01T09:00:00Z",
-            "labels": {"app": "api"},
+            "labels": {"app": app},
         },
         "spec": {"nodeName": "node-a", "containers": [{"name": "api"}]},
         "status": {"phase": "Running", "podIP": "10.1.2.3"},
@@ -217,6 +250,21 @@ fn not_found(path: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// What an API server without the `WatchList` feature answers a streaming-list request with.
+fn streaming_lists_refused() -> Vec<u8> {
+    let body = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+        "message": "sendInitialEvents is forbidden for watch unless the WatchList feature gate is enabled",
+        "reason": "BadRequest", "code": 400,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 /// One chunked `200 OK` whose body has not ended and will not — a watch, or a followed log.
 fn held_open(content_type: &str) -> Vec<u8> {
     format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\n\r\n")
@@ -237,6 +285,28 @@ fn page_of(query: &str) -> usize {
 }
 
 fn pod_page(cluster: &Cluster, query: &str) -> Vec<u8> {
+    // A selector the server indexes: the matching Pods, in one page, as a real API server
+    // answers a `labelSelector` it can evaluate. A selector nothing matches is an empty page.
+    if let Some(selector) = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("labelSelector="))
+    {
+        let items: Vec<Json> = if selector == "app%3Dapi" {
+            (0..cluster.pages * cluster.per_page)
+                .step_by(SELECTED_EVERY)
+                .map(pod)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return ok(&json!({
+            "kind": "PodList",
+            "apiVersion": "v1",
+            "metadata": {"resourceVersion": "90210"},
+            "items": items,
+        })
+        .to_string());
+    }
     let page = page_of(query);
     let first = page * cluster.per_page;
     let items: Vec<Json> = (first..first + cluster.per_page).map(pod).collect();
@@ -256,9 +326,167 @@ fn pod_page(cluster: &Cluster, query: &str) -> Vec<u8> {
     .to_string())
 }
 
+/// The uid of the Deployment whose ReplicaSet the owner-reference derivation looks for.
+const DEPLOYMENT_UID: &str = "66666666-6666-6666-6666-666666666666";
+
+fn group(name: &str, version: &str) -> Json {
+    let group_version = format!("{name}/{version}");
+    json!({
+        "name": name,
+        "versions": [{"groupVersion": group_version, "version": version}],
+        "preferredVersion": {"groupVersion": group_version, "version": version},
+    })
+}
+
+fn collection(kind: &str, api_version: &str, items: &[Json]) -> Json {
+    json!({
+        "kind": format!("{kind}List"),
+        "apiVersion": api_version,
+        "metadata": {"resourceVersion": "90211"},
+        "items": items,
+    })
+}
+
+fn standalone(mut object: Json, api_version: &str, kind: &str) -> Json {
+    if let Some(map) = object.as_object_mut() {
+        map.insert("apiVersion".to_owned(), json!(api_version));
+        map.insert("kind".to_owned(), json!(kind));
+    }
+    object
+}
+
+fn service() -> Json {
+    json!({
+        "metadata": {"name": "api", "namespace": "default", "resourceVersion": "5100",
+                     "uid": "a4a4a4a4-0000-0000-0000-000000000001",
+                     "creationTimestamp": "2026-08-20T08:00:00Z"},
+        "spec": {"selector": {"app": "api"}, "ports": [{"port": 80}]},
+    })
+}
+
+fn deployment() -> Json {
+    json!({
+        "metadata": {"name": "api", "namespace": "default", "resourceVersion": "5200",
+                     "uid": DEPLOYMENT_UID, "generation": 7,
+                     "creationTimestamp": "2026-08-20T08:00:00Z"},
+        "spec": {"replicas": 3, "selector": {"matchLabels": {"app": "api"}}},
+        "status": {"observedGeneration": 7},
+    })
+}
+
+fn replica_set() -> Json {
+    json!({
+        "metadata": {"name": "api-7d9f", "namespace": "default", "resourceVersion": "5300",
+                     "uid": "a1a1a1a1-0000-0000-0000-000000000001",
+                     "labels": {"app": "api"},
+                     "creationTimestamp": "2026-08-20T08:00:00Z",
+                     "ownerReferences": [{"apiVersion": "apps/v1", "kind": "Deployment",
+                                          "name": "api", "uid": DEPLOYMENT_UID,
+                                          "controller": true}]},
+        "spec": {"replicas": 3},
+    })
+}
+
+fn endpoint_slice() -> Json {
+    json!({
+        "metadata": {"name": "api-x7k2", "namespace": "default", "resourceVersion": "5400",
+                     "uid": "a5a5a5a5-0000-0000-0000-000000000001",
+                     "labels": {"kubernetes.io/service-name": "api"},
+                     "creationTimestamp": "2026-08-20T08:00:00Z"},
+        "addressType": "IPv4",
+        "endpoints": [{"addresses": ["10.1.2.3"], "conditions": {"ready": true},
+                       "targetRef": {"kind": "Pod", "name": "api-000000",
+                                     "uid": "00000000-0000-0000-0000-000000000000"}}],
+    })
+}
+
+fn network_policy() -> Json {
+    json!({
+        "metadata": {"name": "api-ingress", "namespace": "default", "resourceVersion": "5500",
+                     "uid": "b5b5b5b5-0000-0000-0000-000000000001",
+                     "creationTimestamp": "2026-08-01T00:00:00Z"},
+        "spec": {"podSelector": {"matchLabels": {"app": "api"}}, "policyTypes": ["Ingress"]},
+    })
+}
+
+/// What a cluster whose objects state relationships answers, where it differs from the plain one.
+fn relating_document(route: &str) -> Option<Json> {
+    Some(match route {
+        "/apis" => json!({
+            "kind": "APIGroupList",
+            "groups": [group("apps", "v1"), group("discovery.k8s.io", "v1"),
+                       group("networking.k8s.io", "v1")],
+        }),
+        "/api/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "v1",
+            "resources": [
+                {"name": "namespaces", "kind": "Namespace", "namespaced": false,
+                 "verbs": ["get", "list", "watch"], "shortNames": ["ns"]},
+                {"name": "pods", "kind": "Pod", "namespaced": true,
+                 "verbs": ["get", "list", "watch"], "shortNames": ["po"]},
+                {"name": "services", "kind": "Service", "namespaced": true,
+                 "verbs": ["get", "list", "watch"], "shortNames": ["svc"]},
+            ],
+        }),
+        "/apis/apps/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "apps/v1",
+            "resources": [
+                {"name": "deployments", "kind": "Deployment", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "replicasets", "kind": "ReplicaSet", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+        "/apis/discovery.k8s.io/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "discovery.k8s.io/v1",
+            "resources": [{"name": "endpointslices", "kind": "EndpointSlice",
+                           "namespaced": true, "verbs": ["get", "list", "watch"]}],
+        }),
+        "/apis/networking.k8s.io/v1" => json!({
+            "kind": "APIResourceList",
+            "groupVersion": "networking.k8s.io/v1",
+            "resources": [
+                {"name": "ingresses", "kind": "Ingress", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+                {"name": "networkpolicies", "kind": "NetworkPolicy", "namespaced": true,
+                 "verbs": ["get", "list", "watch"]},
+            ],
+        }),
+        "/api/v1/namespaces/default/services/api" => standalone(service(), "v1", "Service"),
+        "/api/v1/namespaces/default/services" => collection("Service", "v1", &[service()]),
+        "/apis/apps/v1/namespaces/default/deployments/api" => {
+            standalone(deployment(), "apps/v1", "Deployment")
+        }
+        "/apis/apps/v1/namespaces/default/replicasets" => {
+            collection("ReplicaSet", "apps/v1", &[replica_set()])
+        }
+        "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices" => {
+            collection("EndpointSlice", "discovery.k8s.io/v1", &[endpoint_slice()])
+        }
+        "/apis/networking.k8s.io/v1/namespaces/default/networkpolicies/api-ingress" => {
+            standalone(network_policy(), "networking.k8s.io/v1", "NetworkPolicy")
+        }
+        "/apis/networking.k8s.io/v1/namespaces/default/networkpolicies" => {
+            collection("NetworkPolicy", "networking.k8s.io/v1", &[network_policy()])
+        }
+        "/apis/networking.k8s.io/v1/namespaces/default/ingresses" => {
+            collection("Ingress", "networking.k8s.io/v1", &[])
+        }
+        _ => return None,
+    })
+}
+
 /// What the recorded server answers, for the handful of paths it serves.
 fn document(cluster: &Cluster, path: &str) -> Vec<u8> {
     let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    // This server predates streaming lists (§19.2): the request is refused the way an API
+    // server without the feature refuses it, and the package falls back to list-then-watch.
+    if query.contains("sendInitialEvents=true") {
+        return streaming_lists_refused();
+    }
     if cluster.watch && route == PODS && query.contains("watch=true") {
         return held_open("application/json");
     }
@@ -282,6 +510,11 @@ fn document(cluster: &Cluster, path: &str) -> Vec<u8> {
             map.insert("kind".to_owned(), json!("Pod"));
         }
         return ok(&object.to_string());
+    }
+    if cluster.relating
+        && let Some(body) = relating_document(route)
+    {
+        return ok(&body.to_string());
     }
     let body = match route {
         "/api" => json!({"kind": "APIVersions", "versions": ["v1"]}),
@@ -640,8 +873,9 @@ async fn should_bound_a_watched_collection_at_the_view_capacity_and_report_the_r
     assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
     assert_eq!(
         cluster.asked_for(PODS),
-        21,
-        "the acquisition read the collection in twenty-one pages and the watch had not opened yet"
+        22,
+        "one streaming-list request this server refused (§19.2, ADR-0059), then the acquisition \
+         read the collection in twenty-one pages, and the watch had not opened yet"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }
@@ -816,5 +1050,291 @@ async fn should_terminate_a_followed_log_within_seconds_of_being_cancelled() {
         "a cancelled follow terminates between chunks rather than at the read deadline: \
          {elapsed:?}"
     );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+// --- §17.3, §17.6, §50.4: what a relationship derivation costs, and what it pushes down ----------
+
+/// The request heads that asked for `path`, with their query strings, so a test can say not only
+/// how many times a collection was read but *how* it was asked for.
+fn requests_for(cluster: &Cluster, path: &str) -> Vec<String> {
+    cluster
+        .heads()
+        .iter()
+        .filter_map(|head| head.split_whitespace().nth(1).map(str::to_owned))
+        .filter(|target| target.split('?').next() == Some(path))
+        .collect()
+}
+
+/// Whether every request for `path` carried exactly this `labelSelector`, and none was unfiltered.
+fn only_filtered_by(cluster: &Cluster, path: &str, selector: &str) -> bool {
+    let asked = requests_for(cluster, path);
+    !asked.is_empty()
+        && asked
+            .iter()
+            .all(|target| target.contains(&format!("labelSelector={selector}")))
+}
+
+fn text_of(record: &RecordValue, field: &str) -> Option<String> {
+    match record.get(field) {
+        Some(Value::String(text)) => Some(text.to_string()),
+        Some(Value::Null) | None => None,
+        other => panic!("`{field}` is text or null, and it is {other:?}"),
+    }
+}
+
+async fn relation(
+    plugin: &ono_kuang_supervisor::LoadedPlugin,
+    extra: &[(&str, Json)],
+) -> Vec<Arc<RecordValue>> {
+    let (events, result) = plugin
+        .query("k8s-relation", options(extra))
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    records(&events)
+}
+
+const SERVICES: &str = "/api/v1/namespaces/default/services";
+const SLICES: &str = "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices";
+const REPLICA_SETS: &str = "/apis/apps/v1/namespaces/default/replicasets";
+const POLICIES: &str = "/apis/networking.k8s.io/v1/namespaces/default/networkpolicies";
+const INGRESSES: &str = "/apis/networking.k8s.io/v1/namespaces/default/ingresses";
+
+#[tokio::test]
+async fn should_derive_a_service_s_edges_with_one_filtered_pod_list_and_never_an_unfiltered_one() {
+    // §17.3: "The provider SHOULD push supported label selectors ... when Ono query semantics
+    // map exactly." A Service's `spec.selector` is an equality map, and `app=api` means the same
+    // thing to the API server as to `Graph::selects` — so the Pods a Service selects cost one
+    // request for the Pods that match rather than one request per page of the namespace. The
+    // slices are reached by one label the same way (§26.2). ADR-0058.
+    //
+    // Before this the same question cost an unfiltered Pod listing: on a namespace of a hundred
+    // thousand Pods that is two hundred pages to evaluate a selector the server indexes.
+    let cluster = Cluster::relating(4, 100);
+    let plugin = loaded(Arc::clone(&cluster)).await;
+
+    let edges = relation(
+        &plugin,
+        &[("kind", json!("Service")), ("name", json!("api"))],
+    )
+    .await;
+    assert_eq!(
+        edges
+            .iter()
+            .filter(|edge| text_of(edge, "relation").as_deref() == Some("selects"))
+            .count(),
+        4,
+        "one Pod per page carries `app=api`, and every one of them is selected"
+    );
+    assert_eq!(
+        cluster.asked_for("/api/v1/namespaces/default/services/api"),
+        1
+    );
+    assert_eq!(
+        cluster.asked_for(PODS),
+        1,
+        "one Pod list, and not one per page of a four-page namespace"
+    );
+    assert!(
+        only_filtered_by(&cluster, PODS, "app%3Dapi"),
+        "the Pod list carried the Service's own selector: {:?}",
+        requests_for(&cluster, PODS)
+    );
+    assert!(
+        only_filtered_by(&cluster, SLICES, "kubernetes.io%2Fservice-name%3Dapi"),
+        "the slices were asked for by the service-name label: {:?}",
+        requests_for(&cluster, SLICES)
+    );
+    assert_eq!(
+        cluster.asked_for(INGRESSES),
+        1,
+        "nothing narrows an Ingress listing"
+    );
+    assert_eq!(
+        cluster.heads().len(),
+        10,
+        "six discovery documents, the Service, and three listings — that total is the contract: \
+         {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_prefilter_a_deployment_s_replica_sets_by_its_selector_and_prove_them_by_owner() {
+    // §25.1 and §24.1: the children of a controller are proven by `ownerReferences`, and the
+    // controller's own `spec.selector` — translated as upstream translates it — narrows which
+    // candidates are fetched. A controller adopts only what its selector matches, so the
+    // pre-filter excludes nothing the owner reference would have proven (ADR-0058).
+    let cluster = Cluster::relating(1, 1);
+    let plugin = loaded(Arc::clone(&cluster)).await;
+
+    let edges = relation(
+        &plugin,
+        &[("kind", json!("Deployment")), ("name", json!("api"))],
+    )
+    .await;
+    let owns = edges
+        .iter()
+        .find(|edge| text_of(edge, "relation").as_deref() == Some("owns"))
+        .expect("the Deployment owns its ReplicaSet");
+    assert_eq!(text_of(owns, "target_name").as_deref(), Some("api-7d9f"));
+    assert_eq!(
+        text_of(owns, "evidence_class").as_deref(),
+        Some("owner-reference"),
+        "the pre-filter chose what to read; the owner reference is what proves the edge"
+    );
+    assert!(
+        only_filtered_by(&cluster, REPLICA_SETS, "app%3Dapi"),
+        "the ReplicaSets were asked for by the Deployment's selector: {:?}",
+        requests_for(&cluster, REPLICA_SETS)
+    );
+    assert_eq!(
+        cluster.asked_for(PODS),
+        0,
+        "a Deployment's edges read no Pod at all"
+    );
+    assert_eq!(
+        cluster.heads().len(),
+        8,
+        "six discovery documents, the Deployment, and one filtered listing: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_derive_a_pod_s_selectors_and_policies_from_one_listing_each_and_no_pod_list() {
+    // Appendix B's `selected-by` and `protected-by`, read from the Pod's end: the selectors live
+    // on the Services and the policies, nothing narrows those two listings, and no Pod listing
+    // is needed at all — the Pod is the object that was read.
+    let cluster = Cluster::relating(1, 1);
+    let plugin = loaded(Arc::clone(&cluster)).await;
+
+    let edges = relation(
+        &plugin,
+        &[("kind", json!("Pod")), ("name", json!("api-000000"))],
+    )
+    .await;
+    let words: Vec<String> = edges
+        .iter()
+        .filter_map(|edge| text_of(edge, "relation"))
+        .collect();
+    assert!(words.iter().any(|word| word == "selected-by"), "{words:?}");
+    assert!(words.iter().any(|word| word == "protected-by"), "{words:?}");
+    assert_eq!(cluster.asked_for(SERVICES), 1);
+    assert_eq!(cluster.asked_for(POLICIES), 1);
+    assert_eq!(
+        cluster.asked_for(PODS),
+        0,
+        "the Pod was read by name and nothing listed the rest"
+    );
+    assert_eq!(
+        cluster.heads().len(),
+        9,
+        "six discovery documents, the Pod, and two listings: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_derive_a_network_policy_s_pods_with_its_pod_selector_pushed_down() {
+    // §31.1: the Pods a policy governs, evaluated against `spec.podSelector` — and asked for by
+    // it, so the API server's label index does the narrowing (§17.3).
+    let cluster = Cluster::relating(4, 100);
+    let plugin = loaded(Arc::clone(&cluster)).await;
+
+    let edges = relation(
+        &plugin,
+        &[
+            ("kind", json!("NetworkPolicy")),
+            ("name", json!("api-ingress")),
+        ],
+    )
+    .await;
+    assert_eq!(
+        edges
+            .iter()
+            .filter(|edge| text_of(edge, "relation").as_deref() == Some("selects"))
+            .count(),
+        4
+    );
+    assert_eq!(cluster.asked_for(PODS), 1, "one request, not one per page");
+    assert!(
+        only_filtered_by(&cluster, PODS, "app%3Dapi"),
+        "the Pod list carried the policy's own selector: {:?}",
+        requests_for(&cluster, PODS)
+    );
+    assert_eq!(
+        cluster.heads().len(),
+        8,
+        "six discovery documents, the policy, and one filtered listing: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_answer_a_relation_from_the_index_of_an_open_watch_without_listing_again() {
+    // §50.4: "Selector and owner-reference relationships MAY use indexes maintained over active
+    // caches." A watch this session holds over the namespace's Pods is the listing kept true, so
+    // a second question about the same Pods reads the cache and says so (§20.2): zero Pod
+    // requests, and `origin=cache` on every edge the index answered. The watch is open in a
+    // concurrent invocation of the same instance while the question is asked, which is what
+    // ADR-0058's per-step session borrow exists to allow.
+    let cluster = Cluster::relating_and_watched(1, 3);
+    let plugin = loaded(Arc::clone(&cluster)).await;
+    let mut watch = plugin
+        .query("k8s-change", options(&[("kind", json!("Pod"))]))
+        .await
+        .expect("the watch starts");
+    for _ in 0..3 {
+        let record = next_record(&mut watch, "the acquisition").await;
+        assert_eq!(text_of(&record, "change").as_deref(), Some("listed"));
+    }
+    // The streaming-list request this server refuses (ADR-0059), the listing, and then the watch
+    // itself: the cache is synchronised and being kept true.
+    asked_for_at_least(&cluster, PODS, 3).await;
+    let before = cluster.asked_for(PODS);
+
+    let edges = relation(
+        &plugin,
+        &[("kind", json!("Service")), ("name", json!("api"))],
+    )
+    .await;
+    let selects: Vec<&Arc<RecordValue>> = edges
+        .iter()
+        .filter(|edge| text_of(edge, "relation").as_deref() == Some("selects"))
+        .collect();
+    assert_eq!(
+        selects.len(),
+        1,
+        "the index answers exactly the Pod the selector reaches, out of the three it holds"
+    );
+    for edge in &selects {
+        let source = edge.provenance().source().unwrap_or_default().to_owned();
+        assert!(
+            source.contains("origin=cache"),
+            "an edge concluded from a cache says so rather than claiming a direct read: {source}"
+        );
+    }
+    assert_eq!(
+        cluster.asked_for(PODS),
+        before,
+        "the relationship query made no Pod request of its own: {:?}",
+        cluster.heads()
+    );
+    assert!(
+        !only_filtered_by(&cluster, SLICES, "nothing"),
+        "the slices, which nothing watches, were still read from the API server"
+    );
+
+    let (elapsed, status) = cancelled_in(watch).await;
+    assert_eq!(status, InvokeStatus::Cancelled);
+    assert!(elapsed < PROMPTLY, "{elapsed:?}");
     plugin.shutdown(ShutdownReason::Unload).await;
 }

@@ -262,6 +262,16 @@ struct RecordedCluster {
     /// The test holds it. A frame that is not on the wire cannot have been buffered by anything,
     /// so a record built from it proves the package emitted while the body was still open.
     release: Arc<tokio::sync::Notify>,
+    /// Whether the server serves `apiextensions.k8s.io` with the CRD behind `menagerie.example`,
+    /// a watch on that collection that delivers one MODIFIED and closes, and an OpenAPI document
+    /// for the group that *changes* once that event has been delivered (§12.4, §33.2, ADR-0061).
+    ///
+    /// Layered over `custom`. The flip is keyed on the watch rather than on a request count, so
+    /// the second read of the schema is the new schema because the definition changed and not
+    /// because it was the second read.
+    crd_rotates: bool,
+    /// Whether the CRD watch has delivered its change, after which the schema document differs.
+    rotated: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the server refuses a `fieldSelector` it does not index, as a real one does.
     ///
     /// §17.5's whole subject: "field selector availability varies by resource type and server
@@ -565,6 +575,18 @@ impl RecordedCluster {
         })
     }
 
+    /// The custom-resource server, whose one CRD changes under a watch and whose schema
+    /// document changes with it (ADR-0061).
+    fn with_a_crd_that_changes() -> Arc<Self> {
+        Arc::new(Self {
+            pods: 2,
+            apps: true,
+            custom: true,
+            crd_rotates: true,
+            ..Self::default()
+        })
+    }
+
     /// A server serving two API groups this package has never heard of, both of which offer a
     /// kind of the same name.
     ///
@@ -708,6 +730,21 @@ impl RecordedCluster {
             .map(|heads| heads.clone())
             .unwrap_or_default()
     }
+}
+
+/// What an API server without the `WatchList` feature answers a streaming-list request with.
+fn streaming_lists_refused() -> Vec<u8> {
+    let body = json!({
+        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+        "message": "sendInitialEvents is forbidden for watch unless the WatchList feature gate is enabled",
+        "reason": "BadRequest", "code": 400,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
 }
 
 /// One HTTP/1.1 response with a stated length, as a keep-alive connection delivers it.
@@ -1066,6 +1103,73 @@ fn custom_document(path: &str) -> Option<Json> {
                 "payload": {"note": "not under spec, and still here"},
             }],
         }),
+        _ => return None,
+    })
+}
+
+const CRDS_PATH: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
+
+/// The definition behind `menagerie.example/v1 Sprocket`, before and after somebody changed it:
+/// the second revision no longer declares `renewAt` as an instant.
+fn sprocket_crd(changed: bool) -> Json {
+    json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {
+            "name": "sprockets.menagerie.example",
+            "uid": "crd-sprockets", "resourceVersion": if changed { "7002" } else { "7001" },
+            "creationTimestamp": "2026-09-01T00:00:00Z",
+            "generation": if changed { 2 } else { 1 },
+        },
+        "spec": {
+            "group": "menagerie.example", "scope": "Namespaced",
+            "names": {"plural": "sprockets", "singular": "sprocket", "kind": "Sprocket"},
+            "versions": [{"name": "v1", "served": true, "storage": true}],
+        },
+    })
+}
+
+/// The group's OpenAPI document after the definition changed: `renewAt` is plain text now.
+fn rotated_openapi() -> Json {
+    let mut document = custom_openapi();
+    document["components"]["schemas"]["some.vendors.own.naming.Convention"]["properties"]["spec"]
+        ["properties"]["renewAt"] =
+        json!({"type": "string", "description": "No longer an instant."});
+    document
+}
+
+/// What the CRD-rotating server answers, where it differs from the custom-resource one.
+fn crd_document(path: &str, cluster: &RecordedCluster) -> Option<Json> {
+    let rotated = cluster.rotated.load(std::sync::atomic::Ordering::SeqCst);
+    Some(match path {
+        "/apis" => {
+            let mut groups = custom_document("/apis")?;
+            groups["groups"]
+                .as_array_mut()?
+                .push(group_at("apiextensions.k8s.io", "v1"));
+            groups
+        }
+        "/apis/apiextensions.k8s.io/v1" => resource_list(
+            "apiextensions.k8s.io/v1",
+            &[(
+                "customresourcedefinitions",
+                "CustomResourceDefinition",
+                false,
+            )],
+        ),
+        CRDS_PATH => json!({
+            "kind": "CustomResourceDefinitionList",
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "metadata": {"resourceVersion": "7100"},
+            "items": [sprocket_crd(rotated)],
+        }),
+        "/openapi/v3/apis/menagerie.example/v1" => {
+            if rotated {
+                rotated_openapi()
+            } else {
+                custom_openapi()
+            }
+        }
         _ => return None,
     })
 }
@@ -2193,6 +2297,13 @@ fn unacceptable(head: &str, path: &str) -> Option<Vec<u8>> {
 
 fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     let pods = cluster.pods;
+    // This recorded server predates streaming lists (§19.2, ADR-0059): a watch asking for
+    // `sendInitialEvents` is refused the way an API server without the feature refuses it, and
+    // every watch script below is then played against the list-then-watch fallback it was
+    // written for.
+    if path.contains("sendInitialEvents=true") {
+        return streaming_lists_refused();
+    }
     // Read before the query string is dropped, because `watch=true` is the whole difference
     // between reading a collection and observing it, and it lives nowhere else in the request.
     if cluster.watch != Watching::NotOffered && path.contains("watch=true") {
@@ -2215,6 +2326,17 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
             .find_map(|pair| pair.strip_prefix("fieldSelector="))
     {
         return unindexed_field(selector);
+    }
+    // §33.2's "relevant watches where active": the CRD watch delivers one change and closes, and
+    // from that moment the group's schema document is the new one.
+    if cluster.crd_rotates && path.starts_with(CRDS_PATH) && path.contains("watch=true") {
+        cluster
+            .rotated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        return chunked(&[format!(
+            "{}\n",
+            json!({"type": "MODIFIED", "object": sprocket_crd(true)})
+        )]);
     }
     // §18: which page of the collection this is lives in the query string, exactly as `watch=true`
     // does, so it is answered before the query is dropped.
@@ -2249,6 +2371,11 @@ fn document(path: &str, cluster: &RecordedCluster) -> Vec<u8> {
     // that reads the Pod collection must be able to meet it too, and not only a Pod query.
     if cluster.deny_pod_list && path == "/api/v1/namespaces/default/pods" {
         return denied(path, "list");
+    }
+    if cluster.crd_rotates
+        && let Some(body) = crd_document(path, cluster)
+    {
+        return response(&body.to_string());
     }
     if cluster.custom
         && let Some(body) = custom_document(path)
@@ -2492,7 +2619,10 @@ impl HostServices for RecordedCluster {
                     // A paced watch answers with its head here and with its frames later, each
                     // one when the test releases it. The sender is cloned rather than moved,
                     // because the connection goes on carrying nothing until it is closed.
-                    if cluster.watch == Watching::Paced && path.contains("watch=true") {
+                    if cluster.watch == Watching::Paced
+                        && path.contains("watch=true")
+                        && !path.contains("sendInitialEvents=true")
+                    {
                         let sender = inbound.clone();
                         let gate = Arc::clone(&cluster.release);
                         tokio::spawn(async move {
@@ -6546,9 +6676,10 @@ async fn should_deliver_what_changed_while_it_was_watching() {
 
     assert_eq!(
         asked_for(&cluster, "/api/v1/namespaces/default/pods"),
-        2,
-        "one listing and one watch, both on the collection endpoint — the watch is the same \
-         path with `watch=true` on it"
+        3,
+        "one streaming-list request this server refused (§19.2, ADR-0059), one listing and one \
+         watch, all on the collection endpoint — the watch is the same path with `watch=true` \
+         on it"
     );
     assert!(
         cluster
@@ -6664,8 +6795,9 @@ async fn should_make_a_watch_gap_visible_rather_than_stitching_a_history_over_it
 
     assert_eq!(
         asked_for(&cluster, "/api/v1/namespaces/default/pods"),
-        3,
-        "one acquisition, one watch, and one re-acquisition on the far side of the gap (§19.4)"
+        4,
+        "one refused streaming list (ADR-0059), one acquisition, one watch, and one \
+         re-acquisition on the far side of the gap (§19.4)"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }
@@ -6997,9 +7129,9 @@ async fn should_go_on_watching_after_a_gap_rather_than_ending_at_the_break() {
     );
     assert_eq!(
         asked_for(&cluster, "/api/v1/namespaces/default/pods"),
-        4,
-        "one acquisition, the watch that broke, the re-acquisition, and the watch that replaced \
-         it (§19.4 step 4, §19.5)"
+        5,
+        "one refused streaming list (ADR-0059), one acquisition, the watch that broke, the \
+         re-acquisition, and the watch that replaced it (§19.4 step 4, §19.5)"
     );
 
     invocation.cancel().await;
@@ -7090,8 +7222,9 @@ async fn should_report_the_gap_even_where_the_query_refused_to_pay_for_a_re_acqu
     );
     assert_eq!(
         asked_for(&cluster, "/api/v1/namespaces/default/pods"),
-        2,
-        "one acquisition and one watch: the second listing is exactly what was declined"
+        3,
+        "one refused streaming list (ADR-0059), one acquisition and one watch: the second \
+         listing is exactly what was declined"
     );
     plugin.shutdown(ShutdownReason::Unload).await;
 }
@@ -9304,4 +9437,85 @@ fn resource_list(group_version: &str, resources: &[(&str, &str, bool)]) -> Json 
             }))
             .collect::<Vec<_>>(),
     })
+}
+
+// --- §12.4, §33.2: a schema is invalidated by the change a watch observed (ADR-0061) ------------
+
+#[tokio::test]
+async fn should_project_through_the_new_schema_once_a_watched_crd_changed() {
+    // §33.2 lists "schema changed" among what the provider SHOULD detect "through
+    // discovery/schema invalidation and relevant watches where active", and §12.4 makes CRD
+    // updates the first thing a schema cache MUST account for. The sequence: the kind is typed
+    // through schema A; a watch on the CRD collection observes the definition change; the next
+    // projection loads schema B and types the same field differently — and the old
+    // representation is never presented as current in between.
+    let cluster = RecordedCluster::with_a_crd_that_changes();
+    let plugin = loaded_against(Arc::clone(&cluster)).await;
+    let options = at_cluster(&[
+        ("kind", json!("Sprocket")),
+        ("group", json!("menagerie.example")),
+    ]);
+
+    let (events, result) = plugin
+        .query("k8s-resource", options.clone())
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let before = records(&events);
+    assert!(
+        matches!(
+            before[0].get("spec"),
+            Some(Value::Map(spec)) if matches!(spec.get("renewAt"), Some(Value::Timestamp(_))),
+        ),
+        "schema A declares `renewAt` as an instant"
+    );
+
+    let (changes, result) = plugin
+        .query(
+            "k8s-change",
+            at_cluster(&[
+                ("kind", json!("CustomResourceDefinition")),
+                ("max_changes", json!(2)),
+            ]),
+        )
+        .await
+        .expect("the watch starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let observed: Vec<String> = records(&changes)
+        .iter()
+        .filter_map(|record| text_of(record, "change"))
+        .collect();
+    assert_eq!(
+        observed,
+        vec!["listed", "modified"],
+        "the watch observed the definition change"
+    );
+
+    let (events, result) = plugin
+        .query("k8s-resource", options)
+        .await
+        .expect("the query starts")
+        .collect()
+        .await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    let after = records(&events);
+    assert!(
+        matches!(
+            after[0].get("spec"),
+            Some(Value::Map(spec)) if matches!(spec.get("renewAt"), Some(Value::String(_))),
+        ),
+        "schema B declares it as text, and the projection uses schema B: {:?}",
+        after[0].get("spec")
+    );
+    assert_eq!(
+        asked_for(&cluster, "/openapi/v3/apis/menagerie.example/v1"),
+        2,
+        "the schema was read once per definition, not once per query: {:?}",
+        cluster.heads()
+    );
+    plugin.shutdown(ShutdownReason::Unload).await;
 }

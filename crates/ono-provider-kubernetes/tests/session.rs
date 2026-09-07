@@ -214,6 +214,7 @@ fn one_object_listing(gvr: &Gvr, scope: &Scope, namespace: &str) -> Listing {
     let kind = match gvr.resource() {
         "pods" => "Pod",
         "configmaps" => "ConfigMap",
+        "customresourcedefinitions" => "CustomResourceDefinition",
         other => panic!("this fixture does not know the kind of `{other}`"),
     };
     let body = format!(
@@ -993,7 +994,7 @@ fn should_stop_answering_from_a_cache_the_write_it_made_moved_past() {
         Lookup::Cached(_)
     ));
 
-    session.mutated(&pods(), Some("shop"));
+    session.mutated(&pods(), Some("shop"), "checkout-1");
 
     assert_eq!(
         session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
@@ -1016,7 +1017,7 @@ fn should_not_read_an_invalidated_cache_as_an_absence_or_fill_it_with_what_the_w
         .synchronise(&pods(), &shop(), one_pod_listing())
         .expect("a complete listing seeds the cache");
 
-    session.mutated(&pods(), Some("shop"));
+    session.mutated(&pods(), Some("shop"), "checkout-1");
 
     let after = session.lookup(&pods(), &shop(), Some("shop"), "checkout-1");
     assert!(
@@ -1047,7 +1048,7 @@ fn should_leave_a_cache_the_write_could_not_have_reached_alone() {
             .expect("a complete listing seeds the cache");
     }
 
-    session.mutated(&pods(), Some("shop"));
+    session.mutated(&pods(), Some("shop"), "one");
 
     assert_eq!(
         session.lookup(&pods(), &shop(), Some("shop"), "one"),
@@ -1094,7 +1095,7 @@ fn should_re_read_what_the_cluster_serves_after_it_wrote_a_custom_resource_defin
     session.cache_discovery_document("/apis", APIS_WITH_WIDGETS);
     assert_eq!(session.discovery_document("/apis"), Some(APIS_WITH_WIDGETS));
 
-    session.mutated(&crds(), None);
+    session.mutated(&crds(), None, "widgets.example.io");
 
     assert_eq!(
         session.discovery_document("/apis"),
@@ -1111,7 +1112,7 @@ fn should_not_invalidate_what_the_cluster_serves_for_an_ordinary_write() {
     let mut session = session("dev");
     session.cache_discovery_document("/apis", APIS_WITH_WIDGETS);
 
-    session.mutated(&pods(), Some("shop"));
+    session.mutated(&pods(), Some("shop"), "checkout-1");
 
     assert_eq!(session.discovery_document("/apis"), Some(APIS_WITH_WIDGETS));
 }
@@ -1255,4 +1256,537 @@ fn should_learn_nothing_from_a_document_that_is_the_first_of_its_path() {
     session.cache_discovery_document("/apis/example.io/v1", WIDGETS_V1);
 
     assert!(session.schema(&widget_gvk()).is_some());
+}
+
+// --- §50.4 and §30.5 (core): relationship indexes over a watched cache (ADR-0058) ---------------
+
+/// A listing of two Pods, one of which a `app=checkout` selector reaches and one it does not.
+fn two_pod_listing() -> Listing {
+    listing_of(&[ok(&format!(
+        r#"{{"apiVersion":"v1","kind":"PodList","metadata":{{"resourceVersion":"18010"}},
+            "items":[{},{}]}}"#,
+        labelled_pod_item("checkout-1", "uid-1", "18005", r#"{"app":"checkout"}"#),
+        labelled_pod_item("worker-1", "uid-2", "18006", r#"{"app":"worker"}"#),
+    ))])
+}
+
+fn labelled_pod_item(name: &str, uid: &str, resource_version: &str, labels: &str) -> String {
+    format!(
+        r#"{{"metadata":{{"name":"{name}","namespace":"shop","uid":"{uid}","resourceVersion":"{resource_version}","labels":{labels},"ownerReferences":[{{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"checkout-6ac1","uid":"rs-1","controller":true}}]}}}}"#
+    )
+}
+
+fn checkout_selector() -> ono_provider_kubernetes::index::LabelSelector {
+    let mut labels = std::collections::BTreeMap::new();
+    labels.insert("app".to_owned(), "checkout".to_owned());
+    ono_provider_kubernetes::index::LabelSelector::equalities(&labels)
+}
+
+#[test]
+fn should_answer_a_selector_from_the_index_of_a_live_watch_as_a_cached_observation() {
+    // §50.4: "Selector and owner-reference relationships MAY use indexes maintained over active
+    // caches." §20.2: what the index answers is a cached observation and says so — the moment of
+    // the read that filled the cache, the collection's continuity token, `origin=cache`.
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), two_pod_listing())
+        .expect("a complete listing seeds the cache");
+
+    let indexed = session
+        .indexed(&pods(), &shop())
+        .expect("a live, synchronised stream has a usable index");
+    let selected: Vec<&str> = indexed
+        .matching(Some("shop"), &checkout_selector())
+        .iter()
+        .map(|object| object.name().to_owned())
+        .collect::<Vec<_>>()
+        .leak()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(selected, vec!["checkout-1"]);
+    assert_eq!(
+        indexed
+            .children_of("rs-1")
+            .iter()
+            .map(ono_provider_kubernetes::object::Object::name)
+            .collect::<Vec<_>>(),
+        vec!["checkout-1", "worker-1"],
+        "the owner table answers what a listing filtered by owner reference would"
+    );
+    assert_eq!(indexed.in_namespace(Some("shop")).len(), 2);
+    assert!(indexed.in_namespace(Some("elsewhere")).is_empty());
+
+    let freshness = indexed.freshness();
+    assert_eq!(freshness.origin(), Origin::Cache);
+    assert_eq!(freshness.observed_at().unix_millis(), OBSERVED);
+    assert_eq!(
+        freshness.resource_version(),
+        Some("18010"),
+        "the collection's token, which is what a listing's freshness carries too"
+    );
+    assert_eq!(freshness.watch_synced(), Some(true));
+    let state = indexed.state();
+    assert!(state.usable());
+    assert_eq!(state.objects(), 2);
+    assert_eq!(
+        state.capacity(),
+        ono_provider_kubernetes::index::INDEX_CAPACITY
+    );
+    assert_eq!(state.sync_state(), SyncState::Live);
+}
+
+#[test]
+fn should_update_the_index_as_the_watch_delivers_changes() {
+    // §60.3 at the index: a label changes on one Pod, the watch says so, and the selector's
+    // answer changes with it. Nothing about the index is rebuilt; the one posting moves.
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), two_pod_listing())
+        .expect("a complete listing seeds the cache");
+
+    let relabelled = frame(
+        "MODIFIED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-1","namespace":"shop","uid":"uid-1","resourceVersion":"18011","labels":{"app":"retired"}}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), relabelled.as_bytes())
+        .expect("the frame decodes");
+    assert!(
+        session
+            .indexed(&pods(), &shop())
+            .expect("still live")
+            .matching(Some("shop"), &checkout_selector())
+            .is_empty(),
+        "the selector no longer reaches the relabelled Pod"
+    );
+    assert!(
+        session
+            .indexed(&pods(), &shop())
+            .expect("still live")
+            .children_of("rs-1")
+            .iter()
+            .all(|object| object.name() == "worker-1"),
+        "and the owner posting the new version no longer states is retracted"
+    );
+
+    let arrived = frame(
+        "ADDED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-2","namespace":"shop","uid":"uid-3","resourceVersion":"18012","labels":{"app":"checkout"}}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), arrived.as_bytes())
+        .expect("the frame decodes");
+    let names: Vec<String> = session
+        .indexed(&pods(), &shop())
+        .expect("still live")
+        .matching(Some("shop"), &checkout_selector())
+        .iter()
+        .map(|object| object.name().to_owned())
+        .collect();
+    assert_eq!(names, vec!["checkout-2"]);
+
+    let gone = frame(
+        "DELETED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-2","namespace":"shop","uid":"uid-3","resourceVersion":"18013","labels":{"app":"checkout"}}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), gone.as_bytes())
+        .expect("the frame decodes");
+    assert!(
+        session
+            .indexed(&pods(), &shop())
+            .expect("still live")
+            .matching(Some("shop"), &checkout_selector())
+            .is_empty()
+    );
+    assert_eq!(
+        session
+            .index_state(&pods(), &shop())
+            .expect("the watch is held")
+            .objects(),
+        2
+    );
+}
+
+#[test]
+fn should_refuse_to_answer_from_an_index_whose_stream_is_not_live() {
+    // §50.4's `MUST`: "An incomplete index MUST not return an unqualified complete-looking
+    // graph." The index answers exactly when the cache under it may call an absence an absence
+    // (§20.3), and every other state is a named reason to read the API server instead.
+    use ono_provider_kubernetes::index::Unusable;
+    use ono_provider_kubernetes::session::IndexMiss;
+
+    let mut session = session("dev");
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::NotWatched)
+    );
+
+    session.watch(&pods(), &shop());
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::Unusable(Unusable::NotSynced(SyncState::Syncing))),
+        "before the initial list, a selector over the cache would answer from nothing"
+    );
+
+    session
+        .synchronise(&pods(), &shop(), two_pod_listing())
+        .expect("a complete listing seeds the cache");
+    assert!(session.indexed(&pods(), &shop()).is_ok());
+
+    let expiry = frame(
+        "ERROR",
+        r#"{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 18010 (18700)","reason":"Expired","code":410}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), expiry.as_bytes())
+        .expect("the ERROR frame decodes");
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::Unusable(Unusable::NotSynced(
+            SyncState::GapDetected
+        ))),
+        "past a gap the index still holds postings and is entitled to answer with none of them"
+    );
+    let state = session
+        .index_state(&pods(), &shop())
+        .expect("the watch is held");
+    assert!(!state.usable());
+    assert!(
+        state.describe().contains("gap detected"),
+        "the state names the word §41.4 gives the stream: {}",
+        state.describe()
+    );
+
+    session.mutated(&pods(), Some("shop"), "checkout-1");
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::NotWatched),
+        "a write drops a cache no stream is keeping true, and the index with it (§20.5)"
+    );
+}
+
+// --- §19.2, §19.5: capabilities negotiated from what the server did (ADR-0059) ------------------
+
+#[test]
+fn should_negotiate_bookmarks_from_the_first_bookmark_received() {
+    // §19.5: a reconnect resumes from the latest safe resourceVersion, and a bookmark is what
+    // makes "latest" recent on a quiet collection. `allowWatchBookmarks` is asked for on every
+    // watch; the capability is negotiated the moment the server answers with one, never before.
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), one_pod_listing())
+        .expect("a complete listing seeds the cache");
+    assert!(!session.negotiated(Capability::WatchBookmarks));
+
+    let bookmark = frame(
+        "BOOKMARK",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"18730"}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), bookmark.as_bytes())
+        .expect("the bookmark decodes");
+
+    assert!(session.negotiated(Capability::WatchBookmarks));
+    assert!(
+        !session.negotiated(Capability::StreamingLists),
+        "a bookmark says nothing about streaming lists"
+    );
+    assert_eq!(
+        session
+            .watch_stream(&pods(), &shop())
+            .and_then(|stream| stream
+                .checkpoint()
+                .map(|version| version.as_str().to_owned())),
+        Some("18730".to_owned()),
+        "and the checkpoint the next watch opens from is the bookmark's"
+    );
+}
+
+#[test]
+fn should_negotiate_streaming_lists_from_a_list_that_streamed_and_index_its_initial_state() {
+    // §19.2: the capability is earned by a streaming list that reached its terminating bookmark.
+    // What that bookmark seeds is a cache and an index like any listing's: the lookup answers
+    // from it, the index answers a selector over it, and absence in it is conclusive.
+    let mut session = session("dev");
+    session
+        .begin_streaming_list(&pods(), &shop())
+        .expect("a fresh stream may stream its list");
+    assert!(!session.negotiated(Capability::StreamingLists));
+    assert_eq!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::NotSynced(SyncState::Syncing),
+        "before the initial events end, nothing is synchronised (§20.3)"
+    );
+
+    let initial = frame(
+        "ADDED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-1","namespace":"shop","uid":"uid-1","resourceVersion":"18005","labels":{"app":"checkout"}}}"#,
+    ) + &frame(
+        "ADDED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"worker-1","namespace":"shop","uid":"uid-2","resourceVersion":"18006","labels":{"app":"worker"}}}"#,
+    ) + &frame(
+        "BOOKMARK",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"resourceVersion":"18050","annotations":{"k8s.io/initial-events-end":"true"}}}"#,
+    );
+    let receptions = session
+        .feed_watch(&pods(), &shop(), initial.as_bytes())
+        .expect("the frames decode");
+    assert_eq!(
+        receptions,
+        vec![
+            ono_provider_kubernetes::watch::Reception::Staged,
+            ono_provider_kubernetes::watch::Reception::Staged,
+            ono_provider_kubernetes::watch::Reception::Synchronised,
+        ]
+    );
+
+    assert!(session.negotiated(Capability::StreamingLists));
+    assert!(session.negotiated(Capability::WatchBookmarks));
+    assert!(matches!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::Cached(_)
+    ));
+    assert_eq!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-9"),
+        Lookup::ConfirmedAbsent
+    );
+    let indexed = session
+        .indexed(&pods(), &shop())
+        .expect("the index is usable over a stream a streaming list synchronised");
+    assert_eq!(
+        indexed
+            .matching(Some("shop"), &checkout_selector())
+            .iter()
+            .map(ono_provider_kubernetes::object::Object::name)
+            .collect::<Vec<_>>(),
+        vec!["checkout-1"]
+    );
+    assert_eq!(indexed.freshness().resource_version(), Some("18050"));
+}
+
+#[test]
+fn should_remember_a_refused_capability_until_the_cluster_is_replaced() {
+    // §19.2 requires the negotiation to have a fallback, and §29.4 of the generic contract asks
+    // for the degraded capability rather than a rejected provider. A refusal is remembered so the
+    // question costs one round trip per cluster — and forgotten with everything else the session
+    // knew about a cluster that has been replaced (§10.4).
+    let mut session = session("dev");
+    session.observed_fingerprint(fingerprint(&dev_origin(), Some("uid-cluster-a")));
+    assert!(!session.is_refused(Capability::StreamingLists));
+
+    session.refuse(Capability::StreamingLists);
+    assert!(session.is_refused(Capability::StreamingLists));
+    assert!(!session.negotiated(Capability::StreamingLists));
+    assert_eq!(session.refused(), vec![Capability::StreamingLists]);
+
+    session.negotiate(Capability::StreamingLists);
+    assert!(
+        !session.is_refused(Capability::StreamingLists),
+        "a server that later served one is not a server that refuses them"
+    );
+
+    session.refuse(Capability::StreamingLists);
+    session.observed_fingerprint(fingerprint(&dev_origin(), Some("uid-cluster-b")));
+    assert!(
+        !session.is_refused(Capability::StreamingLists),
+        "a refusal was the previous cluster's, and the new one is asked afresh"
+    );
+}
+
+// --- §20.5 on a live stream: the written object is quarantined, the rest stays true (ADR-0060) --
+
+#[test]
+fn should_quarantine_only_the_written_object_of_a_live_cache_until_its_event_arrives() {
+    // §20.5 and §16.5 of the generic contract, on a cache a live watch is keeping true. The event
+    // the API server sends for the write is the refresh, and it reaches a live stream on its
+    // own — so the stream is kept and the one object is quarantined: served neither as itself
+    // nor as absent until its event arrives, while its neighbours go on being answered. The
+    // index over the collection declines to answer meanwhile, because a selector evaluated over a
+    // cache with a hole in it would answer a subset that looks whole (§50.4).
+    use ono_provider_kubernetes::index::Unusable;
+    use ono_provider_kubernetes::session::IndexMiss;
+
+    let mut session = session("dev");
+    session
+        .synchronise(&pods(), &shop(), two_pod_listing())
+        .expect("a complete listing seeds the cache");
+
+    session.mutated(&pods(), Some("shop"), "checkout-1");
+
+    assert_eq!(
+        session.lookup(&pods(), &shop(), Some("shop"), "checkout-1"),
+        Lookup::NotWatched,
+        "the written object is neither served stale nor reported absent"
+    );
+    assert!(
+        matches!(
+            session.lookup(&pods(), &shop(), Some("shop"), "worker-1"),
+            Lookup::Cached(_)
+        ),
+        "its neighbour is still an observation the live stream keeps true"
+    );
+    assert_eq!(
+        session.watched().len(),
+        1,
+        "the stream is kept, because the event for the write is coming on it"
+    );
+    assert_eq!(
+        session.indexed(&pods(), &shop()).err(),
+        Some(IndexMiss::Unusable(Unusable::PendingWrite))
+    );
+
+    let observed = frame(
+        "MODIFIED",
+        r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"checkout-1","namespace":"shop","uid":"uid-1","resourceVersion":"18020","labels":{"app":"checkout"}}}"#,
+    );
+    session
+        .feed_watch(&pods(), &shop(), observed.as_bytes())
+        .expect("the frame decodes");
+
+    let Lookup::Cached(read) = session.lookup(&pods(), &shop(), Some("shop"), "checkout-1") else {
+        panic!("the write's own event lifts the quarantine");
+    };
+    assert_eq!(
+        read.freshness().resource_version(),
+        Some("18020"),
+        "and what is served is what the server sent, never what the write asked for"
+    );
+    assert!(session.indexed(&pods(), &shop()).is_ok());
+}
+
+// --- §12.4, §33.2: schema freshness on the session's clock (ADR-0061) ---------------------------
+
+const ROOT_A: &str =
+    r#"{"paths":{"api/v1":{"serverRelativeURL":"/openapi/v3/api/v1?hash=AAA111"}}}"#;
+const ROOT_B: &str =
+    r#"{"paths":{"api/v1":{"serverRelativeURL":"/openapi/v3/api/v1?hash=AAA999"}}}"#;
+
+#[test]
+fn should_stop_serving_a_schema_nobody_has_vouched_for_within_the_window() {
+    // §12.4 gave the schema cache four invalidation triggers and no expiry, so a structural
+    // change whose discovery footprint was byte-identical stayed invisible for the life of the
+    // process. The window is the expiry half of §16.2's "explicit invalidation/expiry semantics":
+    // past it, `Session::schema` answers nothing and the next projection loads the document
+    // again — one document, for one kind, and never all of them on every request (§50.2).
+    use ono_provider_kubernetes::session::SCHEMA_VALIDITY;
+    let clock = SteppingClock::at(OBSERVED);
+    let mut session = Session::with_clock(connection("dev"), clock.clone());
+    session.cache_schema(pod_gvk(), Schema::absent());
+    assert_eq!(
+        session
+            .schema_provenance(&pod_gvk())
+            .and_then(|p| p.observed_at())
+            .map(|at| at.unix_millis()),
+        Some(OBSERVED),
+        "the entry says when it was loaded"
+    );
+
+    clock.advance(SCHEMA_VALIDITY - Duration::from_millis(1));
+    assert!(
+        session.schema(&pod_gvk()).is_some(),
+        "inside the window the schema answers, and no document is downloaded"
+    );
+
+    clock.advance(Duration::from_millis(1));
+    assert!(
+        session.schema(&pod_gvk()).is_none(),
+        "past the window the old representation is not presented as current"
+    );
+    assert!(
+        session.schema_provenance(&pod_gvk()).is_some(),
+        "though what it was loaded under is still inspectable"
+    );
+
+    // A schema loaded again is vouched for again, from now.
+    session.cache_schema(pod_gvk(), Schema::absent());
+    assert!(session.schema(&pod_gvk()).is_some());
+}
+
+#[test]
+fn should_vouch_for_a_schema_by_the_root_hash_and_forget_it_when_the_hash_moves() {
+    // The hash route: a root document read within the window names the hash a schema was loaded
+    // under, so the entry stays current without its document being downloaded again; a root
+    // that names a different hash forgets it, so the next projection loads the new one.
+    let mut session = session("dev");
+    session
+        .cache_schema_root(ROOT_A)
+        .expect("a root document reads");
+    assert!(session.schema_root_is_current());
+    session.cache_schema(pod_gvk(), Schema::absent());
+    assert_eq!(
+        session
+            .schema_provenance(&pod_gvk())
+            .and_then(|p| p.hash().map(str::to_owned)),
+        Some("AAA111".to_owned()),
+        "the entry recorded the hash the root published for its group-version"
+    );
+    assert_eq!(
+        session.schema_document_path(&pod_gvk()),
+        "/openapi/v3/api/v1?hash=AAA111",
+        "and the document is asked for at the hashed, immutable URL"
+    );
+
+    let unchanged = session
+        .cache_schema_root(ROOT_A)
+        .expect("a root document reads");
+    assert!(
+        unchanged.is_empty(),
+        "the same hash vouches for the entry again"
+    );
+    assert!(session.schema(&pod_gvk()).is_some());
+
+    let changed = session
+        .cache_schema_root(ROOT_B)
+        .expect("a root document reads");
+    assert_eq!(changed, vec![pod_gvk()]);
+    assert!(
+        session.schema(&pod_gvk()).is_none(),
+        "the hash moved, so the schema is invalidated before anything is projected through it"
+    );
+    assert_eq!(
+        session.schema_document_path(&pod_gvk()),
+        "/openapi/v3/api/v1?hash=AAA999"
+    );
+}
+
+#[test]
+fn should_forget_a_kind_s_schemas_when_a_watched_crd_changes() {
+    // §33.2's "relevant watches where active": a CRD changing under a watch this session holds
+    // is a schema change observed the moment it happened, and every version of the kind it
+    // defines is forgotten before anything is projected through it again (§12.4).
+    let crds = crds();
+    let widgets_v1 = Gvk::new("example.io", "v1", "Widget");
+    let widgets_v2 = Gvk::new("example.io", "v2", "Widget");
+    let mut session = session("dev");
+    session.cache_schema(widgets_v1.clone(), Schema::absent());
+    session.cache_schema(widgets_v2.clone(), Schema::absent());
+    session.cache_schema(pod_gvk(), Schema::absent());
+    session
+        .synchronise(
+            &crds,
+            &Scope::cluster(),
+            one_object_listing(&crds, &Scope::cluster(), "cluster"),
+        )
+        .expect("a complete listing seeds the cache");
+
+    let modified = frame(
+        "MODIFIED",
+        r#"{"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition","metadata":{"name":"widgets.example.io","uid":"crd-1","resourceVersion":"7001"},"spec":{"group":"example.io","names":{"kind":"Widget","plural":"widgets"},"versions":[{"name":"v1","served":true},{"name":"v2","served":true,"storage":true}]}}"#,
+    );
+    session
+        .feed_watch(&crds, &Scope::cluster(), modified.as_bytes())
+        .expect("the frame decodes");
+
+    assert!(session.schema(&widgets_v1).is_none());
+    assert!(session.schema(&widgets_v2).is_none());
+    assert!(
+        session.schema(&pod_gvk()).is_some(),
+        "a kind the definition does not name keeps its schema"
+    );
+    assert!(
+        session.needs_discovery(),
+        "and what the cluster serves is asked again (§33.2)"
+    );
 }

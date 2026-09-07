@@ -32,7 +32,9 @@ use ono_provider_kubernetes::mutation::{
     Verdict, Verification, apply_document, apply_request, delete_request,
 };
 use ono_provider_kubernetes::object::Object;
-use ono_provider_kubernetes::plan::{Action, FieldChange, Plan, Propagation, Target};
+use ono_provider_kubernetes::plan::{
+    Action, FieldChange, Plan, Propagation, Target, VerificationRule,
+};
 use ono_provider_kubernetes::transport::{
     FixtureStream, HttpConnection, Method, ObservedAt, Request, Response,
 };
@@ -871,4 +873,113 @@ fn should_write_an_escaped_pointer_segment_as_the_key_it_spells() {
             .get("app.kubernetes.io~1name")
             .is_none()
     );
+}
+
+// --- §46.4: a verification that watched and did not finish names why (ADR-0060) -----------------
+
+/// A watch that could not go on keeps what the last observation established and names the reason
+/// it stopped, and the reason is one of §46.4's incompletes rather than either verdict.
+#[test]
+fn should_name_why_a_watched_verification_did_not_finish_and_keep_what_it_saw() {
+    use ono_provider_kubernetes::mutation::Unfinished;
+    let plan = rollout_plan();
+    let accepted = object(DEPLOYMENT_ACCEPTED);
+    let last = Verification::of(&plan, Observation::Object(&accepted), &deadline(), at(30));
+    assert_eq!(last.verdict(), Verdict::Pending);
+
+    let gap = Verification::unfinished(plan.verification_rule(), Unfinished::WatchGap, Some(&last));
+
+    assert_eq!(gap.verdict(), Verdict::Inconclusive);
+    assert!(!gap.verdict().is_success());
+    assert!(!gap.verdict().is_failure());
+    assert_eq!(gap.unfinished_because(), Some(Unfinished::WatchGap));
+    assert_eq!(
+        gap.reached(),
+        Some(Stage::SpecObserved),
+        "how far the evidence reached before the break is kept, never raised"
+    );
+    assert!(
+        gap.reconciliation().is_some(),
+        "and the reconciliation state the last observation stood in travels with it"
+    );
+    let said = gap.describe();
+    assert!(said.contains("[watch_gap]"), "{said}");
+    assert!(said.contains("410"), "{said}");
+    assert!(
+        said.contains("not evidence that the change failed"),
+        "{said}"
+    );
+    for forbidden in ["converged by", "rolled out", "healthy"] {
+        assert!(!said.contains(forbidden), "`{forbidden}` in {said}");
+    }
+}
+
+/// The seven ways of not finishing are seven words, and none of them is a verdict.
+#[test]
+fn should_keep_every_unfinished_reason_apart_and_apart_from_failure() {
+    use ono_provider_kubernetes::mutation::Unfinished;
+    let reasons = [
+        Unfinished::GenerationNotObserved,
+        Unfinished::ConditionsInconclusive,
+        Unfinished::WindowExpired,
+        Unfinished::WatchGap,
+        Unfinished::PartialCoverage(Outcome::RequestFailed),
+        Unfinished::WatchUnavailable(Outcome::ReadDenied),
+        Unfinished::TargetGone,
+    ];
+    let mut words: Vec<&str> = reasons.iter().map(|reason| reason.as_str()).collect();
+    words.sort_unstable();
+    words.dedup();
+    assert_eq!(words.len(), reasons.len(), "every reason has its own word");
+    for reason in reasons {
+        let verification =
+            Verification::unfinished(VerificationRule::ControllerConvergence, reason, None);
+        assert_eq!(verification.verdict(), Verdict::Inconclusive);
+        assert!(
+            !verification.verdict().is_failure(),
+            "{reason:?} is not a failure (§46.4)"
+        );
+        assert!(
+            verification.describe().contains(reason.as_str()),
+            "{}",
+            verification.describe()
+        );
+    }
+    assert!(
+        Unfinished::WatchUnavailable(Outcome::ReadDenied)
+            .describe()
+            .contains("read denied"),
+        "a watch that could not be opened says why, in §21.4's words"
+    );
+}
+
+/// A window that ends is one of two incompletes, depending on how far the evidence got: no
+/// controller has recorded the generation, or it has and the status is not yet decisive.
+#[test]
+fn should_say_whether_the_generation_was_observed_when_the_window_ends() {
+    use ono_provider_kubernetes::mutation::Unfinished;
+    let plan = rollout_plan();
+    let accepted = object(DEPLOYMENT_ACCEPTED);
+    let unobserved = Verification::of(&plan, Observation::Object(&accepted), &deadline(), at(600));
+    assert_eq!(unobserved.verdict(), Verdict::Inconclusive);
+    assert_eq!(
+        unobserved.unfinished_because(),
+        Some(Unfinished::GenerationNotObserved)
+    );
+
+    let observed = object(
+        r#"{
+          "apiVersion":"apps/v1","kind":"Deployment",
+          "metadata":{"name":"checkout","namespace":"shop","uid":"dep-uid-1","resourceVersion":"1150","generation":8},
+          "spec":{"replicas":3,"template":{"spec":{"containers":[{"name":"web","image":"shop/web:1.3.0"}]}}},
+          "status":{"observedGeneration":8,"replicas":3,"updatedReplicas":1,"availableReplicas":3}
+        }"#,
+    );
+    let pending = Verification::of(&plan, Observation::Object(&observed), &deadline(), at(600));
+    assert_eq!(pending.verdict(), Verdict::Inconclusive);
+    assert_eq!(
+        pending.unfinished_because(),
+        Some(Unfinished::ConditionsInconclusive)
+    );
+    assert_eq!(pending.reached(), Some(Stage::GenerationObserved));
 }

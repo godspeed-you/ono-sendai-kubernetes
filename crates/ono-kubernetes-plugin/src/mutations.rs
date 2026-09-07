@@ -19,52 +19,73 @@
 //!
 //! **An acceptance reaches one rung.** `MutationOutcome::established_stage` answers
 //! `Stage::ApiAccepted` for a write and nothing for anything else, and no field of the emitted
-//! record can carry a stronger word. Everything above that rung comes from a later observation,
-//! which this module makes exactly once, immediately, with a deadline of zero — so evidence that
-//! is not decisive at once is `Inconclusive`, which §46.4 defines as neither failure nor success.
-//! That is Gate G with no room left for a friendlier sentence.
+//! record can carry a stronger word. Everything above that rung comes from a later observation:
+//! one immediate read, and then — where that read is not decisive — a watch over the target for
+//! at most `VERIFICATION_WINDOW`, consumed until the rule is proven, refuted, or the window
+//! ends (ADR-0060). What the watch could not establish is `Inconclusive` with a *named* reason,
+//! which §46.4 defines as neither failure nor success. That is Gate G with no room left for a
+//! friendlier sentence.
 //!
 //! **Force is a reason.** There is no `force` flag. `force_because` takes the sentence a reviewer
 //! will read, and without it a conflict is an answer that names the owning manager and stops
 //! (§44.3, §44.4). Nothing here retries.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ono_kuang_sdk::protocol::WireError;
 use ono_kuang_sdk::{Ctx, EmitError, Outcome as InvocationOutcome};
 use ono_provider_kubernetes::coverage::Outcome as Coverage;
+use ono_provider_kubernetes::coverage::Scope;
+use ono_provider_kubernetes::discovery::{Gvr, Resource};
 use ono_provider_kubernetes::mutation::{
     Acceptance, ApplyOptions, Deadline, DeleteOptions, Deletion, FieldManager, MutationError,
-    MutationOutcome, Observation, Verification, admission_differences_of, apply_document,
-    apply_request, delete_request,
+    MutationOutcome, Observation, Unfinished, Verdict, Verification, admission_differences_of,
+    apply_document, apply_request, delete_request,
 };
 use ono_provider_kubernetes::object::Object;
 use ono_provider_kubernetes::plan::{Plan, Preflight, VerificationRule};
 use ono_provider_kubernetes::redaction::Guarded;
-use ono_provider_kubernetes::session::{Invalidation, Session};
+use ono_provider_kubernetes::session::{Invalidation, Lookup, Session};
 use ono_provider_kubernetes::transport::{
-    ByteStream, Client, ObservedAt, Operation, Request, Response,
+    ApiError, ByteStream, Client, Clock, ListOptions, ObservedAt, Operation, Request, Response,
+    SystemClock, watch_request,
 };
+use ono_provider_kubernetes::watch::{WatchDecoder, WatchEvent, WatchFailure, WatchStream};
 use ono_value::{ErrorValue, MapValue, Provenance, RecordValue, Schema, Value};
 use serde_json::{Map as JsonMap, Value as Json};
 
+use crate::broker::ReadPolicy;
 use crate::contributions::{Command, SchemaDef, Writes};
 use crate::planning::{self, Intent, Planned, plan_on};
 use crate::query::{
     Conversation, Endpoint, UNAVAILABLE, UNAVAILABLE_CODE, converse, failure, transport_failure,
 };
-use crate::sessions::Sessions;
+use crate::sessions::{Key, Sessions};
 
-/// How long verification may wait before it reports that it did not finish (§46.4).
+/// How long verification may watch for convergence before it reports that it did not finish
+/// (§46.4, ADR-0060).
 ///
-/// Zero, and that is a statement rather than a placeholder. This invocation looks at the target
-/// exactly once, immediately after the write, and then ends; it is not waiting for anything. So
-/// evidence that is not decisive at that moment never became decisive within the window there
-/// was, which §46.4 calls `Inconclusive` — "not evidence that the change failed, and not evidence
-/// that it succeeded". Reporting it as `Pending` would promise a second look that nobody is going
-/// to take.
-const VERIFICATION_WINDOW: Duration = Duration::ZERO;
+/// Sixty seconds, and the number is an argument. A scale or an image change on a healthy
+/// cluster converges in seconds; one that has not converged in a minute is one an operator
+/// wants to look at rather than wait on, and §46.4 is explicit that the window ending means
+/// *incomplete* and never *failed*. The operator may stop it earlier (§62.12), and the watch
+/// notices within a read window (`ReadPolicy::watch`).
+///
+/// `ONO_K8S_VERIFICATION_WINDOW_MS` overrides it for a process — §7.4 of the generic contract's
+/// environment-derived configuration — which is how a deterministic test makes the window end.
+const VERIFICATION_WINDOW: Duration = Duration::from_secs(60);
+
+/// The window this process verifies under.
+fn verification_window() -> Duration {
+    std::env::var("ONO_K8S_VERIFICATION_WINDOW_MS")
+        .ok()
+        .and_then(|millis| millis.parse::<u64>().ok())
+        .map_or(VERIFICATION_WINDOW, Duration::from_millis)
+}
+
+/// How often the session's own watch cache is asked while a change is being verified through it.
+const CACHE_POLL: Duration = Duration::from_millis(100);
 
 /// Answers one contributed command: plan the change, make it, and say what that establishes.
 #[must_use]
@@ -107,8 +128,9 @@ pub fn answer(
         return InvocationOutcome::Cancelled;
     }
 
+    let key = endpoint.session_key();
     let made = sessions.with(
-        &endpoint.session_key(),
+        &key,
         || endpoint.start_session(),
         |session| {
             converse(
@@ -124,10 +146,19 @@ pub fn answer(
             )
         },
     );
-    let made = match made {
+    let mut made = match made {
         Ok(made) => made,
         Err(error) => return InvocationOutcome::Failed(error),
     };
+    // §46.3 and §46.4: the immediate read was not decisive, so the target is watched for
+    // convergence until the rule is proven or the window ends (ADR-0060). Outside the session
+    // borrow, because the watch may be the session's own and another invocation is feeding it.
+    if let Some(verdict) = converge(ctx, sessions, &key, &endpoint, &made) {
+        match verdict {
+            Converged::Verified(verification) => made.verification = Some(verification),
+            Converged::Cancelled => return InvocationOutcome::Cancelled,
+        }
+    }
     // §51.6, before the record is built and whatever becomes of it. A change is the event an
     // audit trail exists for, and the broker cannot see one: everything this command did to the
     // cluster travelled as bytes on a connection it authorised by host and port. The *fields*
@@ -249,6 +280,13 @@ impl How {
 /// One attempt at a change: what was planned, what came back, and what a later look established.
 pub(crate) struct Made {
     plan: Plan,
+    /// Which REST collection serves the target, for the watch that verifies the change.
+    resource: Resource,
+    /// The scope the target was read in.
+    scope: Scope,
+    /// The `resourceVersion` of the last observation of the target, which a verification watch
+    /// opens from so that nothing between that observation and the watch is missed (§19.1).
+    observed_version: Option<String>,
     outcome: MutationOutcome,
     manager: FieldManager,
     forced_because: Option<String>,
@@ -338,9 +376,12 @@ fn apply<S: ByteStream>(
     let response = send(client, endpoint, request)?;
     let outcome = MutationOutcome::read(&planned.plan, options.dry_run(), &response);
     let admission = admission(&outcome, &document);
-    let verification = verify(client, planned, &outcome, None);
+    let (verification, observed_version) = verify(client, planned, &outcome, None);
     Ok(Made {
         plan: planned.plan.clone(),
+        resource: planned.resource.clone(),
+        scope: planned.scope.clone(),
+        observed_version,
         manager: options.manager().clone(),
         forced_because: options.forced_because().map(str::to_owned),
         dry_run: options.dry_run().is_dry_run(),
@@ -367,9 +408,12 @@ fn delete<S: ByteStream>(
     // The refusal is already in `outcome`; `Deletion::read` boxes a second copy of it for the
     // caller that has none, and this one does.
     let mut deletion = Deletion::read(&planned.plan, &options, &response).ok();
-    let verification = verify(client, planned, &outcome, deletion.as_mut());
+    let (verification, observed_version) = verify(client, planned, &outcome, deletion.as_mut());
     Ok(Made {
         plan: planned.plan.clone(),
+        resource: planned.resource.clone(),
+        scope: planned.scope.clone(),
+        observed_version,
         manager: FieldManager::ono(),
         forced_because: None,
         dry_run: options.dry_run().is_dry_run(),
@@ -405,7 +449,11 @@ fn invalidate_what_the_write_reached(
     mut made: Made,
 ) -> Made {
     if made.outcome.is_persisted() {
-        made.invalidated = Some(session.mutated(planned.resource.gvr(), planned.scope.namespace()));
+        made.invalidated = Some(session.mutated(
+            planned.resource.gvr(),
+            planned.scope.namespace(),
+            planned.plan.target().name(),
+        ));
     }
     made
 }
@@ -416,20 +464,26 @@ fn invalidate_what_the_write_reached(
 /// did not happen, so there is nothing to verify. Looking anyway would spend a request to
 /// discover that the object is as it was, and would tempt a reader into treating the answer as
 /// being about a change that was never made.
+///
+/// The read is the first observation and the one the verification watch opens from: its
+/// `resourceVersion` comes back beside the verdict so that [`converge`] can ask the API server
+/// for every change *after* the state this look evaluated, and none of the ones before it.
 fn verify<S: ByteStream>(
     client: &mut Client<S>,
     planned: &Planned,
     outcome: &MutationOutcome,
     deletion: Option<&mut Deletion>,
-) -> Option<Verification> {
+) -> (Option<Verification>, Option<String>) {
     if !outcome.requires_verification() {
-        return None;
+        return (None, None);
     }
     let name = planned.plan.target().name();
+    let mut observed_version = None;
     let (observation, now) = match client.get(planned.resource.gvr(), &planned.scope, name) {
         Ok(read) => {
             let now = read.freshness().observed_at();
             let (object, _) = read.into_parts();
+            observed_version = object.resource_version().map(str::to_owned);
             (Looked::Object(Box::new(object)), now)
         }
         Err(error) => {
@@ -452,13 +506,344 @@ fn verify<S: ByteStream>(
             Looked::Unobservable(outcome) => deletion.observe_absence(*outcome),
         }
     }
-    let deadline = Deadline::starting_at(now, VERIFICATION_WINDOW);
-    Some(Verification::of(
-        &planned.plan,
-        observation.as_observation(),
-        &deadline,
-        now,
-    ))
+    // §46.4's window applies to the rules a watch can prove. An absence is established by a
+    // read (§45.1) and a rule this provider does not have by nothing, so for those two the
+    // immediate observation is the whole verification and the window is already over.
+    let window = if watchable(planned.plan.verification_rule()) {
+        verification_window()
+    } else {
+        Duration::ZERO
+    };
+    let deadline = Deadline::starting_at(now, window);
+    (
+        Some(Verification::of(
+            &planned.plan,
+            observation.as_observation(),
+            &deadline,
+            now,
+        )),
+        observed_version,
+    )
+}
+
+/// Whether a watch over the target can prove this rule (§46.3).
+fn watchable(rule: VerificationRule) -> bool {
+    !matches!(
+        rule,
+        VerificationRule::Absence | VerificationRule::NoneKnown
+    )
+}
+
+/// What watching for convergence came to.
+enum Converged {
+    /// The verdict the watch reached, or the named reason it could not (§46.4).
+    Verified(Verification),
+    /// The operator stopped the verification (§62.12); the change stands as the API server took
+    /// it, and nothing is rolled back (§46.4, §26 of the generic contract).
+    Cancelled,
+}
+
+/// Watches the target until the verification rule is decided or the window ends (§46.3, §46.4).
+///
+/// `None` where there is nothing to wait for: no write was made, the immediate read decided the
+/// question, or the rule is one no watch can prove — an absence is read, and a rule this provider
+/// does not have stays unproven however long anybody watches.
+///
+/// Two sources, in this order (ADR-0060):
+///
+/// 1. **the session's own watch**, where one is open and live over the target's collection: the
+///    cache is polled through the session, and the watch another invocation is feeding is what
+///    delivers the controller's progress (§20.3, §50.4);
+/// 2. **a bounded watch of this invocation's own**, opened at the version the immediate read
+///    observed and narrowed to the target by `fieldSelector=metadata.name`, consumed until the
+///    rule is proven and released with the invocation.
+///
+/// Nothing here fabricates convergence. A gap, a partial observation, a window that ends and a
+/// target that vanishes are each a named `Unfinished`, and every one of them is reported as
+/// incomplete rather than as either verdict (§46.4).
+fn converge(
+    ctx: &mut Ctx<'_>,
+    sessions: &Sessions,
+    key: &Key,
+    endpoint: &Endpoint,
+    made: &Made,
+) -> Option<Converged> {
+    let first = made.verification.as_ref()?;
+    if first.verdict() != Verdict::Pending {
+        return None;
+    }
+    let rule = made.plan.verification_rule();
+    let gvr = made.resource.gvr().clone();
+    let scope = made.scope.clone();
+    let name = made.plan.target().name().to_owned();
+    let started = Instant::now();
+    let window = verification_window();
+    let mut last = first.clone();
+
+    // 1. The session's own watch, where it is live over this collection and scope. It is fed by
+    //    the invocation that opened it, which borrows the session per event (ADR-0058), so
+    //    polling the cache through the session takes turns with it rather than starving it.
+    loop {
+        if ctx.cancelled() {
+            return Some(Converged::Cancelled);
+        }
+        let (live, looked) = sessions.with(
+            key,
+            || endpoint.start_session(),
+            |session| {
+                (
+                    session
+                        .watch_stream(&gvr, &scope)
+                        .is_some_and(WatchStream::absence_is_conclusive),
+                    session.lookup(&gvr, &scope, scope.namespace(), &name),
+                )
+            },
+        );
+        if !live {
+            break;
+        }
+        match looked {
+            // The written object is quarantined until the event for the write arrives on the
+            // session's watch (§20.5, ADR-0060); the stream is live, so it is coming.
+            Lookup::NotWatched | Lookup::NotSynced(_) => {}
+            Lookup::ConfirmedAbsent => {
+                return Some(Converged::Verified(Verification::unfinished(
+                    rule,
+                    Unfinished::TargetGone,
+                    Some(&last),
+                )));
+            }
+            Lookup::Cached(read) => {
+                let now = SystemClock.now();
+                let deadline = Deadline::starting_at(read.freshness().observed_at(), window);
+                let verification = Verification::of(
+                    &made.plan,
+                    Observation::Object(read.object()),
+                    &deadline,
+                    now,
+                );
+                if verification.verdict().is_decided() {
+                    return Some(Converged::Verified(verification));
+                }
+                last = verification;
+            }
+        }
+        if started.elapsed() >= window {
+            return Some(Converged::Verified(Verification::unfinished(
+                rule,
+                window_ended(&last),
+                Some(&last),
+            )));
+        }
+        std::thread::sleep(CACHE_POLL);
+    }
+
+    // 2. A watch of this invocation's own, from the version the immediate read observed.
+    let mut from = made.observed_version.clone();
+    loop {
+        if ctx.cancelled() {
+            return Some(Converged::Cancelled);
+        }
+        let remaining = window.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Some(Converged::Verified(Verification::unfinished(
+                rule,
+                window_ended(&last),
+                Some(&last),
+            )));
+        }
+        let round = converse(
+            ctx,
+            endpoint,
+            Converging {
+                endpoint,
+                plan: &made.plan,
+                gvr: &gvr,
+                scope: &scope,
+                name: &name,
+                from: from.as_deref(),
+                deadline: started + window,
+                last: &last,
+            },
+        );
+        match round {
+            Ok(Watched::Decided(verification)) => {
+                return Some(Converged::Verified(verification));
+            }
+            Ok(Watched::Unfinished(reason, seen)) => {
+                return Some(Converged::Verified(Verification::unfinished(
+                    rule,
+                    reason,
+                    Some(seen.as_ref().unwrap_or(&last)),
+                )));
+            }
+            // The body ended cleanly or the server went quiet past its own timeout: the
+            // checkpoint still names a position it holds, so the watch reopens there (§19.5).
+            Ok(Watched::Reopen(checkpoint, seen)) => {
+                if let Some(seen) = seen {
+                    last = seen;
+                }
+                if checkpoint.is_some() {
+                    from = checkpoint;
+                }
+            }
+            Err(error) => {
+                if ctx.cancelled() {
+                    return Some(Converged::Cancelled);
+                }
+                // The transport failed underneath the watch. That is a read nobody could make,
+                // not a change that failed (§21.4, §46.4).
+                let _ = error;
+                return Some(Converged::Verified(Verification::unfinished(
+                    rule,
+                    Unfinished::WatchUnavailable(Coverage::RequestFailed),
+                    Some(&last),
+                )));
+            }
+        }
+    }
+}
+
+/// Which of §46.4's unfinished answers a window that ended on this evidence is.
+fn window_ended(last: &Verification) -> Unfinished {
+    use ono_provider_kubernetes::condition::Stage;
+    match last.reached() {
+        None => Unfinished::WindowExpired,
+        Some(Stage::ApiAccepted | Stage::SpecObserved) => Unfinished::GenerationNotObserved,
+        Some(_) => Unfinished::ConditionsInconclusive,
+    }
+}
+
+/// What one watch round of a verification came to.
+enum Watched {
+    /// The rule was proven or refuted by an observation on the watch.
+    Decided(Verification),
+    /// The watch could not go on, for this reason, with the last observation it made.
+    Unfinished(Unfinished, Option<Verification>),
+    /// The body ended and the checkpoint is still good: reopen from it, if the window allows.
+    Reopen(Option<String>, Option<Verification>),
+}
+
+/// One bounded watch over the target, read frame by frame until the rule is decided (§46.3).
+struct Converging<'a> {
+    endpoint: &'a Endpoint,
+    plan: &'a Plan,
+    gvr: &'a Gvr,
+    scope: &'a Scope,
+    name: &'a str,
+    from: Option<&'a str>,
+    /// When the window ends, on the invocation's own clock.
+    deadline: Instant,
+    last: &'a Verification,
+}
+
+impl Conversation for Converging<'_> {
+    type Answer = Watched;
+
+    fn read_policy(&self) -> ReadPolicy {
+        // A watch, so the read hands control back on silence: that is where the deadline and
+        // the cancellation are noticed while the controller is taking its time (§62.12).
+        ReadPolicy::watch()
+    }
+
+    fn run<S: ByteStream>(self, client: &mut Client<S>) -> Result<Self::Answer, WireError> {
+        // One object rather than the collection: `metadata.name` is a field selector every
+        // API server indexes, so the watch delivers the target's changes and nobody else's.
+        let options = ListOptions::new().field_selector(format!("metadata.name={}", self.name));
+        let request = self.endpoint.authorise(
+            watch_request(self.gvr, self.scope, &options, self.from)
+                .header("Accept", "application/json"),
+        );
+        let instance = client.provider_instance().to_owned();
+        let mut decoder = WatchDecoder::new(instance);
+        let mut stream = client
+            .connection()
+            .open(&request)
+            .map_err(|error| transport_failure(self.gvr.path().as_str(), &error))?;
+        let unavailable = match stream.status() {
+            200 => None,
+            // §19.4: the version the read observed is already gone from the server's history.
+            // What happened between that read and now was not observed (Gate F).
+            410 => Some(Unfinished::WatchGap),
+            401 | 403 => Some(Unfinished::WatchUnavailable(Coverage::ReadDenied)),
+            404 => Some(Unfinished::WatchUnavailable(Coverage::TypeNotServed)),
+            _ => Some(Unfinished::WatchUnavailable(Coverage::RequestFailed)),
+        };
+        if let Some(reason) = unavailable {
+            return Ok(Watched::Unfinished(reason, None));
+        }
+
+        let mut checkpoint = self.from.map(str::to_owned);
+        let mut seen: Option<Verification> = None;
+        loop {
+            if Instant::now() >= self.deadline {
+                let reason = window_ended(seen.as_ref().unwrap_or(self.last));
+                return Ok(Watched::Unfinished(reason, seen));
+            }
+            let Some(chunk) = stream.next_chunk() else {
+                return Ok(Watched::Reopen(checkpoint, seen));
+            };
+            let events = match chunk {
+                Ok(chunk) => match decoder.decode(&chunk) {
+                    Ok(events) => events,
+                    // A frame that could not be read is an observation with a hole in it, and
+                    // a hole is not evidence either way (§21.4, §46.4).
+                    Err(_) => {
+                        return Ok(Watched::Unfinished(
+                            Unfinished::PartialCoverage(Coverage::RequestFailed),
+                            seen,
+                        ));
+                    }
+                },
+                // Nothing this window. The deadline is checked at the top of the loop, and a
+                // cancellation is noticed by the caller before the next round (§62.12).
+                Err(ApiError::Quiet) => continue,
+                Err(_) => return Ok(Watched::Reopen(checkpoint, seen)),
+            };
+            for event in events {
+                match event {
+                    WatchEvent::Added(object) | WatchEvent::Modified(object) => {
+                        if let Some(version) = object.resource_version() {
+                            checkpoint = Some(version.to_owned());
+                        }
+                        let now = SystemClock.now();
+                        // The deadline the verdict is measured against is the window's own end,
+                        // so a decisive observation is decisive whenever it arrives and an
+                        // indecisive one stays pending until the window says otherwise.
+                        let deadline = Deadline::starting_at(now, Duration::from_secs(1));
+                        let verification = Verification::of(
+                            self.plan,
+                            Observation::Object(&object),
+                            &deadline,
+                            now,
+                        );
+                        if verification.verdict().is_decided() {
+                            return Ok(Watched::Decided(verification));
+                        }
+                        seen = Some(verification);
+                    }
+                    WatchEvent::Deleted(_) => {
+                        return Ok(Watched::Unfinished(Unfinished::TargetGone, seen));
+                    }
+                    WatchEvent::Bookmark(version) | WatchEvent::InitialEventsEnd(version) => {
+                        checkpoint = Some(version.as_str().to_owned());
+                    }
+                    WatchEvent::Error(WatchFailure::Expired) => {
+                        return Ok(Watched::Unfinished(Unfinished::WatchGap, seen));
+                    }
+                    WatchEvent::Error(WatchFailure::Denied) => {
+                        return Ok(Watched::Unfinished(
+                            Unfinished::WatchUnavailable(Coverage::ReadDenied),
+                            seen,
+                        ));
+                    }
+                    WatchEvent::Error(WatchFailure::Interrupted(_)) => {
+                        return Ok(Watched::Reopen(checkpoint, seen));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// What the follow-up read found, owned so that the borrow ends with the request.

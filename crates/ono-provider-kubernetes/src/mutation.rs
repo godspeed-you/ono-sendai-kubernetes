@@ -1262,6 +1262,86 @@ pub enum Observation<'a> {
     Unobservable(Outcome),
 }
 
+/// Why a verification that watched for convergence did not reach a verdict (§46.4, §20.4).
+///
+/// Named rather than folded into one "timed out", because §46.4's `Inconclusive` is a family of
+/// different truths: a window that ended with the controller still silent, a window that ended
+/// with the controller talking and not decisive, a watch whose continuity broke, a target that
+/// vanished, and a watch that could not be opened at all. Each is a different thing an operator
+/// does next, and every one of them is *not* evidence that the change failed (§46.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unfinished {
+    /// The window ended and no controller had recorded observing the generation (§37.3).
+    GenerationNotObserved,
+    /// The window ended with the generation observed and the conditions still not decisive.
+    ConditionsInconclusive,
+    /// The window ended before any observation of the target arrived at all.
+    WindowExpired,
+    /// The watch's continuity broke (`410 Gone`); what happened after the break is unobserved
+    /// (§19.4, Gate F).
+    WatchGap,
+    /// The observation did not cover the target — a denied or failed read, a listing with a
+    /// hole in it (§21.4).
+    PartialCoverage(Outcome),
+    /// No watch could be opened over the target's collection, for this reason (§21.4).
+    WatchUnavailable(Outcome),
+    /// The target left the collection while the change was being verified (§16.3).
+    TargetGone,
+}
+
+impl Unfinished {
+    /// The token this reason is reported under.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GenerationNotObserved => "generation_not_observed",
+            Self::ConditionsInconclusive => "conditions_inconclusive",
+            Self::WindowExpired => "window_expired",
+            Self::WatchGap => "watch_gap",
+            Self::PartialCoverage(_) => "partial_coverage",
+            Self::WatchUnavailable(_) => "watch_unavailable",
+            Self::TargetGone => "target_gone",
+        }
+    }
+
+    /// The reason in words an operator can act on.
+    #[must_use]
+    pub fn describe(self) -> String {
+        match self {
+            Self::GenerationNotObserved => "the verification window ended and no controller had \
+                                            recorded observing the new generation"
+                .to_owned(),
+            Self::ConditionsInconclusive => "the verification window ended with the generation \
+                                             observed and the status not yet decisive"
+                .to_owned(),
+            Self::WindowExpired => {
+                "the verification window ended before any observation of the target arrived"
+                    .to_owned()
+            }
+            Self::WatchGap => "the watch verifying the change lost continuity (410 Gone), so \
+                               what happened after the break was not observed"
+                .to_owned(),
+            Self::PartialCoverage(outcome) => format!(
+                "the observation did not cover the target: {}",
+                outcome.as_str()
+            ),
+            Self::WatchUnavailable(outcome) => format!(
+                "the watch that would have observed the controller could not be opened: {}",
+                outcome.as_str()
+            ),
+            Self::TargetGone => {
+                "the target left the collection while the change was being verified".to_owned()
+            }
+        }
+    }
+}
+
+impl fmt::Display for Unfinished {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
 /// What verification concluded (§46.3, §46.4).
 ///
 /// Four members. The fourth is the one the specification insists on: §46.4 says a timeout means
@@ -1327,6 +1407,7 @@ pub struct Verification {
     reached: Option<Stage>,
     detail: String,
     reconciliation: Option<Reconciliation>,
+    unfinished: Option<Unfinished>,
 }
 
 impl Verification {
@@ -1364,6 +1445,7 @@ impl Verification {
                                  outside it are unobserved (§45.5)"
                             .to_owned(),
                         reconciliation: None,
+                        unfinished: None,
                     }
                 } else {
                     Self::inconclusive(
@@ -1400,6 +1482,7 @@ impl Verification {
                          {seen}), so the planned object's lifetime has ended"
                     ),
                     reconciliation: None,
+                    unfinished: None,
                 }
             } else {
                 Self::inconclusive(
@@ -1456,6 +1539,7 @@ impl Verification {
                          claimed by this rule"
                     .to_owned(),
                 reconciliation: None,
+                unfinished: None,
             };
         }
 
@@ -1467,6 +1551,7 @@ impl Verification {
                 reached: Some(Stage::StatusConverged),
                 detail: "the controller observed the generation and status converged".to_owned(),
                 reconciliation: Some(state),
+                unfinished: None,
             },
             ReconciliationState::Failed => Self {
                 verdict: Verdict::Refuted,
@@ -1474,6 +1559,7 @@ impl Verification {
                 reached: state.state().established_stage(),
                 detail: "the controller reported failure".to_owned(),
                 reconciliation: Some(state),
+                unfinished: None,
             },
             other => {
                 let reached = other.established_stage();
@@ -1498,8 +1584,9 @@ impl Verification {
         deadline: &Deadline,
         now: ObservedAt,
     ) -> Self {
+        let expired = deadline.has_expired(now);
         Self {
-            verdict: if deadline.has_expired(now) {
+            verdict: if expired {
                 Verdict::Inconclusive
             } else {
                 Verdict::Pending
@@ -1507,6 +1594,7 @@ impl Verification {
             rule,
             reached,
             detail,
+            unfinished: expired.then(|| Self::window_ended(reached)),
             reconciliation,
         }
     }
@@ -1518,7 +1606,49 @@ impl Verification {
             reached: None,
             detail,
             reconciliation: None,
+            unfinished: None,
         }
+    }
+
+    /// Which of §46.4's unfinished answers a window that ended on this evidence is.
+    fn window_ended(reached: Option<Stage>) -> Unfinished {
+        match reached {
+            None => Unfinished::WindowExpired,
+            Some(Stage::ApiAccepted | Stage::SpecObserved) => Unfinished::GenerationNotObserved,
+            Some(_) => Unfinished::ConditionsInconclusive,
+        }
+    }
+
+    /// A verification that watched for convergence and did not reach a verdict (§46.4).
+    ///
+    /// `last` is the most recent observation of the target, kept so the record still says how
+    /// far the evidence reached and which reconciliation state it stood in when the watch could
+    /// not go on. The reason is named rather than folded into a sentence, because a window that
+    /// expired, a watch that broke and a target that vanished are three different next steps.
+    #[must_use]
+    pub fn unfinished(rule: VerificationRule, reason: Unfinished, last: Option<&Self>) -> Self {
+        let mut detail = reason.describe();
+        if let Some(last) = last {
+            detail.push_str("; the last observation stood at: ");
+            detail.push_str(&last.detail);
+        }
+        Self {
+            verdict: Verdict::Inconclusive,
+            rule,
+            reached: last.and_then(|last| last.reached),
+            detail,
+            reconciliation: last.and_then(|last| last.reconciliation.clone()),
+            unfinished: Some(reason),
+        }
+    }
+
+    /// Why an inconclusive verification did not finish, where a watch was involved (§46.4).
+    ///
+    /// `None` for a decided verdict, and for an inconclusive one that never watched — a rule
+    /// this provider has none for, a target nobody could read.
+    #[must_use]
+    pub fn unfinished_because(&self) -> Option<Unfinished> {
+        self.unfinished
     }
 
     /// What was established.
@@ -1554,8 +1684,11 @@ impl Verification {
     pub fn describe(&self) -> String {
         let mut line = match self.verdict {
             Verdict::Inconclusive => format!(
-                "verification incomplete: {}. This is not evidence that the change failed, and \
-                 not evidence that it succeeded (§46.4)",
+                "verification incomplete{}: {}. This is not evidence that the change failed, \
+                 and not evidence that it succeeded (§46.4)",
+                self.unfinished
+                    .map(|reason| format!(" [{}]", reason.as_str()))
+                    .unwrap_or_default(),
                 self.detail
             ),
             Verdict::Pending => format!("verification pending: {}", self.detail),

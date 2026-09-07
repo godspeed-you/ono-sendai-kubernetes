@@ -907,3 +907,59 @@ fn should_keep_the_pages_that_crossed_when_a_page_deep_into_a_large_collection_f
         "with the refusal attached to the collection rather than replacing it"
     );
 }
+
+// --- §50.4 and §30.5 (core): the index bound is a number, and crossing it is visible -------------
+
+#[test]
+fn should_declare_an_index_over_a_cache_past_its_bound_unusable_rather_than_answer_a_subset() {
+    // §30.5 of the inherited contract: "index size and invalidation MUST be bounded and
+    // observable." §50.4: "An incomplete index MUST not return an unqualified complete-looking
+    // graph." The two sentences meet at the bound — an index that shed entries past its capacity
+    // would answer a selector with a subset that looks whole — so past the bound this one holds
+    // nothing, says so, and every derivation goes to the API server with its selector pushed
+    // down instead.
+    use ono_provider_kubernetes::index::{INDEX_CAPACITY, LabelSelector, RelationshipIndex};
+    use ono_provider_kubernetes::watch::SyncState;
+
+    let objects: Vec<Object> = (0..1_001)
+        .map(|index| {
+            let item = format!(r#"{{"apiVersion":"v1","kind":"Pod",{}"#, &pod(index)[1..]);
+            Object::parse(INSTANCE, &item).expect("the fixture Pod parses")
+        })
+        .collect();
+    let mut index = RelationshipIndex::bounded(1_000);
+    index.rebuild(&objects);
+
+    assert!(index.is_over_capacity());
+    assert_eq!(
+        index.len(),
+        0,
+        "nothing is kept past the bound, not a prefix"
+    );
+    let state = index.state(SyncState::Live, true, 0);
+    assert!(!state.usable());
+    assert_eq!(state.capacity(), 1_000);
+    assert!(
+        state.describe().contains("unusable"),
+        "{}",
+        state.describe()
+    );
+    let mut wanted = std::collections::BTreeMap::new();
+    wanted.insert("app".to_owned(), "api".to_owned());
+    assert!(
+        index
+            .matching(Some("shop"), &LabelSelector::equalities(&wanted))
+            .is_empty(),
+        "an over-capacity index answers no selector with a subset"
+    );
+
+    let mut within = RelationshipIndex::bounded(1_000);
+    within.rebuild(objects.iter().take(1_000));
+    assert!(!within.is_over_capacity());
+    assert_eq!(within.len(), 1_000);
+    assert!(within.state(SyncState::Live, true, 0).usable());
+    println!(
+        "index bound: {INDEX_CAPACITY} objects by default; {} postings for 1 000 Pods here",
+        within.len()
+    );
+}

@@ -97,6 +97,10 @@ pub enum WatchEvent {
     Deleted(Object),
     /// A checkpoint, carrying a resourceVersion and no object change.
     Bookmark(ResourceVersion),
+    /// The bookmark that ends a streaming list's initial events (§19.2): a `BOOKMARK` annotated
+    /// `k8s.io/initial-events-end: "true"`, whose version is the collection's at the moment the
+    /// initial state was complete — the same thing a listing's `metadata.resourceVersion` is.
+    InitialEventsEnd(ResourceVersion),
     /// The stream failed.
     Error(WatchFailure),
 }
@@ -109,7 +113,7 @@ impl WatchEvent {
             Self::Added(_) => "ADDED",
             Self::Modified(_) => "MODIFIED",
             Self::Deleted(_) => "DELETED",
-            Self::Bookmark(_) => "BOOKMARK",
+            Self::Bookmark(_) | Self::InitialEventsEnd(_) => "BOOKMARK",
             Self::Error(_) => "ERROR",
         }
     }
@@ -423,6 +427,11 @@ pub enum Reception {
     Applied,
     /// A checkpoint moved and nothing else did (§19.3).
     Checkpointed,
+    /// An initial event of a streaming list was staged; the cache is not synchronised yet (§19.2).
+    Staged,
+    /// A streaming list's initial events ended, and the cache is synchronised from them at the
+    /// version the terminating bookmark carried (§19.2, §20.3).
+    Synchronised,
     /// The stream stopped delivering and may resume from its checkpoint (§19.5).
     Suspended,
     /// Continuity broke; a fresh acquisition is required before anything is applied (§19.4).
@@ -480,6 +489,21 @@ pub struct WatchStream {
     /// gaps, so that a trim in this period can never be mistaken for the trim in the last one.
     trim_gap: Option<usize>,
     discarded: usize,
+    /// Objects this session wrote to and has not yet seen the event for (§20.5, §16.5 core).
+    ///
+    /// A write this session made reaches a live stream's cache through the event the API
+    /// server sends for it, not through anything this session puts there. Until that event
+    /// arrives the cached object is known-stale, so it is neither served nor reported absent:
+    /// the key is quarantined, [`Self::find`] answers nothing for it, and the next event that
+    /// names it — the write's own, or a later one — lifts the quarantine.
+    pending_writes: BTreeSet<CacheKey>,
+    /// The initial events of a streaming list, held until the bookmark that ends them (§19.2).
+    ///
+    /// `Some` only between [`Self::begin_streaming_list`] and the terminating bookmark. The
+    /// objects are not in the cache while they are here: before the end bookmark the set is
+    /// incomplete, and a cache seeded from an incomplete set answers absence for everything it
+    /// has not received yet (§20.3).
+    staging: Option<Vec<Object>>,
 }
 
 impl WatchStream {
@@ -500,6 +524,8 @@ impl WatchStream {
             gaps: Vec::new(),
             trim_gap: None,
             discarded: 0,
+            staging: None,
+            pending_writes: BTreeSet::new(),
         }
     }
 
@@ -531,6 +557,9 @@ impl WatchStream {
     /// nobody was watching, and keeps them forever, because no delete event for them will ever
     /// arrive.
     pub fn listed(&mut self, objects: Vec<Object>, collection_version: ResourceVersion) {
+        self.staging = None;
+        // A fresh acquisition observed every object, the written ones included.
+        self.pending_writes.clear();
         self.close_open_segment();
 
         let has_open_gap = self.gaps.last().is_some_and(|gap| !gap.is_closed());
@@ -567,17 +596,82 @@ impl WatchStream {
     pub fn observe(&mut self, event: WatchEvent) -> Reception {
         match event {
             WatchEvent::Error(failure) => self.fail(&failure),
-            WatchEvent::Bookmark(version) => {
-                if self.state != SyncState::Live {
-                    return self.discard();
+            WatchEvent::Bookmark(version) => self.checkpointed(version),
+            // The bookmark that ends a streaming list's initial events synchronises the cache
+            // from what was staged (§19.2). Arriving on a stream that is not streaming a list,
+            // it is an ordinary checkpoint: the annotation says what the server meant, and a
+            // stream that did not ask has nothing to end.
+            WatchEvent::InitialEventsEnd(version) => match self.staging.take() {
+                Some(staged) => {
+                    self.listed(staged, version);
+                    Reception::Synchronised
                 }
-                self.checkpoint = Some(version);
-                Reception::Checkpointed
+                None => self.checkpointed(version),
+            },
+            WatchEvent::Added(object) => {
+                if let Some(staged) = self.staging.as_mut() {
+                    staged.push(object);
+                    return Reception::Staged;
+                }
+                self.record(ChangeClass::Added, object)
             }
-            WatchEvent::Added(object) => self.record(ChangeClass::Added, object),
             WatchEvent::Modified(object) => self.record(ChangeClass::Modified, object),
             WatchEvent::Deleted(object) => self.record(ChangeClass::Deleted, object),
         }
+    }
+
+    /// Begins a streaming list: the next `ADDED` events are the initial state, held back until
+    /// the bookmark that ends them (§19.2).
+    ///
+    /// Only a stream that has not acquired state may begin one. A live stream has a checkpoint
+    /// to resume from, and re-listing it through the stream would be the relist [`Self::listed`]
+    /// already records as a break.
+    ///
+    /// # Errors
+    ///
+    /// [`ResumeError::CheckpointExpired`] past a gap and [`ResumeError::AccessDenied`] after a
+    /// denial, for the same reasons [`Self::reconnected`] gives; a live or reconnecting stream
+    /// answers `Ok` and begins nothing, because it is already acquired.
+    pub fn begin_streaming_list(&mut self) -> Result<(), ResumeError> {
+        match self.state {
+            SyncState::Syncing => {
+                self.staging = Some(Vec::new());
+                Ok(())
+            }
+            SyncState::GapDetected => {
+                // A fresh acquisition is what §19.4 step 3 asks for after an expiry, and a
+                // streaming list is one: the gap stays recorded and closes at the version the
+                // terminating bookmark carries, exactly as a relist would close it.
+                self.staging = Some(Vec::new());
+                Ok(())
+            }
+            SyncState::Denied => Err(ResumeError::AccessDenied),
+            SyncState::Live | SyncState::Reconnecting => Ok(()),
+        }
+    }
+
+    /// Abandons a streaming list whose initial events never ended (§19.2).
+    ///
+    /// The staged objects are dropped rather than applied: without the terminating bookmark the
+    /// set has no version to stand at and no claim to completeness. The stream is back where it
+    /// was before the attempt, which is what makes the list/watch fallback §19.2 requires an
+    /// ordinary acquisition rather than a repair.
+    pub fn abandon_streaming_list(&mut self) -> bool {
+        self.staging.take().is_some()
+    }
+
+    /// Whether a streaming list's initial events are being staged (§19.2).
+    #[must_use]
+    pub fn is_streaming_list(&self) -> bool {
+        self.staging.is_some()
+    }
+
+    fn checkpointed(&mut self, version: ResourceVersion) -> Reception {
+        if self.state != SyncState::Live {
+            return self.discard();
+        }
+        self.checkpoint = Some(version);
+        Reception::Checkpointed
     }
 
     /// Resumes a suspended stream from its checkpoint (§19.5).
@@ -632,10 +726,44 @@ impl WatchStream {
     }
 
     /// One cached object by the namespace and name a human looks it up with.
+    ///
+    /// Nothing for an object this session wrote to and has not yet seen the event for: what the
+    /// cache holds is known-stale, and §16.5 of the generic contract forbids serving that as
+    /// confirmed. Whether that nothing may be read as absence is [`Self::is_pending_write`]'s
+    /// question, and the answer is no.
     #[must_use]
     pub fn find(&self, namespace: Option<&str>, name: &str) -> Option<&Object> {
-        self.objects
-            .get(&(namespace.map(str::to_owned), name.to_owned()))
+        let key = (namespace.map(str::to_owned), name.to_owned());
+        if self.pending_writes.contains(&key) {
+            return None;
+        }
+        self.objects.get(&key)
+    }
+
+    /// Quarantines an object this session has just written to, until its event arrives (§20.5).
+    ///
+    /// Only a live stream quarantines: it is the one that will receive the event. Returns
+    /// whether it did, so a caller can drop a cache that no stream is keeping true instead.
+    pub fn written(&mut self, namespace: Option<&str>, name: &str) -> bool {
+        if !self.absence_is_conclusive() {
+            return false;
+        }
+        self.pending_writes
+            .insert((namespace.map(str::to_owned), name.to_owned()));
+        true
+    }
+
+    /// Whether this object was written by this session and its event has not arrived (§20.5).
+    #[must_use]
+    pub fn is_pending_write(&self, namespace: Option<&str>, name: &str) -> bool {
+        self.pending_writes
+            .contains(&(namespace.map(str::to_owned), name.to_owned()))
+    }
+
+    /// How many written objects are awaiting their event.
+    #[must_use]
+    pub fn pending_writes(&self) -> usize {
+        self.pending_writes.len()
     }
 
     /// Every cached object.
@@ -729,6 +857,9 @@ impl WatchStream {
             self.checkpoint = Some(ResourceVersion::new(version));
         }
         let key = key_of(&object);
+        // The event for a written object is the observation that ends its quarantine, whatever
+        // it says: the object as the server now holds it, or its departure.
+        self.pending_writes.remove(&key);
         match class {
             ChangeClass::Added | ChangeClass::Modified => {
                 self.objects.insert(key, object);
@@ -798,6 +929,9 @@ impl WatchStream {
     }
 
     fn break_continuity(&mut self, reason: GapReason, state: SyncState) -> Reception {
+        // Whatever a streaming list had staged is void with the stream that was delivering it:
+        // an initial state cut short by an expiry has no version to stand at (§19.2, §19.4).
+        self.staging = None;
         if matches!(self.state, SyncState::GapDetected | SyncState::Denied) {
             return Reception::ContinuityBroken;
         }
@@ -1062,6 +1196,9 @@ impl fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
+/// The annotation upstream puts on the bookmark that ends a streaming list's initial events.
+pub const INITIAL_EVENTS_END: &str = "k8s.io/initial-events-end";
+
 /// Turns the bytes of a watch response into [`WatchEvent`]s (§19.3).
 ///
 /// A watch body is a sequence of JSON objects, one per line, each `{"type":…,"object":…}`. The
@@ -1209,13 +1346,29 @@ impl WatchDecoder {
             "ADDED" => Ok(WatchEvent::Added(self.object(object)?)),
             "MODIFIED" => Ok(WatchEvent::Modified(self.object(object)?)),
             "DELETED" => Ok(WatchEvent::Deleted(self.object(object)?)),
-            "BOOKMARK" => object
-                .get("metadata")
-                .and_then(|metadata| metadata.get("resourceVersion"))
-                .and_then(Json::as_str)
-                .filter(|version| !version.is_empty())
-                .map(|version| WatchEvent::Bookmark(ResourceVersion::new(version)))
-                .ok_or(FrameError::UncheckpointedBookmark),
+            "BOOKMARK" => {
+                let metadata = object.get("metadata");
+                let version = metadata
+                    .and_then(|metadata| metadata.get("resourceVersion"))
+                    .and_then(Json::as_str)
+                    .filter(|version| !version.is_empty())
+                    .map(ResourceVersion::new)
+                    .ok_or(FrameError::UncheckpointedBookmark)?;
+                // §19.2: the bookmark that ends a streaming list's initial events is an
+                // ordinary bookmark carrying one annotation, and the annotation is the whole
+                // difference between "you are current at this version" and "the initial state
+                // is complete at this version".
+                let ends_initial_events = metadata
+                    .and_then(|metadata| metadata.get("annotations"))
+                    .and_then(|annotations| annotations.get(INITIAL_EVENTS_END))
+                    .and_then(Json::as_str)
+                    == Some("true");
+                if ends_initial_events {
+                    Ok(WatchEvent::InitialEventsEnd(version))
+                } else {
+                    Ok(WatchEvent::Bookmark(version))
+                }
+            }
             "ERROR" => Ok(WatchEvent::Error(failure_of(object))),
             other => Err(FrameError::UnknownClass(other.to_owned())),
         }
