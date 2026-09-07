@@ -120,6 +120,17 @@ pub(crate) const REFUSED_CODE: &str = "Ono-Sendai-K11901";
 /// The dotted name of [`REFUSED_CODE`].
 pub(crate) const REFUSED: &str = "contribution.refused";
 
+/// `provider.inconclusive`, as core's `docs/contracts/errors.yaml` publishes it (`ADR-0592 (core)`).
+///
+/// The code for a read that came back empty where emptiness proves nothing — an Event search
+/// against a retention window, a log with no retained lines, a verification that ran out of its
+/// window. It is not `contribution.refused` (the package declined under a precondition of its
+/// own) and not `provider.unavailable` (the cluster did not answer): here the cluster answered,
+/// and what it answered establishes neither presence nor absence. ADR-0067.
+pub(crate) const INCONCLUSIVE_CODE: &str = "Ono-Sendai-E0404";
+/// The dotted name of [`INCONCLUSIVE_CODE`].
+pub(crate) const INCONCLUSIVE: &str = "provider.inconclusive";
+
 pub(crate) const UNSUPPORTED_CODE: &str = "Ono-Sendai-E0402";
 /// The dotted name of [`UNSUPPORTED_CODE`].
 pub(crate) const UNSUPPORTED: &str = "provider.unsupported";
@@ -139,11 +150,13 @@ pub(crate) const AMBIGUOUS: &str = "resolve.ambiguous";
 /// that fails at refresh, a malformed `ExecCredential`, a replacement that has already expired,
 /// a grant gone at refresh time, an API server that refuses the replacement too — so that a
 /// dedicated authentication code, once core publishes one, is adopted in one edit here. Until
-/// then it borrows `provider.unavailable`: a cluster this provider cannot reach *as anyone* is
-/// unreachable to it, and the message says why in §8.4's own word, `authentication`.
-pub(crate) const AUTHENTICATION_CODE: &str = UNAVAILABLE_CODE;
+/// then it is `provider.authentication_failed` (`ADR-0592 (core)`, E0405): the external system
+/// did not accept the credential this provider presented, which §8.4 of the generic contract
+/// keeps distinct from `provider.unavailable` (the system did not answer) and from
+/// `provider.authorization_denied` (a known identity was refused). ADR-0067.
+pub(crate) const AUTHENTICATION_CODE: &str = "Ono-Sendai-E0405";
 /// The dotted name of [`AUTHENTICATION_CODE`].
-pub(crate) const AUTHENTICATION: &str = UNAVAILABLE;
+pub(crate) const AUTHENTICATION: &str = "provider.authentication_failed";
 
 /// The port `kubectl proxy` listens on unless told otherwise.
 ///

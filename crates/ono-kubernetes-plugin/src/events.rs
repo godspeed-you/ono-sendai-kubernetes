@@ -43,8 +43,8 @@ use crate::conditions::named;
 use crate::contributions::Target;
 use crate::dynamic::Selector;
 use crate::query::{
-    self, Conversation, Endpoint, REFUSED, REFUSED_CODE, Subject, UNAVAILABLE, UNAVAILABLE_CODE,
-    UNSUPPORTED, UNSUPPORTED_CODE, failure,
+    self, Conversation, Endpoint, INCONCLUSIVE, INCONCLUSIVE_CODE, Subject, UNAVAILABLE,
+    UNAVAILABLE_CODE, UNSUPPORTED, UNSUPPORTED_CODE, failure,
 };
 use crate::records::event_record;
 use crate::sessions::Sessions;
@@ -327,12 +327,15 @@ fn emit(
 /// nothing happened. Retention is minutes to hours, delivery is best-effort, and these
 /// observations were never a complete query of anything. ADR-0025.
 ///
-/// `contribution.refused` since ADR-0028: this is the package's own rule about what an empty
-/// answer proves, and the code that used to carry it claimed the cluster had not answered.
+/// `provider.inconclusive` since ADR-0067: the cluster answered and the answer is empty, and an
+/// empty Event search proves neither presence nor absence — retention is minutes to hours and
+/// delivery is best-effort (`ADR-0592 (core)`). It was `contribution.refused` (ADR-0028), which
+/// says the *package* declined under a precondition of its own; the more exact statement is that
+/// emptiness here is inconclusive.
 fn not_observed(subject: &Identity, outcome: &str) -> Outcome {
     Outcome::Failed(failure(
-        REFUSED_CODE,
-        REFUSED,
+        INCONCLUSIVE_CODE,
+        INCONCLUSIVE,
         format!(
             "no Event regarding `{}/{}` was observed: {outcome}",
             subject.gvk().kind(),

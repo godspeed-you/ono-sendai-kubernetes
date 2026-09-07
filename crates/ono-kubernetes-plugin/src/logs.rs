@@ -54,8 +54,8 @@ use crate::broker::{Lease, ReadPolicy};
 use crate::conditions::named;
 use crate::contributions::Target;
 use crate::query::{
-    self, Answer, Conversation, Endpoint, REFUSED, REFUSED_CODE, UNAVAILABLE, UNAVAILABLE_CODE,
-    UNSUPPORTED, UNSUPPORTED_CODE, converse_on, failure,
+    self, Answer, Conversation, Endpoint, INCONCLUSIVE, INCONCLUSIVE_CODE, UNAVAILABLE,
+    UNAVAILABLE_CODE, UNSUPPORTED, UNSUPPORTED_CODE, converse_on, failure,
 };
 use crate::records::{Line, log_record};
 use crate::sessions::Sessions;
@@ -726,12 +726,13 @@ fn emit(
 /// happened is that the runtime rotated the log away, or the requested tail did not reach back to
 /// it, or the process writes to a file. ADR-0025.
 ///
-/// `contribution.refused` since ADR-0028: the retrieval succeeded and this package declines to
-/// render its emptiness as an absence, which is not the cluster failing to answer.
+/// `provider.inconclusive` since ADR-0067: the retrieval succeeded, the answer is empty, and an
+/// empty log proves neither that the container printed nothing nor anything else — the runtime
+/// may have rotated it away or the tail may not reach back to it (`ADR-0592 (core)`).
 fn empty(retrieved: &Retrieved) -> Outcome {
     Outcome::Failed(failure(
-        REFUSED_CODE,
-        REFUSED,
+        INCONCLUSIVE_CODE,
+        INCONCLUSIVE,
         format!(
             "no line was read from {} [{} run]",
             retrieved.target().describe(),
@@ -759,8 +760,8 @@ fn empty(retrieved: &Retrieved) -> Outcome {
 fn unfollowed(follow: &LogFollow) -> WireError {
     let request = follow.request();
     failure(
-        REFUSED_CODE,
-        REFUSED,
+        INCONCLUSIVE_CODE,
+        INCONCLUSIVE,
         format!(
             "no line arrived while {} was followed [{} run]",
             request.target().describe(),
