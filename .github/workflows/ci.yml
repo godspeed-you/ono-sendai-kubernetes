@@ -21,7 +21,7 @@ env:
   # package against. `should_build_the_shell_from_the_revision_this_package_is_built_against`
   # fails when the two drift, because a green leg against the wrong shell looks exactly like a
   # green leg.
-  ONO_CORE_REV: e274a9061b13b7a8d2b812bb94bd7bf25324e9f1
+  ONO_CORE_REV: ec330e72cbb94b0626b070ceac29571eca37123d
 
 jobs:
   gate:
