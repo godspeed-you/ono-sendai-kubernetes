@@ -124,11 +124,11 @@ fn should_depend_on_a_core_that_reads_the_permission_contract() {
     // K11A §17.3: a lower bound as preflight assistance; the manifest's `kuang_api` stays the
     // authority Ono reads.
     assert!(
-        table("deb").contains("depends = \"ono (>= 0.4.3)\""),
-        "the .deb names the first core release with the permission layer"
+        table("deb").contains("depends = \"ono (>= 0.4.4)\""),
+        "the .deb names the first core release that verifies this package's signature"
     );
     assert!(
-        table("generate-rpm").contains("requires = { ono = \">= 0.4.3\" }"),
+        table("generate-rpm").contains("requires = { ono = \">= 0.4.4\" }"),
         "and so does the .rpm"
     );
     assert!(
