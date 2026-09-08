@@ -135,7 +135,7 @@ declared:
   - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_find_workloads_by_role_across_the_kinds_that_carry_it"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
-  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_open_no_exit_from_a_kubernetes_place_without_the_relation_write_grant"
+  - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_open_no_exit_from_a_kubernetes_place_when_its_spatial_relations_are_denied"
     category: external_tool_unavailable
     prerequisite: "an `ono` binary: `ONO_BINARY`, or a built `ono-sendai` checkout beside this one"
   - id: "crates/ono-kubernetes-plugin/tests/spatial_shell.rs::should_refuse_trace_on_a_kubernetes_noun_by_name_rather_than_answer_an_empty_graph"

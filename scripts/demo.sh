@@ -83,23 +83,28 @@ say "the package, installed the way an operator installs one"
 cargo build -q -p ono-kubernetes-plugin
 HOME_DIR="$(mktemp -d)"
 PACKAGE="io.github.godspeed-you.kubernetes"
-mkdir -p "$HOME_DIR/plugins/$PACKAGE/runtime" "$HOME_DIR/plugins/$PACKAGE/contributions" \
-         "$HOME_DIR/home/.kube" "$HOME_DIR/state" "$HOME_DIR/config/ono"
-cp package/manifest.yaml "$HOME_DIR/plugins/$PACKAGE/"
-cp package/contributions/*.yaml "$HOME_DIR/plugins/$PACKAGE/contributions/"
-cp target/debug/ono-kubernetes "$HOME_DIR/plugins/$PACKAGE/runtime/ono-kubernetes"
+mkdir -p "$HOME_DIR/sources/$PACKAGE/runtime" "$HOME_DIR/sources/$PACKAGE/contributions" \
+         "$HOME_DIR/plugins" "$HOME_DIR/home/.kube" "$HOME_DIR/state" "$HOME_DIR/config/ono"
+cp package/manifest.yaml "$HOME_DIR/sources/$PACKAGE/"
+cp package/contributions/*.yaml "$HOME_DIR/sources/$PACKAGE/contributions/"
+cp target/debug/ono-kubernetes "$HOME_DIR/sources/$PACKAGE/runtime/ono-kubernetes"
 cp "$KUBECONFIG_PATH" "$HOME_DIR/home/.kube/config"
 export ONO_PLUGIN_PATH="$HOME_DIR/plugins" HOME="$HOME_DIR/home" \
        XDG_STATE_HOME="$HOME_DIR/state" XDG_CONFIG_HOME="$HOME_DIR/config" \
        ONO_CONFIG_DIR="$HOME_DIR/config/ono"
-note "installed at $HOME_DIR/plugins"
 
-# The grants, and the scope on the one that reads a file. §51.3 says the provider SHOULD NOT
-# receive arbitrary filesystem read, and it does not: `filesystem.read` is granted with a path
-# scope naming this operator's kubeconfig directory and nothing else. `relation.write` is never
-# granted by default (§35.5), which is why `near` is silent without it.
-GRANT="grant capability filesystem.read --plugin $PACKAGE --scope 'paths=$HOME_DIR/home/.kube/**' | count"
-LOAD="$GRANT; load plugin $PACKAGE --grant network.connect --grant provider.mutate --grant clock.read --grant relation.write --grant secret.use --grant state.persist"
+# One install, the way an operator does it (K11P §12, §26). `--access operate` is the one
+# deliberate choice: the recommended profile reads and never writes, and the last two steps of
+# §65's list change the cluster, so the profile that carries `cluster-mutation` is named — which
+# is what K11P §7.4 asks a script to do instead of a flag that means "yes to everything". No
+# capability is granted by hand: `kubeconfig-read` is pinned to `~/.kube/config` by the
+# manifest itself (§51.3), and `spatial-relations` is automatic, bounded to this package's own
+# shapes, which is why `near` has exits without a `relation.write` anybody typed.
+say "0. install the package by path, under the profile that may change a cluster"
+run "install plugin path:$HOME_DIR/sources/$PACKAGE --access operate --confirm | select status | to json; get permission kubernetes"
+note "installed at $HOME_DIR/plugins; a released package would be \`install plugin kubernetes\`"
+
+LOAD="load plugin $PACKAGE"
 KUBE="--kubeconfig $HOME_DIR/home/.kube/config --context ono-admin"
 
 # --- §65's list, in its own order --------------------------------------------------------------

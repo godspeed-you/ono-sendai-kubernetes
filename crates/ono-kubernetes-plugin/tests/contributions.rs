@@ -1515,3 +1515,146 @@ fn should_test_the_support_matrix_the_specification_declares_and_the_readme_clai
         "`scripts/cluster.sh` defaults to the newest declared minor, {newest}"
     );
 }
+
+// --- the permission contract (K11P §26.1, ADR-0070) ----------------------------------------------
+
+/// The permissions K11P §26.1 requires of the reference provider, as the manifest declares them
+/// and as the host reads them: id, kind, phase, the capabilities underneath, and whether the
+/// recommended profile carries it.
+#[test]
+fn should_declare_the_permissions_k11p_names_for_the_reference_provider() {
+    use ono_kuang_sdk::protocol::{
+        Manifest, PermissionKind, PermissionPhase, RECOMMENDED, ScopeTemplate,
+    };
+
+    let manifest = Manifest::parse(MANIFEST).expect("the package manifest reads");
+    assert_eq!(
+        manifest.format, "kuang-package/2",
+        "the format that carries `permissions`"
+    );
+    let set = manifest.permission_set();
+    assert!(
+        set.declared,
+        "the permissions are declared, not derived from the capability list"
+    );
+
+    let expected: &[(&str, PermissionKind, PermissionPhase, &[Capability], bool)] = &[
+        (
+            "cluster-access",
+            PermissionKind::ExternalObserve,
+            PermissionPhase::Install,
+            &[Capability::NetworkConnect],
+            true,
+        ),
+        (
+            "kubeconfig-read",
+            PermissionKind::FilesystemRead,
+            PermissionPhase::Install,
+            &[Capability::FilesystemRead],
+            true,
+        ),
+        (
+            "credential-use",
+            PermissionKind::SecretUse,
+            PermissionPhase::Install,
+            &[Capability::SecretUse],
+            true,
+        ),
+        (
+            "spatial-relations",
+            PermissionKind::LocalContribution,
+            PermissionPhase::Automatic,
+            &[Capability::RelationWrite],
+            true,
+        ),
+        (
+            "plugin-state",
+            PermissionKind::LocalContribution,
+            PermissionPhase::Automatic,
+            &[Capability::StatePersist, Capability::ClockRead],
+            true,
+        ),
+        (
+            "credential-helper",
+            PermissionKind::ExecuteHelper,
+            PermissionPhase::Jit,
+            &[Capability::ProcessExec],
+            false,
+        ),
+        (
+            "cluster-mutation",
+            PermissionKind::ExternalChange,
+            PermissionPhase::Explicit,
+            &[Capability::ProviderMutate],
+            false,
+        ),
+    ];
+    let recommended = set
+        .profile(RECOMMENDED)
+        .expect("the recommended profile exists");
+    for (id, kind, phase, capabilities, in_recommended) in expected {
+        let descriptor = set
+            .descriptor(id)
+            .unwrap_or_else(|| panic!("the manifest declares `{id}`"));
+        assert_eq!(descriptor.kind, *kind, "`{id}` kind");
+        assert_eq!(descriptor.phase, *phase, "`{id}` phase");
+        assert_eq!(
+            descriptor.capabilities().collect::<Vec<_>>(),
+            capabilities.to_vec(),
+            "`{id}` maps onto exactly these capabilities"
+        );
+        assert_eq!(
+            recommended.permissions.iter().any(|name| name == id),
+            *in_recommended,
+            "`{id}` in the recommended profile"
+        );
+    }
+    assert_eq!(
+        set.descriptors.len(),
+        expected.len(),
+        "and no other permission"
+    );
+
+    // The helper is decided for the one program the kubeconfig names; the mutation for the one
+    // provider instance; the relations for the package's own shapes (K11P §19.3, §26.1).
+    let scope_of = |id: &str| set.descriptor(id).and_then(|d| d.grants[0].scope.clone());
+    assert!(matches!(
+        scope_of("credential-helper"),
+        Some(ScopeTemplate::RuntimeDerived)
+    ));
+    assert!(matches!(
+        scope_of("cluster-access"),
+        Some(ScopeTemplate::RuntimeDerived)
+    ));
+    assert!(matches!(
+        scope_of("spatial-relations"),
+        Some(ScopeTemplate::PackageContributions)
+    ));
+    assert!(matches!(
+        scope_of("cluster-mutation"),
+        Some(ScopeTemplate::ProviderInstance)
+    ));
+    assert!(
+        matches!(scope_of("kubeconfig-read"), Some(ScopeTemplate::Concrete(ref paths))
+            if paths.get("paths").and_then(|p| p.as_array()).is_some_and(|p| p.len() == 2)),
+        "the kubeconfig permission is pinned to the two conventional paths (§51.3)"
+    );
+
+    // K11P §26.4, §26.5: mutation is in `operate` and nowhere the default flow reaches.
+    let operate = set.profile("operate").expect("the operate profile exists");
+    assert!(
+        operate
+            .permissions
+            .iter()
+            .any(|name| name == "cluster-mutation")
+    );
+    let minimal = set.profile("minimal").expect("the minimal profile exists");
+    assert!(
+        minimal.permissions.iter().all(|name| {
+            set.descriptor(name)
+                .is_some_and(|d| d.phase == PermissionPhase::Automatic)
+        }),
+        "minimal is the automatic permissions and nothing else: {:?}",
+        minimal.permissions
+    );
+}

@@ -3736,9 +3736,11 @@ contexts:
 #[tokio::test]
 async fn should_refuse_a_context_that_authenticates_through_an_exec_credential_plugin() {
     // §8.2: an exec plugin runs only under an explicit process-execution capability, and the
-    // host must honour its interaction mode. This package has neither, so it refuses instead of
-    // connecting anonymously — a wrong identity reads as a permission problem on the cluster,
-    // and the operator debugs RBAC for something that was never sent.
+    // host must honour its interaction mode. Nobody here can be asked for the `credential-helper`
+    // permission, so the host answers the package's `process.exec` call with
+    // `permission.required` — naming the helper — and the package refuses instead of connecting
+    // anonymously: a wrong identity reads as a permission problem on the cluster, and the
+    // operator debugs RBAC for something that was never sent (K11P §20.3, ADR-0070).
     let (directory, path) = kubeconfig_at(
         "exec",
         r#"
@@ -3781,11 +3783,11 @@ contexts:
     assert!(records(&events).is_empty(), "nothing was read as somebody");
     assert_eq!(result.status, InvokeStatus::Failed);
     let error = result.error.expect("a structured refusal");
-    assert_eq!(error.name, "provider.unsupported");
+    assert_eq!(error.name, "permission.required");
+    let said = format!("{error:?}");
     assert!(
-        error.message.contains("exec"),
-        "the refusal names what it will not do, got {}",
-        error.message
+        said.contains("aws") && said.contains("credential-helper"),
+        "the refusal names the helper it will not run and the permission that would: {said}"
     );
 
     plugin.shutdown(ShutdownReason::Unload).await;

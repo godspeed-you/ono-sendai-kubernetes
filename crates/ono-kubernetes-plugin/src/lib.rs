@@ -70,7 +70,7 @@ pub const PACKAGE: &str = "io.github.godspeed-you.kubernetes";
 ///
 /// The host refuses a hello that contradicts the manifest, so the two are the same string or the
 /// package does not load.
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 
 /// How many invocations this package's code is willing to answer at once (spec §49.1).
 ///

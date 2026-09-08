@@ -297,16 +297,23 @@ impl Drop for Scratch {
     }
 }
 
-/// Lays this repository's package out the way an operator installs one, with the cluster's
-/// kubeconfig where an operator keeps theirs.
+/// Lays this repository's package out and installs it the way an operator does, with the
+/// cluster's kubeconfig where an operator keeps theirs.
 ///
 /// The documents are the real ones. The kubeconfig is copied into the scratch home rather than
-/// read where it lies, because §7.1 is about the file an operator has and the grant below is
-/// about the directory it is in — and a test that pointed the package at a path under `target/`
-/// would be proving something about `target/`.
+/// read where it lies, because §7.1 is about the file an operator has and the manifest's
+/// `kubeconfig-read` permission is about the conventional path it is at — `~/.kube/config`,
+/// resolved against the scratch `HOME` — and a test that pointed the package at a path under
+/// `target/` would be proving something about `target/`.
+///
+/// The one decision an operator takes before any of this is reachable is the profile:
+/// `--access operate`, named deliberately, because the mutation tests below write to the cluster
+/// and `provider.mutate` is in no recommended profile (K11P §7.4, §26.5; `ADR-0602 (core)` §4).
+/// Nothing else is granted by hand: the profile's permissions mint every grant the package
+/// holds, and the relationship tests need no `relation.write` anybody typed.
 fn plugin_home(live: &Live, name: &str) -> Scratch {
     let scratch = Scratch::new(name);
-    let package = scratch.path().join("plugins").join(PACKAGE);
+    let package = scratch.path().join("sources").join(PACKAGE);
     std::fs::create_dir_all(package.join("runtime")).expect("the runtime directory");
     std::fs::create_dir_all(package.join("contributions")).expect("the contributions directory");
     std::fs::write(package.join("manifest.yaml"), MANIFEST).expect("the manifest");
@@ -314,10 +321,22 @@ fn plugin_home(live: &Live, name: &str) -> Scratch {
     std::fs::write(package.join("contributions/schemas.yaml"), SCHEMAS).expect("the schemas");
     std::fs::write(package.join("contributions/commands.yaml"), COMMANDS).expect("the commands");
     std::fs::copy(PLUGIN, package.join("runtime/ono-kubernetes")).expect("the package binary");
-    for directory in ["home/.kube", "state", "config/ono"] {
+    for directory in ["home/.kube", "plugins", "state", "config/ono"] {
         std::fs::create_dir_all(scratch.path().join(directory)).expect("the scratch directories");
     }
     std::fs::copy(&live.kubeconfig, kubeconfig_in(&scratch)).expect("the kubeconfig");
+    let installed = shell(
+        live,
+        &scratch,
+        &format!(
+            "install plugin path:{} --access operate --confirm | select status | to json",
+            package.display()
+        ),
+    );
+    assert!(
+        installed.stdout.contains("\"success\""),
+        "the package installs under the `operate` profile: {installed:?}"
+    );
     scratch
 }
 
@@ -379,26 +398,14 @@ impl std::fmt::Debug for Run {
 
 /// Runs one script under `ono`, with the scratch home as the whole of its world.
 ///
-/// The script is prefixed with the two decisions an operator takes before any of this is
-/// reachable, and both are the real mechanism rather than a test hook:
-///
-/// * the **scope of `filesystem.read`**. The manifest declares `~/.kube/config` and
-///   `~/.kube/*.yaml`, and the supervisor matches a granted path as a glob against the path the
-///   package actually asks for — so an operator whose kubeconfig is anywhere else widens the
-///   grant deliberately with `grant capability --scope`, which is what §27.3 of the generic
-///   provider contract asks for and what happens here;
-/// * the **grants the package loads with**. `relation.write` is never granted by default (§31.19,
-///   §35.5), so the relationship tests below name it and the reads do not need it.
+/// Nothing is prefixed: the package was installed by [`plugin_home`], its grants come from the
+/// profile chosen there, and a `lazy` package loads at the first contribution the script
+/// reaches (K11P §12.3). That is the whole of an operator's experience, and it is what these
+/// tests exercise.
 fn shell(live: &Live, home: &Scratch, script: &str) -> Run {
     let root = home.path();
-    let full = format!(
-        "grant capability filesystem.read --plugin {PACKAGE} --scope 'paths={}/.kube/**' | count; \
-         load plugin {PACKAGE} --grant network.connect --grant provider.mutate --grant clock.read --grant relation.write; \
-         {script}",
-        root.join("home").display()
-    );
     let output = Command::new(&live.binary)
-        .args(["-c", &full])
+        .args(["-c", script])
         .env("ONO_PLUGIN_PATH", root.join("plugins"))
         .env("HOME", root.join("home"))
         .env("XDG_STATE_HOME", root.join("state"))

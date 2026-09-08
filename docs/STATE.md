@@ -29,7 +29,7 @@ the last two that were not, reach a reader through `changes.rs` and `query.rs`.
 | Specification | `docs/architecture/kubernetes-provider.md` — canonical here, immutable, checksummed |
 | Domain layer | `crates/ono-provider-kubernetes`, twenty-four modules, no host and no cluster |
 | Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations, audit, spatial |
-| Core revision | **`864602a7f0194ad1fc5b3096ebf3d3050cf9d7e4`** — the one every `Cargo.toml`, `Cargo.lock` and `.github/workflows/ci.yml` resolves to, carrying `ADR-0582 (core)` through `ADR-0599 (core)`; `should_build_the_shell_from_the_revision_this_package_is_built_against` fails if any of them diverge |
+| Core revision | **`83a8064a540c0c82b2e1675ba68ab165a98031e0`** — the one every `Cargo.toml`, `Cargo.lock` and `.github/workflows/ci.yml` resolves to, carrying `ADR-0582 (core)` through `ADR-0605 (core)` — the KUANG/11 permission layer among them; `should_build_the_shell_from_the_revision_this_package_is_built_against` fails if any of them diverge |
 | Contributions | 47 targets, 2 commands, 48 schemas, 64 relation shapes, **zero verbs of this package's own** |
 | Tests | 1072 across the workspace, all green; 29 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
 | Live proof | 18 tests in `live_cluster.rs` against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine. Seventeen announce a skip without one; the eighteenth is a static source scan that never does |
@@ -183,7 +183,7 @@ change by watching the controller converge rather than by one immediate read (AD
 The chain runs end to end against a live HTTP API server, typed at an ordinary shell prompt:
 
 ```text
-> grant capability network.connect --plugin io.github.godspeed-you.kubernetes
+> install plugin kubernetes            # since 2026-09-08; the line below was a `grant capability` then
 > get k8s-pod --host 127.0.0.1 --port 18002 | to json
 
 [{"uid":"pod-uid-1","name":"checkout-7f9d","namespace":"shop","api_version":"v1","kind":"Pod",
@@ -223,11 +223,32 @@ plain HTTP. What it establishes is that the route exists and the contracts hold 
 
 ## In progress
 
-Nothing. The completion pass closed the last wiring gap — the dependency-path causal finding — and
+Nothing. The last session moved the package to the KUANG/11 permission contract (below), and
+before it the completion pass closed the last wiring gap — the dependency-path causal finding — and
 made `trace`/`diff`'s absence an explicit out-of-scope boundary rather than an ambiguous one.
 **All fourteen acceptance gates of §62 are met**, and the live suite — now 18 tests — was run
 against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`. The workspace is
 **1072 tests, all green**.
+
+### The permission contract (2026-09-08)
+
+**`install plugin kubernetes` is the whole ceremony, and the six `grant capability` lines are
+gone from the normal path.** Core implemented the KUANG/11 plugin installation, resolution and
+permission specification (K11P; `ADR-0600 (core)` through `ADR-0605 (core)`), naming this provider
+as the reference, and this package is now the worked example (ADR-0070):
+
+- `package/manifest.yaml` is `kuang-package/2`, version `0.2.0`, `kuang_api ">=11.2 <12"`, with the
+  seven permissions and three profiles of K11P §26.1. `recommended` reads and never writes;
+  `spatial-relations` and `plugin-state` are automatic; `credential-helper` is asked for at first
+  use; `cluster-mutation` is in `operate` only, and no manifest could put it elsewhere.
+- `credentials.rs` reads `capabilities.check`'s `ask` as "proceed and let the host ask", refuses a
+  `denied` before the program name is assembled, and names `set permission kubernetes
+  credential-helper …` as the remedy. Nothing runs without a decision, under every answer.
+- The live and spatial suites install the package the way an operator does — one `install plugin
+  path:… --confirm`, `--access operate` where a test writes — and grant nothing by hand.
+  `isolation.rs` holds the three shapes of the helper decision under `ScriptedConsent`.
+- `scripts/demo.sh` and the README lead with the install; `grant capability` is documented as the
+  raw mechanism underneath.
 
 ### The completion pass
 

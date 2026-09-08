@@ -5,8 +5,10 @@ reference KUANG/11 external-system provider.
 
 > Kubernetes is not a command namespace inside Ono. It is a system Ono can understand.
 
-**v0.1.0 is the first release.** It is a KUANG/11 package that builds from this repository and
-runs: it speaks HTTPS to an API server over the host's brokered connection, reads any kind the
+**v0.2.0 moves the package to the KUANG/11 permission contract**: `install plugin kubernetes`
+is the whole ceremony, what it may do is decided in a person's words, and the credential helper of
+a managed cloud is asked for at first use rather than granted blind. v0.1.0 was the first release.
+It is a KUANG/11 package that builds from this repository and runs: it speaks HTTPS to an API server over the host's brokered connection, reads any kind the
 cluster serves, walks relationships with the evidence under each edge, watches a collection live
 at a terminal, and — under a declared risk and an operator's grant — predicts or makes one bounded
 change. Most of it is proven against recorded API bytes, and a suite of integration tests runs the
@@ -34,9 +36,7 @@ Ono verb that already existed. Reading is `get`; the two words that write are co
 `remove`, aimed at the same noun `get` reads.
 
 ```text
-> grant capability network.connect --plugin io.github.godspeed-you.kubernetes
-> grant capability provider.mutate --plugin io.github.godspeed-you.kubernetes   # only to write
-
+> install plugin kubernetes                              # one prompt: the recommended access
 > get k8s-pod --context prod --namespace shop | where phase == "Running"
 > get k8s-pod --context prod --namespace shop --selector 'app=api,tier!=cache'   # pushed to the server
 > get k8s-pod --context prod --namespace shop | take 1 | enter; look             # an object is a place
@@ -57,22 +57,54 @@ Ono verb that already existed. Reading is `get`; the two words that write are co
 > remove k8s-resource --context prod --kind Pod --name api-7d9f
 ```
 
-**What needs a granted capability.** Nothing reaches a cluster without
-`network.connect`; without the grant the invocation fails with `capability.denied` and the server
-sees no request at all. Reading a kubeconfig needs `filesystem.read`, declared in the manifest and
-pinned to `~/.kube/config` and `~/.kube/*.yaml` rather than to the filesystem. `set k8s-resource`
-declares `risk: mutate` and `remove k8s-resource` declares `risk: destructive`, and the host
-applies its own confirmation policy to those descriptors — this package prompts for nothing of its
-own. **`dry_run` defaults to `true`**, so the shortest sentence you can write asks the API server
-to run admission and persist nothing; `--dry_run false` is the one place you are asked to be
-explicit about which of the two you meant.
+**What you are asked, and what it means.** `install plugin kubernetes` shows the recommended
+access in plain words and installs on `Y`:
 
-Reading a cluster and changing one are two grants. `network.connect` is the authority to reach
-the API server at all; **`provider.mutate` is the authority to change state in it**, declared by
-`set k8s-resource` and `remove k8s-resource` and checked by the host at every invocation before any
-of this package's code runs. An operator who grants only `network.connect` gets a read-only
-provider that cannot send a write. A mutation needs both grants; the `risk` descriptor and the
-dry-run default sit on top of that boundary rather than in place of it.
+```text
+Recommended access:
+  - Connect to Kubernetes clusters
+  - Read Kubernetes configuration (paths ~/.kube/config, ~/.kube/*.yaml)
+  - Use Kubernetes credentials
+  - Add Kubernetes relationships to Ono
+  - Keep plugin state and read the clock
+
+Asked only when needed:
+  - Run an external login helper
+
+Not granted:
+  - Change Kubernetes resources
+
+Install with recommended access? [Y/n/details]
+```
+
+Each line is a **permission** of `package/manifest.yaml` — a user-facing statement that resolves
+to exact KUANG/11 capabilities the host grants on its behalf: `network.connect`, `filesystem.read`
+pinned to `~/.kube/config` and `~/.kube/*.yaml` rather than to the filesystem, `secret.use`, a
+`relation.write` bounded to this package's own relation shapes, `state.persist` and `clock.read`.
+`details` shows every one of them with its scope, enforcement and duration, and
+`get permission kubernetes` shows the same afterwards. The host classifies each capability and
+this package cannot lower the class: nothing that changes a cluster can sit in a recommended
+profile, and a manifest that tried would be refused before any of its code ran. The design is
+`ADR-0600 (core)` through `ADR-0605 (core)`, and ADR-0070 here; the contract is
+`docs/contracts/kuang/permissions.v1.yaml` in the core repository.
+
+Nothing reaches a cluster without *Connect to Kubernetes clusters*; with it denied the invocation
+fails with `capability.denied` and the server sees no request at all. `set k8s-resource` declares
+`risk: mutate` and `remove k8s-resource` declares `risk: destructive`, and the host applies its own
+confirmation policy to those descriptors — this package prompts for nothing of its own.
+**`dry_run` defaults to `true`**, so the shortest sentence you can write asks the API server to run
+admission and persist nothing; `--dry_run false` is the one place you are asked to be explicit
+about which of the two you meant.
+
+Reading a cluster and changing one are two decisions. **`provider.mutate` is the authority to
+change state in the cluster**, declared by `set k8s-resource` and `remove k8s-resource` and checked
+by the host at every invocation before any of this package's code runs — and it is in no
+recommended profile. The recommended install is a read-only provider that cannot send a write;
+`set permission kubernetes --profile operate` (or `… cluster-mutation --decision allow`) is the
+deliberate step that enables it, with its own confirmation, and until then a mutation fails with
+`permission.denied` naming that step. The `risk` descriptor and the dry-run default sit on top of
+that boundary rather than in place of it. A script names the profile: `install plugin kubernetes
+--access operate --confirm`.
 
 Every flag above is declared and reaches the registry, so `help get k8s-pod` and
 `help set k8s-resource` list them with their types and defaults — including `--dry_run`, which is
@@ -86,12 +118,26 @@ relationship verb, bound to core targets, so a Kubernetes object's graph is walk
 comparison. Both wait on a generic core increment rather than on this provider. Each limit is named
 with its reason in [`docs/coverage.md`](docs/coverage.md).
 
-**What needs one more grant.** A kubeconfig authenticating through an `exec` credential plugin —
+**What is asked for later.** A kubeconfig authenticating through an `exec` credential plugin —
 which is how EKS, GKE and AKS are usually configured — runs that plugin under `process.exec`, and
-under nothing less: §8.2 requires an explicit process-execution capability, so without the grant
-the context is refused by name and nothing is run. Scope it to the one program your cloud installs
-— `--grant process.exec` with `programs` naming it — and the helper gets the environment your
-kubeconfig declares and nothing inherited.
+under nothing less: §8.2 requires an explicit process-execution capability. You were not asked for
+it at install. The first context that needs a helper is the moment you are asked, for that one
+program:
+
+```text
+Kubernetes needs to run an external program to authenticate to the selected context:
+  /usr/local/bin/aws
+Allow this helper? [o] once  [s] this session  [a] always for this program  [n] deny  [d] details
+```
+
+`always` is a grant scoped to exactly that program, kept across sessions and visible under
+`get permission kubernetes`. A script cannot be asked and gets `permission.required` with the line
+that would allow it — `set permission kubernetes credential-helper --decision allow --scope
+programs=/usr/local/bin/aws`. Either way the helper gets the environment your kubeconfig declares
+and nothing inherited.
+
+`grant capability` and `revoke capability` still exist, as the raw administrative mechanism under
+all of this; `get permission kubernetes --all` shows how each permission maps onto them.
 
 ## What the provider is for
 
@@ -141,12 +187,12 @@ Both are canonical in that repository and are deliberately not copied here.
 
 | | |
 |---|---|
-| KUANG/11 package format | `kuang-package/1`, `kuang_api >=11.1 <12` |
+| KUANG/11 package format | `kuang-package/2` — `/1` plus the `permissions` section — and `kuang_api >=11.2 <12`, the host API that answers `capabilities.check` with `ask` and holds a `process.exec` call on a person's consent (`ADR-0600 (core)`, `ADR-0603 (core)`) |
 | Ono-Sendai core, to build | the revision `Cargo.toml` pins, which carries `ADR-0588 (core)` — a contributed target declares whether its answer ends, which is what lets a watch reach the shell as a live stream rather than as a table that never arrives |
 | Ono-Sendai core, to run | **at or after `ADR-0590 (core)`**, which is the revision every manifest here pins and CI builds the shell from. `ADR-0588 (core)` is what makes `get k8s-change` and `get k8s-log --follow` stream rather than be collected; `ADR-0590 (core)` is what makes a refusal from either of them *reach you*, and a host between the two answers an empty table where this provider refused |
 | Kubernetes versions | **v1.35 – v1.37**, which is what upstream maintained on the specification's snapshot date (§0.5, §5.1). The claim is a tested matrix rather than a parser guard: nothing in the provider inspects `gitVersion`, and a cluster outside the window may work perfectly (§5.2) |
 | Kubernetes versions actually exercised | **v1.35.8, v1.36.4 and v1.37.0** — the declared oldest, the one between and the newest — on ephemeral `kind` clusters in CI and on demand through `scripts/cluster.sh` (§5.5, §59.3, Gate N) |
-| Releases of this provider | **v0.1.0** — the first, built from this repository as a KUANG/11 package |
+| Releases of this provider | **v0.2.0** — the package under the KUANG/11 permission contract; v0.1.0 was the first, built from this repository as a KUANG/11 package |
 
 The provider is discovery-first by construction: every REST path is built from what the connected
 API server says it serves, and no endpoint is compiled in (§5.2). The matrix above is what CI

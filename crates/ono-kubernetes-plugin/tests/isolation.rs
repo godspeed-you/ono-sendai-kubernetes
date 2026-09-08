@@ -49,6 +49,7 @@ use ono_kuang_sdk::protocol::{Capability, InvokeStatus, ShutdownReason};
 use ono_kuang_supervisor::{
     Connection, HostError, HostLimits, HostServices, LiveStream, StreamEvent,
 };
+use ono_kuang_supervisor::{ConsentAnswer, ConsentDuration, ScriptedConsent};
 use ono_kuang_testhost::TestHost;
 use ono_kubernetes_plugin::broker::encode_hex;
 use ono_value::{RecordValue, Value};
@@ -878,13 +879,40 @@ contexts:
         self.loaded_with_credit(1).await
     }
 
-    /// The same instance, with §8.2's process-execution grant.
+    /// The same instance, with §8.2's process-execution grant already made — what a person's
+    /// `always` answer, or `set permission kubernetes credential-helper --decision allow`, leaves
+    /// behind.
     ///
     /// A separate loader rather than a flag on the default one, because the *absence* of the grant
     /// is what every other test in this file runs under and is itself a behaviour §8.2 requires:
-    /// a package that was not granted it refuses by name and runs nothing.
+    /// a package nobody allowed to run a helper runs nothing.
     async fn loaded_with_process_exec(&self) -> ono_kuang_supervisor::LoadedPlugin {
         self.host_granting(Some(Capability::ProcessExec))
+            .load()
+            .await
+            .expect("the package loads under its own manifest")
+    }
+
+    /// The same instance, with a person at the other end of the `credential-helper` permission
+    /// who answers what `answers` says (K11P §14; `ADR-0603 (core)`).
+    async fn loaded_asking(
+        &self,
+        answers: impl IntoIterator<Item = ConsentAnswer>,
+    ) -> (ono_kuang_supervisor::LoadedPlugin, Arc<ScriptedConsent>) {
+        let consent = ScriptedConsent::answering(answers);
+        let plugin = self
+            .host_granting(None)
+            .consent(consent.clone())
+            .load()
+            .await
+            .expect("the package loads under its own manifest");
+        (plugin, consent)
+    }
+
+    /// The same instance, under a decision already made against running a helper.
+    async fn loaded_denying_process_exec(&self) -> ono_kuang_supervisor::LoadedPlugin {
+        self.host_granting(None)
+            .deny(Capability::ProcessExec)
             .load()
             .await
             .expect("the package loads under its own manifest")
@@ -1621,16 +1649,18 @@ async fn should_authenticate_through_the_credential_plugin_a_kubeconfig_names() 
 }
 
 #[tokio::test]
-async fn should_refuse_to_run_a_credential_plugin_without_the_capability_that_governs_it() {
+async fn should_refuse_to_run_a_credential_plugin_when_the_permission_is_denied() {
     // §8.2: "execution MUST occur only through an explicit KUANG/11 process-execution
-    // capability." The refusal is what this package did for every such context before the
-    // capability existed, and it is still what an operator who did not grant it gets.
+    // capability." A decision already made against it — `set permission kubernetes
+    // credential-helper --decision deny`, or a policy deny — is answered `denied` by
+    // `capabilities.check`, and the package refuses before the program name is assembled.
     //
     // The important half is the *negative*: nothing was run. A package that composed the request
     // and let the host refuse it would be relying on the broker to enforce a rule §8.2 puts on
-    // the provider, and the difference shows in a host whose policy is `Ask`.
+    // the provider. The remedy it names is the permission, in a person's words, and never the
+    // raw grant (K11P §16.2, ADR-0070).
     let fixture = Fixture::build();
-    let plugin = fixture.loaded().await;
+    let plugin = fixture.loaded_denying_process_exec().await;
 
     let invocation = plugin
         .query("k8s-pod", fixture.context("helper"))
@@ -1643,14 +1673,13 @@ async fn should_refuse_to_run_a_credential_plugin_without_the_capability_that_go
     let error = result.error.expect("a structured refusal");
     assert!(
         error.message.contains("cloud-cli") && error.message.contains("process.exec"),
-        "the refusal names the helper and the grant that would run it: {error:?}"
+        "the refusal names the helper and the capability underneath: {error:?}"
     );
+    let help = error.help.unwrap_or_default();
     assert!(
-        error
-            .help
-            .unwrap_or_default()
-            .contains("--grant process.exec"),
-        "and says how to grant it"
+        help.contains("set permission kubernetes credential-helper")
+            && help.contains("programs=cloud-cli"),
+        "and says which permission would allow exactly this helper: {help}"
     );
     assert!(
         fixture
@@ -1665,6 +1694,101 @@ async fn should_refuse_to_run_a_credential_plugin_without_the_capability_that_go
         fixture.alpha.heads().is_empty() && fixture.beta.heads().is_empty(),
         "and no request reached either cluster"
     );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_refuse_to_run_a_credential_plugin_when_nobody_can_be_asked_for_it() {
+    // K11P §20.3: the `credential-helper` permission is decided just in time, so a host with
+    // nobody to ask — a script, a pipeline — answers the `process.exec` call itself with
+    // `permission.required`, naming the permission and the line that would allow it. The
+    // package composed the request, because `capabilities.check` said `ask` rather than
+    // `denied`; the host is what held it, and no program ran.
+    let fixture = Fixture::build();
+    let plugin = fixture.loaded().await;
+
+    let invocation = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+
+    assert!(records(&events).is_empty(), "nothing was answered");
+    assert_eq!(result.status, InvokeStatus::Failed);
+    let error = result.error.expect("a structured refusal");
+    assert_eq!(
+        error.name, "permission.required",
+        "the host's own answer reaches the caller unchanged: {error:?}"
+    );
+    let said = format!("{error:?}");
+    assert!(
+        said.contains("credential-helper") && said.contains("cloud-cli"),
+        "it names the permission and the exact program: {said}"
+    );
+    assert!(
+        fixture
+            .fleet
+            .ran
+            .lock()
+            .expect("the record is readable")
+            .is_empty(),
+        "nothing was run"
+    );
+    assert!(
+        fixture.alpha.heads().is_empty() && fixture.beta.heads().is_empty(),
+        "and no request reached either cluster"
+    );
+
+    plugin.shutdown(ShutdownReason::Unload).await;
+}
+
+#[tokio::test]
+async fn should_run_the_credential_plugin_once_a_person_allows_that_helper_at_first_use() {
+    // K11P §14.2, §26.3: the first context that needs a helper is the moment the person is asked
+    // — for *that* program, with the permission's own words — and never at install. One `once`
+    // answer runs the helper once; the request the host put to the person carried the exact
+    // program the kubeconfig named, which is what makes the answer a decision about something.
+    let fixture = Fixture::build();
+    let (plugin, consent) = fixture
+        .loaded_asking([ConsentAnswer::Allow {
+            duration: ConsentDuration::Once,
+            scope: None,
+        }])
+        .await;
+
+    let invocation = plugin
+        .query("k8s-pod", fixture.context("helper"))
+        .await
+        .expect("the query starts");
+    let (events, result) = invocation.collect().await;
+    assert_eq!(result.status, InvokeStatus::Completed, "{:?}", result.error);
+    assert_eq!(
+        records(&events)
+            .iter()
+            .filter_map(|record| text_of(record, "name"))
+            .collect::<Vec<_>>(),
+        vec!["alpha-till".to_owned()],
+        "the helper's token reached the cluster and the cluster answered"
+    );
+
+    let asked = consent.asked();
+    assert_eq!(asked.len(), 1, "one question, at first use: {asked:?}");
+    assert_eq!(asked[0].permission.id, "credential-helper");
+    assert_eq!(asked[0].capability, Capability::ProcessExec);
+    assert_eq!(
+        asked[0].program(),
+        Some("cloud-cli"),
+        "the question names the one program the kubeconfig names: {:?}",
+        asked[0]
+    );
+    let ran = fixture
+        .fleet
+        .ran
+        .lock()
+        .expect("the record is readable")
+        .clone();
+    assert_eq!(ran.len(), 1, "one helper was run: {ran:?}");
 
     plugin.shutdown(ShutdownReason::Unload).await;
 }

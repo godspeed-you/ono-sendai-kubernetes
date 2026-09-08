@@ -127,16 +127,22 @@ impl Drop for Scratch {
     }
 }
 
-/// Lays this repository's package out the way an operator installs one.
+/// Lays this repository's package out and installs it the way an operator does: the package in
+/// a source directory, and one `install plugin` that accepts the recommended access (K11P §12,
+/// §26.2; `ADR-0602 (core)`).
 ///
 /// The documents are the real ones, byte for byte: `contributions.relations` is read from
 /// `package/manifest.yaml` and the schema ids its shapes name are read from
 /// `package/contributions/targets.yaml`, which is exactly the pair the host settles against each
 /// other at load (`ADR-0585 (core)`). A fixture manifest here would prove something about the
 /// fixture.
-fn plugin_home(name: &str) -> Scratch {
+///
+/// Nothing is granted by hand. `install plugin … --confirm` is the recommended profile of
+/// `package/manifest.yaml`: `network.connect` and the automatic `spatial-relations`, which is what
+/// puts the edges below into the shell's map without a `relation.write` anybody typed.
+fn plugin_home(binary: &Path, name: &str) -> Scratch {
     let scratch = Scratch::new(name);
-    let package = scratch.path().join("plugins").join(PACKAGE);
+    let package = scratch.path().join("sources").join(PACKAGE);
     std::fs::create_dir_all(package.join("runtime")).expect("the runtime directory");
     std::fs::create_dir_all(package.join("contributions")).expect("the contributions directory");
     std::fs::write(package.join("manifest.yaml"), MANIFEST).expect("the manifest");
@@ -144,9 +150,21 @@ fn plugin_home(name: &str) -> Scratch {
     std::fs::write(package.join("contributions/schemas.yaml"), SCHEMAS).expect("the schemas");
     std::fs::write(package.join("contributions/commands.yaml"), COMMANDS).expect("the commands");
     std::fs::copy(PLUGIN, package.join("runtime/ono-kubernetes")).expect("the package binary");
-    for directory in ["home", "state", "config/ono"] {
+    for directory in ["home", "plugins", "state", "config/ono"] {
         std::fs::create_dir_all(scratch.path().join(directory)).expect("the scratch directories");
     }
+    let installed = shell(
+        binary,
+        &scratch,
+        &format!(
+            "install plugin path:{} --confirm | select status | to json",
+            package.display()
+        ),
+    );
+    assert!(
+        installed.stdout.contains("\"success\""),
+        "the package installs with its recommended access: {installed:?}"
+    );
     scratch
 }
 
@@ -204,17 +222,12 @@ fn shell(binary: &Path, home: &Scratch, script: &str) -> Run {
     }
 }
 
-/// The `load plugin` line, with the grants a test wants.
-fn load(grants: &[&str]) -> String {
-    let grants: String = grants
-        .iter()
-        .map(|grant| format!(" --grant {grant}"))
-        .collect();
-    format!("load plugin {PACKAGE}{grants}")
+/// The `load plugin` line. Nothing is granted on it: what the package may do was decided when it
+/// was installed, and a `lazy` package would load on first use anyway — the line only makes the
+/// moment explicit in a script whose next statement is the one under test.
+fn load() -> String {
+    format!("load plugin {PACKAGE}")
 }
-
-/// The two grants an operator gives before any of this is reachable.
-const SPATIAL_GRANTS: &[&str] = &["network.connect", "clock.read", "relation.write"];
 
 // --- the recorded API server ---------------------------------------------------------------------
 
@@ -443,11 +456,11 @@ fn document(path: &str) -> Option<Json> {
 
 /// The script prefix every test shares: the package loaded, and the shell standing on the second
 /// of the two Pods that share a name.
-fn standing_on_the_pod(cluster: &RecordedCluster, grants: &[&str], then: &str) -> String {
+fn standing_on_the_pod(cluster: &RecordedCluster, then: &str) -> String {
     format!(
         "{}; get k8s-pod --host 127.0.0.1 --port {} --namespace shop \
          | where uid == \"{SECOND_POD}\" | enter; {then}",
-        load(grants),
+        load(),
         cluster.port
     )
 }
@@ -477,13 +490,13 @@ fn should_hand_a_watch_to_the_shell_as_a_stream_rather_than_a_table() {
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("watch-stream");
+    let home = plugin_home(&binary, "watch-stream");
     let run = shell(
         &binary,
         &home,
         &format!(
             "{}; get k8s-change --host 127.0.0.1 --port {} --namespace shop --kind Pod",
-            load(&["network.connect", "clock.read"]),
+            load(),
             cluster.port
         ),
     );
@@ -502,7 +515,7 @@ fn should_hand_a_watch_to_the_shell_as_a_stream_rather_than_a_table() {
         &home,
         &format!(
             "{}; get k8s-pod --host 127.0.0.1 --port {} --namespace shop | count | to json",
-            load(&["network.connect", "clock.read"]),
+            load(),
             cluster.port
         ),
     );
@@ -543,10 +556,10 @@ fn should_reach_the_registry_with_every_argument_this_package_declares() {
             );
         }
     };
-    let home = plugin_home("registry");
+    let home = plugin_home(&binary, "registry");
 
     for word in ["get k8s-pod", "set k8s-resource", "remove k8s-resource"] {
-        let run = shell(&binary, &home, &format!("{}; help {word}", load(&[])));
+        let run = shell(&binary, &home, &format!("{}; help {word}", load()));
         assert!(
             !run.stdout.contains("resolve.command_not_found")
                 && !run.stderr.contains("resolve.command_not_found"),
@@ -567,7 +580,7 @@ fn should_reach_the_registry_with_every_argument_this_package_declares() {
     let run = shell(
         &binary,
         &home,
-        &format!("{}; help set k8s-resource", load(&[])),
+        &format!("{}; help set k8s-resource", load()),
     );
     assert!(
         run.stdout.contains("--dry_run") && run.stdout.contains("bool (default true)"),
@@ -594,15 +607,11 @@ fn should_enter_a_kubernetes_object_as_a_place_bound_to_its_lifetime() {
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("enter");
+    let home = plugin_home(&binary, "enter");
     let run = shell(
         &binary,
         &home,
-        &standing_on_the_pod(
-            &cluster,
-            &["network.connect", "clock.read"],
-            "look | to json",
-        ),
+        &standing_on_the_pod(&cluster, "look | to json"),
     );
     let here = run.rows();
     assert_eq!(here.len(), 1, "`look` reports one place, got {run:?}");
@@ -645,14 +654,14 @@ fn should_keep_two_pods_of_one_name_apart_as_two_places() {
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("identity");
+    let home = plugin_home(&binary, "identity");
     let run = shell(
         &binary,
         &home,
         &format!(
             "{}; get k8s-pod --host 127.0.0.1 --port {} --namespace shop | enter; \
              find place --type KubernetesPod | to json",
-            load(&["network.connect", "clock.read"]),
+            load(),
             cluster.port
         ),
     );
@@ -696,11 +705,11 @@ fn should_answer_near_with_the_neighbours_this_package_contributes() {
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("near");
+    let home = plugin_home(&binary, "near");
     let run = shell(
         &binary,
         &home,
-        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "near | to json"),
+        &standing_on_the_pod(&cluster, "near | to json"),
     );
     let neighbours = run.rows();
     let by_relation = |word: &str| -> Option<Json> {
@@ -773,13 +782,12 @@ fn should_follow_a_contributed_relation_to_the_node_a_pod_runs_on() {
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("follow");
+    let home = plugin_home(&binary, "follow");
     let run = shell(
         &binary,
         &home,
         &standing_on_the_pod(
             &cluster,
-            SPATIAL_GRANTS,
             "follow io.github.godspeed-you.kubernetes.pod_to_node; look | to json",
         ),
     );
@@ -815,13 +823,12 @@ fn should_reach_the_namespace_a_pod_is_in_without_routing_it_through_the_owner()
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("containment");
+    let home = plugin_home(&binary, "containment");
     let run = shell(
         &binary,
         &home,
         &standing_on_the_pod(
             &cluster,
-            SPATIAL_GRANTS,
             "follow io.github.godspeed-you.kubernetes.pod_to_namespace; look | to json",
         ),
     );
@@ -838,7 +845,6 @@ fn should_reach_the_namespace_a_pod_is_in_without_routing_it_through_the_owner()
         &home,
         &standing_on_the_pod(
             &cluster,
-            SPATIAL_GRANTS,
             "follow io.github.godspeed-you.kubernetes.pod_to_replicaset; look | to json",
         ),
     );
@@ -868,11 +874,11 @@ fn should_go_up_from_a_pod_to_its_namespace_and_from_there_to_the_cluster() {
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("up");
+    let home = plugin_home(&binary, "up");
     let run = shell(
         &binary,
         &home,
-        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "up; look | to json"),
+        &standing_on_the_pod(&cluster, "up; look | to json"),
     );
     let place = &run.rows()[0]["place"];
     assert_eq!(
@@ -885,7 +891,7 @@ fn should_go_up_from_a_pod_to_its_namespace_and_from_there_to_the_cluster() {
     let run = shell(
         &binary,
         &home,
-        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "up; up; look | to json"),
+        &standing_on_the_pod(&cluster, "up; up; look | to json"),
     );
     let place = &run.rows()[0]["place"];
     assert_eq!(
@@ -894,11 +900,7 @@ fn should_go_up_from_a_pod_to_its_namespace_and_from_there_to_the_cluster() {
         "two `up`s from a Pod is the provider instance, got {run:?}"
     );
 
-    let run = shell(
-        &binary,
-        &home,
-        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "up; up; up"),
-    );
+    let run = shell(&binary, &home, &standing_on_the_pod(&cluster, "up; up; up"));
     let said = format!("{}{}", run.stdout, run.stderr);
     assert!(
         said.contains("spatial.no_parent") && said.contains("top of what its package contributes"),
@@ -909,11 +911,7 @@ fn should_go_up_from_a_pod_to_its_namespace_and_from_there_to_the_cluster() {
     let run = shell(
         &binary,
         &home,
-        &standing_on_the_pod(
-            &cluster,
-            SPATIAL_GRANTS,
-            "up; up; back; back; look | to json",
-        ),
+        &standing_on_the_pod(&cluster, "up; up; back; back; look | to json"),
     );
     let place = &run.rows()[0]["place"];
     assert_eq!(
@@ -940,13 +938,13 @@ fn should_enter_the_cluster_and_find_its_namespaces_and_nodes_among_the_exits() 
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("cluster");
+    let home = plugin_home(&binary, "cluster");
     let run = shell(
         &binary,
         &home,
         &format!(
             "{}; get k8s-cluster --host 127.0.0.1 --port {} | enter; near | to json",
-            load(SPATIAL_GRANTS),
+            load(),
             cluster.port
         ),
     );
@@ -979,15 +977,11 @@ fn should_find_workloads_by_role_across_the_kinds_that_carry_it() {
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("roles");
+    let home = plugin_home(&binary, "roles");
     let run = shell(
         &binary,
         &home,
-        &standing_on_the_pod(
-            &cluster,
-            SPATIAL_GRANTS,
-            "find place --role workload | to json",
-        ),
+        &standing_on_the_pod(&cluster, "find place --role workload | to json"),
     );
     let rows = run.rows();
     let mut kinds: Vec<&str> = rows
@@ -1014,7 +1008,7 @@ fn should_find_workloads_by_role_across_the_kinds_that_carry_it() {
     let refused = shell(
         &binary,
         &home,
-        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "find place --role nonsense"),
+        &standing_on_the_pod(&cluster, "find place --role nonsense"),
     );
     assert!(
         refused
@@ -1047,14 +1041,14 @@ fn should_refuse_trace_on_a_kubernetes_noun_by_name_rather_than_answer_an_empty_
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("trace");
+    let home = plugin_home(&binary, "trace");
     let run = shell(
         &binary,
         &home,
         &format!(
             "{}; trace k8s-pod --host 127.0.0.1 --port {} --namespace shop --name checkout \
              | to json",
-            load(SPATIAL_GRANTS),
+            load(),
             cluster.port
         ),
     );
@@ -1077,7 +1071,7 @@ fn should_refuse_trace_on_a_kubernetes_noun_by_name_rather_than_answer_an_empty_
     let run = shell(
         &binary,
         &home,
-        &standing_on_the_pod(&cluster, SPATIAL_GRANTS, "near | to json"),
+        &standing_on_the_pod(&cluster, "near | to json"),
     );
     assert!(
         !run.rows().is_empty(),
@@ -1086,37 +1080,46 @@ fn should_refuse_trace_on_a_kubernetes_noun_by_name_rather_than_answer_an_empty_
 }
 
 #[test]
-fn should_open_no_exit_from_a_kubernetes_place_without_the_relation_write_grant() {
-    // §35.5 puts the capability filter before the merge, and §31.19 never grants
-    // `relation.write` by default. So the same `near` that answered above answers with nothing
-    // here — and the difference between "no edges" and "not allowed to contribute edges" is one
-    // the *shell* does not draw, because a package without the grant is never asked. The package
+fn should_open_no_exit_from_a_kubernetes_place_when_its_spatial_relations_are_denied() {
+    // §35.5 puts the capability filter before the merge. `spatial-relations` is automatic — the
+    // install above included it without a prompt, because a `relation.write` bounded to the
+    // package's own shapes is class A (K11P §7.1, `ADR-0600 (core)`) — and a decision a person
+    // makes against it is kept: the same `near` that answered above answers with nothing here.
+    // The difference between "no edges" and "not allowed to contribute edges" is one the *shell*
+    // does not draw, because a package whose permission is denied is never asked. The package
     // draws it where it can: invoking the contribution directly is `capability.denied` naming
     // `relation.write`, which `tests/query.rs` holds.
     let binary = match ono() {
         Ok(binary) => binary,
         Err(missing) => {
             return announce_skip(
-                "should_open_no_exit_from_a_kubernetes_place_without_the_relation_write_grant",
+                "should_open_no_exit_from_a_kubernetes_place_when_its_spatial_relations_are_denied",
                 "external_tool_unavailable",
                 &missing,
             );
         }
     };
     let cluster = RecordedCluster::start();
-    let home = plugin_home("ungranted");
-    let run = shell(
+    let home = plugin_home(&binary, "denied");
+    let denied = shell(
         &binary,
         &home,
-        &standing_on_the_pod(
-            &cluster,
-            &["network.connect", "clock.read"],
-            "near | to json",
+        &format!(
+            "set permission {PACKAGE} spatial-relations --decision deny | select state | to json"
         ),
     );
     assert!(
+        denied.stdout.contains("denied"),
+        "the automatic permission can be denied by name: {denied:?}"
+    );
+    let run = shell(
+        &binary,
+        &home,
+        &standing_on_the_pod(&cluster, "near | to json"),
+    );
+    assert!(
         run.rows().is_empty(),
-        "without the grant the package contributes no relation, so the place has no exits: \
-         {run:?}"
+        "with the permission denied the package contributes no relation, so the place has no \
+         exits: {run:?}"
     );
 }

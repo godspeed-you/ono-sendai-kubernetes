@@ -20,7 +20,7 @@
 //! environment and the stdio; this package owns the decision and the parse.
 
 use ono_kuang_sdk::Ctx;
-use ono_kuang_sdk::protocol::{WireError, method};
+use ono_kuang_sdk::protocol::{CheckAnswer, WireError, method};
 use ono_provider_kubernetes::exec::{ExecCredential, ExecPlugin};
 use ono_provider_kubernetes::kubeconfig::Secret;
 use ono_provider_kubernetes::transport::{Clock as _, SystemClock};
@@ -69,27 +69,51 @@ pub(crate) fn run(
     context: &str,
     instance: &str,
 ) -> Result<Ran, WireError> {
-    // The grant first, before the program name is assembled, so a package without it never even
-    // composes the request. §21.4 of the generic contract: this is a *local* block and not
-    // anything the cluster said, and the message says so.
-    if !matches!(
-        ctx.check_capability(PROCESS_EXEC),
-        Ok(ono_kuang_sdk::protocol::CheckAnswer::Granted)
-    ) {
-        audit::refused_locally(ctx, instance, PROCESS_EXEC, "credential plugin");
-        return Err(failure(
-            UNSUPPORTED_CODE,
-            UNSUPPORTED,
-            format!(
-                "context `{context}` authenticates through the credential plugin `{}`, and this \
-                 package was not granted `{PROCESS_EXEC}`",
-                plugin.command()
-            ),
-            "§8.2 requires an explicit process-execution capability for a credential plugin. \
-             Grant it — `load plugin io.github.godspeed-you.kubernetes --grant process.exec` — or \
-             use a context with a token or a client certificate. Nothing was run and no request \
-             reached the cluster.",
-        ));
+    // The decision first, before the program name is assembled, so a package that may not run
+    // a helper never even composes the request. §21.4 of the generic contract: this is a *local*
+    // block and not anything the cluster said, and the message says so.
+    //
+    // `Ask` proceeds. Under `kuang-host/11.2` it means the `credential-helper` permission of this
+    // package decides the family just in time (K11P §14, `ADR-0603 (core)`): the `process.exec`
+    // call below names the one program the kubeconfig names, the host puts exactly that to the
+    // person — or answers `permission.required` where nobody can be asked — and nothing runs
+    // until they say so. `Denied` is a decision already made, and the remedy is the permission,
+    // never the raw grant (ADR-0070).
+    match ctx.check_capability(PROCESS_EXEC) {
+        Ok(CheckAnswer::Granted | CheckAnswer::Ask) => {}
+        Ok(CheckAnswer::Denied) => {
+            audit::refused_locally(ctx, instance, PROCESS_EXEC, "credential plugin");
+            return Err(failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                format!(
+                    "context `{context}` authenticates through the credential plugin `{}`, and \
+                     running a login helper is denied for this package (`{PROCESS_EXEC}`)",
+                    plugin.command()
+                ),
+                &format!(
+                    "§8.2 runs a credential plugin only under an explicit process-execution \
+                     permission. Allow this one — `set permission kubernetes credential-helper \
+                     --decision allow --scope programs={}` — or use a context with a token or a \
+                     client certificate. Nothing was run and no request reached the cluster.",
+                    plugin.command()
+                ),
+            ));
+        }
+        Ok(CheckAnswer::Unknown) | Err(_) => {
+            audit::refused_locally(ctx, instance, PROCESS_EXEC, "credential plugin");
+            return Err(failure(
+                UNSUPPORTED_CODE,
+                UNSUPPORTED,
+                format!(
+                    "context `{context}` authenticates through the credential plugin `{}`, and \
+                     this host could not say whether `{PROCESS_EXEC}` is allowed",
+                    plugin.command()
+                ),
+                "A host that cannot answer `capabilities.check` for `process.exec` is older than \
+                 `kuang-host/11.2`. Nothing was run and no request reached the cluster.",
+            ));
+        }
     }
 
     // §8.2's interaction mode. A package invoked from a pipeline has no terminal to lend, and

@@ -1398,7 +1398,9 @@ async fn should_refuse_a_mutation_to_a_read_only_grant_that_can_reach_the_cluste
     // operator who granted `network.connect` — the authority to *read* a cluster — has not
     // thereby granted the authority to *change* one. The host checks `provider.mutate` at the
     // invocation, so the write is refused before any of this package's code runs, and the
-    // cluster this same grant could read sees no PATCH.
+    // cluster this same grant could read sees no PATCH. Under the permission layer the refusal
+    // is `permission.denied`, leading with the `cluster-mutation` permission a person would
+    // enable rather than with the capability id (K11P §15.1, `ADR-0602 (core)` §5, ADR-0070).
     let cluster = RecordedCluster::playing(Scenario::Accepted);
     let plugin = TestHost::new(PLUGIN, MANIFEST)
         .grant(Capability::NetworkConnect)
@@ -1410,11 +1412,15 @@ async fn should_refuse_a_mutation_to_a_read_only_grant_that_can_reach_the_cluste
         .invoke(SET, scale_down(&[("dry_run", json!(false))]))
         .await
         .expect_err("a read grant does not authorise a write");
-    assert_eq!(refusal.name, "capability.denied");
+    assert_eq!(refusal.name, "permission.denied");
+    let said = format!("{refusal:?}");
     assert!(
-        refusal.message.contains("provider.mutate"),
-        "the refusal names the mutation authority, not the transport: {}",
-        refusal.message
+        said.contains("cluster-mutation") || said.contains("provider.mutate"),
+        "the refusal names the mutation authority, not the transport: {said}"
+    );
+    assert!(
+        !said.contains("network.connect"),
+        "and not the transport: {said}"
     );
     assert!(
         cluster.heads().is_empty(),
