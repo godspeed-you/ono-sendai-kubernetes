@@ -29,7 +29,7 @@ the last two that were not, reach a reader through `changes.rs` and `query.rs`.
 | Specification | `docs/architecture/kubernetes-provider.md` — canonical here, immutable, checksummed |
 | Domain layer | `crates/ono-provider-kubernetes`, twenty-four modules, no host and no cluster |
 | Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations, audit, spatial |
-| Core revision | **`443225bf81ccc52c103bc2058e00165161fb0ac1`** — the one every `Cargo.toml`, `Cargo.lock` and `.github/workflows/ci.yml` resolves to, carrying `ADR-0582 (core)` through `ADR-0605 (core)` — the KUANG/11 permission layer among them; `should_build_the_shell_from_the_revision_this_package_is_built_against` fails if any of them diverge |
+| Core revision | **`e274a9061b13b7a8d2b812bb94bd7bf25324e9f1`** — the one every `Cargo.toml`, `Cargo.lock` and `.github/workflows/ci.yml` resolves to, carrying `ADR-0582 (core)` through `ADR-0605 (core)` — the KUANG/11 permission layer among them; `should_build_the_shell_from_the_revision_this_package_is_built_against` fails if any of them diverge |
 | Contributions | 47 targets, 2 commands, 48 schemas, 64 relation shapes, **zero verbs of this package's own** |
 | Tests | 1072 across the workspace, all green; 29 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
 | Live proof | 18 tests in `live_cluster.rs` against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine. Seventeen announce a skip without one; the eighteenth is a static source scan that never does |
@@ -229,6 +229,16 @@ made `trace`/`diff`'s absence an explicit out-of-scope boundary rather than an a
 **All fourteen acceptance gates of §62 are met**, and the live suite — now 18 tests — was run
 against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`. The workspace is
 **1072 tests, all green**.
+
+### The distribution wrapper (2026-09-08)
+
+**`ono-plugin-kubernetes` is a source, never an installer** (ADR-0071; K11A §22). The plugin crate
+carries `cargo deb` and `cargo generate-rpm` metadata placing the signed payload — manifest,
+contributions, runtime, signature — under `/usr/lib/ono-sendai/plugin-sources/<id>/0.2.0/` with
+the `kuang-system-origin/1` sidecar beside it, no maintainer script, nothing in `/usr/bin`, and a
+lower bound of `ono (>= 0.4.3)`. `scripts/package.sh --key …` builds both and prints the content
+digest a catalog entry states; `tests/packaging.rs` holds the metadata to K11A §11.3 and §17. The
+workspace version is `0.2.0`, what the manifest has declared since ADR-0070.
 
 ### The permission contract (2026-09-08)
 

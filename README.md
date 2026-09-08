@@ -139,6 +139,29 @@ and nothing inherited.
 `grant capability` and `revoke capability` still exist, as the raw administrative mechanism under
 all of this; `get permission kubernetes --all` shows how each permission maps onto them.
 
+**From your distribution's package manager.** The same signed payload ships as a `.deb` and an
+`.rpm` named `ono-plugin-kubernetes` (K11A §22, ADR-0071). Installing one places the payload
+under `/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/<version>/` and
+nothing else — no maintainer script, no activation, no trust, no permission. Ono then does what
+it does for any source:
+
+```text
+$ sudo apt install ono-plugin-kubernetes         # or: sudo dnf install ono-plugin-kubernetes
+$ ono
+> install plugin kubernetes
+Source: system package (ono-plugin-kubernetes)
+…
+Install with recommended access? [Y/n/details]
+```
+
+The package manager grants Ono nothing; the prompt is the same one, and the payload is copied
+into Ono's own store, so `apt upgrade` under the root makes a new candidate and never touches the
+running plugin until you run `install plugin kubernetes` again. `remove plugin kubernetes`
+removes Ono's copy and tells you the system source remains; `apt remove ono-plugin-kubernetes`
+removes that. `scripts/package.sh --key <signing key>` builds both wrappers and prints the
+content digest a catalog entry states; the generic contract is core's
+`docs/specs/kuang11/kuang11-plugin-package-acquisition-system-distribution.md`.
+
 ## What the provider is for
 
 A cloud-native troubleshooting path crosses `Ingress → Service → EndpointSlice → Pod → Node →

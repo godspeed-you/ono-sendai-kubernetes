@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -51,9 +51,9 @@ webpki-roots = "0.26"
 # reference names the commit that carries the change, and moves when somebody moves it on purpose.
 # All four crates come from one revision: they share `ono-kuang-protocol`, and two revisions of it
 # in one tree are two incompatible copies of every type that crosses the boundary.
-ono-kuang-sdk = { git = "https://github.com/godspeed-you/ono-sendai", rev = "443225bf81ccc52c103bc2058e00165161fb0ac1" }
-ono-kuang-protocol = { git = "https://github.com/godspeed-you/ono-sendai", rev = "443225bf81ccc52c103bc2058e00165161fb0ac1" }
-ono-value = { git = "https://github.com/godspeed-you/ono-sendai", rev = "443225bf81ccc52c103bc2058e00165161fb0ac1" }
+ono-kuang-sdk = { git = "https://github.com/godspeed-you/ono-sendai", rev = "e274a9061b13b7a8d2b812bb94bd7bf25324e9f1" }
+ono-kuang-protocol = { git = "https://github.com/godspeed-you/ono-sendai", rev = "e274a9061b13b7a8d2b812bb94bd7bf25324e9f1" }
+ono-value = { git = "https://github.com/godspeed-you/ono-sendai", rev = "e274a9061b13b7a8d2b812bb94bd7bf25324e9f1" }
 
 [profile.dev]
 # Line tables keep test backtraces readable at a fraction of full debuginfo's disk cost.
