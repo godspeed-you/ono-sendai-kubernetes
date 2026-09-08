@@ -29,7 +29,7 @@ the last two that were not, reach a reader through `changes.rs` and `query.rs`.
 | Specification | `docs/architecture/kubernetes-provider.md` — canonical here, immutable, checksummed |
 | Domain layer | `crates/ono-provider-kubernetes`, twenty-four modules, no host and no cluster |
 | Package | `crates/ono-kubernetes-plugin`, the `ono-kubernetes` binary: contributions, broker, sessions, query, dynamic, changes, cluster, records, relations, events, evidence, logs, timeline, why, conditions, planning, mutations, audit, spatial |
-| Core revision | **`ec330e72cbb94b0626b070ceac29571eca37123d`** — the one every `Cargo.toml`, `Cargo.lock` and `.github/workflows/ci.yml` resolves to, carrying `ADR-0582 (core)` through `ADR-0605 (core)` — the KUANG/11 permission layer among them; `should_build_the_shell_from_the_revision_this_package_is_built_against` fails if any of them diverge |
+| Core revision | **`1a2408811453dda9ff357c58be94ec9d97822043`** — the one every `Cargo.toml`, `Cargo.lock` and `.github/workflows/ci.yml` resolves to, carrying `ADR-0582 (core)` through `ADR-0605 (core)` — the KUANG/11 permission layer among them; `should_build_the_shell_from_the_revision_this_package_is_built_against` fails if any of them diverge |
 | Contributions | 47 targets, 2 commands, 48 schemas, 64 relation shapes, **zero verbs of this package's own** |
 | Tests | 1072 across the workspace, all green; 29 announce a skip without a cluster or an `ono` binary, and every one of them is declared in `docs/contracts/expected_test_skips.yaml`, checked in both directions |
 | Live proof | 18 tests in `live_cluster.rs` against real `kind` clusters at all three declared versions — v1.35.8, v1.36.4 and v1.37.0 — with no `kubectl` on the machine. Seventeen announce a skip without one; the eighteenth is a static source scan that never does |
@@ -229,6 +229,18 @@ made `trace`/`diff`'s absence an explicit out-of-scope boundary rather than an a
 **All fourteen acceptance gates of §62 are met**, and the live suite — now 18 tests — was run
 against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`. The workspace is
 **1072 tests, all green**.
+
+### Signed by nobody's key (2026-09-08)
+
+**The wrappers are released from a workflow that holds no secret** (`ADR-0609 (core)`, ADR-0071).
+The payload's signature was ed25519 with a private key somebody had to keep, which is why v0.2.0
+shipped as a source release: this project has no such key and does not want one. Core now verifies
+a keyless signature, so `.github/workflows/release.yml` signs the payload against a certificate
+issued to the run, verifies the bundle it just made against the identity a reader will check, and
+publishes the `.deb`, the `.rpm` and the `.kuang` archive. `scripts/package.sh --keyless` is that
+path, `--key` remains for a local build, and `tests/packaging.rs` holds the workflow to using no
+repository secret. An operator trusts it by enrolling the workflow identity, which the README
+gives verbatim.
 
 ### The distribution wrapper (2026-09-08)
 

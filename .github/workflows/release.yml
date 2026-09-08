@@ -1,0 +1,87 @@
+# The provider's release: the KUANG/11 payload, signed by nobody's key, wrapped as a `.deb` and
+# an `.rpm` that place it under the system source root (K11A §8, §17, §22; ADR-0071,
+# `ADR-0609 (core)`).
+#
+# The whole of the signing material is `id-token: write`: a token this run can prove, exchanged
+# for a certificate that lives about ten minutes. There is no private key here and none in this
+# repository's secrets, which is the point — a plugin publisher should not have to keep one.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The core revision this package is built and verified against, identical to the one every
+  # manifest pins (`should_build_the_shell_from_the_revision_this_package_is_built_against`).
+  ONO_CORE_REV: 1a2408811453dda9ff357c58be94ec9d97822043
+
+jobs:
+  package:
+    name: sign and wrap the payload
+    runs-on: ubuntu-latest
+    permissions:
+      # `contents: write` attaches the assets; `id-token: write` is what keyless signing needs.
+      # Both live on this job alone, and a fork cannot start this workflow: it triggers on a tag.
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # `kuang-sign` comes from the core revision this package pins, so the description it writes
+      # is the one that revision's host recomputes when it verifies (`ADR-0609 (core)`).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: godspeed-you/ono-sendai
+          ref: ${{ env.ONO_CORE_REV }}
+          path: ono-sendai
+
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.62.11
+        with:
+          tool: cargo-deb@3.7.0,cargo-generate-rpm@0.21.0
+
+      # Keyless, pinned by the installer action's commit and by the cosign release it names.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.3"
+
+      - name: build the signing tool from the core revision this package pins
+        run: |
+          cargo build --release --manifest-path ono-sendai/Cargo.toml -p ono-kuang-sdk --bin kuang-sign
+          echo "$GITHUB_WORKSPACE/ono-sendai/target/release" >> "$GITHUB_PATH"
+
+      # Builds the runtime, stages the payload, writes the description, signs it against a
+      # certificate issued to this run, verifies the bundle it just made against the identity a
+      # reader will check, and wraps the result.
+      - name: build, sign and wrap the payload
+        run: scripts/package.sh --keyless
+
+      - name: show what is being published
+        run: ls -l target/debian target/generate-rpm target/payload
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          assets=(
+            "target/debian/ono-plugin-kubernetes_${version}_amd64.deb"
+            "target/generate-rpm/ono-plugin-kubernetes-${version}-1.x86_64.rpm"
+            "target/payload/io.github.godspeed-you.kubernetes-${version}.kuang"
+          )
+          for asset in "${assets[@]}"; do
+            test -f "$asset" || { echo "release: $asset was not built" >&2; exit 1; }
+          done
+          # The tag may already carry a release written by hand; adding to it is the ordinary
+          # case, and creating one is what a tag pushed on its own needs.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --title "$tag" --generate-notes
+          fi

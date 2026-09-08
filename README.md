@@ -154,12 +154,32 @@ Source: system package (ono-plugin-kubernetes)
 Install with recommended access? [Y/n/details]
 ```
 
+**Who signed it, and how to trust them.** The payload is signed without a key: the release
+workflow proves its identity with a short-lived token, a certificate is issued to it for about ten
+minutes, and the public transparency log records that it was used (`ADR-0609 (core)`, ADR-0071).
+Nothing in this repository holds a private key, and there is no secret to leak. Ono verifies that
+offline; to trust it, enrol the identity once:
+
+```yaml
+# ~/.config/ono/kuang/trust.yaml
+format: kuang-trust/1
+identities:
+  - publisher: io.github.godspeed-you
+    issuer: https://token.actions.githubusercontent.com
+    identity: https://github.com/godspeed-you/ono-sendai-kubernetes/.github/workflows/release.yml@refs/tags/*
+    trust: trusted
+```
+
+Until you do, `verify plugin kubernetes` answers `signature: valid` and `trust: unknown`, which
+are two different questions and stay two answers.
+
 The package manager grants Ono nothing; the prompt is the same one, and the payload is copied
 into Ono's own store, so `apt upgrade` under the root makes a new candidate and never touches the
 running plugin until you run `install plugin kubernetes` again. `remove plugin kubernetes`
 removes Ono's copy and tells you the system source remains; `apt remove ono-plugin-kubernetes`
-removes that. `scripts/package.sh --key <signing key>` builds both wrappers and prints the
-content digest a catalog entry states; the generic contract is core's
+removes that. `scripts/package.sh --keyless` is what the release runs, and
+`scripts/package.sh --key <signing key>` builds both wrappers locally and prints the content
+digest a catalog entry states; the generic contract is core's
 `docs/specs/kuang11/kuang11-plugin-package-acquisition-system-distribution.md`.
 
 ## What the provider is for

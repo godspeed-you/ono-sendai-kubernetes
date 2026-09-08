@@ -22,8 +22,8 @@ serde_json = { workspace = true }
 # The deterministic test host of spec §31.73, and the supervisor types its host services are
 # written against. Both come from the same git reference as the SDK, so a plugin is tested
 # against exactly the host revision it is built against.
-ono-kuang-testhost = { git = "https://github.com/godspeed-you/ono-sendai", rev = "ec330e72cbb94b0626b070ceac29571eca37123d" }
-ono-kuang-supervisor = { git = "https://github.com/godspeed-you/ono-sendai", rev = "ec330e72cbb94b0626b070ceac29571eca37123d" }
+ono-kuang-testhost = { git = "https://github.com/godspeed-you/ono-sendai", rev = "1a2408811453dda9ff357c58be94ec9d97822043" }
+ono-kuang-supervisor = { git = "https://github.com/godspeed-you/ono-sendai", rev = "1a2408811453dda9ff357c58be94ec9d97822043" }
 async-trait = "0.1"
 # The recorded cluster speaks TLS in one test, so the package's own `rustls` session has a real
 # server on the other end of it rather than a fixture that replays a handshake.
@@ -57,7 +57,7 @@ assets = [
     ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/manifest.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/", "644"],
     ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/contributions/*.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/contributions/", "644"],
     ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/runtime/ono-kubernetes", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/runtime/", "755"],
-    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/signature.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/", "644"],
+    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/signature.*", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/", "644"],
     ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.0.origin.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/", "644"],
     ["../../README.md", "usr/share/doc/ono-plugin-kubernetes/README.md", "644"],
 ]
@@ -72,7 +72,7 @@ assets = [
     { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/manifest.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/manifest.yaml", mode = "644" },
     { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/contributions/*.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/contributions/", mode = "644" },
     { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/runtime/ono-kubernetes", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/runtime/ono-kubernetes", mode = "755" },
-    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/signature.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/signature.yaml", mode = "644" },
+    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.0/signature.*", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0/", mode = "644" },
     { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.0.origin.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.0.origin.yaml", mode = "644" },
     { source = "../../LICENSE", dest = "/usr/share/licenses/ono-plugin-kubernetes/LICENSE", mode = "644", doc = true },
     { source = "../../README.md", dest = "/usr/share/doc/ono-plugin-kubernetes/README.md", mode = "644", doc = true },

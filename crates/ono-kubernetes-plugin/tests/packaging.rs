@@ -14,6 +14,7 @@ const CRATE_MANIFEST: &str = include_str!("../Cargo.toml");
 const WORKSPACE: &str = include_str!("../../../Cargo.toml");
 const PACKAGE_MANIFEST: &str = include_str!("../../../package/manifest.yaml");
 const SCRIPT: &str = include_str!("../../../scripts/package.sh");
+const RELEASE: &str = include_str!("../../../.github/workflows/release.yml");
 
 const ROOT: &str = "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/";
 
@@ -52,11 +53,14 @@ fn should_name_the_wrapper_ono_plugin_kubernetes_and_place_the_payload_under_the
             text.contains("name = \"ono-plugin-kubernetes\""),
             "[{tool}] is named for the short name"
         );
+        // `signature.` rather than one name: the payload carries the ed25519 document, the
+        // keyless bundle, or both, and the wrapper takes whichever the build produced
+        // (`ADR-0609 (core)`).
         for file in [
             "manifest.yaml",
             "contributions/",
             "runtime/ono-kubernetes",
-            "signature.yaml",
+            "signature.",
         ] {
             assert!(
                 text.contains(&format!(
@@ -134,6 +138,34 @@ fn should_depend_on_a_core_that_reads_the_permission_contract() {
 }
 
 #[test]
+fn should_release_by_signing_with_no_key_anybody_keeps() {
+    // `ADR-0609 (core)`, ADR-0071: the release signs the payload against a certificate issued to
+    // the run. The whole of the signing material is the OIDC token, so the absence of a secret
+    // is the property worth pinning — a workflow that grew one would still pass every other test
+    // here.
+    assert!(
+        !RELEASE.contains("secrets."),
+        "the release workflow uses no repository secret"
+    );
+    assert!(
+        RELEASE.contains("id-token: write") && RELEASE.contains("contents: write"),
+        "it asks for the token that signs and the permission that publishes, and nothing else"
+    );
+    assert!(
+        RELEASE.contains("scripts/package.sh --keyless"),
+        "and it signs the payload the keyless way"
+    );
+    assert!(
+        SCRIPT.contains("cosign sign-blob --yes") && SCRIPT.contains("cosign verify-blob"),
+        "the script signs and then checks what it made, before anything is wrapped"
+    );
+    assert!(
+        SCRIPT.contains("--certificate-identity-regexp"),
+        "against the identity a reader will check, not merely against any certificate"
+    );
+}
+
+#[test]
 fn should_sign_the_payload_it_wraps_and_state_the_digest_a_catalog_needs() {
     // K11A §5, §17.2, §22: the wrapper carries the same signed payload a catalog install would
     // verify, unchanged, and the script prints the content digest a catalog release states.
@@ -142,8 +174,8 @@ fn should_sign_the_payload_it_wraps_and_state_the_digest_a_catalog_needs() {
         "the payload is signed before it is wrapped"
     );
     assert!(
-        SCRIPT.contains("--key <signing key> is required"),
-        "and an unsigned wrapper is refused"
+        SCRIPT.contains("name how the payload is signed"),
+        "and a wrapper that names neither way of signing is refused"
     );
     assert!(
         SCRIPT.contains("\"$sign\" digest \"$payload\""),
