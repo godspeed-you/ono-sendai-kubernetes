@@ -166,6 +166,28 @@ fn should_release_by_signing_with_no_key_anybody_keeps() {
 }
 
 #[test]
+fn should_refuse_a_tag_that_disagrees_with_the_declared_version_before_it_builds() {
+    // The asset names come from the tag and the payload directory comes from the manifest, so a
+    // tag that names a version the tree does not declare produces files nobody asked for. The
+    // first v0.2.1 release found that out after a full build, when the publish step looked for a
+    // `.deb` `cargo deb` had written under the other name. The check belongs before the build.
+    let check = RELEASE
+        .find("read the version this tree declares")
+        .expect("the release workflow checks the tag against the declared version");
+    let build = RELEASE
+        .find("scripts/package.sh --keyless")
+        .expect("and it builds the payload");
+    assert!(
+        check < build,
+        "the check runs before the build, so a mismatch costs seconds rather than a whole run"
+    );
+    assert!(
+        RELEASE.contains("package/manifest.yaml"),
+        "the version it compares against is the one the payload directory is named for"
+    );
+}
+
+#[test]
 fn should_sign_the_payload_it_wraps_and_state_the_digest_a_catalog_needs() {
     // K11A §5, §17.2, §22: the wrapper carries the same signed payload a catalog install would
     // verify, unchanged, and the script prints the content digest a catalog release states.

@@ -230,6 +230,16 @@ made `trace`/`diff`'s absence an explicit out-of-scope boundary rather than an a
 against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`. The workspace is
 **1072 tests, all green**.
 
+### v0.2.1, and the version a tag names (2026-09-08)
+
+**The package is `0.2.1`**, which is what the payload directory, the wrapper asset names and the
+manifest all say. The first attempt at the release found the reason to bump it: the tag was pushed
+as `v0.2.1` while every version in the tree still read `0.2.0`, so `cargo deb` wrote a file the
+publish step was not looking for and nothing was attached. The workflow now reads the manifest and
+refuses a tag that disagrees with it, before it builds anything, so that mismatch costs seconds
+rather than a whole build. `tests/packaging.rs` already tied the three versions together; nothing
+tied them to the tag.
+
 ### Signed by nobody's key (2026-09-08)
 
 **The wrappers are released from a workflow that holds no secret** (`ADR-0609 (core)`, ADR-0071).
