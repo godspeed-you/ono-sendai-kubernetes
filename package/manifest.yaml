@@ -17,7 +17,7 @@ package:
   # even though the Ono-Sendai project ships it.
   id: io.github.godspeed-you.kubernetes
   name: kubernetes
-  version: 0.2.1
+  version: 0.2.2
   description: Kubernetes as typed resources, relationships and places rather than a command namespace.
   publisher: io.github.godspeed-you
   license: Apache-2.0

@@ -54,11 +54,11 @@ places the plugin payload under /usr/lib/ono-sendai/plugin-sources/ and nothing 
 not installed into Ono, trusted, permitted or activated until a user runs
 `install plugin kubernetes` in ono and accepts the access it asks for."""
 assets = [
-    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.1/manifest.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.1/", "644"],
-    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.1/contributions/*.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.1/contributions/", "644"],
-    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.1/runtime/ono-kubernetes", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.1/runtime/", "755"],
-    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.1/signature.*", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.1/", "644"],
-    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.1.origin.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/", "644"],
+    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.2/manifest.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.2/", "644"],
+    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.2/contributions/*.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.2/contributions/", "644"],
+    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.2/runtime/ono-kubernetes", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.2/runtime/", "755"],
+    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.2/signature.*", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.2/", "644"],
+    ["../../target/payload/io.github.godspeed-you.kubernetes/0.2.2.origin.yaml", "usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/", "644"],
     ["../../README.md", "usr/share/doc/ono-plugin-kubernetes/README.md", "644"],
 ]
 
@@ -69,11 +69,11 @@ license = "Apache-2.0"
 url = "https://github.com/godspeed-you/ono-sendai-kubernetes"
 requires = { ono = ">= 0.4.4" }
 assets = [
-    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.1/manifest.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.1/manifest.yaml", mode = "644" },
-    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.1/contributions/*.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.1/contributions/", mode = "644" },
-    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.1/runtime/ono-kubernetes", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.1/runtime/ono-kubernetes", mode = "755" },
-    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.1/signature.*", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.1/", mode = "644" },
-    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.1.origin.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.1.origin.yaml", mode = "644" },
+    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.2/manifest.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.2/manifest.yaml", mode = "644" },
+    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.2/contributions/*.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.2/contributions/", mode = "644" },
+    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.2/runtime/ono-kubernetes", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.2/runtime/ono-kubernetes", mode = "755" },
+    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.2/signature.*", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.2/", mode = "644" },
+    { source = "../../target/payload/io.github.godspeed-you.kubernetes/0.2.2.origin.yaml", dest = "/usr/lib/ono-sendai/plugin-sources/io.github.godspeed-you.kubernetes/0.2.2.origin.yaml", mode = "644" },
     { source = "../../LICENSE", dest = "/usr/share/licenses/ono-plugin-kubernetes/LICENSE", mode = "644", doc = true },
     { source = "../../README.md", dest = "/usr/share/doc/ono-plugin-kubernetes/README.md", mode = "644", doc = true },
 ]

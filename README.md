@@ -5,7 +5,7 @@ reference KUANG/11 external-system provider.
 
 > Kubernetes is not a command namespace inside Ono. It is a system Ono can understand.
 
-**v0.2.1 ships the package as a `.deb` and an `.rpm`, signed by nobody's key**: the release
+**v0.2.2 ships the package as a `.deb` and an `.rpm`, signed by nobody's key**: the release
 workflow keeps no secret, proves its identity with a short-lived token, and a reader checks which
 workflow on which tag signed. v0.2.0 moved the package to the KUANG/11 permission contract:
 `install plugin kubernetes` is the whole ceremony, what it may do is decided in a person's words,
@@ -238,7 +238,7 @@ Both are canonical in that repository and are deliberately not copied here.
 | Ono-Sendai core, to run | **at or after `ADR-0590 (core)`**, which is the revision every manifest here pins and CI builds the shell from. `ADR-0588 (core)` is what makes `get k8s-change` and `get k8s-log --follow` stream rather than be collected; `ADR-0590 (core)` is what makes a refusal from either of them *reach you*, and a host between the two answers an empty table where this provider refused |
 | Kubernetes versions | **v1.35 – v1.37**, which is what upstream maintained on the specification's snapshot date (§0.5, §5.1). The claim is a tested matrix rather than a parser guard: nothing in the provider inspects `gitVersion`, and a cluster outside the window may work perfectly (§5.2) |
 | Kubernetes versions actually exercised | **v1.35.8, v1.36.4 and v1.37.0** — the declared oldest, the one between and the newest — on ephemeral `kind` clusters in CI and on demand through `scripts/cluster.sh` (§5.5, §59.3, Gate N) |
-| Releases of this provider | **v0.2.1** — the signed `.deb` and `.rpm` wrappers, needing `ono >= 0.4.4`; v0.2.0 brought the KUANG/11 permission contract; v0.1.0 was the first, built from this repository as a KUANG/11 package |
+| Releases of this provider | **v0.2.2** — the signed `.deb` and `.rpm` wrappers, needing `ono >= 0.4.4`; v0.2.0 brought the KUANG/11 permission contract; v0.1.0 was the first, built from this repository as a KUANG/11 package |
 
 The provider is discovery-first by construction: every REST path is built from what the connected
 API server says it serves, and no endpoint is compiled in (§5.2). The matrix above is what CI

@@ -230,15 +230,25 @@ made `trace`/`diff`'s absence an explicit out-of-scope boundary rather than an a
 against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`. The workspace is
 **1072 tests, all green**.
 
-### v0.2.1, and the version a tag names (2026-09-08)
+### v0.2.2, and the version a tag names (2026-09-08)
 
-**The package is `0.2.1`**, which is what the payload directory, the wrapper asset names and the
-manifest all say. The first attempt at the release found the reason to bump it: the tag was pushed
+**The package is `0.2.2`**, which is what the payload directory, the wrapper asset names and the
+manifest all say. The first attempt at a release found the reason to bump it: the tag was pushed
 as `v0.2.1` while every version in the tree still read `0.2.0`, so `cargo deb` wrote a file the
 publish step was not looking for and nothing was attached. The workflow now reads the manifest and
 refuses a tag that disagrees with it, before it builds anything, so that mismatch costs seconds
 rather than a whole build. `tests/packaging.rs` already tied the three versions together; nothing
 tied them to the tag.
+
+**`v0.2.1` is skipped, and the tag is left where it is.** It points at a tree declaring `0.2.0`,
+so no correct release can come from it, and moving a pushed tag rewrites a published reference for
+a number that is worth less than the rewrite. Nothing was ever published under it — the run signed
+the payload and failed at the publish step — so the tag is a dead end rather than a broken release.
+It may be deleted when somebody wants to, and nothing depends on that happening:
+
+```bash
+git push origin :refs/tags/v0.2.1 && git tag -d v0.2.1
+```
 
 ### Signed by nobody's key (2026-09-08)
 
