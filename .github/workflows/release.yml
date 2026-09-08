@@ -18,7 +18,7 @@ permissions:
 env:
   # The core revision this package is built and verified against, identical to the one every
   # manifest pins (`should_build_the_shell_from_the_revision_this_package_is_built_against`).
-  ONO_CORE_REV: 5e49ee75cd32255ca9d16700ee1701d86e663f08
+  ONO_CORE_REV: e2f20eea7509d6ffcaea35553d2c41503b55871b
 
 jobs:
   package:

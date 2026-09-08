@@ -230,6 +230,22 @@ made `trace`/`diff`'s absence an explicit out-of-scope boundary rather than an a
 against `kind` at v1.35.8, v1.36.4 and v1.37.0 on a machine with no `kubectl`. The workspace is
 **1072 tests, all green**.
 
+### v0.2.3, and an archive that arrived unsigned (2026-09-08)
+
+**v0.2.2's `.kuang` carries no signature, and v0.2.3 is the release that does.** Verifying the
+published assets rather than trusting the workflow's green tick found it: the `.deb` places
+`signature.sigstore.json` under the system root, and the archive beside it held only the manifest,
+the contributions and the runtime. `kuang-sign pack` appended the ed25519 document by name and had
+never been taught the keyless bundle exists, so a package signed only the new way packed as its
+artifact alone — and would install under local-development semantics, silently, because every file
+it declares is there. Fixed in core as `ono_kuang_protocol::packed_files`, which decides what
+travels beside the walk that decides what is covered, and the core revision this repository pins
+moves to it.
+
+The `.deb` and the `.rpm` of v0.2.2 are unaffected: their asset lists take `signature.*` by name.
+The `.kuang` is the catalog's network artifact, which is the one path that had no other copy of
+the signature to fall back on.
+
 ### v0.2.2, and the version a tag names (2026-09-08)
 
 **The package is `0.2.2`**, which is what the payload directory, the wrapper asset names and the
