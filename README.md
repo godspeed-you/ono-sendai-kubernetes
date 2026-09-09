@@ -268,7 +268,7 @@ It narrates; the assertions live in `crates/ono-kubernetes-plugin/tests/live_clu
 | Ono-Sendai core | **0.4.4 or newer** to run; to build, the core revision `Cargo.toml` pins, which CI builds the shell from |
 | KUANG/11 package format | `kuang-package/2` and `kuang_api >=11.2 <12` — the host API that answers `capabilities.check` with `ask` and holds a `process.exec` call on a person's consent |
 | Kubernetes versions | **v1.35 – v1.37**, what upstream maintained on the specification's snapshot date (§0.5, §5.1). Nothing inspects `gitVersion`, so a cluster outside the window may work perfectly (§5.2) |
-| Versions actually exercised | **v1.35.8, v1.36.4 and v1.37.0** — the declared oldest, one between, the newest — on ephemeral `kind` clusters in CI and on demand through `scripts/cluster.sh` |
+| Kubernetes versions actually exercised | **v1.35.8, v1.36.4 and v1.37.0** — the declared oldest, one between, the newest — on ephemeral `kind` clusters in CI and on demand through `scripts/cluster.sh` |
 | Platforms | linux-amd64 and linux-arm64 in the manifest; releases publish amd64 wrappers |
 | Releases | **v0.2.3**, the signed `.deb`, `.rpm` and `.kuang`. v0.2.2's `.kuang` was packed without its signature and should not be used; v0.2.0 brought the KUANG/11 permission contract; v0.1.0 was the first |
 
