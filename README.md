@@ -12,6 +12,7 @@ navigates the shell's spatial model, and — under a grant an operator gives del
 one bounded change. No Kubernetes concept lives in core.
 
 [**Install**](#installing-it) · [**Quick start**](#quick-start) ·
+[**User guide**](https://github.com/godspeed-you/ono-sendai-kubernetes/wiki) ·
 [**Specification**](docs/architecture/kubernetes-provider.md) ·
 [**Coverage**](docs/coverage.md) ·
 [**Releases**](https://github.com/godspeed-you/ono-sendai-kubernetes/releases)
@@ -195,6 +196,12 @@ change you have not made, `k8s-evidence` for what a `Node` says about the machin
 the registry, so `help get k8s-pod` and `help set k8s-resource` list them with their types and
 defaults — `--depth` on `k8s-why`, `--selector` on a listing, `--dry_run` on a write.
 
+The [wiki](https://github.com/godspeed-you/ono-sendai-kubernetes/wiki) walks the same ground at
+length: the [User Guide](https://github.com/godspeed-you/ono-sendai-kubernetes/wiki/User-Guide)
+goes from an empty machine to working inside a cluster, and the
+[Reference](https://github.com/godspeed-you/ono-sendai-kubernetes/wiki/Reference) lists every noun,
+option, permission, relation id and error code.
+
 ## Changing a cluster
 
 `provider.mutate` is the authority to change cluster state. `set k8s-resource` and
@@ -276,6 +283,7 @@ It narrates; the assertions live in `crates/ono-kubernetes-plugin/tests/live_clu
 
 | | |
 |---|---|
+| [Wiki](https://github.com/godspeed-you/ono-sendai-kubernetes/wiki) | the user guide, from install to working inside a cluster, and the reference for every noun, option, permission and error |
 | [`docs/architecture/kubernetes-provider.md`](docs/architecture/kubernetes-provider.md) | the Kubernetes Provider Specification — canonical here, immutable, checksummed |
 | [`docs/coverage.md`](docs/coverage.md) | what of it is built, section by section, with the evidence for each verdict |
 | [`docs/STATE.md`](docs/STATE.md) | the work board: what is in progress, found, or deferred |
